@@ -47,6 +47,10 @@ keyring = "4"
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 
+# Test-only (hoisted to workspace so all crates resolve the same version)
+tempfile = "3"
+serial_test = "3"
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"
