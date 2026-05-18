@@ -1,0 +1,55 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Tauri / frontend
+/ui/node_modules/
+/ui/dist/
+/ui/.vite/
+
+# Tauri build output
+/crates/desktop/target/
+/src-tauri/target/
+
+# Distribution
+/dist/
+/release/
+
+# Native binaries
+*.exe
+*.msi
+*.dmg
+*.AppImage
+*.deb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Env / Secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+.npmrc
+credentials.json
+
+# Local Claude / project assistant files (per global rule)
+CLAUDE.md
+GEMINI.md
+AGENTS.md
+.claude/
+.serena/
+
+# Spec, plans, briefs — internal-only, never tracked
+/docs/
