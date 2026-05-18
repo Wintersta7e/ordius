@@ -77,7 +77,10 @@ pub enum Trigger {
     },
     /// HTTP webhook (v1.1+). Schema-accepted in v1.0, never fires.
     Webhook {
-        /// Optional shared-secret token from OS keyring.
+        /// Template expression resolving to the shared-secret token at run
+        /// time — e.g. `"{{secrets.WHK_TOKEN}}"`. The substitution layer
+        /// (Phase 5) reads the actual value from the OS keyring; the raw
+        /// secret must never appear here on disk.
         #[serde(default)]
         secret_token: Option<String>,
     },
