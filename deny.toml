@@ -27,8 +27,11 @@ allow = [
 confidence-threshold = 0.9
 exceptions = []
 
+# Aligned with clippy's `multiple_crate_versions = "allow"` in
+# the workspace Cargo.toml: deep tokio/serde trees routinely ship
+# multiple compatible versions; warning on them is noise, not signal.
 [bans]
-multiple-versions = "warn"
+multiple-versions = "allow"
 wildcards = "deny"
 allow-wildcard-paths = false
 deny = []
@@ -42,7 +45,8 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
 
 [advisories]
-db-path = "~/.cargo/advisory-db"
+# db-path defaults to $CARGO_HOME/advisory-db; don't set it here
+# because cargo-deny does not shell-expand `~`.
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
 ignore = []
