@@ -10,4 +10,6 @@
 
 pub mod types;
 
-pub use types::{PortDef, PortType, PortValue};
+pub use types::{
+    BackoffStrategy, Edge, EdgeType, Node, PortDef, PortType, PortValue, Pos, RetryOn, RetryPolicy,
+};
