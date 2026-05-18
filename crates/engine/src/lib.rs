@@ -8,10 +8,12 @@
 //! - templates: substitute, redact
 //! - secrets: keyring read/write
 
+pub mod error;
 pub mod loader;
 pub mod types;
 pub mod validation;
 
+pub use error::{EngineError, Result};
 pub use loader::{LoadError, load_workflow};
 pub use types::{
     BackoffStrategy, Category, ConfigFieldDef, ConfigFieldType, Edge, EdgeType, ExecutionBackend,
