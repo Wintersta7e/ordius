@@ -4,6 +4,7 @@ pub mod edge;
 pub mod node;
 pub mod node_type;
 pub mod port;
+pub mod workflow;
 
 pub use edge::{Edge, EdgeType};
 pub use node::{BackoffStrategy, Node, Pos, RetryOn, RetryPolicy};
@@ -12,3 +13,4 @@ pub use node_type::{
     OutputParse,
 };
 pub use port::{PortDef, PortType, PortValue};
+pub use workflow::{Trigger, Workflow};
