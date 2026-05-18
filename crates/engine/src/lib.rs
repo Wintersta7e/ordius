@@ -7,3 +7,7 @@
 //! - storage: `Db`, `RunRecorder`
 //! - templates: substitute, redact
 //! - secrets: keyring read/write
+
+pub mod types;
+
+pub use types::{PortDef, PortType, PortValue};
