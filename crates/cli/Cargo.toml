@@ -1,0 +1,22 @@
+[package]
+name = "ordius-cli"
+description = "Ordius command-line interface. Headless workflow runner."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ordius-cli"
+path = "src/main.rs"
+
+[dependencies]
+ordius-engine = { path = "../engine" }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
