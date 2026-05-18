@@ -10,6 +10,7 @@
 
 pub mod loader;
 pub mod types;
+pub mod validation;
 
 pub use loader::{LoadError, load_workflow};
 pub use types::{
@@ -17,3 +18,4 @@ pub use types::{
     ExecutionSpec, Node, NodeType, OutputParse, PortDef, PortType, PortValue, Pos, RetryOn,
     RetryPolicy, Trigger, Workflow,
 };
+pub use validation::{ValidationError, validate};
