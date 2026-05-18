@@ -88,11 +88,12 @@ impl Default for RetryPolicy {
     }
 }
 
-/// Backoff growth pattern between retry attempts.
+/// Backoff growth pattern between retry attempts. See `docs/02-engine-model.md`
+/// "Retry policy" for the executor-side semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BackoffStrategy {
-    /// `backoff_ms * 2^(attempt-1)` — doubles each attempt.
+    /// `backoff_ms * 2^(attempt-1)`, capped at 60 000 ms per spec.
     Exponential,
     /// `backoff_ms * attempt` — grows linearly.
     Linear,
