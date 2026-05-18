@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Wire-format port type tag. Used by `PortDef` (compile-time port spec)
 /// and as an implicit discriminator for `PortValue` runtime values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PortType {
     /// UTF-8 string.
@@ -39,6 +39,14 @@ pub struct PortDef {
 
 /// Runtime value carried across edges. Discriminated by structure
 /// (`#[serde(untagged)]`) to keep the wire format compact.
+///
+/// **Serde note.** `String`, `File`, and `Bytes` all serialise as JSON
+/// strings. Untagged deserialisation picks the first match, so any
+/// string-shaped input deserialises as `PortValue::String` — never as
+/// `File` or `Bytes`. This is intentional: variant identity for the
+/// three string-shaped cases is carried out-of-band by the declaring
+/// `PortDef::ty`, not by the wire form. Treat this enum as write-typed
+/// but read-coalesced for those three variants.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PortValue {
