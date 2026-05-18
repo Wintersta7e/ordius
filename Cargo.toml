@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = ["crates/engine", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+authors = ["Wintersta7e <Wintersta7e@users.noreply.github.com>"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "process", "signal", "fs", "io-util", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# serde_yaml is deprecated upstream; using the actively-maintained fork via Cargo package rename.
+serde_yaml = { version = "0.10", package = "serde_yaml_ng" }
+
+# Errors / logging
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+glob = "0.3"
+
+# Storage
+rusqlite = { version = "0.39", features = ["bundled", "chrono"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.34"
+
+# HTTP / external
+reqwest = { version = "0.13", features = ["json", "stream"] }
+jsonpath-rust = "1"
+keyring = "4"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_must_use = "deny"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+let_underscore_drop = "warn"
+unused_lifetimes = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# Pragmatic allows
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+multiple_crate_versions = "allow"
+cargo_common_metadata = "allow"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
