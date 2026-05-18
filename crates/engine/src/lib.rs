@@ -8,8 +8,10 @@
 //! - templates: substitute, redact
 //! - secrets: keyring read/write
 
+pub mod loader;
 pub mod types;
 
+pub use loader::{LoadError, load_workflow};
 pub use types::{
     BackoffStrategy, Category, ConfigFieldDef, ConfigFieldType, Edge, EdgeType, ExecutionBackend,
     ExecutionSpec, Node, NodeType, OutputParse, PortDef, PortType, PortValue, Pos, RetryOn,
