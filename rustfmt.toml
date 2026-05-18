@@ -1,0 +1,25 @@
+# Most options below are unstable in rustfmt and require nightly rustfmt
+# to take effect. They are kept here for two reasons:
+#   1) `cargo +nightly fmt` applies them when developers opt in
+#   2) They document the canonical style intent on stable
+# Stable rustfmt honors only: edition, max_width, newline_style, hard_tabs.
+edition = "2024"
+max_width = 100
+newline_style = "Unix"
+hard_tabs = false
+tab_spaces = 4
+
+# Unstable on stable rustfmt — emit a warning but don't fail.
+unstable_features = true
+imports_granularity = "Module"
+group_imports = "StdExternalCrate"
+use_field_init_shorthand = true
+use_try_shorthand = true
+struct_lit_single_line = true
+match_block_trailing_comma = true
+overflow_delimited_expr = true
+format_strings = false
+hex_literal_case = "Lower"
+normalize_comments = true
+wrap_comments = true
+comment_width = 100

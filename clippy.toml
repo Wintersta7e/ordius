@@ -1,0 +1,25 @@
+# Per-lint thresholds and config. Lint enable/disable lives in
+# [workspace.lints.clippy] in the root Cargo.toml.
+
+# Minimum supported Rust — matches rust-toolchain.toml channel.
+msrv = "1.95"
+
+# We are at v0.1 and own all consumers; breaking-API discipline can wait.
+avoid-breaking-exported-api = false
+
+# Test code is allowed to be looser — fixing unwraps in tests just
+# obscures intent without preventing real bugs.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-print-in-tests = true
+allow-dbg-in-tests = true
+
+# Cognitive-complexity defaults are tight (25); nudged for tokio/future
+# heavy code that legitimately branches more than `if/else` analyses think.
+cognitive-complexity-threshold = 30
+too-many-arguments-threshold = 8
+type-complexity-threshold = 250
+
+# Verbose-bit-mask threshold is annoying for SQLite/keyring code that
+# uses flag constants. Bumped from default 1 to 4.
+verbose-bit-mask-threshold = 4

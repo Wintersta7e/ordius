@@ -1,0 +1,48 @@
+# cargo-deny policy file. Run via `cargo deny check` (requires
+# `cargo install cargo-deny` first — not enforced at compile time).
+#
+# This config is intentionally strict on advisories and sources;
+# license-allowlist is permissive enough to cover the current dep tree
+# without rejecting reasonable crates.
+
+[graph]
+all-features = true
+
+[licenses]
+# SPDX expressions accepted in the Cargo ecosystem.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-DFS-2016",
+  "Unicode-3.0",
+  "CC0-1.0",
+  "Zlib",
+  "MPL-2.0",
+  "0BSD",
+]
+confidence-threshold = 0.9
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = false
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = []
