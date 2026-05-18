@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 /// normal DAG execution; loop edges create back-edges from condition
 /// nodes for the scheduler's iteration logic.
 ///
-/// **Wire format.** Fields serialise in snake_case on disk (per project
+/// **Wire format.** Fields serialise in `snake_case` on disk (per project
 /// convention). The `kind` Rust field renames to `edge_type` in JSON so
 /// the storage key matches the rest of the schema. The Tauri command
-/// boundary converts to camelCase for the GUI; engine code never sees
-/// the camelCase form.
+/// boundary converts to `camelCase` for the GUI; engine code never sees
+/// the `camelCase` form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Edge {
     /// Stable identifier within the workflow.
