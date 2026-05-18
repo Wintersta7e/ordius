@@ -11,5 +11,7 @@
 pub mod types;
 
 pub use types::{
-    BackoffStrategy, Edge, EdgeType, Node, PortDef, PortType, PortValue, Pos, RetryOn, RetryPolicy,
+    BackoffStrategy, Category, ConfigFieldDef, ConfigFieldType, Edge, EdgeType, ExecutionBackend,
+    ExecutionSpec, Node, NodeType, OutputParse, PortDef, PortType, PortValue, Pos, RetryOn,
+    RetryPolicy,
 };
