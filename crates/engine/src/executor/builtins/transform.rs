@@ -1,8 +1,7 @@
-//! `transform` built-in (Phase 4 cut): `jsonpath`, `regex_extract`,
-//! `regex_replace`.
+//! `transform` built-in: `jsonpath`, `regex_extract`, `regex_replace`.
 //!
-//! The `template` op lands in Phase 5 alongside the unified
-//! substitution engine. Single primary output: `text` (string).
+//! A `template` op joins this set once the template substitution
+//! engine is wired in. Single primary output: `text` (string).
 
 use super::util::config_str;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};

@@ -1,7 +1,7 @@
 //! `NodeType` registry.
 //!
 //! Built-ins are inserted at startup via [`Registry::with_v1_0_builtins`];
-//! manifest-loaded types land here once Phase 10's loader runs.
+//! manifest-loaded types land here once the manifest loader ships.
 
 use crate::types::{Category, ExecutionBackend, ExecutionSpec, NodeType, OutputParse};
 use std::collections::HashMap;

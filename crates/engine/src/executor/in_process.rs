@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 /// Owns one instance of each `InProcess`-backed built-in
 /// (`DelayExecutor`, `TransformExecutor`, `ConditionExecutor`)
 /// and forwards each `run` call to whichever one supports the
-/// node. When the engine's top-level dispatcher (Phase 7) sees
+/// node. When the engine's top-level dispatcher sees
 /// `ExecutionBackend::Subprocess`, it falls through to the
 /// subprocess executor instead.
 pub struct InProcessExecutor {

@@ -79,8 +79,8 @@ pub enum Trigger {
     Webhook {
         /// Template expression resolving to the shared-secret token at run
         /// time — e.g. `"{{secrets.WHK_TOKEN}}"`. The substitution layer
-        /// (Phase 5) reads the actual value from the OS keyring; the raw
-        /// secret must never appear here on disk.
+        /// reads the actual value from the OS keyring; the raw secret
+        /// must never appear here on disk.
         #[serde(default)]
         secret_token: Option<String>,
     },

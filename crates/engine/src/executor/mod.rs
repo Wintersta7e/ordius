@@ -39,10 +39,10 @@ pub enum NodeError {
         #[source]
         source: std::io::Error,
     },
-    /// HTTP request failure (used by the `http` node in Phase 7).
+    /// HTTP request failure (used by the `http` node).
     #[error("http: {0}")]
     Http(String),
-    /// Subprocess invocation failure (used by the `shell` node in Phase 6).
+    /// Subprocess invocation failure (used by the `shell` node).
     #[error("subprocess: {0}")]
     Subprocess(String),
     /// Node exceeded its `timeout_ms` budget.
