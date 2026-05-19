@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { Editor } from "./routes/Editor";
+import { History } from "./routes/History";
 import { Home } from "./routes/Home";
+import { Settings } from "./routes/Settings";
 import { bindNavigate, type Route } from "./lib/router";
 
-// Phase 1.5a: two wired routes — Home and Editor. History +
-// Settings land in 1.7 / 1.8. Theme + routing state live at the
+// All four v1.1 routes wired. Theme + routing state live at the
 // App root so navigation between routes doesn't flicker the
 // theme cascade.
 function App() {
@@ -35,9 +36,21 @@ function App() {
         />
       );
     case "history":
+      return (
+        <History
+          theme={theme}
+          onThemeToggle={toggleTheme}
+          onNavigate={setRoute}
+        />
+      );
     case "settings":
-      // Phases 1.7 / 1.8 — fall through to Home for now.
-      return <Home theme={theme} onThemeToggle={toggleTheme} />;
+      return (
+        <Settings
+          theme={theme}
+          onThemeToggle={toggleTheme}
+          onNavigate={setRoute}
+        />
+      );
     case "home":
     default:
       return <Home theme={theme} onThemeToggle={toggleTheme} />;

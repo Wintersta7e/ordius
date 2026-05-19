@@ -1,12 +1,13 @@
 // Editor + Home top bar.
 //
-// Phase 1.4 wires the Home variant: wordmark, page label, history /
-// settings / theme buttons on the right.
+// Wires the Home / History / Settings variant: wordmark, page
+// label, history / settings / theme buttons on the right.
 
 import type { JSX } from "react";
 
 import { OrdiusWordmark } from "../Wordmark";
 import { Ic } from "../icons";
+import { navigate, type Route } from "../../lib/router";
 
 interface Props {
   /** Label rendered after the wordmark divider (e.g. "home"). */
@@ -15,9 +16,20 @@ interface Props {
   theme: "dark" | "light";
   /** Called when the user clicks the theme toggle. */
   onThemeToggle: () => void;
+  /** Optional navigation override — falls back to the global navigate(). */
+  onNavigate?: (route: Route) => void;
 }
 
-export function TopBar({ pageLabel, theme, onThemeToggle }: Props): JSX.Element {
+export function TopBar({
+  pageLabel,
+  theme,
+  onThemeToggle,
+  onNavigate,
+}: Props): JSX.Element {
+  const go = (route: Route) => {
+    if (onNavigate) onNavigate(route);
+    else navigate(route);
+  };
   return (
     <header
       style={{
@@ -32,7 +44,21 @@ export function TopBar({ pageLabel, theme, onThemeToggle }: Props): JSX.Element 
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-        <OrdiusWordmark size="md" />
+        <button
+          type="button"
+          className="btn ghost"
+          style={{
+            background: "transparent",
+            border: 0,
+            padding: 0,
+            cursor: "pointer",
+            height: "auto",
+          }}
+          onClick={() => go({ kind: "home" })}
+          title="Home"
+        >
+          <OrdiusWordmark size="md" />
+        </button>
         <span style={{ color: "var(--line)" }}>│</span>
         <span
           style={{
@@ -60,6 +86,7 @@ export function TopBar({ pageLabel, theme, onThemeToggle }: Props): JSX.Element 
           className="btn ghost icon"
           title="Run history"
           aria-label="Open run history"
+          onClick={() => go({ kind: "history" })}
         >
           {Ic["log"]?.({ size: 14 })}
         </button>
@@ -68,6 +95,7 @@ export function TopBar({ pageLabel, theme, onThemeToggle }: Props): JSX.Element 
           className="btn ghost icon"
           title="Settings"
           aria-label="Open settings"
+          onClick={() => go({ kind: "settings" })}
         >
           {Ic["cog"]?.({ size: 14 })}
         </button>
