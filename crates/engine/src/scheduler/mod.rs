@@ -16,13 +16,13 @@ use std::collections::{HashMap, HashSet};
 /// loop edges. The run-loop polls [`Scheduler::ready`] for work and
 /// [`Scheduler::is_done`] (and, later, `is_stalled`) for termination.
 pub struct Scheduler<'a> {
-    pub(crate) nodes: &'a [Node],
-    pub(crate) incoming: HashMap<&'a str, Vec<&'a Edge>>,
-    pub(crate) outgoing: HashMap<&'a str, Vec<&'a Edge>>,
-    pub(crate) loops_by_condition: HashMap<&'a str, Vec<&'a Edge>>,
-    pub(crate) state: HashMap<String, NodeState>,
-    pub(crate) loop_counters: HashMap<String, u32>,
-    pub(crate) emitted_skipped: HashSet<String>,
+    nodes: &'a [Node],
+    incoming: HashMap<&'a str, Vec<&'a Edge>>,
+    outgoing: HashMap<&'a str, Vec<&'a Edge>>,
+    loops_by_condition: HashMap<&'a str, Vec<&'a Edge>>,
+    state: HashMap<String, NodeState>,
+    loop_counters: HashMap<String, u32>,
+    pending_skipped: Vec<String>,
 }
 
 /// A successful loop fire returned by [`Scheduler::try_loop`].
@@ -81,7 +81,7 @@ impl<'a> Scheduler<'a> {
             loops_by_condition,
             state,
             loop_counters: HashMap::new(),
-            emitted_skipped: HashSet::new(),
+            pending_skipped: Vec::new(),
         }
     }
 
@@ -129,9 +129,14 @@ impl<'a> Scheduler<'a> {
                 .all(|n| !matches!(self.state_of(&n.id), NodeState::Ready | NodeState::Running))
     }
 
-    /// Mark `node_id` as `Running`. Idempotent.
+    /// Transition `node_id` from `Ready` to `Running`. No-op for
+    /// any other current state — callers cannot use this to
+    /// resurrect a `Done` / `Error` / `Skipped` node, and
+    /// re-calling on an already-`Running` node has no effect.
     pub fn start_node(&mut self, node_id: &str) {
-        self.state.insert(node_id.into(), NodeState::Running);
+        if self.state_of(node_id) == NodeState::Ready {
+            self.state.insert(node_id.into(), NodeState::Running);
+        }
     }
 
     /// Mark `node_id` as `Done` and promote any downstream nodes
@@ -272,14 +277,7 @@ impl<'a> Scheduler<'a> {
     /// this to emit exactly one `node:skipped` event per
     /// transition.
     pub fn drain_newly_skipped(&mut self) -> Vec<String> {
-        let mut out = Vec::new();
-        for n in self.nodes {
-            if self.state_of(&n.id) == NodeState::Skipped && !self.emitted_skipped.contains(&n.id) {
-                self.emitted_skipped.insert(n.id.clone());
-                out.push(n.id.clone());
-            }
-        }
-        out
+        std::mem::take(&mut self.pending_skipped)
     }
 
     /// Mark `root` and its transitive forward-edge descendants as
@@ -295,6 +293,7 @@ impl<'a> Scheduler<'a> {
                 continue;
             }
             self.state.insert(id.clone(), NodeState::Skipped);
+            self.pending_skipped.push(id.clone());
             if let Some(outs) = self.outgoing.get(id.as_str()) {
                 for e in outs {
                     stack.push(e.to_node_id.clone());
