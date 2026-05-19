@@ -1,7 +1,5 @@
-//! `transform` built-in: `jsonpath`, `regex_extract`, `regex_replace`.
-//!
-//! A `template` op joins this set once the template substitution
-//! engine is wired in. Single primary output: `text` (string).
+//! `transform` built-in: `template`, `jsonpath`, `regex_extract`,
+//! `regex_replace`. Single primary output: `text` (string).
 
 use super::util::config_str;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
@@ -25,7 +23,7 @@ impl NodeExecutor for TransformExecutor {
         &self,
         node: &Node,
         _nt: &NodeType,
-        _ctx: &RunContext,
+        ctx: &RunContext,
         cancel: CancellationToken,
     ) -> Result<NodeOutputs, NodeError> {
         if cancel.is_cancelled() {
@@ -37,10 +35,12 @@ impl NodeExecutor for TransformExecutor {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| {
                 NodeError::Config(
-                    "transform: 'op' required: jsonpath|regex_extract|regex_replace".into(),
+                    "transform: 'op' required: template|jsonpath|regex_extract|regex_replace"
+                        .into(),
                 )
             })?;
         let result = match op {
+            "template" => apply_template(node, ctx)?,
             "jsonpath" => apply_jsonpath(&node.config)?,
             "regex_extract" => apply_regex_extract(&node.config)?,
             "regex_replace" => apply_regex_replace(&node.config)?,
@@ -54,6 +54,43 @@ impl NodeExecutor for TransformExecutor {
         out.insert("text".into(), PortValue::String(result));
         Ok(out)
     }
+}
+
+fn apply_template(node: &Node, ctx: &RunContext) -> Result<String, NodeError> {
+    let tmpl = node
+        .config
+        .get("template")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            NodeError::Config("transform.template: 'template' (string) required".into())
+        })?;
+    let secrets_store = ctx.secrets_store.clone();
+    let emitter = ctx.emitter.clone();
+    let secrets_resolver = move |name: &str| -> Option<String> {
+        let store = secrets_store.as_ref()?;
+        let value = store.get(name).ok()?;
+        emitter.register_secret(name.to_string(), value.clone());
+        Some(value)
+    };
+    let env_resolver = |name: &str| std::env::var(name).ok();
+    let kv_resolver = |_: &str| None;
+    let env_allow = crate::template::default_env_allowlist();
+    let sub_ctx = crate::template::SubstitutionContext {
+        vars: &ctx.variables,
+        secrets: &secrets_resolver,
+        upstream_outputs: &ctx.upstream_outputs,
+        current_inputs: &ctx.current_inputs,
+        current_config: &node.config,
+        kv: &kv_resolver,
+        env: &env_resolver,
+        env_allowlist: &env_allow,
+        run_id: &ctx.run_id,
+        workspace: &ctx.workspace,
+        started_at_iso: &ctx.started_at_iso,
+        workflow_id: &ctx.workflow_id,
+        workflow_name: &ctx.workflow_name,
+    };
+    crate::template::substitute(tmpl, &sub_ctx).map_err(|e| NodeError::Template(e.to_string()))
 }
 
 fn apply_jsonpath(cfg: &HashMap<String, serde_json::Value>) -> Result<String, NodeError> {

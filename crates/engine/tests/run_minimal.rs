@@ -75,10 +75,13 @@ async fn two_delay_nodes_run_end_to_end() {
     let ctx = RunContext {
         run_id: rec.run_id.clone(),
         workflow_id: wf.id.clone(),
+        workflow_name: wf.name.clone(),
+        started_at_iso: String::new(),
         workspace: dir.path().to_path_buf(),
         variables: HashMap::new(),
         recorder: rec.clone(),
         emitter: em.clone(),
+        secrets_store: None,
         current_inputs: HashMap::new(),
         upstream_outputs: HashMap::new(),
     };

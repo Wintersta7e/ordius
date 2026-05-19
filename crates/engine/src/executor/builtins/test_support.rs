@@ -36,10 +36,13 @@ pub(super) fn make_ctx() -> (RunContext, TempDir) {
     let ctx = RunContext {
         run_id: rec.run_id.clone(),
         workflow_id: "w".into(),
+        workflow_name: String::new(),
+        started_at_iso: String::new(),
         workspace: dir.path().to_path_buf(),
         variables: HashMap::new(),
         recorder: rec,
         emitter: Arc::new(em),
+        secrets_store: None,
         current_inputs: HashMap::new(),
         upstream_outputs: HashMap::new(),
     };
