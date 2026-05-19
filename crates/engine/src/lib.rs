@@ -17,6 +17,7 @@ pub mod loader;
 pub mod recorder;
 pub mod registry;
 pub mod scheduler;
+pub mod template;
 pub mod types;
 pub mod validation;
 
@@ -27,6 +28,7 @@ pub use executor::{InProcessExecutor, NodeError, NodeExecutor, NodeOutputs, RunC
 pub use loader::{LoadError, load_workflow};
 pub use recorder::{NodeRunRow, RunRecorder, sweep_stale_locks};
 pub use scheduler::{LoopFire, NodeState, Scheduler};
+pub use template::{SubstitutionContext, TemplateError, default_env_allowlist, substitute};
 pub use types::{
     BackoffStrategy, Category, ConfigFieldDef, ConfigFieldType, Edge, EdgeType, ExecutionBackend,
     ExecutionSpec, Node, NodeType, OutputParse, PortDef, PortType, PortValue, Pos, RetryOn,

@@ -1,0 +1,243 @@
+//! Template substitution engine for `{{namespace.key}}` forms.
+//!
+//! Non-Turing: no loops or conditionals. Every reference must
+//! resolve at substitution time; undefined references produce a
+//! loud [`TemplateError::Undefined`] rather than a silent empty
+//! string.
+
+use crate::types::PortValue;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use thiserror::Error;
+
+const ORDIUS_USER_PREFIX: &str = "ORDIUS_USER_";
+
+/// Default env-var allowlist for `{{env.NAME}}` resolution.
+///
+/// `PATH` is deliberately excluded — substituting `PATH` into a
+/// shell command is an injection vector. The executor uses its
+/// own inherited `PATH` instead. Names matching the
+/// `ORDIUS_USER_*` prefix are always allowed (checked by the
+/// substituter, not present in this set).
+#[must_use]
+pub fn default_env_allowlist() -> HashSet<String> {
+    ["HOME", "USERPROFILE", "LANG", "TZ"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+/// Per-substitution context.
+///
+/// Every field is a borrow — the substituter never owns its
+/// inputs. Callers populate `secrets` and `kv` with closures
+/// wrapping the OS keyring and the `SQLite` kv store
+/// respectively.
+pub struct SubstitutionContext<'a> {
+    /// Workflow variables.
+    pub vars: &'a HashMap<String, String>,
+    /// Resolver for `{{secrets.NAME}}` — typically wraps the OS keyring.
+    pub secrets: &'a dyn Fn(&str) -> Option<String>,
+    /// Upstream outputs collected so far, keyed by `(node_id, port_name)`.
+    pub upstream_outputs: &'a HashMap<(String, String), PortValue>,
+    /// Inputs wired into the current node by the run-loop.
+    pub current_inputs: &'a HashMap<String, PortValue>,
+    /// Current node's config map (`{{config.X}}` resolves here).
+    pub current_config: &'a HashMap<String, serde_json::Value>,
+    /// Resolver for `{{kv.KEY}}`.
+    pub kv: &'a dyn Fn(&str) -> Option<String>,
+    /// Resolver for `{{env.NAME}}` — production callers wrap
+    /// `std::env::var(name).ok()`. The allowlist is enforced
+    /// before the resolver is called, so resolvers see only
+    /// permitted names.
+    pub env: &'a dyn Fn(&str) -> Option<String>,
+    /// Allowlist for `{{env.NAME}}` resolution.
+    pub env_allowlist: &'a HashSet<String>,
+    /// Run id (`{{run.id}}`).
+    pub run_id: &'a str,
+    /// Run workspace directory (`{{run.workspace}}`).
+    pub workspace: &'a Path,
+    /// ISO-8601 run start time (`{{run.startedAt}}`).
+    pub started_at_iso: &'a str,
+    /// Workflow id (`{{workflow.id}}`).
+    pub workflow_id: &'a str,
+    /// Workflow name (`{{workflow.name}}`).
+    pub workflow_name: &'a str,
+}
+
+/// Failure modes for [`substitute`].
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum TemplateError {
+    /// A reference could not be resolved.
+    #[error("undefined: {0}")]
+    Undefined(String),
+    /// Template surface syntax violation (unclosed `{{`, etc.).
+    #[error("syntax: {0}")]
+    Syntax(String),
+}
+
+/// Substitute every `{{...}}` in `tmpl` using `ctx`.
+///
+/// Supported forms:
+/// - `{{vars.X}}` / `{{secrets.X}}` / `{{kv.X}}` / `{{env.X}}`
+/// - `{{inputs.PORT}}` / `{{config.KEY}}`
+/// - `{{nodes.NID.outputs.PORT}}`
+/// - `{{run.id}}` / `{{run.workspace}}` / `{{run.startedAt}}`
+/// - `{{workflow.id}}` / `{{workflow.name}}`
+/// - `{{json EXPR}}` — JSON-escape the resolved expression
+///
+/// Undefined references fail loud — they never silently render
+/// as the empty string.
+pub fn substitute(tmpl: &str, ctx: &SubstitutionContext<'_>) -> Result<String, TemplateError> {
+    let mut out = String::new();
+    let mut remaining = tmpl;
+    while let Some(start) = remaining.find("{{") {
+        out.push_str(&remaining[..start]);
+        let after_open = &remaining[start + 2..];
+        let end = after_open
+            .find("}}")
+            .ok_or_else(|| TemplateError::Syntax("unclosed `{{`".into()))?;
+        let inner = after_open[..end].trim();
+        let value = resolve(inner, ctx)?;
+        out.push_str(&value);
+        remaining = &after_open[end + 2..];
+    }
+    out.push_str(remaining);
+    Ok(out)
+}
+
+fn resolve(expr: &str, ctx: &SubstitutionContext<'_>) -> Result<String, TemplateError> {
+    if let Some(rest) = expr.strip_prefix("json ") {
+        let inner = resolve(rest.trim(), ctx)?;
+        return serde_json::to_string(&inner)
+            .map_err(|e| TemplateError::Syntax(format!("json helper: {e}")));
+    }
+    let mut parts = expr.split('.');
+    let ns = parts
+        .next()
+        .ok_or_else(|| TemplateError::Syntax("empty reference".into()))?;
+    match ns {
+        "vars" => single_key(&mut parts, "vars", |k| {
+            ctx.vars
+                .get(k)
+                .cloned()
+                .ok_or_else(|| TemplateError::Undefined(format!("vars.{k}")))
+        }),
+        "secrets" => single_key(&mut parts, "secrets", |k| {
+            (ctx.secrets)(k).ok_or_else(|| TemplateError::Undefined(format!("secrets.{k}")))
+        }),
+        "kv" => single_key(&mut parts, "kv", |k| {
+            (ctx.kv)(k).ok_or_else(|| TemplateError::Undefined(format!("kv.{k}")))
+        }),
+        "inputs" => single_key(&mut parts, "inputs", |k| {
+            ctx.current_inputs
+                .get(k)
+                .map(port_value_to_string)
+                .transpose()?
+                .ok_or_else(|| TemplateError::Undefined(format!("inputs.{k}")))
+        }),
+        "config" => single_key(&mut parts, "config", |k| {
+            ctx.current_config
+                .get(k)
+                .map(json_value_to_string)
+                .ok_or_else(|| TemplateError::Undefined(format!("config.{k}")))
+        }),
+        "env" => single_key(&mut parts, "env", |k| {
+            if !ctx.env_allowlist.contains(k) && !k.starts_with(ORDIUS_USER_PREFIX) {
+                return Err(TemplateError::Undefined(format!(
+                    "env.{k} (not allowlisted)"
+                )));
+            }
+            (ctx.env)(k).ok_or_else(|| TemplateError::Undefined(format!("env.{k}")))
+        }),
+        "run" => match parts.next() {
+            Some("id") => no_trailing(&mut parts, "run.id").map(|()| ctx.run_id.to_string()),
+            Some("workspace") => no_trailing(&mut parts, "run.workspace")
+                .map(|()| ctx.workspace.display().to_string()),
+            Some("startedAt") => {
+                no_trailing(&mut parts, "run.startedAt").map(|()| ctx.started_at_iso.to_string())
+            },
+            Some(other) => Err(TemplateError::Undefined(format!("run.{other}"))),
+            None => Err(TemplateError::Syntax("run.X required".into())),
+        },
+        "workflow" => match parts.next() {
+            Some("id") => {
+                no_trailing(&mut parts, "workflow.id").map(|()| ctx.workflow_id.to_string())
+            },
+            Some("name") => {
+                no_trailing(&mut parts, "workflow.name").map(|()| ctx.workflow_name.to_string())
+            },
+            Some(other) => Err(TemplateError::Undefined(format!("workflow.{other}"))),
+            None => Err(TemplateError::Syntax("workflow.X required".into())),
+        },
+        "nodes" => {
+            let nid = parts
+                .next()
+                .ok_or_else(|| TemplateError::Syntax("nodes.NID.outputs.PORT".into()))?;
+            let kw = parts
+                .next()
+                .ok_or_else(|| TemplateError::Syntax("nodes.NID.outputs.PORT".into()))?;
+            if kw != "outputs" {
+                return Err(TemplateError::Syntax(format!(
+                    "nodes.{nid}.{kw}: expected 'outputs'"
+                )));
+            }
+            let port = parts
+                .next()
+                .ok_or_else(|| TemplateError::Syntax("nodes.NID.outputs.PORT".into()))?;
+            no_trailing(&mut parts, "nodes.NID.outputs.PORT")?;
+            ctx.upstream_outputs
+                .get(&(nid.to_string(), port.to_string()))
+                .map(port_value_to_string)
+                .transpose()?
+                .ok_or_else(|| TemplateError::Undefined(format!("nodes.{nid}.outputs.{port}")))
+        },
+        other => Err(TemplateError::Syntax(format!("unknown namespace: {other}"))),
+    }
+}
+
+fn single_key<F>(
+    parts: &mut std::str::Split<'_, char>,
+    ns: &str,
+    f: F,
+) -> Result<String, TemplateError>
+where
+    F: FnOnce(&str) -> Result<String, TemplateError>,
+{
+    let key = parts
+        .next()
+        .ok_or_else(|| TemplateError::Syntax(format!("{ns}.NAME required")))?;
+    no_trailing(parts, ns)?;
+    f(key)
+}
+
+fn no_trailing(parts: &mut std::str::Split<'_, char>, what: &str) -> Result<(), TemplateError> {
+    if parts.next().is_some() {
+        Err(TemplateError::Syntax(format!("{what} has too many parts")))
+    } else {
+        Ok(())
+    }
+}
+
+fn port_value_to_string(v: &PortValue) -> Result<String, TemplateError> {
+    Ok(match v {
+        PortValue::String(s) => s.clone(),
+        PortValue::Number(n) => n.to_string(),
+        PortValue::Boolean(b) => b.to_string(),
+        PortValue::Json(j) => serde_json::to_string(j)
+            .map_err(|e| TemplateError::Syntax(format!("encode json: {e}")))?,
+        PortValue::File(p) | PortValue::Bytes(p) => p.clone(),
+        PortValue::Vector(v) => serde_json::to_string(v)
+            .map_err(|e| TemplateError::Syntax(format!("encode vector: {e}")))?,
+    })
+}
+
+fn json_value_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests;
