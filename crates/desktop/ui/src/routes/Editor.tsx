@@ -270,12 +270,8 @@ export function Editor({
   // cursor-tracking ghost is a v1.x polish item.
   const handleRun = useCallback(() => {
     if (!workflow) return;
-    if (!insideTauri) {
-      console.warn("run requires the Tauri host");
-      return;
-    }
     setRunDialogOpen(true);
-  }, [workflow, insideTauri]);
+  }, [workflow]);
 
   const handleRunConfirm = useCallback(
     async (input: {
@@ -287,6 +283,7 @@ export function Editor({
       setRunDialogOpen(false);
       setRunState(emptyRunState());
       setMode("run");
+      if (!insideTauri) return;
       try {
         await runWorkflow(
           {
@@ -303,7 +300,7 @@ export function Editor({
         setError(String(e));
       }
     },
-    [workflow],
+    [workflow, insideTauri],
   );
 
   const handleStop = useCallback(async () => {

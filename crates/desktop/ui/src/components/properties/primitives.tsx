@@ -66,7 +66,7 @@ export function Section({ label, suffix, children }: SectionProps): JSX.Element 
 }
 
 interface FieldProps {
-  label: string;
+  label: ReactNode;
   hint?: string | undefined;
   children: ReactNode;
 }
