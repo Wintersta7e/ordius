@@ -186,6 +186,7 @@ impl Engine {
         _auto_resume: bool,
     ) -> Result<RunSummary> {
         let mut upstream_outputs: HashMap<(String, String), PortValue> = HashMap::new();
+        let mut iterations: HashMap<String, u32> = HashMap::new();
         let mut node_runs_count: usize = 0;
 
         let mut sched = Scheduler::new(&wf);
@@ -244,11 +245,12 @@ impl Engine {
                         message: format!("unknown node type '{}'", node.ty),
                     })?;
 
+                let iteration = *iterations.entry(node.id.clone()).or_insert(1);
                 let started_at = chrono::Utc::now().timestamp_millis();
                 sched.start_node(&node.id);
                 recorder.record_node_run(&NodeRunRow {
                     node_id: &node.id,
-                    iteration: 1,
+                    iteration,
                     attempt: 1,
                     node_type: &node.ty,
                     status: "running",
@@ -262,7 +264,7 @@ impl Engine {
                 emitter.emit_node(
                     EventType::NodeStarted,
                     node.id.clone(),
-                    1,
+                    iteration,
                     1,
                     HashMap::new(),
                 );
@@ -278,7 +280,7 @@ impl Engine {
                                 .map_err(|e| EngineError::Db(format!("encode output: {e}")))?;
                             recorder.record_node_output(
                                 &node.id,
-                                1,
+                                iteration,
                                 1,
                                 port_name,
                                 Some(&value_json),
@@ -289,7 +291,7 @@ impl Engine {
                         }
                         recorder.record_node_run(&NodeRunRow {
                             node_id: &node.id,
-                            iteration: 1,
+                            iteration,
                             attempt: 1,
                             node_type: &node.ty,
                             status: "done",
@@ -302,7 +304,7 @@ impl Engine {
                         emitter.emit_node(
                             EventType::NodeDone,
                             node.id.clone(),
-                            1,
+                            iteration,
                             1,
                             HashMap::from([
                                 ("finished_at".into(), serde_json::json!(finished_at)),
@@ -310,12 +312,41 @@ impl Engine {
                             ]),
                         );
                         sched.complete_node(&node.id);
+
+                        // condition node: route branch + maybe fire a loop.
+                        if node.ty == "condition"
+                            && let Some(PortValue::String(branch)) = outputs.get("branch")
+                        {
+                            let branch = branch.clone();
+                            sched.resolve_condition(&node.id, &branch);
+                            if let Some(fire) = sched.try_loop(&node.id, &branch) {
+                                let mut payload: HashMap<String, serde_json::Value> =
+                                    HashMap::with_capacity(2);
+                                payload
+                                    .insert("iteration".into(), serde_json::json!(fire.iteration));
+                                payload.insert(
+                                    "reset_nodes".into(),
+                                    serde_json::json!(fire.reset_nodes.clone()),
+                                );
+                                emitter.emit_node(
+                                    EventType::NodeLoop,
+                                    node.id.clone(),
+                                    iteration,
+                                    1,
+                                    payload,
+                                );
+                                for reset_id in fire.reset_nodes {
+                                    let entry = iterations.entry(reset_id).or_insert(1);
+                                    *entry += 1;
+                                }
+                            }
+                        }
                     },
                     Err(e) => {
                         let msg = e.to_string();
                         recorder.record_node_run(&NodeRunRow {
                             node_id: &node.id,
-                            iteration: 1,
+                            iteration,
                             attempt: 1,
                             node_type: &node.ty,
                             status: "error",
@@ -328,7 +359,7 @@ impl Engine {
                         emitter.emit_node(
                             EventType::NodeError,
                             node.id.clone(),
-                            1,
+                            iteration,
                             1,
                             HashMap::from([("error".into(), serde_json::json!(msg))]),
                         );
