@@ -184,8 +184,17 @@ fn resolve_templated_inputs(
     nt: &NodeType,
     ctx: &RunContext,
 ) -> Result<ResolvedInputs, NodeError> {
-    let secrets_resolver = |name: &str| -> Option<String> {
-        ctx.secrets_store.as_ref().and_then(|s| s.get(name).ok())
+    // Register every looked-up secret on the emitter so any later
+    // occurrence of its value in stdout/stderr gets redacted from
+    // node:output events. Without this a `{{secrets.X}}` interpolation
+    // would silently leak through the child's stdout.
+    let secrets_store = ctx.secrets_store.clone();
+    let emitter = ctx.emitter.clone();
+    let secrets_resolver = move |name: &str| -> Option<String> {
+        let store = secrets_store.as_ref()?;
+        let value = store.get(name).ok()?;
+        emitter.register_secret(name.to_string(), value.clone());
+        Some(value)
     };
     let kv_resolver = |_: &str| -> Option<String> { None }; // KV node arrives in Phase 7
     let env_allowlist = default_env_allowlist();
@@ -965,6 +974,52 @@ mod tests {
             NodeError::Other(msg) => assert!(msg.contains("json"), "msg = {msg}"),
             other => panic!("expected NodeError::Other, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn secret_interpolated_into_argv_is_redacted_in_stdout_events() {
+        use crate::secrets::Store;
+
+        keyring::use_sample_store(&HashMap::from([("persist", "false")])).unwrap();
+        let store_dir = TempDir::new().unwrap();
+        let store = Arc::new(Store::with_index_path(
+            store_dir.path().join("secrets-index.json"),
+        ));
+        store.set("UNIQUE_TOK", "redaction-sentinel-9X7Y3").unwrap();
+
+        let (mut ctx, mut rx, _dir) = test_ctx();
+        ctx.secrets_store = Some(store);
+
+        let nt = subprocess_node_type(vec![
+            "sh".into(),
+            "-c".into(),
+            "echo leaked={{secrets.UNIQUE_TOK}}".into(),
+        ]);
+        let node = trivial_node();
+
+        SubprocessExecutor
+            .run(&node, &nt, &ctx, CancellationToken::new())
+            .await
+            .expect("should exit 0");
+
+        let outs = collect_output(&mut rx);
+        let stdout: Vec<&str> = outs
+            .iter()
+            .filter(|(c, _)| c == "stdout")
+            .map(|(_, t)| t.as_str())
+            .collect();
+        assert_eq!(stdout.len(), 1, "exactly one stdout line, got {outs:?}");
+        let line = stdout[0];
+        assert!(
+            !line.contains("redaction-sentinel-9X7Y3"),
+            "raw secret leaked: {line:?}"
+        );
+        assert!(
+            line.contains("<redacted:UNIQUE_TOK>"),
+            "expected redaction marker, got {line:?}"
+        );
     }
 
     #[cfg(unix)]
