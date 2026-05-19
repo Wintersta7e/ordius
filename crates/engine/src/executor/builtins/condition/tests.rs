@@ -1,4 +1,4 @@
-use super::super::test_support::{dummy_node_type, make_ctx};
+use crate::executor::test_support::{dummy_node_type, make_ctx};
 use super::*;
 use crate::types::{Category, Pos};
 
@@ -25,7 +25,7 @@ fn condition_node(cfg: &serde_json::Value) -> Node {
 }
 
 async fn run_condition(cfg: &serde_json::Value) -> Result<String, NodeError> {
-    let (ctx, _dir) = make_ctx();
+    let (ctx, _rx, _dir) = make_ctx();
     let n = condition_node(cfg);
     let outs = ConditionExecutor
         .run(&n, &condition_node_type(), &ctx, CancellationToken::new())

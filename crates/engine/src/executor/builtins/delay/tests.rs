@@ -1,4 +1,4 @@
-use super::super::test_support::{dummy_node_type, make_ctx};
+use crate::executor::test_support::{dummy_node_type, make_ctx};
 use super::*;
 use crate::types::{Category, Pos};
 use std::collections::HashMap;
@@ -23,7 +23,7 @@ fn delay_node(ms: u64) -> Node {
 
 #[tokio::test]
 async fn delay_sleeps_at_least_n_ms() {
-    let (ctx, _dir) = make_ctx();
+    let (ctx, _rx, _dir) = make_ctx();
     let node = delay_node(80);
     let start = Instant::now();
     DelayExecutor
@@ -35,7 +35,7 @@ async fn delay_sleeps_at_least_n_ms() {
 
 #[tokio::test]
 async fn delay_cancels_promptly() {
-    let (ctx, _dir) = make_ctx();
+    let (ctx, _rx, _dir) = make_ctx();
     let node = delay_node(60_000);
     let cancel = CancellationToken::new();
     let cancel_child = cancel.clone();
@@ -52,7 +52,7 @@ async fn delay_cancels_promptly() {
 
 #[tokio::test]
 async fn delay_rejects_missing_ms_config() {
-    let (ctx, _dir) = make_ctx();
+    let (ctx, _rx, _dir) = make_ctx();
     let node = Node {
         id: "n".into(),
         ty: "delay".into(),

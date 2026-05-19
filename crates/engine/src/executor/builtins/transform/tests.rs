@@ -1,4 +1,4 @@
-use super::super::test_support::{dummy_node_type, make_ctx};
+use crate::executor::test_support::{dummy_node_type, make_ctx};
 use super::*;
 use crate::types::{Category, Pos};
 
@@ -26,7 +26,7 @@ fn transform_node(cfg: &serde_json::Value) -> Node {
 }
 
 async fn run_transform(cfg: &serde_json::Value) -> Result<String, NodeError> {
-    let (ctx, _dir) = make_ctx();
+    let (ctx, _rx, _dir) = make_ctx();
     let n = transform_node(cfg);
     let outs = TransformExecutor
         .run(&n, &transform_node_type(), &ctx, CancellationToken::new())
@@ -88,7 +88,7 @@ async fn missing_op_is_config_error() {
 
 #[tokio::test]
 async fn template_op_renders_with_variables() {
-    let (mut ctx, _dir) = make_ctx();
+    let (mut ctx, _rx, _dir) = make_ctx();
     ctx.variables.insert("name".into(), "world".into());
     let n = transform_node(&serde_json::json!({
         "op": "template",
@@ -106,7 +106,7 @@ async fn template_op_renders_with_variables() {
 
 #[tokio::test]
 async fn template_op_undefined_ref_is_template_error() {
-    let (ctx, _dir) = make_ctx();
+    let (ctx, _rx, _dir) = make_ctx();
     let n = transform_node(&serde_json::json!({
         "op": "template",
         "template": "{{vars.missing}}",

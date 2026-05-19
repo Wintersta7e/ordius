@@ -6,6 +6,9 @@ pub mod context;
 pub mod in_process;
 pub mod subprocess;
 
+#[cfg(test)]
+mod test_support;
+
 pub use context::{EnvResolver, RunContext, wrap_process_env};
 pub use in_process::InProcessExecutor;
 pub use subprocess::SubprocessExecutor;

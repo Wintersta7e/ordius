@@ -632,82 +632,12 @@ mod win_job {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::open;
     use crate::events::RunEvent;
-    use crate::executor::wrap_process_env;
-    use crate::recorder::RunRecorder;
-    use crate::types::{Category, ExecutionSpec, Node, NodeType, OutputParse, Pos, Workflow};
+    use crate::executor::test_support::{
+        make_ctx as test_ctx, subprocess_node_type, trivial_subprocess_node as trivial_node,
+    };
     use tempfile::TempDir;
     use tokio::sync::broadcast;
-
-    fn test_ctx() -> (RunContext, broadcast::Receiver<RunEvent>, TempDir) {
-        let dir = TempDir::new().unwrap();
-        let pool = open(dir.path().join("t.db")).unwrap();
-        let wf = Workflow {
-            id: "w".into(),
-            name: String::new(),
-            schema_version: 1,
-            created_at: None,
-            updated_at: None,
-            variables: HashMap::new(),
-            triggers: vec![],
-            nodes: vec![],
-            edges: vec![],
-        };
-        let rec = Arc::new(RunRecorder::start(pool, &wf, "{}", &HashMap::new(), "test").unwrap());
-        let (em, rx) = Emitter::new(rec.clone());
-        let ctx = RunContext {
-            run_id: rec.run_id.clone(),
-            workflow_id: "w".into(),
-            workflow_name: String::new(),
-            started_at_iso: String::new(),
-            workspace: dir.path().to_path_buf(),
-            variables: HashMap::new(),
-            recorder: rec,
-            emitter: Arc::new(em),
-            secrets_store: None,
-            env: wrap_process_env(),
-            current_inputs: HashMap::new(),
-            upstream_outputs: HashMap::new(),
-        };
-        (ctx, rx, dir)
-    }
-
-    fn subprocess_node_type(command: Vec<String>) -> NodeType {
-        NodeType {
-            id: "test_subprocess".into(),
-            name: String::new(),
-            category: Category::Execution,
-            tags: vec![],
-            icon: String::new(),
-            description: String::new(),
-            inputs: vec![],
-            outputs: vec![],
-            config: vec![],
-            execution: ExecutionSpec {
-                backend: ExecutionBackend::Subprocess,
-                command,
-                stdin_template: None,
-                env: HashMap::new(),
-                timeout_ms: None,
-                output_parse: OutputParse::Text,
-                output_map: HashMap::new(),
-            },
-        }
-    }
-
-    fn trivial_node() -> Node {
-        Node {
-            id: "n1".into(),
-            ty: "test_subprocess".into(),
-            name: String::new(),
-            config: HashMap::new(),
-            pos: Pos::default(),
-            timeout_ms: None,
-            retry: None,
-            continue_on_error: false,
-        }
-    }
 
     fn collect_output(rx: &mut broadcast::Receiver<RunEvent>) -> Vec<(String, String)> {
         let mut out = Vec::new();
