@@ -9,6 +9,7 @@
 //! - secrets: keyring read/write
 
 pub mod db;
+pub mod emitter;
 pub mod error;
 pub mod events;
 pub mod loader;
@@ -17,6 +18,7 @@ pub mod scheduler;
 pub mod types;
 pub mod validation;
 
+pub use emitter::Emitter;
 pub use error::{EngineError, Result};
 pub use events::{EventType, RunEvent};
 pub use loader::{LoadError, load_workflow};
