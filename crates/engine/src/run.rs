@@ -173,7 +173,11 @@ impl Engine {
     /// `done` from `error` at the end because
     /// [`Scheduler::is_done`] returns true once no Ready/Running
     /// nodes remain, which a cascaded failure also satisfies.
-    #[allow(clippy::too_many_lines)] // dispatch + persistence + event emission all live here
+    // Still over clippy's 100-line line limit even after extracting
+    // persist_node_outputs / finalize_node_run / route_condition_outputs
+    // — the dispatch loop's per-node context construction + scheduler
+    // dance still dominate.
+    #[allow(clippy::too_many_lines)]
     async fn run_loop_inner(
         &self,
         wf: Arc<Workflow>,
@@ -274,93 +278,52 @@ impl Engine {
 
                 match res {
                     Ok(outputs) => {
-                        for (port_name, value) in &outputs {
-                            let value_json = serde_json::to_string(value)
-                                .map_err(|e| EngineError::Db(format!("encode output: {e}")))?;
-                            recorder.record_node_output(
-                                &node.id,
-                                iteration,
-                                1,
-                                port_name,
-                                Some(&value_json),
-                                None,
-                            )?;
-                            upstream_outputs
-                                .insert((node.id.clone(), port_name.clone()), value.clone());
-                        }
-                        recorder.record_node_run(&NodeRunRow {
-                            node_id: &node.id,
+                        persist_node_outputs(
+                            &recorder,
+                            &mut upstream_outputs,
+                            &node.id,
                             iteration,
-                            attempt: 1,
-                            node_type: &node.ty,
-                            status: "done",
-                            started_at: Some(started_at),
-                            finished_at: Some(finished_at),
-                            duration_ms: Some(duration),
-                            output_summary: None,
-                            error: None,
-                        })?;
-                        emitter.emit_node(
+                            &outputs,
+                        )?;
+                        finalize_node_run(
+                            &recorder,
+                            &emitter,
+                            &node,
+                            iteration,
+                            started_at,
+                            finished_at,
+                            "done",
+                            None,
                             EventType::NodeDone,
-                            node.id.clone(),
-                            iteration,
-                            1,
                             HashMap::from([
                                 ("finished_at".into(), serde_json::json!(finished_at)),
                                 ("duration_ms".into(), serde_json::json!(duration)),
                             ]),
-                        );
+                        )?;
                         sched.complete_node(&node.id);
-
-                        if node.ty == CONDITION_NODE_TYPE_ID
-                            && let Some(PortValue::String(branch)) = outputs.get("branch")
-                        {
-                            let branch = branch.clone();
-                            sched.resolve_condition(&node.id, &branch);
-                            if let Some(fire) = sched.try_loop(&node.id, &branch) {
-                                let mut payload: HashMap<String, serde_json::Value> =
-                                    HashMap::with_capacity(2);
-                                payload
-                                    .insert("iteration".into(), serde_json::json!(fire.iteration));
-                                payload.insert(
-                                    "reset_nodes".into(),
-                                    serde_json::json!(fire.reset_nodes.clone()),
-                                );
-                                emitter.emit_node(
-                                    EventType::NodeLoop,
-                                    node.id.clone(),
-                                    iteration,
-                                    1,
-                                    payload,
-                                );
-                                for reset_id in fire.reset_nodes {
-                                    let entry = iterations.entry(reset_id).or_insert(1);
-                                    *entry += 1;
-                                }
-                            }
-                        }
+                        route_condition_outputs(
+                            &mut sched,
+                            &mut iterations,
+                            &emitter,
+                            &node,
+                            iteration,
+                            &outputs,
+                        );
                     },
                     Err(e) => {
                         let msg = e.to_string();
-                        recorder.record_node_run(&NodeRunRow {
-                            node_id: &node.id,
+                        finalize_node_run(
+                            &recorder,
+                            &emitter,
+                            &node,
                             iteration,
-                            attempt: 1,
-                            node_type: &node.ty,
-                            status: "error",
-                            started_at: Some(started_at),
-                            finished_at: Some(finished_at),
-                            duration_ms: Some(duration),
-                            output_summary: None,
-                            error: Some(&msg),
-                        })?;
-                        emitter.emit_node(
+                            started_at,
+                            finished_at,
+                            "error",
+                            Some(&msg),
                             EventType::NodeError,
-                            node.id.clone(),
-                            iteration,
-                            1,
                             HashMap::from([("error".into(), serde_json::json!(msg))]),
-                        );
+                        )?;
                         if node.continue_on_error {
                             sched.complete_node(&node.id);
                         } else {
@@ -410,6 +373,90 @@ impl Engine {
             status: status.into(),
             node_runs: node_runs_count,
         })
+    }
+}
+
+/// Persist every output port + populate the run-loop's
+/// authoritative `upstream_outputs` map. Inline JSON only today;
+/// the >8 KB file-back fallback is not yet wired.
+fn persist_node_outputs(
+    recorder: &RunRecorder,
+    upstream_outputs: &mut HashMap<(String, String), PortValue>,
+    node_id: &str,
+    iteration: u32,
+    outputs: &crate::executor::NodeOutputs,
+) -> Result<()> {
+    for (port_name, value) in outputs {
+        let value_json = serde_json::to_string(value)
+            .map_err(|e| EngineError::Db(format!("encode output: {e}")))?;
+        recorder.record_node_output(node_id, iteration, 1, port_name, Some(&value_json), None)?;
+        upstream_outputs.insert((node_id.to_string(), port_name.clone()), value.clone());
+    }
+    Ok(())
+}
+
+/// Shared `done` / `error` finalisation: update the `node_runs`
+/// row, then emit the terminal `node:*` event with the same shape
+/// both arms used to build by hand.
+#[allow(clippy::too_many_arguments)] // the row + event payload genuinely needs all of these
+fn finalize_node_run(
+    recorder: &RunRecorder,
+    emitter: &Emitter,
+    node: &crate::types::Node,
+    iteration: u32,
+    started_at: i64,
+    finished_at: i64,
+    status: &str,
+    error: Option<&str>,
+    event_type: EventType,
+    event_payload: HashMap<String, serde_json::Value>,
+) -> Result<()> {
+    recorder.record_node_run(&NodeRunRow {
+        node_id: &node.id,
+        iteration,
+        attempt: 1,
+        node_type: &node.ty,
+        status,
+        started_at: Some(started_at),
+        finished_at: Some(finished_at),
+        duration_ms: Some(finished_at - started_at),
+        output_summary: None,
+        error,
+    })?;
+    emitter.emit_node(event_type, node.id.clone(), iteration, 1, event_payload);
+    Ok(())
+}
+
+/// Route a freshly-completed condition node's `branch` output
+/// into the scheduler + fire any loop edge keyed off that branch.
+/// No-op for non-condition nodes or condition outputs missing the
+/// `branch` String port.
+fn route_condition_outputs(
+    sched: &mut crate::scheduler::Scheduler<'_>,
+    iterations: &mut HashMap<String, u32>,
+    emitter: &Emitter,
+    node: &crate::types::Node,
+    iteration: u32,
+    outputs: &crate::executor::NodeOutputs,
+) {
+    if node.ty != CONDITION_NODE_TYPE_ID {
+        return;
+    }
+    let Some(PortValue::String(branch)) = outputs.get("branch") else {
+        return;
+    };
+    let branch = branch.clone();
+    sched.resolve_condition(&node.id, &branch);
+    let Some(fire) = sched.try_loop(&node.id, &branch) else {
+        return;
+    };
+    let mut payload: HashMap<String, serde_json::Value> = HashMap::with_capacity(2);
+    payload.insert("iteration".into(), serde_json::json!(fire.iteration));
+    payload.insert("reset_nodes".into(), serde_json::json!(fire.reset_nodes));
+    emitter.emit_node(EventType::NodeLoop, node.id.clone(), iteration, 1, payload);
+    for reset_id in fire.reset_nodes {
+        let entry = iterations.entry(reset_id).or_insert(1);
+        *entry += 1;
     }
 }
 
