@@ -11,13 +11,14 @@ use clap::{Parser, Subcommand};
 use ordius_engine::registry::Registry;
 use ordius_engine::types::Workflow;
 use ordius_engine::types::{Category, NodeType};
-use ordius_engine::{Store, load_workflow, validate};
+use ordius_engine::{Engine, EngineError, EventType, Store, load_workflow, validate};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Top-level CLI: global flags + a required subcommand.
 #[derive(Parser, Debug)]
@@ -209,10 +210,6 @@ async fn main() -> ExitCode {
     }
 }
 
-#[allow(
-    clippy::unused_async,
-    reason = "subcommand bodies in follow-up commits will await (engine.start_run, ndjson streaming)."
-)]
 async fn dispatch(cli: Cli) -> anyhow::Result<u8> {
     let home = resolve_home(cli.home);
     let json = cli.json;
@@ -222,12 +219,13 @@ async fn dispatch(cli: Cli) -> anyhow::Result<u8> {
         Cmd::Secrets { sub } => cmd_secrets(sub, &home),
         Cmd::Export { id } => cmd_export(&home, &id),
         Cmd::Import { as_id } => cmd_import(&home, as_id.as_deref()),
+        Cmd::Run(args) => cmd_run(&home, args).await,
         Cmd::Gui => {
             eprintln!("ordius-cli: GUI binary not installed yet (lands in v1.1)");
             eprintln!("Until then, use 'ordius-cli run <id>' from the terminal.");
             Ok(2)
         },
-        Cmd::Run(_) | Cmd::Runs { .. } => {
+        Cmd::Runs { .. } => {
             anyhow::bail!("subcommand not yet wired in this build");
         },
     }
@@ -506,6 +504,112 @@ fn secrets_rm(store: &Store, name: &str, force: bool) -> anyhow::Result<u8> {
     Ok(0)
 }
 
+async fn cmd_run(home: &Path, args: RunArgs) -> anyhow::Result<u8> {
+    init_keyring()?;
+    let wf_path = workflow_path(home, &args.id);
+    let wf = load_workflow(&wf_path)
+        .with_context(|| format!("load workflow {} from {}", args.id, wf_path.display()))?;
+    let variables = collect_variables(&args)?;
+
+    let engine = Arc::new(
+        Engine::new(home.to_path_buf())
+            .await
+            .context("open engine")?,
+    );
+    let engine_for_signal = engine.clone();
+    let signal_task = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("\nordius: shutting down...");
+            let drained = engine_for_signal.shutdown(Duration::from_secs(5)).await;
+            drop(drained);
+            std::process::exit(130);
+        }
+    });
+
+    let handle = match engine.start_run(Arc::new(wf), variables, "cli", args.yes) {
+        Ok(h) => h,
+        Err(EngineError::Validation(e)) => {
+            eprintln!("ordius: validation failed: {e}");
+            signal_task.abort();
+            return Ok(2);
+        },
+        Err(EngineError::AlreadyRunning { id, run_id }) => {
+            eprintln!("ordius: workflow {id} already running (run_id={run_id})");
+            signal_task.abort();
+            return Ok(3);
+        },
+        Err(e) => {
+            signal_task.abort();
+            return Err(e).context("start workflow run");
+        },
+    };
+
+    let run_id = handle.run_id.clone();
+    if args.json_events {
+        stream_events_to_stdout(handle.event_rx).await?;
+    }
+    let summary = handle
+        .join
+        .await
+        .context("await run task")?
+        .context("run loop returned error")?;
+    signal_task.abort();
+
+    let code = u8::from(summary.status != "done");
+    if !args.json_events {
+        println!(
+            "{}: {} ({} node runs)",
+            summary.status, summary.run_id, summary.node_runs,
+        );
+    }
+    drop(run_id);
+    Ok(code)
+}
+
+fn collect_variables(args: &RunArgs) -> anyhow::Result<HashMap<String, String>> {
+    let mut vars: HashMap<String, String> = HashMap::new();
+    if let Some(path) = &args.vars_file {
+        let body = fs::read_to_string(path)
+            .with_context(|| format!("read vars file {}", path.display()))?;
+        let parsed: HashMap<String, String> = if body.trim_start().starts_with('{') {
+            serde_json::from_str(&body).context("parse vars file as JSON")?
+        } else {
+            serde_yaml::from_str(&body).context("parse vars file as YAML")?
+        };
+        vars.extend(parsed);
+    }
+    for (k, v) in &args.var {
+        vars.insert(k.clone(), v.clone());
+    }
+    Ok(vars)
+}
+
+async fn stream_events_to_stdout(
+    mut rx: tokio::sync::broadcast::Receiver<ordius_engine::RunEvent>,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let stdout = tokio::io::stdout();
+    let mut bufw = tokio::io::BufWriter::new(stdout);
+    loop {
+        match rx.recv().await {
+            Ok(ev) => {
+                let line = serde_json::to_string(&ev).context("serialise event")?;
+                bufw.write_all(line.as_bytes()).await?;
+                bufw.write_all(b"\n").await?;
+                bufw.flush().await?;
+                if matches!(
+                    ev.ty,
+                    EventType::WorkflowDone | EventType::WorkflowError | EventType::WorkflowStopped
+                ) {
+                    return Ok(());
+                }
+            },
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+        }
+    }
+}
+
 fn cmd_export(home: &Path, id: &str) -> anyhow::Result<u8> {
     let path = workflow_path(home, id);
     let wf = load_workflow(&path)
@@ -570,6 +674,11 @@ fn init_tracing(verbose: u8) {
     };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
-    let init = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    // stderr keeps tracing logs out of NDJSON streamed on stdout via
+    // `run --json-events`.
+    let init = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
     drop(init);
 }

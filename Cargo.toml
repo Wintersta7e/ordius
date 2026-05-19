@@ -11,7 +11,7 @@ authors = ["Wintersta7e <Wintersta7e@users.noreply.github.com>"]
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "process", "signal", "fs", "io-util", "sync", "time"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "process", "signal", "fs", "io-util", "io-std", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 futures = "0.3"
 async-trait = "0.1"
