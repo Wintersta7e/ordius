@@ -12,9 +12,12 @@
 //!   main thread, so the descendant tree dies atomically on
 //!   `TerminateJobObject`.
 //!
-//! Each child's stdout and stderr are line-buffered and forwarded
-//! to the run's [`Emitter`] as `node:output` events; the full
-//! stdout is also accumulated for the eventual `output_parse` step.
+//! Every argv element, environment value, and stdin template is
+//! resolved through the unified [`crate::template::substitute`]
+//! engine before spawn. Stdout/stderr are line-buffered and
+//! forwarded to the run's [`Emitter`] as `node:output` events; the
+//! full stdout is also accumulated for the eventual `output_parse`
+//! step.
 //!
 //! The OS-level guarantees replace the `taskkill /T` workarounds
 //! the engine used in earlier prototypes.
@@ -23,6 +26,7 @@
 use crate::emitter::Emitter;
 use crate::events::EventType;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
+use crate::template::{SubstitutionContext, default_env_allowlist, substitute};
 use crate::types::{ExecutionBackend, Node, NodeType};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -30,7 +34,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 #[cfg(unix)]
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -61,35 +65,153 @@ impl NodeExecutor for SubprocessExecutor {
         ctx: &RunContext,
         cancel: CancellationToken,
     ) -> Result<NodeOutputs, NodeError> {
-        let (program, args) = nt
-            .execution
-            .command
+        // Resolve every templated input synchronously, in a separate
+        // stack frame, so the SubstitutionContext + its closures
+        // fully drop before any await — otherwise their non-Send
+        // `&dyn Fn` references would taint the run() future.
+        let ResolvedInputs {
+            argv,
+            env_pairs,
+            stdin_body,
+        } = resolve_templated_inputs(node, nt, ctx)?;
+
+        // ---- Build the command --------------------------------------------
+        let (program, argv_rest) = argv
             .split_first()
             .ok_or_else(|| NodeError::Config("execution.command is empty".into()))?;
 
         let mut cmd = Command::new(program);
-        cmd.args(args);
+        cmd.args(argv_rest);
+        for (k, v) in &env_pairs {
+            cmd.env(k, v);
+        }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        if stdin_body.is_some() {
+            cmd.stdin(Stdio::piped());
+        }
         cmd.kill_on_drop(true);
 
         #[cfg(unix)]
-        {
-            configure_unix_command(&mut cmd);
-            run_unix(cmd, ctx.emitter.clone(), node.id.clone(), cancel).await
-        }
+        configure_unix_command(&mut cmd);
         #[cfg(windows)]
-        {
-            configure_windows_command(&mut cmd);
-            run_windows(cmd, ctx.emitter.clone(), node.id.clone(), cancel).await
+        configure_windows_command(&mut cmd);
+
+        // ---- Spawn (platform-specific) ------------------------------------
+        let mut sup = platform_spawn(cmd)?;
+
+        // ---- Stdin writer (if templated) ----------------------------------
+        if let (Some(body), Some(mut stdin)) = (stdin_body, sup.child.stdin.take()) {
+            // Writer runs on its own task so a child that reads
+            // stdin fully before producing stdout can't deadlock
+            // us (we're holding the read loop for stdout below).
+            tokio::spawn(async move {
+                let write_res = stdin.write_all(body.as_bytes()).await;
+                drop(write_res);
+                let shutdown_res = stdin.shutdown().await;
+                drop(shutdown_res);
+            });
         }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = (cmd, ctx, node, cancel);
-            Err(NodeError::Subprocess(
-                "subprocess executor: unsupported platform".into(),
-            ))
-        }
+
+        // ---- Stream stdout/stderr -----------------------------------------
+        let emitter = ctx.emitter.clone();
+        let stdout_handle = spawn_line_reader(
+            sup.child.stdout.take(),
+            emitter.clone(),
+            node.id.clone(),
+            "stdout",
+        );
+        let stderr_handle =
+            spawn_line_reader(sup.child.stderr.take(), emitter, node.id.clone(), "stderr");
+
+        // ---- Wait / cancel ------------------------------------------------
+        let outcome = tokio::select! {
+            wait_res = sup.child.wait() => Outcome::Exit(wait_res),
+            () = cancel.cancelled() => {
+                platform_cancel(&mut sup).await;
+                Outcome::Cancelled
+            }
+        };
+
+        let _stdout_lines = stdout_handle.await.unwrap_or_default();
+        let _stderr_lines = stderr_handle.await.unwrap_or_default();
+
+        finalize_outcome(outcome)
     }
+}
+
+// =====================================================================
+// Shared types
+// =====================================================================
+
+/// Owned substitution outputs handed from the sync prep phase
+/// into the async spawn phase.
+struct ResolvedInputs {
+    argv: Vec<String>,
+    env_pairs: Vec<(String, String)>,
+    stdin_body: Option<String>,
+}
+
+/// Resolve every templated input on the node's `ExecutionSpec` in
+/// a single sync pass. Returns owned strings so the caller's
+/// future doesn't have to hold the `SubstitutionContext` (which
+/// borrows non-Send `&dyn Fn` closures) across any await.
+fn resolve_templated_inputs(
+    node: &Node,
+    nt: &NodeType,
+    ctx: &RunContext,
+) -> Result<ResolvedInputs, NodeError> {
+    let secrets_resolver = |name: &str| -> Option<String> {
+        ctx.secrets_store.as_ref().and_then(|s| s.get(name).ok())
+    };
+    let kv_resolver = |_: &str| -> Option<String> { None }; // KV node arrives in Phase 7
+    let env_allowlist = default_env_allowlist();
+
+    let subctx = SubstitutionContext {
+        vars: &ctx.variables,
+        secrets: &secrets_resolver,
+        upstream_outputs: &ctx.upstream_outputs,
+        current_inputs: &ctx.current_inputs,
+        current_config: &node.config,
+        kv: &kv_resolver,
+        env: &*ctx.env,
+        env_allowlist: &env_allowlist,
+        run_id: &ctx.run_id,
+        workspace: &ctx.workspace,
+        started_at_iso: &ctx.started_at_iso,
+        workflow_id: &ctx.workflow_id,
+        workflow_name: &ctx.workflow_name,
+    };
+
+    let argv: Vec<String> = nt
+        .execution
+        .command
+        .iter()
+        .map(|s| substitute(s, &subctx).map_err(|e| NodeError::Template(e.to_string())))
+        .collect::<Result<_, _>>()?;
+
+    let env_pairs: Vec<(String, String)> = nt
+        .execution
+        .env
+        .iter()
+        .map(|(k, v)| {
+            substitute(v, &subctx)
+                .map(|sub| (k.clone(), sub))
+                .map_err(|e| NodeError::Template(e.to_string()))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let stdin_body: Option<String> = nt
+        .execution
+        .stdin_template
+        .as_deref()
+        .map(|t| substitute(t, &subctx).map_err(|e| NodeError::Template(e.to_string())))
+        .transpose()?;
+
+    Ok(ResolvedInputs {
+        argv,
+        env_pairs,
+        stdin_body,
+    })
 }
 
 /// Outcome of the `tokio::select!` between `child.wait()` and `cancel`.
@@ -128,44 +250,56 @@ where
     })
 }
 
+/// Map a select-outcome to an executor result. The stdout
+/// accumulator used by the `output_parse` step is wired in
+/// alongside it; for now successful exits return an empty
+/// `NodeOutputs`.
+fn finalize_outcome(outcome: Outcome) -> Result<NodeOutputs, NodeError> {
+    match outcome {
+        Outcome::Cancelled => Err(NodeError::Cancelled),
+        Outcome::Exit(Err(e)) => Err(NodeError::Subprocess(format!("wait: {e}"))),
+        Outcome::Exit(Ok(_status)) => Ok(NodeOutputs::new()),
+    }
+}
+
 // =====================================================================
 // Unix
 // =====================================================================
 
+/// Per-platform supervised child. On Unix this is just the child
+/// and its PID; on Windows we additionally hold the Job Object
+/// handle that owns the whole tree.
 #[cfg(unix)]
-async fn run_unix(
-    mut cmd: Command,
-    emitter: Arc<Emitter>,
-    node_id: String,
-    cancel: CancellationToken,
-) -> Result<NodeOutputs, NodeError> {
-    let mut child = cmd
+struct Supervised {
+    child: tokio::process::Child,
+    pid: u32,
+}
+
+#[cfg(unix)]
+fn platform_spawn(mut cmd: Command) -> Result<Supervised, NodeError> {
+    let child = cmd
         .spawn()
         .map_err(|e| NodeError::Subprocess(format!("spawn: {e}")))?;
     let pid = child
         .id()
         .ok_or_else(|| NodeError::Subprocess("child has no pid (already reaped)".into()))?;
+    Ok(Supervised { child, pid })
+}
 
-    let stdout_handle = spawn_line_reader(
-        child.stdout.take(),
-        emitter.clone(),
-        node_id.clone(),
-        "stdout",
-    );
-    let stderr_handle = spawn_line_reader(child.stderr.take(), emitter, node_id, "stderr");
+#[cfg(unix)]
+async fn platform_cancel(sup: &mut Supervised) {
+    use nix::sys::signal::Signal;
 
-    let outcome = tokio::select! {
-        wait_res = child.wait() => Outcome::Exit(wait_res),
-        () = cancel.cancelled() => {
-            cancel_unix_child(&mut child, pid).await;
-            Outcome::Cancelled
+    let _soft = kill_unix_pgroup(sup.pid, Signal::SIGTERM);
+    let grace = tokio::time::sleep(CANCEL_GRACE);
+    tokio::select! {
+        wait_res = sup.child.wait() => { drop(wait_res); }
+        () = grace => {
+            let _hard = kill_unix_pgroup(sup.pid, Signal::SIGKILL);
+            let reap = sup.child.wait().await;
+            drop(reap);
         }
-    };
-
-    let _stdout_lines = stdout_handle.await.unwrap_or_default();
-    let _stderr_lines = stderr_handle.await.unwrap_or_default();
-
-    finalize_outcome(outcome)
+    }
 }
 
 /// Configure a Unix `Command` so the child becomes the leader of
@@ -189,24 +323,6 @@ pub(crate) fn configure_unix_command(cmd: &mut Command) {
     }
 }
 
-/// SIGTERM the whole process group, give it [`CANCEL_GRACE`], then
-/// SIGKILL the group if the child hasn't exited yet.
-#[cfg(unix)]
-async fn cancel_unix_child(child: &mut tokio::process::Child, pid: u32) {
-    use nix::sys::signal::Signal;
-
-    let _soft = kill_unix_pgroup(pid, Signal::SIGTERM);
-    let grace = tokio::time::sleep(CANCEL_GRACE);
-    tokio::select! {
-        wait_res = child.wait() => { drop(wait_res); }
-        () = grace => {
-            let _hard = kill_unix_pgroup(pid, Signal::SIGKILL);
-            let reap = child.wait().await;
-            drop(reap);
-        }
-    }
-}
-
 /// Send `signal` to the process group led by `pid`. A negative PID
 /// passed to `kill(2)` targets every member of the group, so a
 /// SIGTERM here also reaches any grandchildren the original child
@@ -226,52 +342,56 @@ fn kill_unix_pgroup(pid: u32, signal: nix::sys::signal::Signal) -> std::io::Resu
 // Windows
 // =====================================================================
 
-/// Windows command-configuration hook. Job-Object setup happens
-/// post-spawn (see [`win_job::spawn_supervised`]), so the
-/// pre-spawn hook itself is a no-op placeholder retained for
-/// symmetry with the Unix path.
 #[cfg(windows)]
-pub(crate) fn configure_windows_command(_cmd: &mut Command) {}
+struct Supervised {
+    child: tokio::process::Child,
+    job: windows::Win32::Foundation::HANDLE,
+}
+
+// SAFETY: Windows kernel HANDLEs are safe to use from any thread —
+// concurrency is enforced by the kernel — and we hold this one
+// uniquely (no aliasing). HANDLE only fails Send/Sync automatically
+// because its inner field is a raw pointer.
+#[cfg(windows)]
+unsafe impl Send for Supervised {}
+#[cfg(windows)]
+unsafe impl Sync for Supervised {}
 
 #[cfg(windows)]
-async fn run_windows(
-    mut cmd: Command,
-    emitter: Arc<Emitter>,
-    node_id: String,
-    cancel: CancellationToken,
-) -> Result<NodeOutputs, NodeError> {
-    let mut sup = win_job::spawn_supervised(&mut cmd)?;
+impl Drop for Supervised {
+    fn drop(&mut self) {
+        // SAFETY: `job` is a live kernel handle we own.
+        let close = unsafe { windows::Win32::Foundation::CloseHandle(self.job) };
+        drop(close);
+    }
+}
+
+#[cfg(windows)]
+fn platform_spawn(mut cmd: Command) -> Result<Supervised, NodeError> {
+    let sup = win_job::spawn_supervised(&mut cmd)?;
     let pid = sup
         .child
         .id()
         .ok_or_else(|| NodeError::Subprocess("child has no pid (already reaped)".into()))?;
     win_job::resume_initial_thread(pid)?;
-
-    let stdout_handle = spawn_line_reader(
-        sup.child.stdout.take(),
-        emitter.clone(),
-        node_id.clone(),
-        "stdout",
-    );
-    let stderr_handle = spawn_line_reader(sup.child.stderr.take(), emitter, node_id, "stderr");
-
-    let outcome = tokio::select! {
-        wait_res = sup.child.wait() => Outcome::Exit(wait_res),
-        () = cancel.cancelled() => {
-            // TerminateJobObject hard-kills every process in the
-            // job atomically — analog of kill(-pgid, SIGKILL).
-            win_job::terminate_job(sup.job);
-            let reap = sup.child.wait().await;
-            drop(reap);
-            Outcome::Cancelled
-        }
-    };
-
-    let _stdout_lines = stdout_handle.await.unwrap_or_default();
-    let _stderr_lines = stderr_handle.await.unwrap_or_default();
-
-    finalize_outcome(outcome)
+    Ok(sup)
 }
+
+#[cfg(windows)]
+async fn platform_cancel(sup: &mut Supervised) {
+    // TerminateJobObject hard-kills every process in the job
+    // atomically — analog of kill(-pgid, SIGKILL).
+    win_job::terminate_job(sup.job);
+    let reap = sup.child.wait().await;
+    drop(reap);
+}
+
+/// Windows command-configuration hook. Job-Object setup happens
+/// post-spawn (see [`win_job::spawn_supervised`]); the pre-spawn
+/// hook itself is a no-op placeholder retained for symmetry with
+/// the Unix path.
+#[cfg(windows)]
+pub(crate) fn configure_windows_command(_cmd: &mut Command) {}
 
 #[cfg(windows)]
 mod win_job {
@@ -285,7 +405,7 @@ mod win_job {
     //! terminates the whole tree atomically — no `taskkill /T`
     //! workarounds, no race with grand-children we can't see.
 
-    use super::{Command, NodeError};
+    use super::{Command, NodeError, Supervised};
     use windows::Win32::Foundation::{CloseHandle, FALSE, HANDLE};
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -299,36 +419,6 @@ mod win_job {
         CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
     };
 
-    /// A spawned-suspended child and the Job Object that owns it.
-    /// The child's main thread is still parked at this point;
-    /// `resume_initial_thread` will let it actually run.
-    ///
-    /// Closing the job handle on drop kills every still-running
-    /// process in the tree (via `KILL_ON_JOB_CLOSE`), which is the
-    /// safety net even if cancellation didn't run explicitly.
-    pub(super) struct Supervised {
-        pub(super) child: tokio::process::Child,
-        pub(super) job: HANDLE,
-    }
-
-    // SAFETY: Windows kernel HANDLEs are safe to use from any
-    // thread — concurrency is enforced by the kernel — and we hold
-    // this one uniquely (no aliasing). HANDLE only fails Send/Sync
-    // automatically because its inner field is a raw pointer.
-    unsafe impl Send for Supervised {}
-    unsafe impl Sync for Supervised {}
-
-    impl Drop for Supervised {
-        fn drop(&mut self) {
-            // SAFETY: `job` is a live kernel handle we own.
-            let close = unsafe { CloseHandle(self.job) };
-            drop(close);
-        }
-    }
-
-    /// Spawn `cmd` with the main thread suspended, create a fresh
-    /// Job Object configured to kill its members on close, and
-    /// assign the child to that job before any user code runs.
     pub(super) fn spawn_supervised(cmd: &mut Command) -> Result<Supervised, NodeError> {
         cmd.creation_flags(CREATE_SUSPENDED.0 | CREATE_NEW_PROCESS_GROUP.0);
         let child = cmd
@@ -390,10 +480,6 @@ mod win_job {
         Ok(Supervised { child, job })
     }
 
-    /// Resume the (single) main thread of a child spawned with
-    /// `CREATE_SUSPENDED`. The child has exactly one thread until
-    /// it runs, so the first thread we find owned by `pid` is the
-    /// one to wake up.
     pub(super) fn resume_initial_thread(pid: u32) -> Result<(), NodeError> {
         // SAFETY: snapshot is an owned kernel handle; closed below.
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
@@ -443,29 +529,10 @@ mod win_job {
         Ok(())
     }
 
-    /// Terminate every process in `job` with exit code 1. The
-    /// child's `wait()` future then resolves naturally with an
-    /// abnormal exit status.
     pub(super) fn terminate_job(job: HANDLE) {
         // SAFETY: `job` is a live kernel handle the caller owns.
         let res = unsafe { TerminateJobObject(job, 1) };
         drop(res);
-    }
-}
-
-// =====================================================================
-// Shared
-// =====================================================================
-
-/// Map a select-outcome to an executor result. The stdout
-/// accumulator used by the `output_parse` step is wired in
-/// alongside it; for now successful exits return an empty
-/// `NodeOutputs`.
-fn finalize_outcome(outcome: Outcome) -> Result<NodeOutputs, NodeError> {
-    match outcome {
-        Outcome::Cancelled => Err(NodeError::Cancelled),
-        Outcome::Exit(Err(e)) => Err(NodeError::Subprocess(format!("wait: {e}"))),
-        Outcome::Exit(Ok(_status)) => Ok(NodeOutputs::new()),
     }
 }
 
@@ -553,16 +620,26 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn unix_spawn_smoke() {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "echo hi"]).stdout(Stdio::piped());
-        configure_unix_command(&mut cmd);
-
-        let mut child = cmd.spawn().expect("spawn sh -c 'echo hi'");
-        let status = child.wait().await.expect("wait for child");
-        assert!(status.success(), "child should exit 0");
+    fn collect_output(rx: &mut broadcast::Receiver<RunEvent>) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if ev.ty == EventType::NodeOutput {
+                let channel = ev
+                    .payload
+                    .get("channel")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let text = ev
+                    .payload
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                out.push((channel, text));
+            }
+        }
+        out
     }
 
     #[cfg(unix)]
@@ -575,7 +652,7 @@ mod tests {
             .run(&node, &nt, &ctx, CancellationToken::new())
             .await
             .expect("true should exit 0");
-        assert!(res.is_empty(), "no outputs wired yet (Task 6.8)");
+        assert!(res.is_empty(), "no outputs wired yet (output_parse step)");
     }
 
     #[cfg(unix)]
@@ -629,30 +706,13 @@ mod tests {
             .await
             .expect("loop should exit 0");
 
-        let mut got = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            if ev.ty == EventType::NodeOutput {
-                let channel = ev
-                    .payload
-                    .get("channel")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let text = ev
-                    .payload
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if channel == "stdout" {
-                    got.push((ev.seq, text.to_string()));
-                }
-            }
-        }
-        let texts: Vec<&str> = got.iter().map(|(_, s)| s.as_str()).collect();
-        assert_eq!(texts, vec!["line 1", "line 2", "line 3"], "got {got:?}");
-        // seqs must be strictly increasing — recorder is monotonic.
-        for w in got.windows(2) {
-            assert!(w[0].0 < w[1].0, "non-monotonic seq: {got:?}");
-        }
+        let out = collect_output(&mut rx);
+        let stdout_texts: Vec<&str> = out
+            .iter()
+            .filter(|(c, _)| c == "stdout")
+            .map(|(_, t)| t.as_str())
+            .collect();
+        assert_eq!(stdout_texts, vec!["line 1", "line 2", "line 3"]);
     }
 
     #[cfg(unix)]
@@ -671,16 +731,82 @@ mod tests {
             .await
             .expect("should exit 0");
 
-        let mut saw_stderr = false;
-        while let Ok(ev) = rx.try_recv() {
-            if ev.ty == EventType::NodeOutput
-                && ev.payload.get("channel").and_then(|v| v.as_str()) == Some("stderr")
-                && ev.payload.get("text").and_then(|v| v.as_str()) == Some("to-stderr")
-            {
-                saw_stderr = true;
-            }
-        }
-        assert!(saw_stderr, "expected stderr event with text 'to-stderr'");
+        let out = collect_output(&mut rx);
+        let saw = out.iter().any(|(c, t)| c == "stderr" && t == "to-stderr");
+        assert!(
+            saw,
+            "expected stderr event with text 'to-stderr', got {out:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn argv_positional_passes_substituted_values_as_whole_tokens() {
+        let (ctx, mut rx, _dir) = test_ctx();
+        let mut nt = subprocess_node_type(vec![
+            "sh".into(),
+            "-c".into(),
+            "echo \"arg1=$1 arg2=$2\"".into(),
+            "--".into(),
+            "{{config.first}}".into(),
+            "{{config.second}}".into(),
+        ]);
+        // Verify env substitution along the same path.
+        nt.execution
+            .env
+            .insert("SOMEVAR".into(), "v={{config.first}}".into());
+
+        let mut node = trivial_node();
+        node.config
+            .insert("first".into(), serde_json::Value::String("hi there".into()));
+        // Second arg contains {{evil}} — must NOT be re-parsed by
+        // substitute() once it's been put into argv.
+        node.config.insert(
+            "second".into(),
+            serde_json::Value::String("{{evil}}".into()),
+        );
+
+        SubprocessExecutor
+            .run(&node, &nt, &ctx, CancellationToken::new())
+            .await
+            .expect("argv positional should run");
+
+        let out = collect_output(&mut rx);
+        let stdout: Vec<&str> = out
+            .iter()
+            .filter(|(c, _)| c == "stdout")
+            .map(|(_, t)| t.as_str())
+            .collect();
+        assert_eq!(stdout, vec!["arg1=hi there arg2={{evil}}"], "got {out:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stdin_template_feeds_child_then_closes() {
+        let (ctx, mut rx, _dir) = test_ctx();
+        let mut nt = subprocess_node_type(vec![
+            "sh".into(),
+            "-c".into(),
+            "cat".into(), // echo stdin to stdout
+        ]);
+        nt.execution.stdin_template = Some("hello {{config.name}}\nsecond line".into());
+
+        let mut node = trivial_node();
+        node.config
+            .insert("name".into(), serde_json::Value::String("world".into()));
+
+        SubprocessExecutor
+            .run(&node, &nt, &ctx, CancellationToken::new())
+            .await
+            .expect("cat should exit 0 once stdin closes");
+
+        let out = collect_output(&mut rx);
+        let stdout: Vec<&str> = out
+            .iter()
+            .filter(|(c, _)| c == "stdout")
+            .map(|(_, t)| t.as_str())
+            .collect();
+        assert_eq!(stdout, vec!["hello world", "second line"], "got {out:?}");
     }
 
     #[cfg(windows)]
