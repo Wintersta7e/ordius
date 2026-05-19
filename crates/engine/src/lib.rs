@@ -23,7 +23,7 @@ pub mod validation;
 pub use emitter::Emitter;
 pub use error::{EngineError, Result};
 pub use events::{EventType, RunEvent};
-pub use executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
+pub use executor::{InProcessExecutor, NodeError, NodeExecutor, NodeOutputs, RunContext};
 pub use loader::{LoadError, load_workflow};
 pub use recorder::{NodeRunRow, RunRecorder, sweep_stale_locks};
 pub use scheduler::{LoopFire, NodeState, Scheduler};

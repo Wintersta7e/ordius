@@ -3,8 +3,10 @@
 
 pub mod builtins;
 pub mod context;
+pub mod in_process;
 
 pub use context::RunContext;
+pub use in_process::InProcessExecutor;
 
 use crate::types::{Node, NodeType, PortValue};
 use async_trait::async_trait;
