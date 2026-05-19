@@ -37,10 +37,37 @@ impl Emitter {
         self.tx.subscribe()
     }
 
-    /// Emit an event. Persists it via the recorder (logging a
-    /// warning on failure) and fans it out to subscribers. A
-    /// failed broadcast send simply means no receivers are
-    /// currently attached and is intentionally ignored.
+    /// Emit a workflow-level event with no associated node. Thin
+    /// wrapper around [`Self::emit`] that fills the node-scoped
+    /// positional fields with `None`.
+    pub fn emit_workflow(&self, ty: EventType, payload: HashMap<String, serde_json::Value>) {
+        self.emit(ty, None, None, None, payload);
+    }
+
+    /// Emit a node-scoped event. Convenience wrapper around
+    /// [`Self::emit`] that takes the node id by `impl Into<String>`
+    /// and requires both `iteration` and `attempt` — these are
+    /// always meaningful on node events.
+    pub fn emit_node(
+        &self,
+        ty: EventType,
+        node_id: impl Into<String>,
+        iteration: u32,
+        attempt: u32,
+        payload: HashMap<String, serde_json::Value>,
+    ) {
+        self.emit(
+            ty,
+            Some(node_id.into()),
+            Some(iteration),
+            Some(attempt),
+            payload,
+        );
+    }
+
+    /// Emit an event with full positional control over the
+    /// optional fields. Prefer [`Self::emit_workflow`] or
+    /// [`Self::emit_node`] for the common cases.
     pub fn emit(
         &self,
         ty: EventType,

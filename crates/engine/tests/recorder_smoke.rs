@@ -36,21 +36,9 @@ fn end_to_end_minimal_run_persists() {
         Arc::new(RunRecorder::start(pool.clone(), &wf, "{}", &HashMap::new(), "cli").unwrap());
     let (em, _rx) = Emitter::new(rec.clone());
 
-    em.emit(EventType::WorkflowStarted, None, None, None, HashMap::new());
-    em.emit(
-        EventType::NodeStarted,
-        Some("n1".into()),
-        Some(1),
-        Some(1),
-        HashMap::new(),
-    );
-    em.emit(
-        EventType::NodeDone,
-        Some("n1".into()),
-        Some(1),
-        Some(1),
-        HashMap::new(),
-    );
+    em.emit_workflow(EventType::WorkflowStarted, HashMap::new());
+    em.emit_node(EventType::NodeStarted, "n1", 1, 1, HashMap::new());
+    em.emit_node(EventType::NodeDone, "n1", 1, 1, HashMap::new());
 
     rec.finalize("done", None).unwrap();
 
