@@ -11,8 +11,10 @@ import type { JSX } from "react";
 import {
   type NodeType,
   type Workflow,
+  type Workspace,
   listNodeTypes,
   listWorkflows,
+  listWorkspaces,
   loadWorkflow,
   runWorkflow,
   saveWorkflow,
@@ -37,6 +39,7 @@ import {
   reduceRunEvent,
   type LiveRunState,
 } from "../components/run";
+import { RunDialog } from "../components/dialogs";
 import type { Route } from "../lib/router";
 
 interface Props {
@@ -60,9 +63,28 @@ export function Editor({
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [runState, setRunState] = useState<LiveRunState>(emptyRunState);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [runDialogOpen, setRunDialogOpen] = useState(false);
 
   const insideTauri =
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+  // Workspace catalog → RunDialog's workspace picker.
+  useEffect(() => {
+    if (!insideTauri) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const ws = await listWorkspaces();
+        if (!cancelled) setWorkspaces(ws);
+      } catch {
+        /* non-fatal — RunDialog falls back to engine home */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [insideTauri]);
 
   // Load node-type catalog once (under Tauri) — used by the Canvas
   // for port lookup and category tinting.
@@ -246,29 +268,43 @@ export function Editor({
   // For Phase 1.5c the new node lands below the lowest existing
   // node so it's always visible; drag-from-palette with a
   // cursor-tracking ghost is a v1.x polish item.
-  const handleRun = useCallback(async () => {
+  const handleRun = useCallback(() => {
     if (!workflow) return;
     if (!insideTauri) {
       console.warn("run requires the Tauri host");
       return;
     }
-    setRunState(emptyRunState());
-    setMode("run");
-    try {
-      await runWorkflow(
-        {
-          workflowId: workflow.id,
-          variables: {},
-          autoResume: true,
-        },
-        (event) => {
-          setRunState((current) => reduceRunEvent(current, event));
-        },
-      );
-    } catch (e: unknown) {
-      setError(String(e));
-    }
+    setRunDialogOpen(true);
   }, [workflow, insideTauri]);
+
+  const handleRunConfirm = useCallback(
+    async (input: {
+      variables: Record<string, string>;
+      workspaceId: string | null;
+      autoResume: boolean;
+    }) => {
+      if (!workflow) return;
+      setRunDialogOpen(false);
+      setRunState(emptyRunState());
+      setMode("run");
+      try {
+        await runWorkflow(
+          {
+            workflowId: workflow.id,
+            variables: input.variables,
+            workspaceId: input.workspaceId,
+            autoResume: input.autoResume,
+          },
+          (event) => {
+            setRunState((current) => reduceRunEvent(current, event));
+          },
+        );
+      } catch (e: unknown) {
+        setError(String(e));
+      }
+    },
+    [workflow],
+  );
 
   const handleStop = useCallback(async () => {
     if (!runState.runId) return;
@@ -469,6 +505,17 @@ export function Editor({
         tail={`mode: ${mode} · ${activeId ?? "no workflow"} · ${
           workflow?.nodes.length ?? 0
         }n ${workflow?.edges.length ?? 0}e`}
+      />
+
+      <RunDialog
+        open={runDialogOpen}
+        workflowName={workflow?.name ?? activeId ?? "(none)"}
+        variableDefaults={workflow?.variables ?? {}}
+        workspaces={workspaces}
+        defaultWorkspaceId={null}
+        autoResume
+        onConfirm={(input) => void handleRunConfirm(input)}
+        onCancel={() => setRunDialogOpen(false)}
       />
     </div>
   );
