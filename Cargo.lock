@@ -2588,6 +2588,7 @@ dependencies = [
  "clap",
  "ordius-engine",
  "predicates",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

@@ -6,8 +6,12 @@
 //! dispatches by subcommand. Each subcommand owns its own engine
 //! initialisation (so `--help` doesn't open `runs.db`).
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use ordius_engine::{load_workflow, validate};
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// Top-level CLI: global flags + a required subcommand.
@@ -205,9 +209,10 @@ async fn main() -> ExitCode {
     reason = "subcommand bodies in follow-up commits will await (engine.start_run, ndjson streaming)."
 )]
 async fn dispatch(cli: Cli) -> anyhow::Result<u8> {
+    let home = resolve_home(cli.home);
     match cli.cmd {
+        Cmd::Workflows { sub } => cmd_workflows(sub, &home),
         Cmd::Run(_)
-        | Cmd::Workflows { .. }
         | Cmd::Runs { .. }
         | Cmd::Nodes { .. }
         | Cmd::Secrets { .. }
@@ -217,6 +222,131 @@ async fn dispatch(cli: Cli) -> anyhow::Result<u8> {
             anyhow::bail!("subcommand not yet wired in this build");
         },
     }
+}
+
+/// Resolve the engine home directory: explicit `--home` wins,
+/// otherwise `$HOME/.ordius` (Unix) or `$USERPROFILE/.ordius`
+/// (Windows). Falls back to a relative `./.ordius` if neither env
+/// var is set — keeps the binary runnable in stripped environments.
+fn resolve_home(override_path: Option<PathBuf>) -> PathBuf {
+    override_path.unwrap_or_else(|| {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map_or_else(
+                || PathBuf::from(".ordius"),
+                |h| PathBuf::from(h).join(".ordius"),
+            )
+    })
+}
+
+fn workflows_dir(home: &Path) -> PathBuf {
+    home.join("workflows")
+}
+
+fn workflow_path(home: &Path, id: &str) -> PathBuf {
+    workflows_dir(home).join(format!("{id}.json"))
+}
+
+fn cmd_workflows(sub: WorkflowsSub, home: &Path) -> anyhow::Result<u8> {
+    match sub {
+        WorkflowsSub::Ls => workflows_ls(home),
+        WorkflowsSub::Show { id } => workflows_show(home, &id),
+        WorkflowsSub::Validate { id_or_path } => workflows_validate(home, &id_or_path),
+        WorkflowsSub::Rm { id, force } => workflows_rm(home, &id, force),
+    }
+}
+
+fn workflows_ls(home: &Path) -> anyhow::Result<u8> {
+    let dir = workflows_dir(home);
+    if !dir.exists() {
+        // Empty home is not an error — just nothing to list yet.
+        println!("(no workflows; nothing in {})", dir.display());
+        return Ok(0);
+    }
+    let mut entries: Vec<(String, String, usize)> = Vec::new();
+    for raw in fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))? {
+        let entry = raw.with_context(|| format!("read_dir entry under {}", dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+            continue;
+        }
+        match load_workflow(&path) {
+            Ok(wf) => entries.push((wf.id.clone(), wf.name.clone(), wf.triggers.len())),
+            Err(e) => eprintln!("warn: {} failed to parse: {e}", path.display()),
+        }
+    }
+    entries.sort();
+    println!("{:<24} {:<32} TRIGGERS", "ID", "NAME");
+    for (id, name, triggers) in entries {
+        println!("{id:<24} {name:<32} {triggers}");
+    }
+    Ok(0)
+}
+
+fn workflows_show(home: &Path, id: &str) -> anyhow::Result<u8> {
+    let path = workflow_path(home, id);
+    let wf = load_workflow(&path)
+        .with_context(|| format!("load workflow {id} from {}", path.display()))?;
+    let json =
+        serde_json::to_string_pretty(&wf).with_context(|| format!("serialise workflow {id}"))?;
+    println!("{json}");
+    Ok(0)
+}
+
+fn workflows_validate(home: &Path, id_or_path: &str) -> anyhow::Result<u8> {
+    let path = resolve_id_or_path(home, id_or_path);
+    let wf =
+        load_workflow(&path).with_context(|| format!("load workflow from {}", path.display()))?;
+    match validate(&wf) {
+        Ok(()) => {
+            println!("ok");
+            Ok(0)
+        },
+        Err(e) => {
+            eprintln!("validation error: {e}");
+            Ok(2)
+        },
+    }
+}
+
+fn workflows_rm(home: &Path, id: &str, force: bool) -> anyhow::Result<u8> {
+    let path = workflow_path(home, id);
+    if !path.exists() {
+        anyhow::bail!("workflow {id} not found at {}", path.display());
+    }
+    if !force && !confirm(&format!("Delete workflow {id}?"))? {
+        eprintln!("aborted");
+        return Ok(1);
+    }
+    fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+    println!("removed {id}");
+    Ok(0)
+}
+
+fn resolve_id_or_path(home: &Path, id_or_path: &str) -> PathBuf {
+    let p = Path::new(id_or_path);
+    let has_known_ext = p.extension().is_some_and(|ext| {
+        ["json", "yaml", "yml"]
+            .iter()
+            .any(|e| ext.eq_ignore_ascii_case(e))
+    });
+    let has_separator = id_or_path.contains('/') || id_or_path.contains('\\');
+    if has_known_ext || has_separator {
+        PathBuf::from(id_or_path)
+    } else {
+        workflow_path(home, id_or_path)
+    }
+}
+
+fn confirm(prompt: &str) -> anyhow::Result<bool> {
+    use std::io::BufRead;
+    eprint!("{prompt} [y/N] ");
+    io::stderr().flush()?;
+    let stdin = io::stdin();
+    let mut line = String::new();
+    stdin.lock().read_line(&mut line)?;
+    let ans = line.trim().to_lowercase();
+    Ok(matches!(ans.as_str(), "y" | "yes"))
 }
 
 fn init_tracing(verbose: u8) {
