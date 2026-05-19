@@ -5,7 +5,7 @@
 //! tasks, wrap it in `Arc<RunRecorder>`.
 
 use crate::db::DbPool;
-use crate::events::RunEvent;
+use crate::events::{EventType, RunEvent};
 use crate::types::Workflow;
 use crate::{EngineError, Result};
 use chrono::Utc;
@@ -73,26 +73,32 @@ impl RunRecorder {
         let vars_json =
             serde_json::to_string(variables).map_err(|e| EngineError::Db(e.to_string()))?;
         let conn = pool.get()?;
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO run_snapshots (id, workflow_id, created_at, workflow_json, node_specs_json) \
              VALUES (?,?,?,?,?)",
-            rusqlite::params![&snapshot_id, &wf.id, now, &wf_json, node_specs_json],
-        )?;
-        conn.execute(
+        )?
+        .execute(rusqlite::params![
+            &snapshot_id,
+            &wf.id,
+            now,
+            &wf_json,
+            node_specs_json,
+        ])?;
+        conn.prepare_cached(
             "INSERT INTO runs (id, workflow_id, workflow_name, status, started_at, \
                                variables_json, trigger_kind, workflow_snapshot_id) \
              VALUES (?,?,?,?,?,?,?,?)",
-            rusqlite::params![
-                &run_id,
-                &wf.id,
-                &wf.name,
-                "running",
-                now,
-                &vars_json,
-                trigger_kind,
-                &snapshot_id,
-            ],
-        )?;
+        )?
+        .execute(rusqlite::params![
+            &run_id,
+            &wf.id,
+            &wf.name,
+            "running",
+            now,
+            &vars_json,
+            trigger_kind,
+            &snapshot_id,
+        ])?;
         Ok(Self {
             pool,
             run_id,
@@ -109,31 +115,40 @@ impl RunRecorder {
 
     /// Persist an emitted event to the `run_events` table.
     pub fn record_event(&self, ev: &RunEvent) -> Result<()> {
-        let payload_json =
-            serde_json::to_string(&ev.payload).map_err(|e| EngineError::Db(e.to_string()))?;
+        // Empty payload is the common case (workflow lifecycle +
+        // most node events) — skip the serializer state machine.
+        let payload_json = if ev.payload.is_empty() {
+            String::from("{}")
+        } else {
+            serde_json::to_string(&ev.payload).map_err(|e| EngineError::Db(e.to_string()))?
+        };
         let seq_i64 =
             i64::try_from(ev.seq).map_err(|e| EngineError::Db(format!("seq overflow: {e}")))?;
-        let channel = ev
-            .payload
-            .get("channel")
-            .and_then(serde_json::Value::as_str);
+        // `channel` is meaningful only on NodeOutput events.
+        let channel = if ev.ty == EventType::NodeOutput {
+            ev.payload
+                .get("channel")
+                .and_then(serde_json::Value::as_str)
+        } else {
+            None
+        };
         let conn = self.pool.get()?;
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO run_events \
                (run_id, seq, emitted_at, type, node_id, iteration, attempt, channel, payload_json) \
              VALUES (?,?,?,?,?,?,?,?,?)",
-            rusqlite::params![
-                &self.run_id,
-                seq_i64,
-                ev.emitted_at,
-                ev.ty.wire_tag(),
-                &ev.node_id,
-                ev.iteration,
-                ev.attempt,
-                channel,
-                &payload_json,
-            ],
-        )?;
+        )?
+        .execute(rusqlite::params![
+            &self.run_id,
+            seq_i64,
+            ev.emitted_at,
+            ev.ty.wire_tag(),
+            &ev.node_id,
+            ev.iteration,
+            ev.attempt,
+            channel,
+            &payload_json,
+        ])?;
         Ok(())
     }
 
@@ -142,25 +157,25 @@ impl RunRecorder {
     /// accepts updates as the node transitions through statuses.
     pub fn record_node_run(&self, row: &NodeRunRow<'_>) -> Result<()> {
         let conn = self.pool.get()?;
-        conn.execute(
+        conn.prepare_cached(
             "INSERT OR REPLACE INTO node_runs \
                (run_id, node_id, iteration, attempt, node_type, status, \
                 started_at, finished_at, duration_ms, output_summary, error) \
              VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            rusqlite::params![
-                &self.run_id,
-                row.node_id,
-                row.iteration,
-                row.attempt,
-                row.node_type,
-                row.status,
-                row.started_at,
-                row.finished_at,
-                row.duration_ms,
-                row.output_summary,
-                row.error,
-            ],
-        )?;
+        )?
+        .execute(rusqlite::params![
+            &self.run_id,
+            row.node_id,
+            row.iteration,
+            row.attempt,
+            row.node_type,
+            row.status,
+            row.started_at,
+            row.finished_at,
+            row.duration_ms,
+            row.output_summary,
+            row.error,
+        ])?;
         Ok(())
     }
 
@@ -179,20 +194,20 @@ impl RunRecorder {
         value_path: Option<&str>,
     ) -> Result<()> {
         let conn = self.pool.get()?;
-        conn.execute(
+        conn.prepare_cached(
             "INSERT OR REPLACE INTO node_outputs \
                (run_id, node_id, iteration, attempt, port_name, value_inline, value_path) \
              VALUES (?,?,?,?,?,?,?)",
-            rusqlite::params![
-                &self.run_id,
-                node_id,
-                iteration,
-                attempt,
-                port_name,
-                value_inline,
-                value_path,
-            ],
-        )?;
+        )?
+        .execute(rusqlite::params![
+            &self.run_id,
+            node_id,
+            iteration,
+            attempt,
+            port_name,
+            value_inline,
+            value_path,
+        ])?;
         Ok(())
     }
 
