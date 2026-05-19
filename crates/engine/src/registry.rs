@@ -55,6 +55,7 @@ impl Registry {
         r.register(condition_spec());
         r.register(shell_spec());
         r.register(http_spec());
+        r.register(llm_spec());
         r
     }
 }
@@ -170,6 +171,89 @@ fn http_spec() -> NodeType {
                 label: "Timeout (ms)".into(),
                 ty: ConfigFieldType::Number,
                 default: Some(serde_json::json!(30_000)),
+                required: false,
+            },
+        ],
+        execution: in_process_execution_spec(),
+    }
+}
+
+fn llm_spec() -> NodeType {
+    NodeType {
+        id: "llm".into(),
+        name: "LLM".into(),
+        category: Category::Integration,
+        tags: vec![],
+        icon: "sparkles".into(),
+        description: "OpenAI-compatible chat completion. Streams assistant deltas as \
+                      node:output when stream=true. Non-2xx surfaces on finish_reason."
+            .into(),
+        inputs: vec![],
+        outputs: vec![
+            PortDef {
+                name: "text".into(),
+                ty: PortType::String,
+                required: false,
+            },
+            PortDef {
+                name: "tokens_used".into(),
+                ty: PortType::Number,
+                required: false,
+            },
+            PortDef {
+                name: "finish_reason".into(),
+                ty: PortType::String,
+                required: false,
+            },
+        ],
+        config: vec![
+            ConfigFieldDef {
+                name: "url".into(),
+                label: "Base URL".into(),
+                ty: ConfigFieldType::String,
+                default: Some(serde_json::json!("http://localhost:11434/v1")),
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "model".into(),
+                label: "Model".into(),
+                ty: ConfigFieldType::String,
+                default: None,
+                required: true,
+            },
+            ConfigFieldDef {
+                name: "messages".into(),
+                label: "Messages".into(),
+                ty: ConfigFieldType::Textarea,
+                default: None,
+                required: true,
+            },
+            ConfigFieldDef {
+                name: "temperature".into(),
+                label: "Temperature".into(),
+                ty: ConfigFieldType::Number,
+                default: Some(serde_json::json!(0.7)),
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "max_tokens".into(),
+                label: "Max tokens".into(),
+                ty: ConfigFieldType::Number,
+                default: None,
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "stream".into(),
+                label: "Stream".into(),
+                ty: ConfigFieldType::Boolean,
+                default: Some(serde_json::json!(true)),
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "api_key".into(),
+                label: "API key".into(),
+                ty: ConfigFieldType::Secret,
+                default: None,
                 required: false,
             },
         ],
