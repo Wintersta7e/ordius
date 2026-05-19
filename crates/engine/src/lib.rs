@@ -160,14 +160,44 @@ impl Engine {
             })
     }
 
-    /// Graceful shutdown — drain active runs within `drain_timeout`
-    /// before forcing cancellation. Async because the eventual
-    /// drain loop awaits the per-run join handles.
-    #[allow(clippy::unused_async)]
-    pub async fn shutdown(&self, _drain_timeout: Duration) -> Result<()> {
-        Err(EngineError::NotImplemented(
-            "Engine::shutdown — graceful drain not yet implemented",
-        ))
+    /// Graceful shutdown. Snapshots every active run's cancel
+    /// token, fires them all, polls `run_tokens` until empty (or
+    /// `drain_timeout` elapses), then returns. The run loops
+    /// themselves remove their own entries from `run_senders` /
+    /// `run_tokens` on exit, so emptiness means everything has
+    /// finalized.
+    pub async fn shutdown(&self, drain_timeout: Duration) -> Result<()> {
+        let active: Vec<CancellationToken> = self
+            .run_tokens
+            .lock()
+            .expect("engine run_tokens mutex poisoned")
+            .values()
+            .cloned()
+            .collect();
+        for token in &active {
+            token.cancel();
+        }
+
+        let deadline = tokio::time::Instant::now() + drain_timeout;
+        loop {
+            if self
+                .run_tokens
+                .lock()
+                .expect("engine run_tokens mutex poisoned")
+                .is_empty()
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Last-ditch grace window for subprocess executors to
+        // finish their cancellation arm (SIGKILL after SIGTERM,
+        // TerminateJobObject, etc.) before we return.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        Ok(())
     }
 }
 
@@ -192,10 +222,58 @@ mod engine_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn shutdown_is_not_implemented_yet() {
+    async fn shutdown_with_no_active_runs_is_quick() {
         let dir = TempDir::new().unwrap();
         let eng = Engine::new(dir.path().to_path_buf()).await.unwrap();
-        let err = eng.shutdown(Duration::from_secs(1)).await.unwrap_err();
-        assert!(matches!(err, EngineError::NotImplemented(_)));
+        let start = std::time::Instant::now();
+        eng.shutdown(Duration::from_secs(2)).await.unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "no active runs should return immediately, took {:?}",
+            start.elapsed(),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_cancels_running_workflows() {
+        use crate::types::{Node, Pos, Workflow};
+        use std::collections::HashMap;
+
+        let dir = TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+
+        let wf = Arc::new(Workflow {
+            id: "wf_shutdown".into(),
+            name: "long".into(),
+            schema_version: 1,
+            created_at: None,
+            updated_at: None,
+            variables: HashMap::new(),
+            triggers: vec![],
+            nodes: vec![Node {
+                id: "slow".into(),
+                ty: "delay".into(),
+                name: String::new(),
+                config: HashMap::from([("ms".into(), serde_json::json!(60_000))]),
+                pos: Pos::default(),
+                timeout_ms: None,
+                retry: None,
+                continue_on_error: false,
+            }],
+            edges: vec![],
+        });
+
+        let handle = engine
+            .start_run(wf, HashMap::new(), "test", false)
+            .expect("start_run");
+        // Let the run loop start dispatching before we ask to shut down.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        engine
+            .shutdown(Duration::from_secs(2))
+            .await
+            .expect("shutdown drains");
+
+        let summary = handle.join.await.expect("join").expect("run ok");
+        assert_eq!(summary.status, "stopped");
     }
 }
