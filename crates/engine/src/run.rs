@@ -485,9 +485,14 @@ async fn run_with_retry(
 }
 
 /// Dispatch a single attempt under an optional per-attempt
-/// timeout. On elapsed, cancels the attempt token so the
-/// subprocess (or any other inner select-on-cancel future) tears
-/// down; converts to [`NodeError::Timeout`].
+/// timeout. On elapsed, cancels the attempt token AND awaits the
+/// executor future's teardown with a bounded grace window — that
+/// way the subprocess executor's `cancel.cancelled()` arm runs
+/// (SIGTERM → SIGKILL to `-pgid` on Unix; `TerminateJobObject` on
+/// Windows) before this function returns. Returning early with
+/// `tokio::time::timeout(budget, inner).await` drops `inner`
+/// without giving its cancellation arm a chance to fire, so any
+/// in-flight child processes outlive the run.
 async fn dispatch_one_attempt(
     dispatcher: &Dispatcher,
     node: &crate::types::Node,
@@ -500,13 +505,24 @@ async fn dispatch_one_attempt(
         return dispatcher.run(node, nt, ctx, attempt_cancel).await;
     };
     let budget = Duration::from_millis(ms);
-    let inner = dispatcher.run(node, nt, ctx, attempt_cancel.clone());
-    tokio::time::timeout(budget, inner)
-        .await
-        .unwrap_or_else(|_| {
+    let run_fut = dispatcher.run(node, nt, ctx, attempt_cancel.clone());
+    tokio::pin!(run_fut);
+
+    tokio::select! {
+        biased;
+        result = &mut run_fut => result,
+        () = tokio::time::sleep(budget) => {
             attempt_cancel.cancel();
+            // Grace window for the executor's cancellation arm to
+            // finish. Subprocess Unix waits 2s between SIGTERM and
+            // SIGKILL; the line-reader drain after wait() bumps the
+            // worst-case envelope. 5s covers both with margin.
+            let grace = Duration::from_secs(5);
+            let teardown = tokio::time::timeout(grace, &mut run_fut).await;
+            drop(teardown);
             Err(NodeError::Timeout(ms))
-        })
+        }
+    }
 }
 
 fn compute_backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
@@ -803,6 +819,66 @@ mod tests {
         );
         let summary = handle.join.await.expect("join").expect("run ok");
         assert_eq!(summary.status, "stopped");
+    }
+
+    /// Regression test for the bug Codex flagged: a per-attempt
+    /// timeout that drops the executor future via
+    /// `tokio::time::timeout` cancels its inner select on cancel
+    /// without firing the subprocess executor's SIGTERM-then-SIGKILL
+    /// arm. `kill_on_drop` masks the bug for direct shell sequences
+    /// but a backgrounded grandchild reparents to init and keeps
+    /// running. The fixed `dispatch_one_attempt` cancels the attempt
+    /// token first, which routes through the executor's Unix arm
+    /// (`kill(-pgid, SIGTERM)` → grace → `SIGKILL`) and reaches the
+    /// whole process group. Skipped on non-Unix targets.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timeout_actually_kills_subprocess_group() {
+        let dir = TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+
+        // Background shell touches the marker after the outer shell
+        // would have been killed by `kill_on_drop` alone. Only a
+        // pgid-wide SIGTERM/SIGKILL reaches it.
+        let marker = dir.path().join("survived");
+        let command = format!(r#"sh -c "sleep 0.5; touch '{}'" & wait"#, marker.display());
+
+        let wf = Arc::new(Workflow {
+            id: "wf_subproc_kill".into(),
+            name: "subproc_kill".into(),
+            schema_version: 1,
+            created_at: None,
+            updated_at: None,
+            variables: HashMap::new(),
+            triggers: vec![],
+            nodes: vec![Node {
+                id: "shell".into(),
+                ty: "shell".into(),
+                name: String::new(),
+                config: HashMap::from([("command".into(), serde_json::json!(command))]),
+                pos: Pos::default(),
+                timeout_ms: Some(50),
+                retry: None,
+                continue_on_error: false,
+            }],
+            edges: vec![],
+        });
+
+        let summary = engine
+            .run_workflow(wf, HashMap::new(), "test", false)
+            .await
+            .expect("run completes");
+        assert_eq!(summary.status, "error", "expected timeout → run error");
+
+        // Wait longer than the backgrounded `sleep 0.5` so any
+        // pgid-survivor would have time to `touch` the marker.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        assert!(
+            !marker.exists(),
+            "subprocess group survived its timeout: \
+             dispatch_one_attempt dropped the executor future before \
+             the SIGTERM-to-pgid arm could fire",
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
