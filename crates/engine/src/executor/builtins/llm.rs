@@ -16,9 +16,7 @@ use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::types::{Node, NodeType, PortValue};
 use async_trait::async_trait;
 use futures::StreamExt;
-use reqwest::Client;
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -29,14 +27,6 @@ const NODE_TYPE_ID: &str = "llm";
 const SSE_DONE: &str = "[DONE]";
 const SSE_DATA_PREFIX: &str = "data:";
 const CHANNEL_LLM: &str = "llm";
-
-/// Shared HTTP client. Separate from the `http` builtin's client
-/// only to avoid coupling timeouts / pooling between the two; in
-/// practice both could share once we settle on tuning.
-fn client() -> &'static Client {
-    static CLIENT: OnceLock<Client> = OnceLock::new();
-    CLIENT.get_or_init(Client::new)
-}
 
 /// In-process LLM executor — see module docs for failure policy
 /// and streaming semantics.
@@ -103,7 +93,7 @@ impl NodeExecutor for LlmExecutor {
         body.insert("stream".into(), serde_json::Value::Bool(stream));
 
         let url = format!("{base_url}/chat/completions");
-        let mut req = client()
+        let mut req = super::super::http_client::shared()
             .post(&url)
             .timeout(Duration::from_millis(timeout_ms))
             .json(&serde_json::Value::Object(body));

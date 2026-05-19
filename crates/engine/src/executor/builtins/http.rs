@@ -10,21 +10,12 @@
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::types::{Node, NodeType, PortValue};
 use async_trait::async_trait;
-use reqwest::{Client, Method, header::HeaderMap, header::HeaderName, header::HeaderValue};
-use std::sync::OnceLock;
+use reqwest::{Method, header::HeaderMap, header::HeaderName, header::HeaderValue};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const NODE_TYPE_ID: &str = "http";
-
-/// Shared HTTP client. `reqwest::Client` is `Clone` + `Send` + `Sync`
-/// and amortises the TLS / DNS pool across calls — reconstructing
-/// per request would be a real cost.
-fn client() -> &'static Client {
-    static CLIENT: OnceLock<Client> = OnceLock::new();
-    CLIENT.get_or_init(Client::new)
-}
 
 /// HTTP executor — see module docs for failure policy.
 pub struct HttpExecutor;
@@ -60,7 +51,7 @@ impl NodeExecutor for HttpExecutor {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(DEFAULT_TIMEOUT_MS);
 
-        let mut req = client()
+        let mut req = super::super::http_client::shared()
             .request(method, url)
             .timeout(Duration::from_millis(timeout_ms));
 
