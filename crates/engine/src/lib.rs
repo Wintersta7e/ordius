@@ -10,11 +10,13 @@
 
 pub mod error;
 pub mod loader;
+pub mod scheduler;
 pub mod types;
 pub mod validation;
 
 pub use error::{EngineError, Result};
 pub use loader::{LoadError, load_workflow};
+pub use scheduler::{NodeState, Scheduler};
 pub use types::{
     BackoffStrategy, Category, ConfigFieldDef, ConfigFieldType, Edge, EdgeType, ExecutionBackend,
     ExecutionSpec, Node, NodeType, OutputParse, PortDef, PortType, PortValue, Pos, RetryOn,
