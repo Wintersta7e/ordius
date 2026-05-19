@@ -38,15 +38,13 @@ pub enum SecretError {
 
 /// Keyring-backed secrets store with an on-disk name index.
 pub struct Store {
-    service: String,
     sidecar: PathBuf,
 }
 
 impl Store {
-    /// Build a store pointed at `~/.ordius/secrets-index.json`
-    /// using the default keyring service name. Reads `HOME`
-    /// (Unix) or `USERPROFILE` (Windows) to locate the home
-    /// directory.
+    /// Build a store pointed at `~/.ordius/secrets-index.json`.
+    /// Reads `HOME` (Unix) or `USERPROFILE` (Windows) to locate
+    /// the home directory.
     pub fn default_for_user() -> Result<Self, SecretError> {
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
@@ -54,33 +52,30 @@ impl Store {
         let sidecar = PathBuf::from(home)
             .join(".ordius")
             .join("secrets-index.json");
-        Ok(Self {
-            service: DEFAULT_SERVICE.into(),
-            sidecar,
-        })
+        Ok(Self { sidecar })
     }
 
-    /// Build a store that maintains its name index at `index_path`
-    /// using the default keyring service name. Used by tests and
-    /// any caller that wants a non-default sidecar location.
+    /// Build a store that maintains its name index at `index_path`.
+    /// Used by tests and any caller that wants a non-default
+    /// sidecar location.
     #[must_use]
-    pub fn with_index_path(index_path: PathBuf) -> Self {
+    pub const fn with_index_path(index_path: PathBuf) -> Self {
         Self {
-            service: DEFAULT_SERVICE.into(),
             sidecar: index_path,
         }
     }
 
     /// Read the secret named `name` from the OS keyring.
     pub fn get(&self, name: &str) -> Result<String, SecretError> {
-        let entry = keyring_core::Entry::new(&self.service, name)?;
+        let _ = self;
+        let entry = keyring_core::Entry::new(DEFAULT_SERVICE, name)?;
         Ok(entry.get_password()?)
     }
 
     /// Store `value` under `name` in the OS keyring and add the
     /// name to the sidecar index.
     pub fn set(&self, name: &str, value: &str) -> Result<(), SecretError> {
-        let entry = keyring_core::Entry::new(&self.service, name)?;
+        let entry = keyring_core::Entry::new(DEFAULT_SERVICE, name)?;
         entry.set_password(value)?;
         self.update_index(|names| {
             if !names.iter().any(|n| n == name) {
@@ -93,7 +88,7 @@ impl Store {
     /// Remove the secret named `name` from the keyring and from
     /// the sidecar index.
     pub fn delete(&self, name: &str) -> Result<(), SecretError> {
-        let entry = keyring_core::Entry::new(&self.service, name)?;
+        let entry = keyring_core::Entry::new(DEFAULT_SERVICE, name)?;
         entry.delete_credential()?;
         self.update_index(|names| {
             names.retain(|n| n != name);

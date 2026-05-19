@@ -26,7 +26,6 @@ jsonpath-rust = { workspace = true }
 regex = { workspace = true }
 glob = { workspace = true }
 reqwest = { workspace = true }
-keyring = { workspace = true }
 keyring-core = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
@@ -35,3 +34,4 @@ async-trait = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 serial_test = { workspace = true }
+keyring = { workspace = true }
