@@ -50,6 +50,15 @@ impl Emitter {
         self.tx.subscribe()
     }
 
+    /// Clone of the underlying broadcast sender — used by the
+    /// engine to register the channel in its per-run subscriber
+    /// map so external callers can subscribe later without holding
+    /// the emitter directly.
+    #[must_use]
+    pub fn broadcast_sender(&self) -> broadcast::Sender<RunEvent> {
+        self.tx.clone()
+    }
+
     /// Register a secret `(name, value)` pair so the emitter can
     /// redact every occurrence of `value` from emitted
     /// `node:output` `text` payloads. Dedupes on the

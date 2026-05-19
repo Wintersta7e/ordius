@@ -17,6 +17,7 @@ pub mod executor;
 pub mod loader;
 pub mod recorder;
 pub mod registry;
+pub mod run;
 pub mod scheduler;
 pub mod secrets;
 pub mod template;
@@ -33,6 +34,7 @@ pub use executor::{
 };
 pub use loader::{LoadError, load_workflow};
 pub use recorder::{NodeRunRow, RunRecorder, sweep_stale_locks};
+pub use run::{RunHandle, RunSummary};
 pub use scheduler::{LoopFire, NodeState, Scheduler};
 pub use secrets::{SecretError, Store, redact_secrets};
 pub use template::{SubstitutionContext, TemplateError, default_env_allowlist, substitute};

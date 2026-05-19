@@ -419,7 +419,14 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "checkpoint", "condition", "delay", "file", "http", "llm", "shell", "transform",
+                "checkpoint",
+                "condition",
+                "delay",
+                "file",
+                "http",
+                "llm",
+                "shell",
+                "transform",
             ],
         );
     }
