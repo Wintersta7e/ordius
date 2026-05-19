@@ -48,6 +48,7 @@ impl Registry {
         let mut r = Self::new();
         r.register(delay_spec());
         r.register(transform_spec());
+        r.register(condition_spec());
         r
     }
 }
@@ -87,6 +88,21 @@ fn transform_spec() -> NodeType {
         tags: vec![],
         icon: "shuffle".into(),
         description: "JSONPath / regex extraction and replacement".into(),
+        inputs: vec![],
+        outputs: vec![],
+        config: vec![],
+        execution: in_process_execution_spec(),
+    }
+}
+
+fn condition_spec() -> NodeType {
+    NodeType {
+        id: "condition".into(),
+        name: "Condition".into(),
+        category: Category::Control,
+        tags: vec![],
+        icon: "git-branch".into(),
+        description: "Branch evaluator (boolean / exit_code / regex / jsonpath)".into(),
         inputs: vec![],
         outputs: vec![],
         config: vec![],
