@@ -8,11 +8,14 @@
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use ordius_engine::registry::Registry;
+use ordius_engine::types::{Category, NodeType};
 use ordius_engine::{load_workflow, validate};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 /// Top-level CLI: global flags + a required subcommand.
 #[derive(Parser, Debug)]
@@ -210,11 +213,12 @@ async fn main() -> ExitCode {
 )]
 async fn dispatch(cli: Cli) -> anyhow::Result<u8> {
     let home = resolve_home(cli.home);
+    let json = cli.json;
     match cli.cmd {
         Cmd::Workflows { sub } => cmd_workflows(sub, &home),
+        Cmd::Nodes { sub } => cmd_nodes(sub, json),
         Cmd::Run(_)
         | Cmd::Runs { .. }
-        | Cmd::Nodes { .. }
         | Cmd::Secrets { .. }
         | Cmd::Export { .. }
         | Cmd::Import { .. }
@@ -336,6 +340,84 @@ fn resolve_id_or_path(home: &Path, id_or_path: &str) -> PathBuf {
     } else {
         workflow_path(home, id_or_path)
     }
+}
+
+fn cmd_nodes(sub: NodesSub, json_out: bool) -> anyhow::Result<u8> {
+    let registry = Registry::with_v1_0_builtins();
+    match sub {
+        NodesSub::Ls { category, tag } => nodes_ls(&registry, category.as_deref(), &tag, json_out),
+        NodesSub::Show { ty } => nodes_show(&registry, &ty),
+    }
+}
+
+const fn category_str(c: Category) -> &'static str {
+    match c {
+        Category::Execution => "execution",
+        Category::Llm => "llm",
+        Category::Data => "data",
+        Category::Control => "control",
+        Category::Integration => "integration",
+    }
+}
+
+fn nodes_ls(
+    registry: &Registry,
+    category: Option<&str>,
+    tags: &[String],
+    json_out: bool,
+) -> anyhow::Result<u8> {
+    let mut ids = registry.ids();
+    ids.sort();
+    let mut matches: Vec<Arc<NodeType>> = Vec::new();
+    for id in ids {
+        let Some(nt) = registry.get(&id) else {
+            continue;
+        };
+        if let Some(want) = category
+            && !category_str(nt.category).eq_ignore_ascii_case(want)
+        {
+            continue;
+        }
+        if !tags.is_empty()
+            && !tags.iter().all(|requested| {
+                nt.tags
+                    .iter()
+                    .any(|present| present.eq_ignore_ascii_case(requested))
+            })
+        {
+            continue;
+        }
+        matches.push(nt);
+    }
+    if json_out {
+        let array: Vec<&NodeType> = matches.iter().map(AsRef::as_ref).collect();
+        println!("{}", serde_json::to_string_pretty(&array)?);
+        return Ok(0);
+    }
+    println!("{:<14} {:<28} {:<13} TAGS", "ID", "NAME", "CATEGORY");
+    for nt in &matches {
+        let tags_str = if nt.tags.is_empty() {
+            "-".to_string()
+        } else {
+            nt.tags.join(",")
+        };
+        println!(
+            "{:<14} {:<28} {:<13} {}",
+            nt.id,
+            nt.name,
+            category_str(nt.category),
+            tags_str,
+        );
+    }
+    Ok(0)
+}
+
+fn nodes_show(registry: &Registry, ty: &str) -> anyhow::Result<u8> {
+    let nt = registry
+        .get(ty)
+        .ok_or_else(|| anyhow::anyhow!("unknown node type: {ty}"))?;
+    println!("{}", serde_json::to_string_pretty(nt.as_ref())?);
+    Ok(0)
 }
 
 fn confirm(prompt: &str) -> anyhow::Result<bool> {
