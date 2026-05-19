@@ -9,12 +9,14 @@
 //! - secrets: keyring read/write
 
 pub mod error;
+pub mod events;
 pub mod loader;
 pub mod scheduler;
 pub mod types;
 pub mod validation;
 
 pub use error::{EngineError, Result};
+pub use events::{EventType, RunEvent};
 pub use loader::{LoadError, load_workflow};
 pub use scheduler::{LoopFire, NodeState, Scheduler};
 pub use types::{
