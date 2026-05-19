@@ -19,14 +19,18 @@
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::types::{ExecutionBackend, Node, NodeType};
 use async_trait::async_trait;
+#[cfg(unix)]
 use std::time::Duration;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-/// Grace period between the soft (`SIGTERM` / `TerminateJobObject`)
-/// signal and the hard kill. Long enough for shells and Python
-/// interpreters to flush stdout, short enough that a hung child
-/// doesn't block run finalization.
+/// Grace period between SIGTERM and SIGKILL on Unix. Long enough
+/// for shells and Python interpreters to flush stdout, short
+/// enough that a hung child doesn't block run finalization.
+///
+/// Windows cancellation uses `TerminateJobObject`, which is hard-
+/// kill only — no grace window — so this constant is Unix-only.
+#[cfg(unix)]
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 /// Executor for nodes whose `ExecutionSpec::backend` is
@@ -162,11 +166,110 @@ fn kill_unix_pgroup(pid: u32, signal: nix::sys::signal::Signal) -> std::io::Resu
 }
 
 /// Windows command-configuration hook. Job-Object setup happens
-/// post-spawn, so the pre-spawn hook is currently a no-op
-/// placeholder.
+/// post-spawn (see [`win_job::spawn_supervised`]), so the
+/// pre-spawn hook itself is a no-op placeholder retained for
+/// symmetry with the Unix path.
 #[cfg(windows)]
 #[allow(dead_code)] // wired into SubprocessExecutor::run alongside Job Object setup
 pub(crate) fn configure_windows_command(_cmd: &mut Command) {}
+
+#[cfg(windows)]
+mod win_job {
+    //! Windows process supervision via Job Objects.
+    //!
+    //! Spawning a child with `CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP`
+    //! and assigning it to a fresh Job Object with the
+    //! `KILL_ON_JOB_CLOSE` limit before its main thread runs means
+    //! every descendant the program later spawns inherits the job
+    //! membership automatically. Closing or terminating the job then
+    //! terminates the whole tree atomically — no `taskkill /T`
+    //! workarounds, no race with grand-children we can't see.
+
+    use super::{Command, NodeError};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+    use windows::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED};
+
+    /// A spawned-suspended child and the Job Object that owns it.
+    /// The child's main thread is still parked at this point;
+    /// `resume_initial_thread` will let it actually run.
+    #[allow(dead_code)] // consumed by resume_initial_thread + terminate_supervised
+    pub(super) struct Supervised {
+        pub(super) child: tokio::process::Child,
+        pub(super) job: HANDLE,
+    }
+
+    /// Spawn `cmd` with the main thread suspended, create a fresh
+    /// Job Object configured to kill its members on close, and
+    /// assign the child to that job before any user code runs.
+    ///
+    /// On any failure after the child has been spawned we close the
+    /// job handle so the OS can clean up.
+    #[allow(dead_code)] // wired into SubprocessExecutor::run with terminate_supervised
+    pub(super) fn spawn_supervised(cmd: &mut Command) -> Result<Supervised, NodeError> {
+        cmd.creation_flags(CREATE_SUSPENDED.0 | CREATE_NEW_PROCESS_GROUP.0);
+        let child = cmd
+            .spawn()
+            .map_err(|e| NodeError::Subprocess(format!("spawn: {e}")))?;
+
+        // SAFETY: CreateJobObjectW returns an owned kernel handle.
+        // Ownership is transferred to `Supervised` on success and
+        // explicitly closed on every error path below.
+        let job = unsafe { CreateJobObjectW(None, None) }
+            .map_err(|e| NodeError::Subprocess(format!("CreateJobObjectW: {e}")))?;
+
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let info_size = u32::try_from(std::mem::size_of_val(&info))
+            .expect("JOBOBJECT_EXTENDED_LIMIT_INFORMATION fits in u32");
+        // SAFETY: `info` is a fully-initialized stack struct; the
+        // pointer is valid for `info_size` bytes; the job handle was
+        // just created.
+        let set_res = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(info).cast(),
+                info_size,
+            )
+        };
+        if let Err(e) = set_res {
+            // SAFETY: `job` is a live kernel handle we created.
+            let close = unsafe { CloseHandle(job) };
+            drop(close);
+            return Err(NodeError::Subprocess(format!(
+                "SetInformationJobObject: {e}"
+            )));
+        }
+
+        let raw = child.raw_handle().ok_or_else(|| {
+            // SAFETY: closing the job we just created.
+            let close = unsafe { CloseHandle(job) };
+            drop(close);
+            NodeError::Subprocess("child has no raw handle".into())
+        })?;
+        let child_handle = HANDLE(raw.cast());
+
+        // SAFETY: `child_handle` borrows from the `Child` we just
+        // spawned and are about to return — the OS handle stays
+        // valid for the call.
+        let assign_res = unsafe { AssignProcessToJobObject(job, child_handle) };
+        if let Err(e) = assign_res {
+            // SAFETY: closing the job we just created.
+            let close = unsafe { CloseHandle(job) };
+            drop(close);
+            return Err(NodeError::Subprocess(format!(
+                "AssignProcessToJobObject: {e}"
+            )));
+        }
+
+        Ok(Supervised { child, job })
+    }
+}
 
 #[cfg(test)]
 mod tests {
