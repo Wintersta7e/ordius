@@ -34,6 +34,14 @@ fn fwd_branch(id: &str, from: &str, to: &str, branch: &str) -> Edge {
     e
 }
 
+fn loop_edge(id: &str, from: &str, to: &str, branch: &str, max: u32) -> Edge {
+    let mut e = fwd(id, from, to);
+    e.kind = EdgeType::Loop;
+    e.branch = Some(branch.into());
+    e.max_iterations = Some(max);
+    e
+}
+
 fn wf(nodes: Vec<Node>, edges: Vec<Edge>) -> Workflow {
     Workflow {
         id: "w".into(),
@@ -129,6 +137,53 @@ fn condition_promotes_unbranched_edges() {
     s.resolve_condition("cond", "false");
     assert_eq!(s.state_of("b"), NodeState::Skipped);
     assert_eq!(s.state_of("c"), NodeState::Ready);
+}
+
+#[test]
+fn loop_resets_subgraph_within_cap() {
+    let w = wf(
+        vec![node("a"), node("cond"), node("b")],
+        vec![
+            fwd("e1", "a", "cond"),
+            fwd_branch("e2", "cond", "b", "done"),
+            loop_edge("eloop", "cond", "a", "loop", 2),
+        ],
+    );
+    let mut s = Scheduler::new(&w);
+    s.complete_node("a");
+    assert_eq!(s.state_of("cond"), NodeState::Ready);
+    let fired = s.try_loop("cond", "loop").expect("first fire");
+    assert_eq!(fired.iteration, 1);
+    assert!(fired.reset_nodes.iter().any(|id| id == "a"));
+    assert!(fired.reset_nodes.iter().any(|id| id == "cond"));
+    assert_eq!(s.state_of("a"), NodeState::Ready);
+    assert_eq!(s.state_of("cond"), NodeState::Pending);
+    s.complete_node("a");
+    let fired2 = s.try_loop("cond", "loop").expect("second fire");
+    assert_eq!(fired2.iteration, 2);
+    s.complete_node("a");
+    assert!(s.try_loop("cond", "loop").is_none());
+}
+
+#[test]
+fn try_loop_returns_none_when_branch_unknown() {
+    let w = wf(
+        vec![node("a"), node("cond")],
+        vec![
+            fwd("e1", "a", "cond"),
+            loop_edge("eloop", "cond", "a", "loop", 3),
+        ],
+    );
+    let mut s = Scheduler::new(&w);
+    s.complete_node("a");
+    assert!(s.try_loop("cond", "no-such-branch").is_none());
+}
+
+#[test]
+fn try_loop_returns_none_for_node_with_no_loop_edges() {
+    let w = wf(vec![node("a")], vec![]);
+    let mut s = Scheduler::new(&w);
+    assert!(s.try_loop("a", "loop").is_none());
 }
 
 #[test]

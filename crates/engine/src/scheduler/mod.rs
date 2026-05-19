@@ -19,13 +19,28 @@ pub struct Scheduler<'a> {
     pub(crate) nodes: &'a [Node],
     pub(crate) incoming: HashMap<&'a str, Vec<&'a Edge>>,
     pub(crate) outgoing: HashMap<&'a str, Vec<&'a Edge>>,
-    #[expect(dead_code, reason = "consumed by loop-firing logic")]
     pub(crate) loops_by_condition: HashMap<&'a str, Vec<&'a Edge>>,
     pub(crate) state: HashMap<String, NodeState>,
-    #[expect(dead_code, reason = "consumed by loop-firing logic")]
     pub(crate) loop_counters: HashMap<String, u32>,
     #[expect(dead_code, reason = "consumed by skip-event drainer")]
     pub(crate) emitted_skipped: HashSet<String>,
+}
+
+/// A successful loop fire returned by [`Scheduler::try_loop`].
+///
+/// The caller is responsible for emitting the corresponding
+/// `node:loop` event using these fields, and for re-dispatching
+/// the freshly-reset nodes.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LoopFire<'a> {
+    /// The loop edge that fired.
+    pub edge: &'a Edge,
+    /// 1-based iteration count (the first fire reports 1).
+    pub iteration: u32,
+    /// Nodes whose state was reset for the new iteration —
+    /// includes the condition node itself plus everything in the
+    /// loop subgraph between the loop target and the condition.
+    pub reset_nodes: Vec<String>,
 }
 
 impl<'a> Scheduler<'a> {
@@ -169,6 +184,73 @@ impl<'a> Scheduler<'a> {
                 self.state.insert(d, NodeState::Ready);
             }
         }
+    }
+
+    /// Attempt to fire a loop edge from `condition_node_id` with
+    /// the chosen `branch` label. Returns `None` if there is no
+    /// matching loop edge or the edge's `max_iterations` cap has
+    /// already been reached.
+    ///
+    /// On success, the loop subgraph (forward-reachable nodes
+    /// from the loop target up to but not including the
+    /// condition node, plus the condition node itself) is reset
+    /// to its initial state (`Ready` if it has no incoming
+    /// forward edges, otherwise `Pending`) and a [`LoopFire`] is
+    /// returned describing what was reset.
+    pub fn try_loop(&mut self, condition_node_id: &str, branch: &str) -> Option<LoopFire<'a>> {
+        let loops = self.loops_by_condition.get(condition_node_id)?.clone();
+        let edge = loops
+            .into_iter()
+            .find(|e| e.branch.as_deref() == Some(branch))?;
+        let cap = edge.max_iterations.unwrap_or(1);
+        let count = self.loop_counters.entry(edge.id.clone()).or_insert(0);
+        if *count >= cap {
+            return None;
+        }
+        *count += 1;
+        let iteration = *count;
+        let mut reset_nodes = self.collect_loop_subgraph(&edge.to_node_id, condition_node_id);
+        // Include the condition node itself in the reset — otherwise
+        // it stays Done and the next iteration cannot re-run it.
+        reset_nodes.push(condition_node_id.to_string());
+        for id in &reset_nodes {
+            let s = if self.incoming.get(id.as_str()).is_none_or(Vec::is_empty) {
+                NodeState::Ready
+            } else {
+                NodeState::Pending
+            };
+            self.state.insert(id.clone(), s);
+        }
+        Some(LoopFire {
+            edge,
+            iteration,
+            reset_nodes,
+        })
+    }
+
+    /// BFS from `start` through forward edges, stopping at `end`
+    /// (exclusive). Returns the nodes between `start` and `end`
+    /// on the looping subgraph; the caller adds `end` to the
+    /// reset set itself.
+    fn collect_loop_subgraph(&self, start: &str, end: &str) -> Vec<String> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out: Vec<String> = Vec::new();
+        let mut q: Vec<String> = vec![start.to_string()];
+        while let Some(cur) = q.pop() {
+            if cur == end {
+                continue;
+            }
+            if !seen.insert(cur.clone()) {
+                continue;
+            }
+            if let Some(outs) = self.outgoing.get(cur.as_str()) {
+                for e in outs {
+                    q.push(e.to_node_id.clone());
+                }
+            }
+            out.push(cur);
+        }
+        out
     }
 
     /// Mark `root` and its transitive forward-edge descendants as
