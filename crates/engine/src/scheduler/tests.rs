@@ -229,3 +229,37 @@ fn is_done_when_all_terminal() {
     s.complete_node("b");
     assert!(s.is_done());
 }
+
+#[test]
+fn stall_detected_when_no_progress_possible() {
+    let w = wf(vec![node("a"), node("b")], vec![fwd("e", "a", "b")]);
+    let mut s = Scheduler::new(&w);
+    // Force the source node Pending so nothing is Ready/Running
+    // but the workflow isn't done.
+    s.state.insert("a".into(), NodeState::Pending);
+    assert!(s.is_stalled());
+}
+
+#[test]
+fn fresh_scheduler_with_source_is_not_stalled() {
+    let w = wf(vec![node("a"), node("b")], vec![fwd("e", "a", "b")]);
+    let s = Scheduler::new(&w);
+    assert!(!s.is_stalled());
+}
+
+#[test]
+fn running_node_is_not_stalled() {
+    let w = wf(vec![node("a"), node("b")], vec![fwd("e", "a", "b")]);
+    let mut s = Scheduler::new(&w);
+    s.start_node("a");
+    assert!(!s.is_stalled());
+}
+
+#[test]
+fn done_workflow_is_not_stalled() {
+    let w = wf(vec![node("a")], vec![]);
+    let mut s = Scheduler::new(&w);
+    s.complete_node("a");
+    assert!(s.is_done());
+    assert!(!s.is_stalled());
+}

@@ -115,6 +115,20 @@ impl<'a> Scheduler<'a> {
         })
     }
 
+    /// True when no node is `Ready` or `Running` and the
+    /// workflow is not yet done — i.e. there are still
+    /// `Pending` nodes but nothing can dispatch them. The
+    /// run-loop surfaces this as a `workflow:error` rather than
+    /// hanging.
+    #[must_use]
+    pub fn is_stalled(&self) -> bool {
+        !self.is_done()
+            && self
+                .nodes
+                .iter()
+                .all(|n| !matches!(self.state_of(&n.id), NodeState::Ready | NodeState::Running))
+    }
+
     /// Mark `node_id` as `Running`. Idempotent.
     pub fn start_node(&mut self, node_id: &str) {
         self.state.insert(node_id.into(), NodeState::Running);
