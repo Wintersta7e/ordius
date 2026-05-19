@@ -209,18 +209,11 @@ fn resolve_templated_inputs(
     nt: &NodeType,
     ctx: &RunContext,
 ) -> Result<ResolvedInputs, NodeError> {
-    // Register every looked-up secret on the emitter so any later
-    // occurrence of its value in stdout/stderr gets redacted from
-    // node:output events. Without this a `{{secrets.X}}` interpolation
-    // would silently leak through the child's stdout.
-    let secrets_store = ctx.secrets_store.clone();
-    let emitter = ctx.emitter.clone();
-    let secrets_resolver = move |name: &str| -> Option<String> {
-        let store = secrets_store.as_ref()?;
-        let value = store.get(name).ok()?;
-        emitter.register_secret(name.to_string(), value.clone());
-        Some(value)
-    };
+    // Wraps secrets-store reads with emitter.register_secret so
+    // resolved values are redacted out of any later node:output
+    // events — otherwise `{{secrets.X}}` interpolation would
+    // silently leak through the child's stdout.
+    let secrets_resolver = crate::executor::context::make_secrets_resolver(ctx);
     // KV-store lookups are not yet wired; the resolver always
     // returns None so `{{kv.X}}` fails loud via TemplateError::Undefined.
     let kv_resolver = |_: &str| -> Option<String> { None };

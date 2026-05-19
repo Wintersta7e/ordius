@@ -67,3 +67,23 @@ pub struct RunContext {
     /// caller (CLI / GUI) signals resume / cancel.
     pub checkpoints: Arc<CheckpointRegistry>,
 }
+
+/// Build the closure that `template::SubstitutionContext::secrets`
+/// expects.
+///
+/// The closure looks the name up on `ctx.secrets_store` (or
+/// returns `None` when no store is configured) and — crucially —
+/// registers the resolved value on `ctx.emitter` so any later
+/// occurrence of it in `node:output` events is redacted. Every
+/// executor that does template substitution must route through
+/// this helper, otherwise `{{secrets.X}}` would silently leak.
+pub fn make_secrets_resolver(ctx: &RunContext) -> impl Fn(&str) -> Option<String> + 'static {
+    let secrets_store = ctx.secrets_store.clone();
+    let emitter = ctx.emitter.clone();
+    move |name: &str| {
+        let store = secrets_store.as_ref()?;
+        let value = store.get(name).ok()?;
+        emitter.register_secret(name.to_string(), value.clone());
+        Some(value)
+    }
+}

@@ -69,17 +69,8 @@ fn apply_template(node: &Node, ctx: &RunContext) -> Result<String, NodeError> {
         .ok_or_else(|| {
             NodeError::Config("transform.template: 'template' (string) required".into())
         })?;
-    let secrets_store = ctx.secrets_store.clone();
-    let emitter = ctx.emitter.clone();
-    let secrets_resolver = move |name: &str| -> Option<String> {
-        let store = secrets_store.as_ref()?;
-        let value = store.get(name).ok()?;
-        emitter.register_secret(name.to_string(), value.clone());
-        Some(value)
-    };
+    let secrets_resolver = crate::executor::context::make_secrets_resolver(ctx);
     let kv_resolver = |_: &str| None;
-    let env_arc = ctx.env.clone();
-    let env_resolver = move |name: &str| env_arc(name);
     let env_allow = crate::template::default_env_allowlist();
     let sub_ctx = crate::template::SubstitutionContext {
         vars: &ctx.variables,
@@ -88,7 +79,7 @@ fn apply_template(node: &Node, ctx: &RunContext) -> Result<String, NodeError> {
         current_inputs: &ctx.current_inputs,
         current_config: &node.config,
         kv: &kv_resolver,
-        env: &env_resolver,
+        env: &*ctx.env,
         env_allowlist: &env_allow,
         run_id: &ctx.run_id,
         workspace: &ctx.workspace,
