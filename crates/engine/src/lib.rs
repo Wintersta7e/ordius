@@ -8,6 +8,7 @@
 //! - templates: substitute, redact
 //! - secrets: keyring read/write
 
+pub mod db;
 pub mod error;
 pub mod events;
 pub mod loader;
