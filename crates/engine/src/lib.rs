@@ -15,6 +15,7 @@ pub mod error;
 pub mod events;
 pub mod executor;
 pub mod loader;
+pub mod manifests;
 pub mod recorder;
 pub mod registry;
 pub mod run;
