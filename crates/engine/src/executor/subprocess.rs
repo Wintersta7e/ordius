@@ -12,16 +12,27 @@
 //!   main thread, so the descendant tree dies atomically on
 //!   `TerminateJobObject`.
 //!
+//! Each child's stdout and stderr are line-buffered and forwarded
+//! to the run's [`Emitter`] as `node:output` events; the full
+//! stdout is also accumulated for the eventual `output_parse` step.
+//!
 //! The OS-level guarantees replace the `taskkill /T` workarounds
 //! the engine used in earlier prototypes.
 #![allow(unsafe_code)]
 
+use crate::emitter::Emitter;
+use crate::events::EventType;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::types::{ExecutionBackend, Node, NodeType};
 use async_trait::async_trait;
+use std::collections::HashMap;
+use std::process::Stdio;
+use std::sync::Arc;
 #[cfg(unix)]
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 /// Grace period between SIGTERM and SIGKILL on Unix. Long enough
@@ -35,10 +46,6 @@ const CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 /// Executor for nodes whose `ExecutionSpec::backend` is
 /// [`ExecutionBackend::Subprocess`].
-///
-/// The argv-substitution / streaming / output-parsing wiring lands
-/// in later Phase-6 tasks; today this is the bare spawn + cancel
-/// loop dispatched per OS.
 pub struct SubprocessExecutor;
 
 #[async_trait]
@@ -49,9 +56,9 @@ impl NodeExecutor for SubprocessExecutor {
 
     async fn run(
         &self,
-        _node: &Node,
+        node: &Node,
         nt: &NodeType,
-        _ctx: &RunContext,
+        ctx: &RunContext,
         cancel: CancellationToken,
     ) -> Result<NodeOutputs, NodeError> {
         let (program, args) = nt
@@ -62,21 +69,22 @@ impl NodeExecutor for SubprocessExecutor {
 
         let mut cmd = Command::new(program);
         cmd.args(args);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
         #[cfg(unix)]
         {
             configure_unix_command(&mut cmd);
-            run_unix(cmd, cancel).await
+            run_unix(cmd, ctx.emitter.clone(), node.id.clone(), cancel).await
         }
         #[cfg(windows)]
         {
             configure_windows_command(&mut cmd);
-            run_windows(cmd, cancel).await
+            run_windows(cmd, ctx.emitter.clone(), node.id.clone(), cancel).await
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = (cmd, cancel);
+            let _ = (cmd, ctx, node, cancel);
             Err(NodeError::Subprocess(
                 "subprocess executor: unsupported platform".into(),
             ))
@@ -84,12 +92,53 @@ impl NodeExecutor for SubprocessExecutor {
     }
 }
 
+/// Outcome of the `tokio::select!` between `child.wait()` and `cancel`.
+enum Outcome {
+    Exit(std::io::Result<std::process::ExitStatus>),
+    Cancelled,
+}
+
+/// Spawn a tokio task that reads `pipe` line-by-line, emits each
+/// line as a `node:output` event tagged with `channel`, and returns
+/// the lines after EOF. EOF arrives when the child closes its end
+/// of the pipe — which happens when the child exits.
+fn spawn_line_reader<R>(
+    pipe: Option<R>,
+    emitter: Arc<Emitter>,
+    node_id: String,
+    channel: &'static str,
+) -> JoinHandle<Vec<String>>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+{
+    tokio::spawn(async move {
+        let Some(p) = pipe else {
+            return Vec::new();
+        };
+        let mut acc = Vec::new();
+        let mut reader = BufReader::new(p).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            let mut payload: HashMap<String, serde_json::Value> = HashMap::new();
+            payload.insert("channel".into(), serde_json::Value::String(channel.into()));
+            payload.insert("text".into(), serde_json::Value::String(line.clone()));
+            emitter.emit_node(EventType::NodeOutput, node_id.clone(), 0, 0, payload);
+            acc.push(line);
+        }
+        acc
+    })
+}
+
 // =====================================================================
 // Unix
 // =====================================================================
 
 #[cfg(unix)]
-async fn run_unix(mut cmd: Command, cancel: CancellationToken) -> Result<NodeOutputs, NodeError> {
+async fn run_unix(
+    mut cmd: Command,
+    emitter: Arc<Emitter>,
+    node_id: String,
+    cancel: CancellationToken,
+) -> Result<NodeOutputs, NodeError> {
     let mut child = cmd
         .spawn()
         .map_err(|e| NodeError::Subprocess(format!("spawn: {e}")))?;
@@ -97,18 +146,26 @@ async fn run_unix(mut cmd: Command, cancel: CancellationToken) -> Result<NodeOut
         .id()
         .ok_or_else(|| NodeError::Subprocess("child has no pid (already reaped)".into()))?;
 
-    tokio::select! {
-        wait_res = child.wait() => {
-            let _status = wait_res
-                .map_err(|e| NodeError::Subprocess(format!("wait: {e}")))?;
-            // Output parsing + exit_code port land in Task 6.8.
-            Ok(NodeOutputs::new())
-        }
+    let stdout_handle = spawn_line_reader(
+        child.stdout.take(),
+        emitter.clone(),
+        node_id.clone(),
+        "stdout",
+    );
+    let stderr_handle = spawn_line_reader(child.stderr.take(), emitter, node_id, "stderr");
+
+    let outcome = tokio::select! {
+        wait_res = child.wait() => Outcome::Exit(wait_res),
         () = cancel.cancelled() => {
             cancel_unix_child(&mut child, pid).await;
-            Err(NodeError::Cancelled)
+            Outcome::Cancelled
         }
-    }
+    };
+
+    let _stdout_lines = stdout_handle.await.unwrap_or_default();
+    let _stderr_lines = stderr_handle.await.unwrap_or_default();
+
+    finalize_outcome(outcome)
 }
 
 /// Configure a Unix `Command` so the child becomes the leader of
@@ -179,6 +236,8 @@ pub(crate) fn configure_windows_command(_cmd: &mut Command) {}
 #[cfg(windows)]
 async fn run_windows(
     mut cmd: Command,
+    emitter: Arc<Emitter>,
+    node_id: String,
     cancel: CancellationToken,
 ) -> Result<NodeOutputs, NodeError> {
     let mut sup = win_job::spawn_supervised(&mut cmd)?;
@@ -188,26 +247,30 @@ async fn run_windows(
         .ok_or_else(|| NodeError::Subprocess("child has no pid (already reaped)".into()))?;
     win_job::resume_initial_thread(pid)?;
 
-    tokio::select! {
-        wait_res = sup.child.wait() => {
-            let _status = wait_res
-                .map_err(|e| NodeError::Subprocess(format!("wait: {e}")))?;
-            Ok(NodeOutputs::new())
-        }
+    let stdout_handle = spawn_line_reader(
+        sup.child.stdout.take(),
+        emitter.clone(),
+        node_id.clone(),
+        "stdout",
+    );
+    let stderr_handle = spawn_line_reader(sup.child.stderr.take(), emitter, node_id, "stderr");
+
+    let outcome = tokio::select! {
+        wait_res = sup.child.wait() => Outcome::Exit(wait_res),
         () = cancel.cancelled() => {
             // TerminateJobObject hard-kills every process in the
-            // job atomically — the analog of `kill(-pgid, SIGKILL)`.
-            // No grace period because the call is unconditional;
-            // workflows that need cooperative shutdown should
-            // honor cancellation in their own scripts.
+            // job atomically — analog of kill(-pgid, SIGKILL).
             win_job::terminate_job(sup.job);
-            // Reap so the OS releases the child's handles before
-            // run finalization. Supervised's Drop closes the job.
             let reap = sup.child.wait().await;
             drop(reap);
-            Err(NodeError::Cancelled)
+            Outcome::Cancelled
         }
-    }
+    };
+
+    let _stdout_lines = stdout_handle.await.unwrap_or_default();
+    let _stderr_lines = stderr_handle.await.unwrap_or_default();
+
+    finalize_outcome(outcome)
 }
 
 #[cfg(windows)]
@@ -266,9 +329,6 @@ mod win_job {
     /// Spawn `cmd` with the main thread suspended, create a fresh
     /// Job Object configured to kill its members on close, and
     /// assign the child to that job before any user code runs.
-    ///
-    /// On any failure after the child has been spawned we close the
-    /// job handle so the OS can clean up.
     pub(super) fn spawn_supervised(cmd: &mut Command) -> Result<Supervised, NodeError> {
         cmd.creation_flags(CREATE_SUSPENDED.0 | CREATE_NEW_PROCESS_GROUP.0);
         let child = cmd
@@ -276,8 +336,6 @@ mod win_job {
             .map_err(|e| NodeError::Subprocess(format!("spawn: {e}")))?;
 
         // SAFETY: CreateJobObjectW returns an owned kernel handle.
-        // Ownership is transferred to `Supervised` on success and
-        // explicitly closed on every error path below.
         let job = unsafe { CreateJobObjectW(None, None) }
             .map_err(|e| NodeError::Subprocess(format!("CreateJobObjectW: {e}")))?;
 
@@ -336,11 +394,6 @@ mod win_job {
     /// `CREATE_SUSPENDED`. The child has exactly one thread until
     /// it runs, so the first thread we find owned by `pid` is the
     /// one to wake up.
-    ///
-    /// The alternative — opening `CreateProcessW` ourselves to
-    /// capture the thread handle returned in `PROCESS_INFORMATION`
-    /// — would require bypassing `tokio::process::Command` entirely,
-    /// which is a much larger surgery.
     pub(super) fn resume_initial_thread(pid: u32) -> Result<(), NodeError> {
         // SAFETY: snapshot is an owned kernel handle; closed below.
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
@@ -395,10 +448,24 @@ mod win_job {
     /// abnormal exit status.
     pub(super) fn terminate_job(job: HANDLE) {
         // SAFETY: `job` is a live kernel handle the caller owns.
-        // Errors from TerminateJobObject (e.g. job already empty)
-        // are not actionable — we cancel best-effort.
         let res = unsafe { TerminateJobObject(job, 1) };
         drop(res);
+    }
+}
+
+// =====================================================================
+// Shared
+// =====================================================================
+
+/// Map a select-outcome to an executor result. The stdout
+/// accumulator used by the `output_parse` step is wired in
+/// alongside it; for now successful exits return an empty
+/// `NodeOutputs`.
+fn finalize_outcome(outcome: Outcome) -> Result<NodeOutputs, NodeError> {
+    match outcome {
+        Outcome::Cancelled => Err(NodeError::Cancelled),
+        Outcome::Exit(Err(e)) => Err(NodeError::Subprocess(format!("wait: {e}"))),
+        Outcome::Exit(Ok(_status)) => Ok(NodeOutputs::new()),
     }
 }
 
@@ -410,15 +477,14 @@ mod win_job {
 mod tests {
     use super::*;
     use crate::db::open;
-    use crate::emitter::Emitter;
+    use crate::events::RunEvent;
     use crate::executor::wrap_process_env;
     use crate::recorder::RunRecorder;
     use crate::types::{Category, ExecutionSpec, Node, NodeType, OutputParse, Pos, Workflow};
-    use std::collections::HashMap;
-    use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio::sync::broadcast;
 
-    fn test_ctx() -> (RunContext, TempDir) {
+    fn test_ctx() -> (RunContext, broadcast::Receiver<RunEvent>, TempDir) {
         let dir = TempDir::new().unwrap();
         let pool = open(dir.path().join("t.db")).unwrap();
         let wf = Workflow {
@@ -433,7 +499,7 @@ mod tests {
             edges: vec![],
         };
         let rec = Arc::new(RunRecorder::start(pool, &wf, "{}", &HashMap::new(), "test").unwrap());
-        let (em, _) = Emitter::new(rec.clone());
+        let (em, rx) = Emitter::new(rec.clone());
         let ctx = RunContext {
             run_id: rec.run_id.clone(),
             workflow_id: "w".into(),
@@ -448,7 +514,7 @@ mod tests {
             current_inputs: HashMap::new(),
             upstream_outputs: HashMap::new(),
         };
-        (ctx, dir)
+        (ctx, rx, dir)
     }
 
     fn subprocess_node_type(command: Vec<String>) -> NodeType {
@@ -476,7 +542,7 @@ mod tests {
 
     fn trivial_node() -> Node {
         Node {
-            id: "n".into(),
+            id: "n1".into(),
             ty: "test_subprocess".into(),
             name: String::new(),
             config: HashMap::new(),
@@ -490,8 +556,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn unix_spawn_smoke() {
-        use std::process::Stdio;
-
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "echo hi"]).stdout(Stdio::piped());
         configure_unix_command(&mut cmd);
@@ -504,7 +568,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn unix_run_completes_for_quick_command() {
-        let (ctx, _dir) = test_ctx();
+        let (ctx, _rx, _dir) = test_ctx();
         let nt = subprocess_node_type(vec!["true".into()]);
         let node = trivial_node();
         let res = SubprocessExecutor
@@ -517,10 +581,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn unix_cancel_kills_process_group() {
-        let (ctx, _dir) = test_ctx();
-        // bash -c "sleep 30; echo done" — the inner sleep is what
-        // would survive a naive `child.kill()` if cancellation only
-        // killed the bash leader. setsid + kill(-pgid) reaches it.
+        let (ctx, _rx, _dir) = test_ctx();
         let nt = subprocess_node_type(vec![
             "bash".into(),
             "-c".into(),
@@ -530,10 +591,10 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
-        let nt_for_task = nt.clone();
-        let node_for_task = node.clone();
         let ctx_arc = Arc::new(ctx);
         let ctx_for_task = ctx_arc.clone();
+        let nt_for_task = nt.clone();
+        let node_for_task = node.clone();
 
         let handle = tokio::spawn(async move {
             SubprocessExecutor
@@ -552,10 +613,80 @@ mod tests {
         assert!(matches!(res, Err(NodeError::Cancelled)), "got {res:?}");
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unix_stdout_emits_one_event_per_line_in_order() {
+        let (ctx, mut rx, _dir) = test_ctx();
+        let nt = subprocess_node_type(vec![
+            "bash".into(),
+            "-c".into(),
+            "for i in 1 2 3; do echo \"line $i\"; done".into(),
+        ]);
+        let node = trivial_node();
+
+        SubprocessExecutor
+            .run(&node, &nt, &ctx, CancellationToken::new())
+            .await
+            .expect("loop should exit 0");
+
+        let mut got = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if ev.ty == EventType::NodeOutput {
+                let channel = ev
+                    .payload
+                    .get("channel")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let text = ev
+                    .payload
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if channel == "stdout" {
+                    got.push((ev.seq, text.to_string()));
+                }
+            }
+        }
+        let texts: Vec<&str> = got.iter().map(|(_, s)| s.as_str()).collect();
+        assert_eq!(texts, vec!["line 1", "line 2", "line 3"], "got {got:?}");
+        // seqs must be strictly increasing — recorder is monotonic.
+        for w in got.windows(2) {
+            assert!(w[0].0 < w[1].0, "non-monotonic seq: {got:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unix_stderr_events_carry_channel_stderr() {
+        let (ctx, mut rx, _dir) = test_ctx();
+        let nt = subprocess_node_type(vec![
+            "bash".into(),
+            "-c".into(),
+            "echo to-stderr 1>&2".into(),
+        ]);
+        let node = trivial_node();
+
+        SubprocessExecutor
+            .run(&node, &nt, &ctx, CancellationToken::new())
+            .await
+            .expect("should exit 0");
+
+        let mut saw_stderr = false;
+        while let Ok(ev) = rx.try_recv() {
+            if ev.ty == EventType::NodeOutput
+                && ev.payload.get("channel").and_then(|v| v.as_str()) == Some("stderr")
+                && ev.payload.get("text").and_then(|v| v.as_str()) == Some("to-stderr")
+            {
+                saw_stderr = true;
+            }
+        }
+        assert!(saw_stderr, "expected stderr event with text 'to-stderr'");
+    }
+
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread")]
     async fn windows_resume_runs_suspended_child() {
-        let (ctx, _dir) = test_ctx();
+        let (ctx, _rx, _dir) = test_ctx();
         let nt = subprocess_node_type(vec!["cmd".into(), "/C".into(), "echo hi".into()]);
         let node = trivial_node();
         let res = SubprocessExecutor
