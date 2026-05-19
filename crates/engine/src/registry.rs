@@ -271,7 +271,7 @@ fn llm_spec() -> NodeType {
     NodeType {
         id: LLM_NODE_TYPE_ID.into(),
         name: "LLM".into(),
-        category: Category::Integration,
+        category: Category::Llm,
         tags: vec![],
         icon: "sparkles".into(),
         description: "OpenAI-compatible chat completion. Streams assistant deltas as \
