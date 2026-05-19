@@ -26,6 +26,7 @@ import {
   listWorkspaces,
   systemStatus,
 } from "../engine";
+import { navigate as navigateRoute } from "../lib/router";
 import { TopBar } from "../components/chrome/TopBar";
 import { Hero } from "../components/home/Hero";
 import { LeftRail, type RunningWorkflow } from "../components/home/LeftRail";
@@ -183,7 +184,7 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
   const activeWorkspace = workspaces[0] ?? null;
 
   const handleOpen = useCallback((id: string) => {
-    console.warn("editor route lands in Phase 1.5", { id });
+    navigateRoute({ kind: "editor", workflowId: id });
   }, []);
   const handleRun = useCallback((id: string) => {
     console.warn("run dialog lands in Phase 1.9", { id });
@@ -192,7 +193,7 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
     console.warn("import flow lands in Phase 1.9");
   }, []);
   const handleNewWorkflow = useCallback(() => {
-    console.warn("new-workflow flow lands in Phase 1.5");
+    navigateRoute({ kind: "editor" });
   }, []);
 
   return (
