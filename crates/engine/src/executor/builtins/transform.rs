@@ -11,12 +11,17 @@ use tokio_util::sync::CancellationToken;
 
 /// Three ops: `jsonpath`, `regex_extract`, `regex_replace`.
 /// Output port `text` carries the resulting string.
+#[allow(unreachable_pub)]
+pub const NODE_TYPE_ID: &str = "transform";
+
+/// `JSONPath` / regex / template transformer; emits the result on
+/// the `text` port.
 pub struct TransformExecutor;
 
 #[async_trait]
 impl NodeExecutor for TransformExecutor {
     fn supports(&self, nt: &NodeType) -> bool {
-        nt.id == "transform"
+        nt.id == NODE_TYPE_ID
     }
 
     async fn run(

@@ -3,6 +3,13 @@
 //! Built-ins are inserted at startup via [`Registry::with_v1_0_builtins`];
 //! manifest-loaded types land here once the manifest loader ships.
 
+use crate::executor::builtins::checkpoint::NODE_TYPE_ID as CHECKPOINT_NODE_TYPE_ID;
+use crate::executor::builtins::condition::NODE_TYPE_ID as CONDITION_NODE_TYPE_ID;
+use crate::executor::builtins::delay::NODE_TYPE_ID as DELAY_NODE_TYPE_ID;
+use crate::executor::builtins::file::NODE_TYPE_ID as FILE_NODE_TYPE_ID;
+use crate::executor::builtins::http::NODE_TYPE_ID as HTTP_NODE_TYPE_ID;
+use crate::executor::builtins::llm::NODE_TYPE_ID as LLM_NODE_TYPE_ID;
+use crate::executor::builtins::transform::NODE_TYPE_ID as TRANSFORM_NODE_TYPE_ID;
 use crate::executor::subprocess::{PORT_EXIT_CODE, PORT_TEXT, SHELL_NODE_TYPE_ID};
 use crate::types::{
     Category, ConfigFieldDef, ConfigFieldType, ExecutionBackend, ExecutionSpec, NodeType,
@@ -76,7 +83,7 @@ fn in_process_execution_spec() -> ExecutionSpec {
 
 fn delay_spec() -> NodeType {
     NodeType {
-        id: "delay".into(),
+        id: DELAY_NODE_TYPE_ID.into(),
         name: "Delay".into(),
         category: Category::Control,
         tags: vec![],
@@ -91,7 +98,7 @@ fn delay_spec() -> NodeType {
 
 fn transform_spec() -> NodeType {
     NodeType {
-        id: "transform".into(),
+        id: TRANSFORM_NODE_TYPE_ID.into(),
         name: "Transform".into(),
         category: Category::Data,
         tags: vec![],
@@ -106,7 +113,7 @@ fn transform_spec() -> NodeType {
 
 fn http_spec() -> NodeType {
     NodeType {
-        id: "http".into(),
+        id: HTTP_NODE_TYPE_ID.into(),
         name: "HTTP".into(),
         category: Category::Integration,
         tags: vec![],
@@ -182,7 +189,7 @@ fn http_spec() -> NodeType {
 
 fn checkpoint_spec() -> NodeType {
     NodeType {
-        id: "checkpoint".into(),
+        id: CHECKPOINT_NODE_TYPE_ID.into(),
         name: "Checkpoint".into(),
         category: Category::Control,
         tags: vec![],
@@ -214,7 +221,7 @@ fn checkpoint_spec() -> NodeType {
 
 fn file_spec() -> NodeType {
     NodeType {
-        id: "file".into(),
+        id: FILE_NODE_TYPE_ID.into(),
         name: "File".into(),
         category: Category::Data,
         tags: vec![],
@@ -262,7 +269,7 @@ fn file_spec() -> NodeType {
 
 fn llm_spec() -> NodeType {
     NodeType {
-        id: "llm".into(),
+        id: LLM_NODE_TYPE_ID.into(),
         name: "LLM".into(),
         category: Category::Integration,
         tags: vec![],
@@ -345,7 +352,7 @@ fn llm_spec() -> NodeType {
 
 fn condition_spec() -> NodeType {
     NodeType {
-        id: "condition".into(),
+        id: CONDITION_NODE_TYPE_ID.into(),
         name: "Condition".into(),
         category: Category::Control,
         tags: vec![],

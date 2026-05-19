@@ -17,6 +17,7 @@
 
 use crate::emitter::Emitter;
 use crate::events::{EventType, RunEvent};
+use crate::executor::builtins::condition::NODE_TYPE_ID as CONDITION_NODE_TYPE_ID;
 use crate::executor::{Dispatcher, NodeExecutor, RunContext, wrap_process_env};
 use crate::recorder::{NodeRunRow, RunRecorder};
 use crate::scheduler::Scheduler;
@@ -311,7 +312,7 @@ impl Engine {
                         );
                         sched.complete_node(&node.id);
 
-                        if node.ty == "condition"
+                        if node.ty == CONDITION_NODE_TYPE_ID
                             && let Some(PortValue::String(branch)) = outputs.get("branch")
                         {
                             let branch = branch.clone();

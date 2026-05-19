@@ -10,7 +10,8 @@ use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
-const NODE_TYPE_ID: &str = "file";
+#[allow(unreachable_pub)]
+pub const NODE_TYPE_ID: &str = "file";
 
 /// File-system built-in: read / write / append / list / glob / stat.
 pub struct FileExecutor;

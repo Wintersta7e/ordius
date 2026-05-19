@@ -23,7 +23,8 @@ use tokio_util::sync::CancellationToken;
 const DEFAULT_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_MODEL_TEMP: f64 = 0.7;
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
-const NODE_TYPE_ID: &str = "llm";
+#[allow(unreachable_pub)]
+pub const NODE_TYPE_ID: &str = "llm";
 const SSE_DONE: &str = "[DONE]";
 const SSE_DATA_PREFIX: &str = "data:";
 const CHANNEL_LLM: &str = "llm";

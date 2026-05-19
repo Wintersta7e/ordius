@@ -15,7 +15,8 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
-const NODE_TYPE_ID: &str = "http";
+#[allow(unreachable_pub)]
+pub const NODE_TYPE_ID: &str = "http";
 
 /// HTTP executor — see module docs for failure policy.
 pub struct HttpExecutor;

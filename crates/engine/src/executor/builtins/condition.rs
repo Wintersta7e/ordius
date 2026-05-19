@@ -12,12 +12,17 @@ use std::collections::HashMap;
 use tokio_util::sync::CancellationToken;
 
 /// Four modes: `boolean`, `exit_code`, `regex`, `jsonpath`.
+#[allow(unreachable_pub)]
+pub const NODE_TYPE_ID: &str = "condition";
+
+/// Branch evaluator: reads its config's `mode` and emits the
+/// `branch` String port the scheduler uses to route downstream.
 pub struct ConditionExecutor;
 
 #[async_trait]
 impl NodeExecutor for ConditionExecutor {
     fn supports(&self, nt: &NodeType) -> bool {
-        nt.id == "condition"
+        nt.id == NODE_TYPE_ID
     }
 
     async fn run(

@@ -15,7 +15,8 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use tokio_util::sync::CancellationToken;
 
-const NODE_TYPE_ID: &str = "checkpoint";
+#[allow(unreachable_pub)]
+pub const NODE_TYPE_ID: &str = "checkpoint";
 const DEFAULT_MESSAGE: &str = "Waiting for user to continue...";
 
 /// Built-in `checkpoint` executor — see module docs.

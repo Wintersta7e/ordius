@@ -6,6 +6,9 @@ use async_trait::async_trait;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
+#[allow(unreachable_pub)]
+pub const NODE_TYPE_ID: &str = "delay";
+
 /// Sleeps for `config.ms` milliseconds, returning empty outputs.
 /// Cancellation aborts the sleep immediately with [`NodeError::Cancelled`].
 pub struct DelayExecutor;
@@ -13,7 +16,7 @@ pub struct DelayExecutor;
 #[async_trait]
 impl NodeExecutor for DelayExecutor {
     fn supports(&self, nt: &NodeType) -> bool {
-        nt.id == "delay"
+        nt.id == NODE_TYPE_ID
     }
 
     async fn run(
