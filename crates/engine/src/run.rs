@@ -18,16 +18,21 @@
 use crate::emitter::Emitter;
 use crate::events::{EventType, RunEvent};
 use crate::executor::builtins::condition::NODE_TYPE_ID as CONDITION_NODE_TYPE_ID;
-use crate::executor::{Dispatcher, NodeExecutor, RunContext, wrap_process_env};
+use crate::executor::{Dispatcher, NodeError, NodeExecutor, RunContext, wrap_process_env};
 use crate::recorder::{NodeRunRow, RunRecorder};
 use crate::scheduler::Scheduler;
-use crate::types::{EdgeType, PortValue, Workflow};
+use crate::types::{BackoffStrategy, EdgeType, PortValue, RetryOn, RetryPolicy, Workflow};
 use crate::{Engine, EngineError, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+
+/// Cap on retry backoff sleeps. Workflows should fail loud rather
+/// than silently park on a multi-minute delay.
+const BACKOFF_CAP: Duration = Duration::from_mins(1);
 
 /// Terminal summary returned by the run loop.
 #[derive(Debug, Clone)]
@@ -249,31 +254,25 @@ impl Engine {
                     })?;
 
                 let iteration = *iterations.entry(node.id.clone()).or_insert(1);
-                let started_at = chrono::Utc::now().timestamp_millis();
-                sched.start_node(&node.id);
-                recorder.record_node_run(&NodeRunRow {
-                    node_id: &node.id,
-                    iteration,
-                    attempt: 1,
-                    node_type: &node.ty,
-                    status: "running",
-                    started_at: Some(started_at),
-                    finished_at: None,
-                    duration_ms: None,
-                    output_summary: None,
-                    error: None,
-                })?;
-                node_runs_count += 1;
-                emitter.emit_node(
-                    EventType::NodeStarted,
-                    node.id.clone(),
-                    iteration,
-                    1,
-                    HashMap::new(),
-                );
+                let retry_policy = node.retry.clone().unwrap_or_default();
+                let effective_timeout = node.timeout_ms.or(nt.execution.timeout_ms);
 
-                let res = dispatcher.run(&node, &nt, &ctx, cancel.clone()).await;
-                let finished_at = chrono::Utc::now().timestamp_millis();
+                sched.start_node(&node.id);
+
+                let (res, attempt, started_at, finished_at) = run_with_retry(
+                    &dispatcher,
+                    &recorder,
+                    &emitter,
+                    &node,
+                    &nt,
+                    &ctx,
+                    iteration,
+                    &retry_policy,
+                    effective_timeout,
+                    &cancel,
+                    &mut node_runs_count,
+                )
+                .await?;
                 let duration = finished_at - started_at;
 
                 match res {
@@ -290,6 +289,7 @@ impl Engine {
                             &emitter,
                             &node,
                             iteration,
+                            attempt,
                             started_at,
                             finished_at,
                             "done",
@@ -317,6 +317,7 @@ impl Engine {
                             &emitter,
                             &node,
                             iteration,
+                            attempt,
                             started_at,
                             finished_at,
                             "error",
@@ -376,6 +377,161 @@ impl Engine {
     }
 }
 
+/// Drive one node to a terminal result, honoring its `RetryPolicy`
+/// and per-attempt timeout budget. Each attempt writes its own
+/// `node_runs` row keyed on `(run, node, iteration, attempt)`;
+/// intermediate failures emit `node:retry` and sleep for
+/// `compute_backoff(policy, attempt)` (cancellable). Returns
+/// `(final_result, final_attempt, started_at, finished_at)` so
+/// the caller's `finalize_node_run` writes the row that records
+/// the terminal outcome.
+#[allow(clippy::too_many_arguments)]
+async fn run_with_retry(
+    dispatcher: &Dispatcher,
+    recorder: &RunRecorder,
+    emitter: &Emitter,
+    node: &crate::types::Node,
+    nt: &crate::types::NodeType,
+    ctx: &RunContext,
+    iteration: u32,
+    policy: &RetryPolicy,
+    timeout_ms: Option<u64>,
+    cancel: &CancellationToken,
+    node_runs_count: &mut usize,
+) -> Result<(
+    std::result::Result<crate::executor::NodeOutputs, NodeError>,
+    u32,
+    i64,
+    i64,
+)> {
+    let mut attempt: u32 = 1;
+    loop {
+        let started_at = chrono::Utc::now().timestamp_millis();
+        recorder.record_node_run(&NodeRunRow {
+            node_id: &node.id,
+            iteration,
+            attempt,
+            node_type: &node.ty,
+            status: "running",
+            started_at: Some(started_at),
+            finished_at: None,
+            duration_ms: None,
+            output_summary: None,
+            error: None,
+        })?;
+        *node_runs_count += 1;
+        emitter.emit_node(
+            EventType::NodeStarted,
+            node.id.clone(),
+            iteration,
+            attempt,
+            HashMap::new(),
+        );
+
+        // Child token so a timeout for this attempt doesn't cancel
+        // the run-wide token (which would prevent further retries).
+        let attempt_cancel = cancel.child_token();
+        let res = dispatch_one_attempt(dispatcher, node, nt, ctx, attempt_cancel, timeout_ms).await;
+        let finished_at = chrono::Utc::now().timestamp_millis();
+
+        let should_retry = match &res {
+            Ok(_) => false,
+            Err(_) if cancel.is_cancelled() => false,
+            Err(e) => attempt < policy.max_attempts && retry_matches(policy.retry_on, e),
+        };
+
+        if !should_retry {
+            return Ok((res, attempt, started_at, finished_at));
+        }
+
+        // Mid-retry: persist this attempt's failure + emit node:retry.
+        let msg = res
+            .as_ref()
+            .err()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        recorder.record_node_run(&NodeRunRow {
+            node_id: &node.id,
+            iteration,
+            attempt,
+            node_type: &node.ty,
+            status: "error",
+            started_at: Some(started_at),
+            finished_at: Some(finished_at),
+            duration_ms: Some(finished_at - started_at),
+            output_summary: None,
+            error: Some(&msg),
+        })?;
+        emitter.emit_node(
+            EventType::NodeRetry,
+            node.id.clone(),
+            iteration,
+            attempt,
+            HashMap::from([
+                ("prev_error".into(), serde_json::json!(msg)),
+                ("next_attempt".into(), serde_json::json!(attempt + 1)),
+            ]),
+        );
+
+        let delay = compute_backoff(policy, attempt);
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {}
+            () = cancel.cancelled() => {
+                return Ok((Err(NodeError::Cancelled), attempt, started_at, finished_at));
+            }
+        }
+        attempt += 1;
+    }
+}
+
+/// Dispatch a single attempt under an optional per-attempt
+/// timeout. On elapsed, cancels the attempt token so the
+/// subprocess (or any other inner select-on-cancel future) tears
+/// down; converts to [`NodeError::Timeout`].
+async fn dispatch_one_attempt(
+    dispatcher: &Dispatcher,
+    node: &crate::types::Node,
+    nt: &crate::types::NodeType,
+    ctx: &RunContext,
+    attempt_cancel: CancellationToken,
+    timeout_ms: Option<u64>,
+) -> std::result::Result<crate::executor::NodeOutputs, NodeError> {
+    let Some(ms) = timeout_ms else {
+        return dispatcher.run(node, nt, ctx, attempt_cancel).await;
+    };
+    let budget = Duration::from_millis(ms);
+    let inner = dispatcher.run(node, nt, ctx, attempt_cancel.clone());
+    tokio::time::timeout(budget, inner)
+        .await
+        .unwrap_or_else(|_| {
+            attempt_cancel.cancel();
+            Err(NodeError::Timeout(ms))
+        })
+}
+
+fn compute_backoff(policy: &RetryPolicy, attempt: u32) -> Duration {
+    let base = u128::from(policy.backoff_ms);
+    let cap = BACKOFF_CAP.as_millis();
+    let ms = match policy.backoff_strategy {
+        BackoffStrategy::Fixed => base,
+        BackoffStrategy::Linear => base.saturating_mul(u128::from(attempt)),
+        BackoffStrategy::Exponential => {
+            let shift = attempt.saturating_sub(1).min(20);
+            base.saturating_mul(1u128 << shift)
+        },
+    };
+    Duration::from_millis(u64::try_from(ms.min(cap)).unwrap_or(u64::MAX))
+}
+
+const fn retry_matches(retry_on: RetryOn, err: &NodeError) -> bool {
+    let is_timeout = matches!(err, NodeError::Timeout(_));
+    match retry_on {
+        RetryOn::Error => !is_timeout,
+        RetryOn::Timeout => is_timeout,
+        RetryOn::Both => true,
+    }
+}
+
 /// Persist every output port + populate the run-loop's
 /// authoritative `upstream_outputs` map. Inline JSON only today;
 /// the >8 KB file-back fallback is not yet wired.
@@ -404,6 +560,7 @@ fn finalize_node_run(
     emitter: &Emitter,
     node: &crate::types::Node,
     iteration: u32,
+    attempt: u32,
     started_at: i64,
     finished_at: i64,
     status: &str,
@@ -414,7 +571,7 @@ fn finalize_node_run(
     recorder.record_node_run(&NodeRunRow {
         node_id: &node.id,
         iteration,
-        attempt: 1,
+        attempt,
         node_type: &node.ty,
         status,
         started_at: Some(started_at),
@@ -423,7 +580,13 @@ fn finalize_node_run(
         output_summary: None,
         error,
     })?;
-    emitter.emit_node(event_type, node.id.clone(), iteration, 1, event_payload);
+    emitter.emit_node(
+        event_type,
+        node.id.clone(),
+        iteration,
+        attempt,
+        event_payload,
+    );
     Ok(())
 }
 
@@ -640,5 +803,121 @@ mod tests {
         );
         let summary = handle.join.await.expect("join").expect("run ok");
         assert_eq!(summary.status, "stopped");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn per_node_timeout_short_circuits_long_delay() {
+        let dir = TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+
+        let wf = Arc::new(Workflow {
+            id: "wf_timeout".into(),
+            name: "timeout".into(),
+            schema_version: 1,
+            created_at: None,
+            updated_at: None,
+            variables: HashMap::new(),
+            triggers: vec![],
+            nodes: vec![Node {
+                id: "slow".into(),
+                ty: "delay".into(),
+                name: String::new(),
+                config: HashMap::from([("ms".into(), serde_json::json!(5_000))]),
+                pos: Pos::default(),
+                timeout_ms: Some(50),
+                retry: None,
+                continue_on_error: false,
+            }],
+            edges: vec![],
+        });
+
+        let start = std::time::Instant::now();
+        let summary = engine
+            .run_workflow(wf, HashMap::new(), "test", false)
+            .await
+            .expect("run completes (timeout is a node-level failure)");
+        let elapsed = start.elapsed();
+        assert_eq!(summary.status, "error");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "timeout should fire within ~50ms, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retry_on_timeout_exhausts_max_attempts() {
+        // Subprocess non-zero exits are locked-in as Ok-with-exit_code
+        // per Phase 6, so we can't trigger retry from a flaky shell.
+        // A delay node with a tight timeout_ms gives every attempt a
+        // real NodeError::Timeout, which retry_on=Both matches.
+        let dir = TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+
+        let wf = Arc::new(Workflow {
+            id: "wf_retry_timeout".into(),
+            name: "retry-timeout".into(),
+            schema_version: 1,
+            created_at: None,
+            updated_at: None,
+            variables: HashMap::new(),
+            triggers: vec![],
+            nodes: vec![Node {
+                id: "flake".into(),
+                ty: "delay".into(),
+                name: String::new(),
+                config: HashMap::from([("ms".into(), serde_json::json!(500))]),
+                pos: Pos::default(),
+                timeout_ms: Some(20),
+                retry: Some(RetryPolicy {
+                    max_attempts: 3,
+                    backoff_ms: 5,
+                    backoff_strategy: BackoffStrategy::Fixed,
+                    retry_on: RetryOn::Both,
+                }),
+                continue_on_error: false,
+            }],
+            edges: vec![],
+        });
+
+        let summary = engine
+            .run_workflow(wf, HashMap::new(), "test", false)
+            .await
+            .expect("run completes once retry budget is exhausted");
+        assert_eq!(summary.status, "error");
+        // 3 attempts → 3 node_runs rows (one per attempt for the same iteration).
+        assert_eq!(summary.node_runs, 3);
+    }
+
+    #[test]
+    fn compute_backoff_exponential_capped() {
+        let policy = RetryPolicy {
+            max_attempts: 99,
+            backoff_ms: 100,
+            backoff_strategy: BackoffStrategy::Exponential,
+            retry_on: RetryOn::Error,
+        };
+        assert_eq!(compute_backoff(&policy, 1), Duration::from_millis(100));
+        assert_eq!(compute_backoff(&policy, 2), Duration::from_millis(200));
+        assert_eq!(compute_backoff(&policy, 3), Duration::from_millis(400));
+        assert_eq!(compute_backoff(&policy, 30), BACKOFF_CAP);
+    }
+
+    #[test]
+    fn retry_matches_honors_policy_kind() {
+        assert!(retry_matches(
+            RetryOn::Error,
+            &NodeError::Subprocess("x".into())
+        ));
+        assert!(!retry_matches(RetryOn::Error, &NodeError::Timeout(10)));
+        assert!(retry_matches(RetryOn::Timeout, &NodeError::Timeout(10)));
+        assert!(!retry_matches(
+            RetryOn::Timeout,
+            &NodeError::Subprocess("x".into())
+        ));
+        assert!(retry_matches(RetryOn::Both, &NodeError::Timeout(10)));
+        assert!(retry_matches(
+            RetryOn::Both,
+            &NodeError::Subprocess("x".into())
+        ));
     }
 }
