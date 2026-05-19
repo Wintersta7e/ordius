@@ -27,8 +27,9 @@ use crate::emitter::Emitter;
 use crate::events::EventType;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::template::{SubstitutionContext, default_env_allowlist, substitute};
-use crate::types::{ExecutionBackend, Node, NodeType};
+use crate::types::{ExecutionBackend, Node, NodeType, OutputParse, PortValue};
 use async_trait::async_trait;
+use jsonpath_rust::JsonPath;
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -132,10 +133,14 @@ impl NodeExecutor for SubprocessExecutor {
             }
         };
 
-        let _stdout_lines = stdout_handle.await.unwrap_or_default();
+        let stdout_lines = stdout_handle.await.unwrap_or_default();
         let _stderr_lines = stderr_handle.await.unwrap_or_default();
 
-        finalize_outcome(outcome)
+        match outcome {
+            Outcome::Cancelled => Err(NodeError::Cancelled),
+            Outcome::Exit(Err(e)) => Err(NodeError::Subprocess(format!("wait: {e}"))),
+            Outcome::Exit(Ok(status)) => parse_outputs(nt, &stdout_lines, status),
+        }
     }
 }
 
@@ -250,16 +255,56 @@ where
     })
 }
 
-/// Map a select-outcome to an executor result. The stdout
-/// accumulator used by the `output_parse` step is wired in
-/// alongside it; for now successful exits return an empty
-/// `NodeOutputs`.
-fn finalize_outcome(outcome: Outcome) -> Result<NodeOutputs, NodeError> {
-    match outcome {
-        Outcome::Cancelled => Err(NodeError::Cancelled),
-        Outcome::Exit(Err(e)) => Err(NodeError::Subprocess(format!("wait: {e}"))),
-        Outcome::Exit(Ok(_status)) => Ok(NodeOutputs::new()),
+/// Turn the child's accumulated stdout + exit status into output
+/// ports per `execution.output_parse`:
+///
+/// - `Text`: trimmed stdout → `text` (`PortValue::String`).
+/// - `Json`: parse stdout as JSON; each `(port_name, jsonpath)`
+///   entry in `output_map` evaluates the `JSONPath`, takes the
+///   first match, and stores it on `port_name` as
+///   `PortValue::Json`. Parse failures or unmatched paths fail
+///   the node loudly.
+///
+/// `exit_code` is always populated.
+fn parse_outputs(
+    nt: &NodeType,
+    stdout_lines: &[String],
+    status: std::process::ExitStatus,
+) -> Result<NodeOutputs, NodeError> {
+    let mut outputs = NodeOutputs::new();
+
+    let code = status.code().unwrap_or(-1);
+    outputs.insert("exit_code".into(), PortValue::Number(f64::from(code)));
+
+    let joined = stdout_lines.join("\n");
+
+    match nt.execution.output_parse {
+        OutputParse::Text => {
+            outputs.insert(
+                "text".into(),
+                PortValue::String(joined.trim_end().to_string()),
+            );
+        },
+        OutputParse::Json => {
+            let parsed: serde_json::Value = serde_json::from_str(joined.trim())
+                .map_err(|e| NodeError::Other(format!("json: parse stdout: {e}")))?;
+            for (port_name, expr) in &nt.execution.output_map {
+                let matched = parsed.query(expr).map_err(|e| {
+                    NodeError::Other(format!(
+                        "json: output_map[{port_name}]: invalid JSONPath '{expr}': {e}"
+                    ))
+                })?;
+                let first = matched.into_iter().next().ok_or_else(|| {
+                    NodeError::Other(format!(
+                        "json: output_map[{port_name}]: no match for '{expr}'"
+                    ))
+                })?;
+                outputs.insert(port_name.clone(), PortValue::Json(first.clone()));
+            }
+        },
     }
+
+    Ok(outputs)
 }
 
 // =====================================================================
@@ -652,7 +697,9 @@ mod tests {
             .run(&node, &nt, &ctx, CancellationToken::new())
             .await
             .expect("true should exit 0");
-        assert!(res.is_empty(), "no outputs wired yet (output_parse step)");
+        // text mode now populates `text` (empty here since `true` prints nothing) + `exit_code`.
+        assert_eq!(res.get("text"), Some(&PortValue::String(String::new())));
+        assert_eq!(res.get("exit_code"), Some(&PortValue::Number(0.0)));
     }
 
     #[cfg(unix)]
@@ -807,6 +854,97 @@ mod tests {
             .map(|(_, t)| t.as_str())
             .collect();
         assert_eq!(stdout, vec!["hello world", "second line"], "got {out:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn text_mode_sets_text_and_exit_code_ports() {
+        let (ctx, _rx, _dir) = test_ctx();
+        let nt = subprocess_node_type(vec![
+            "sh".into(),
+            "-c".into(),
+            "echo first; echo second".into(),
+        ]);
+        let node = trivial_node();
+
+        let res = SubprocessExecutor
+            .run(&node, &nt, &ctx, CancellationToken::new())
+            .await
+            .expect("should exit 0");
+
+        assert_eq!(
+            res.get("text"),
+            Some(&PortValue::String("first\nsecond".into()))
+        );
+        assert_eq!(res.get("exit_code"), Some(&PortValue::Number(0.0)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn json_mode_runs_output_map_jsonpath() {
+        let (ctx, _rx, _dir) = test_ctx();
+        let mut nt = subprocess_node_type(vec![
+            "sh".into(),
+            "-c".into(),
+            r#"echo '{"x":42,"y":"hi"}'"#.into(),
+        ]);
+        nt.execution.output_parse = OutputParse::Json;
+        nt.execution
+            .output_map
+            .insert("result".into(), "$.x".into());
+        nt.execution
+            .output_map
+            .insert("greeting".into(), "$.y".into());
+        let node = trivial_node();
+
+        let res = SubprocessExecutor
+            .run(&node, &nt, &ctx, CancellationToken::new())
+            .await
+            .expect("should exit 0");
+
+        assert_eq!(
+            res.get("result"),
+            Some(&PortValue::Json(serde_json::json!(42)))
+        );
+        assert_eq!(
+            res.get("greeting"),
+            Some(&PortValue::Json(serde_json::json!("hi")))
+        );
+        assert_eq!(res.get("exit_code"), Some(&PortValue::Number(0.0)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn json_mode_malformed_stdout_fails_node() {
+        let (ctx, _rx, _dir) = test_ctx();
+        let mut nt = subprocess_node_type(vec!["sh".into(), "-c".into(), "echo not json".into()]);
+        nt.execution.output_parse = OutputParse::Json;
+        let node = trivial_node();
+
+        let err = SubprocessExecutor
+            .run(&node, &nt, &ctx, CancellationToken::new())
+            .await
+            .expect_err("malformed JSON in json mode must fail");
+
+        match err {
+            NodeError::Other(msg) => assert!(msg.contains("json"), "msg = {msg}"),
+            other => panic!("expected NodeError::Other, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exit_code_propagates_nonzero() {
+        let (ctx, _rx, _dir) = test_ctx();
+        let nt = subprocess_node_type(vec!["sh".into(), "-c".into(), "exit 7".into()]);
+        let node = trivial_node();
+
+        let res = SubprocessExecutor
+            .run(&node, &nt, &ctx, CancellationToken::new())
+            .await
+            .expect("non-zero exit is a successful run from the executor's POV");
+
+        assert_eq!(res.get("exit_code"), Some(&PortValue::Number(7.0)));
     }
 
     #[cfg(windows)]
