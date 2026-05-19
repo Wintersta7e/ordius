@@ -40,6 +40,7 @@ import { SectionTitle } from "../components/SectionTitle";
 import { StatusRibbon } from "../components/home/StatusRibbon";
 import { demoHomeData } from "../data/demoHome";
 import { NoticeBanner } from "../components/NoticeBanner";
+import { PillRow } from "../components/PillRow";
 
 type SortKey = "recent" | "name" | "runs";
 
@@ -286,7 +287,7 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
               label="workflows"
               count={`${sortedCards.length} saved`}
               right={
-                <FilterSeg value={sort} options={SORT_OPTIONS} onChange={setSort} />
+                <PillRow value={sort} options={SORT_OPTIONS} onChange={setSort} />
               }
             />
 
@@ -372,48 +373,3 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
   );
 }
 
-interface FilterSegProps {
-  value: SortKey;
-  options: SortOption[];
-  onChange: (id: SortKey) => void;
-}
-
-function FilterSeg({ value, options, onChange }: FilterSegProps): JSX.Element {
-  return (
-    <div
-      style={{
-        display: "inline-flex",
-        background: "var(--bg-input)",
-        border: "1px solid var(--line)",
-        borderRadius: 3,
-        padding: 2,
-        fontFamily: "var(--mono)",
-      }}
-    >
-      {options.map((o) => {
-        const active = o.id === value;
-        return (
-          <button
-            key={o.id}
-            type="button"
-            onClick={() => onChange(o.id)}
-            style={{
-              appearance: "none",
-              border: 0,
-              background: active ? "var(--bg-active)" : "transparent",
-              color: active ? "var(--txt)" : "var(--txt-dim)",
-              fontFamily: "var(--mono)",
-              fontSize: 11,
-              padding: "3px 10px",
-              height: 20,
-              borderRadius: 2,
-              cursor: "pointer",
-            }}
-          >
-            {o.label}
-          </button>
-        );
-      })}
-    </div>
-  );
-}

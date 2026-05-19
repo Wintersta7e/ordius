@@ -17,6 +17,7 @@ import { fmtDuration } from "../lib/format";
 import type { Route } from "../lib/router";
 import { demoHistoryRuns } from "../data/demoHistory";
 import { NoticeBanner } from "../components/NoticeBanner";
+import { PillRow } from "../components/PillRow";
 
 interface Props {
   theme: "dark" | "light";
@@ -275,38 +276,15 @@ export function History({ theme, onThemeToggle, onNavigate }: Props): JSX.Elemen
             >
               range
             </span>
-            <div
-              style={{
-                display: "inline-flex",
-                background: "var(--bg-input)",
-                border: "1px solid var(--line)",
-                borderRadius: 3,
-                padding: 2,
-              }}
-            >
-              {(["24h", "7d", "all"] as TimeRange[]).map((r) => (
-                <button
-                  key={r}
-                  type="button"
-                  onClick={() => setTimeRange(r)}
-                  style={{
-                    appearance: "none",
-                    border: 0,
-                    background:
-                      timeRange === r ? "var(--bg-active)" : "transparent",
-                    color: timeRange === r ? "var(--txt)" : "var(--txt-dim)",
-                    fontFamily: "var(--mono)",
-                    fontSize: 11,
-                    padding: "3px 10px",
-                    height: 20,
-                    borderRadius: 2,
-                    cursor: "pointer",
-                  }}
-                >
-                  {r === "24h" ? "24h" : r === "7d" ? "7 days" : "all time"}
-                </button>
-              ))}
-            </div>
+            <PillRow<TimeRange>
+              value={timeRange}
+              options={[
+                { id: "24h", label: "24h" },
+                { id: "7d", label: "7 days" },
+                { id: "all", label: "all time" },
+              ]}
+              onChange={setTimeRange}
+            />
           </div>
 
           {/* Filter bar */}
@@ -314,44 +292,11 @@ export function History({ theme, onThemeToggle, onNavigate }: Props): JSX.Elemen
             label="runs"
             count={`${filtered.length} shown`}
             right={
-              <div
-                style={{
-                  display: "inline-flex",
-                  background: "var(--bg-input)",
-                  border: "1px solid var(--line)",
-                  borderRadius: 3,
-                  padding: 2,
-                  fontFamily: "var(--mono)",
-                }}
-              >
-                {(["all", "done", "error", "stopped", "running"] as StatusFilter[]).map(
-                  (s) => (
-                    <button
-                      key={s}
-                      type="button"
-                      onClick={() => setStatusFilter(s)}
-                      style={{
-                        appearance: "none",
-                        border: 0,
-                        background:
-                          statusFilter === s
-                            ? "var(--bg-active)"
-                            : "transparent",
-                        color:
-                          statusFilter === s ? "var(--txt)" : "var(--txt-dim)",
-                        fontFamily: "var(--mono)",
-                        fontSize: 11,
-                        padding: "3px 10px",
-                        height: 20,
-                        borderRadius: 2,
-                        cursor: "pointer",
-                      }}
-                    >
-                      {s}
-                    </button>
-                  ),
-                )}
-              </div>
+              <PillRow<StatusFilter>
+                value={statusFilter}
+                options={["all", "done", "error", "stopped", "running"]}
+                onChange={setStatusFilter}
+              />
             }
           />
 

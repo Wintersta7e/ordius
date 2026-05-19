@@ -72,6 +72,7 @@ export function Settings({ theme, onThemeToggle }: Props): JSX.Element {
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const activeIndex = SECTIONS.findIndex((s) => s.id === active);
   const insideTauri =
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -267,24 +268,20 @@ export function Settings({ theme, onThemeToggle }: Props): JSX.Element {
         >
           {error ? <NoticeBanner message={error} /> : null}
 
-          {(() => {
-            const idx = SECTIONS.findIndex((s) => s.id === active);
-            if (idx < 0) return null;
-            return (
-              <div
-                style={{
-                  fontFamily: "var(--mono)",
-                  fontSize: 10,
-                  letterSpacing: "0.18em",
-                  textTransform: "uppercase",
-                  color: "var(--accent)",
-                  marginBottom: 4,
-                }}
-              >
-                section · {String(idx + 1).padStart(2, "0")}
-              </div>
-            );
-          })()}
+          {activeIndex >= 0 ? (
+            <div
+              style={{
+                fontFamily: "var(--mono)",
+                fontSize: 10,
+                letterSpacing: "0.18em",
+                textTransform: "uppercase",
+                color: "var(--accent)",
+                marginBottom: 4,
+              }}
+            >
+              section · {String(activeIndex + 1).padStart(2, "0")}
+            </div>
+          ) : null}
           {active === "appearance" ? (
             <AppearanceSection settings={settings} onPatch={patchSettings} />
           ) : null}
