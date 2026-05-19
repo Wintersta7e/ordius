@@ -26,6 +26,7 @@ import {
   type WorkflowTab,
 } from "../components/chrome/WorkflowTabStrip";
 import { StatusRibbon } from "../components/home/StatusRibbon";
+import { Palette } from "../components/palette";
 import type { Route } from "../lib/router";
 
 interface Props {
@@ -184,6 +185,41 @@ export function Editor({
     [activeId],
   );
 
+  // Drop a fresh node from the palette into the open workflow.
+  // For Phase 1.5c the new node lands below the lowest existing
+  // node so it's always visible; drag-from-palette with a
+  // cursor-tracking ghost is a v1.x polish item.
+  const handleAddNode = useCallback(
+    (typeId: string) => {
+      const nodeType = nodeTypes.find((t) => t.id === typeId);
+      setWorkflow((wf) => {
+        if (!wf) return wf;
+        const nextId = synthesiseNodeId(typeId, wf.nodes);
+        const pos = nextDropPosition(wf.nodes);
+        return {
+          ...wf,
+          nodes: [
+            ...wf.nodes,
+            {
+              id: nextId,
+              type: typeId,
+              name: nodeType?.name ?? typeId,
+              config: {},
+              pos,
+              continue_on_error: false,
+            },
+          ],
+        };
+      });
+      setTabs((existing) =>
+        existing.map((t) =>
+          t.id === activeId ? { ...t, dirty: true } : t,
+        ),
+      );
+    },
+    [nodeTypes, activeId],
+  );
+
   return (
     <div
       style={{
@@ -222,31 +258,8 @@ export function Editor({
           overflow: "hidden",
         }}
       >
-        {/* Palette placeholder — Phase 1.5c */}
-        <aside
-          style={{
-            background: "var(--bg-panel)",
-            borderRight: "1px solid var(--line)",
-            display: "flex",
-            flexDirection: "column",
-            minHeight: 0,
-          }}
-        >
-          <ColumnHeader label="palette" suffix="phase 1.5c" />
-          <div
-            style={{
-              flex: 1,
-              padding: 14,
-              fontFamily: "var(--mono)",
-              fontSize: 11,
-              color: "var(--txt-faint)",
-              lineHeight: 1.55,
-            }}
-          >
-            categorised node-type list lands here. drag onto canvas or
-            click to drop at viewport centre.
-          </div>
-        </aside>
+        {/* Palette — Phase 1.5c */}
+        <Palette nodeTypes={nodeTypes} onAdd={handleAddNode} />
 
         {/* Canvas — Phase 1.5b */}
         <section style={{ position: "relative", minWidth: 0 }}>
@@ -399,4 +412,28 @@ function ColumnHeader({
       ) : null}
     </div>
   );
+}
+
+/** Pick an id like `delay-3` that doesn't collide with existing nodes. */
+function synthesiseNodeId(
+  typeId: string,
+  existing: ReadonlyArray<{ id: string }>,
+): string {
+  const ids = new Set(existing.map((n) => n.id));
+  let counter = 1;
+  let candidate = `${typeId}-${counter}`;
+  while (ids.has(candidate)) {
+    counter += 1;
+    candidate = `${typeId}-${counter}`;
+  }
+  return candidate;
+}
+
+/** Drop new nodes below the lowest existing node so they don't overlap. */
+function nextDropPosition(
+  existing: ReadonlyArray<{ pos: { x: number; y: number } }>,
+): { x: number; y: number } {
+  if (existing.length === 0) return { x: 80, y: 80 };
+  const maxY = existing.reduce((acc, n) => Math.max(acc, n.pos.y), 0);
+  return { x: 80, y: maxY + 220 };
 }
