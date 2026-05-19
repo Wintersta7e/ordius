@@ -35,20 +35,26 @@ import { fmtBytes } from "../lib/format";
 import type { Route } from "../lib/router";
 
 type SectionId =
-  | "appearance"
   | "secrets"
   | "workspaces"
+  | "retention"
   | "concurrency"
   | "models"
+  | "appearance"
   | "about";
 
-const SECTIONS: Array<{ id: SectionId; label: string }> = [
-  { id: "appearance", label: "appearance" },
-  { id: "secrets", label: "secrets" },
-  { id: "workspaces", label: "workspaces" },
-  { id: "concurrency", label: "concurrency" },
-  { id: "models", label: "models" },
-  { id: "about", label: "about" },
+const SECTIONS: Array<{
+  id: SectionId;
+  label: string;
+  description: string;
+}> = [
+  { id: "secrets", label: "Secrets", description: "API keys, tokens, passwords" },
+  { id: "workspaces", label: "Workspaces", description: "Project folders workflows run against" },
+  { id: "retention", label: "Retention", description: "Run history & workspace cleanup" },
+  { id: "concurrency", label: "Concurrency", description: "Parallel workflow & node limits" },
+  { id: "models", label: "Models", description: "Default LLM endpoints" },
+  { id: "appearance", label: "Appearance", description: "Theme & visual preferences" },
+  { id: "about", label: "About", description: "Version, paths, license" },
 ];
 
 interface Props {
@@ -58,7 +64,7 @@ interface Props {
 }
 
 export function Settings({ theme, onThemeToggle }: Props): JSX.Element {
-  const [active, setActive] = useState<SectionId>("appearance");
+  const [active, setActive] = useState<SectionId>("secrets");
   const [settings, setSettingsState] = useState<SettingsShape | null>(null);
   const [secrets, setSecretsState] = useState<SecretMeta[]>([]);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
@@ -157,32 +163,96 @@ export function Settings({ theme, onThemeToggle }: Props): JSX.Element {
             flexDirection: "column",
           }}
         >
-          {SECTIONS.map((section) => (
-            <button
-              key={section.id}
-              type="button"
-              onClick={() => setActive(section.id)}
-              style={{
-                appearance: "none",
-                border: 0,
-                background:
-                  active === section.id ? "var(--bg-active)" : "transparent",
-                color:
-                  active === section.id ? "var(--txt)" : "var(--txt-dim)",
-                padding: "10px 18px",
-                textAlign: "left",
-                fontFamily: "var(--mono)",
-                fontSize: 12,
-                letterSpacing: "0.04em",
-                cursor: "pointer",
-                borderLeft: `3px solid ${
-                  active === section.id ? "var(--accent)" : "transparent"
-                }`,
-              }}
-            >
-              {section.label}
-            </button>
-          ))}
+          <div
+            style={{
+              padding: "0 18px 10px",
+              fontFamily: "var(--mono)",
+              fontSize: 10,
+              letterSpacing: "0.18em",
+              textTransform: "uppercase",
+              color: "var(--accent)",
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+            }}
+          >
+            <span style={{ color: "var(--accent)" }}>┌</span>
+            <span style={{ flex: 1 }}>sections</span>
+            <span style={{ color: "var(--txt-faint)" }}>
+              {SECTIONS.length} total
+            </span>
+            <span style={{ color: "var(--accent)" }}>┐</span>
+          </div>
+          {SECTIONS.map((section, i) => {
+            const isActive = active === section.id;
+            const num = String(i + 1).padStart(2, "0");
+            return (
+              <button
+                key={section.id}
+                type="button"
+                onClick={() => setActive(section.id)}
+                style={{
+                  appearance: "none",
+                  border: 0,
+                  background: isActive ? "var(--bg-active)" : "transparent",
+                  color: isActive ? "var(--txt)" : "var(--txt-dim)",
+                  padding: "10px 18px",
+                  textAlign: "left",
+                  fontFamily: "var(--mono)",
+                  cursor: "pointer",
+                  borderLeft: `3px solid ${
+                    isActive ? "var(--accent)" : "transparent"
+                  }`,
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: 10,
+                }}
+              >
+                <span
+                  style={{
+                    color: "var(--txt-faint)",
+                    fontSize: 10,
+                    paddingTop: 2,
+                  }}
+                >
+                  {num}
+                </span>
+                <span style={{ flex: 1, minWidth: 0 }}>
+                  <span
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      fontSize: 12.5,
+                      fontWeight: 500,
+                      letterSpacing: "0.02em",
+                      color: isActive ? "var(--txt)" : "var(--txt)",
+                    }}
+                  >
+                    {section.label}
+                    {isActive ? (
+                      <span
+                        style={{ color: "var(--accent)", marginLeft: "auto" }}
+                      >
+                        ▸
+                      </span>
+                    ) : null}
+                  </span>
+                  <span
+                    style={{
+                      display: "block",
+                      fontSize: 10.5,
+                      color: "var(--txt-faint)",
+                      marginTop: 2,
+                      lineHeight: 1.3,
+                    }}
+                  >
+                    {section.description}
+                  </span>
+                </span>
+              </button>
+            );
+          })}
         </aside>
 
         <section
@@ -212,6 +282,24 @@ export function Settings({ theme, onThemeToggle }: Props): JSX.Element {
             </div>
           ) : null}
 
+          {(() => {
+            const idx = SECTIONS.findIndex((s) => s.id === active);
+            if (idx < 0) return null;
+            return (
+              <div
+                style={{
+                  fontFamily: "var(--mono)",
+                  fontSize: 10,
+                  letterSpacing: "0.18em",
+                  textTransform: "uppercase",
+                  color: "var(--accent)",
+                  marginBottom: 4,
+                }}
+              >
+                section · {String(idx + 1).padStart(2, "0")}
+              </div>
+            );
+          })()}
           {active === "appearance" ? (
             <AppearanceSection settings={settings} onPatch={patchSettings} />
           ) : null}
@@ -228,6 +316,9 @@ export function Settings({ theme, onThemeToggle }: Props): JSX.Element {
               onReload={reload}
               insideTauri={insideTauri}
             />
+          ) : null}
+          {active === "retention" ? (
+            <RetentionSection settings={settings} onPatch={patchSettings} />
           ) : null}
           {active === "concurrency" ? (
             <ConcurrencySection settings={settings} onPatch={patchSettings} />
@@ -599,8 +690,8 @@ function ConcurrencySection({
   return (
     <div>
       <Heading
-        text="Concurrency & retention"
-        sub="How many runs can run in parallel; how long history sticks around."
+        text="Concurrency"
+        sub="How many runs can launch in parallel before new ones queue."
       />
       <Card>
         <Field label="max concurrent runs" hint="default 4">
@@ -611,6 +702,26 @@ function ConcurrencySection({
             }
           />
         </Field>
+      </Card>
+    </div>
+  );
+}
+
+function RetentionSection({
+  settings,
+  onPatch,
+}: {
+  settings: SettingsShape | null;
+  onPatch: (patch: Partial<SettingsShape>) => Promise<void>;
+}): JSX.Element {
+  if (!settings) return <Loading />;
+  return (
+    <div>
+      <Heading
+        text="Retention"
+        sub="How long run history and recorded events stick around before cleanup."
+      />
+      <Card>
         <Field label="retention (days)" hint="0 → keep forever">
           <NumberInput
             value={settings.retentionDays}
