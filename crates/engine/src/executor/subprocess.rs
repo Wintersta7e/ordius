@@ -137,16 +137,26 @@ impl NodeExecutor for SubprocessExecutor {
         }
 
         let emitter = ctx.emitter.clone();
+        // Snapshot iteration + attempt at spawn time so every line
+        // event tags the same coordinates the run loop will record
+        // for this attempt's node_runs row. attempt is read from the
+        // shared atomic the retry loop updates per attempt.
+        let iteration = ctx.iteration;
+        let attempt = ctx.attempt.load(std::sync::atomic::Ordering::Relaxed);
         let stdout_handle = spawn_line_reader(
             sup.child.stdout.take(),
             emitter.clone(),
             node.id.clone(),
+            iteration,
+            attempt,
             CHANNEL_STDOUT,
         );
         let stderr_handle = spawn_line_reader(
             sup.child.stderr.take(),
             emitter,
             node.id.clone(),
+            iteration,
+            attempt,
             CHANNEL_STDERR,
         );
 
@@ -297,6 +307,8 @@ fn spawn_line_reader<R>(
     pipe: Option<R>,
     emitter: Arc<Emitter>,
     node_id: String,
+    iteration: u32,
+    attempt: u32,
     channel: &'static str,
 ) -> JoinHandle<Vec<String>>
 where
@@ -318,7 +330,13 @@ where
                 serde_json::Value::String(channel.into()),
             );
             payload.insert(KEY_TEXT.into(), serde_json::Value::String(line.clone()));
-            emitter.emit_node(EventType::NodeOutput, node_id.clone(), 0, 0, payload);
+            emitter.emit_node(
+                EventType::NodeOutput,
+                node_id.clone(),
+                iteration,
+                attempt,
+                payload,
+            );
             acc.push(line);
         }
         acc

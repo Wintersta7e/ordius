@@ -104,7 +104,17 @@ impl Engine {
             .expect("engine run_tokens mutex poisoned")
             .insert(rec.run_id.clone(), cancel.clone());
 
-        em.emit(EventType::WorkflowStarted, None, None, None, HashMap::new());
+        em.emit(
+            EventType::WorkflowStarted,
+            None,
+            None,
+            None,
+            HashMap::from([
+                ("workflow_id".into(), serde_json::json!(wf.id)),
+                ("workflow_name".into(), serde_json::json!(wf.name)),
+                ("trigger_kind".into(), serde_json::json!(trigger_kind)),
+            ]),
+        );
 
         let workspace = self.home().join("workspaces").join(&rec.run_id);
         if let Err(e) = std::fs::create_dir_all(&workspace) {
@@ -229,6 +239,18 @@ impl Engine {
                     }
                 }
 
+                let nt = self
+                    .registry()
+                    .get(&node.ty)
+                    .ok_or_else(|| EngineError::Node {
+                        node_id: node.id.clone(),
+                        message: format!("unknown node type '{}'", node.ty),
+                    })?;
+
+                let iteration = *iterations.entry(node.id.clone()).or_insert(1);
+                let retry_policy = node.retry.clone().unwrap_or_default();
+                let effective_timeout = node.timeout_ms.or(nt.execution.timeout_ms);
+
                 let ctx = RunContext {
                     run_id: recorder.run_id.clone(),
                     workflow_id: wf.id.clone(),
@@ -243,19 +265,9 @@ impl Engine {
                     current_inputs,
                     upstream_outputs: upstream_outputs.clone(),
                     checkpoints: self.checkpoints(),
+                    iteration,
+                    attempt: std::sync::atomic::AtomicU32::new(1),
                 };
-
-                let nt = self
-                    .registry()
-                    .get(&node.ty)
-                    .ok_or_else(|| EngineError::Node {
-                        node_id: node.id.clone(),
-                        message: format!("unknown node type '{}'", node.ty),
-                    })?;
-
-                let iteration = *iterations.entry(node.id.clone()).or_insert(1);
-                let retry_policy = node.retry.clone().unwrap_or_default();
-                let effective_timeout = node.timeout_ms.or(nt.execution.timeout_ms);
 
                 sched.start_node(&node.id);
 
@@ -407,6 +419,13 @@ async fn run_with_retry(
 )> {
     let mut attempt: u32 = 1;
     loop {
+        // Publish the current attempt to the shared `RunContext` so
+        // executors that emit intra-attempt events (subprocess
+        // line-by-line stdout, `llm` SSE deltas, `checkpoint` pauses)
+        // report the same `attempt` the run loop will persist for
+        // this attempt's `node_runs` row.
+        ctx.attempt
+            .store(attempt, std::sync::atomic::Ordering::Relaxed);
         let started_at = chrono::Utc::now().timestamp_millis();
         recorder.record_node_run(&NodeRunRow {
             node_id: &node.id,
@@ -426,7 +445,10 @@ async fn run_with_retry(
             node.id.clone(),
             iteration,
             attempt,
-            HashMap::new(),
+            HashMap::from([
+                ("node_type".into(), serde_json::json!(node.ty)),
+                ("started_at".into(), serde_json::json!(started_at)),
+            ]),
         );
 
         // Child token so a timeout for this attempt doesn't cancel
@@ -735,6 +757,67 @@ mod tests {
         assert_eq!(
             attempt, 2,
             "persisted output's attempt column must reflect the attempt that produced it, not a hard-coded 1",
+        );
+    }
+
+    /// Regression test for Codex finding E: subprocess / llm /
+    /// checkpoint events were emitted with iteration=0 attempt=0
+    /// from inside the executors, and workflow:started / node:started
+    /// carried empty payloads. After the fix iteration + attempt
+    /// flow through `RunContext` to those emit sites, and the run
+    /// loop populates metadata in the started-event payloads.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn started_events_carry_metadata_and_real_iteration_attempt() {
+        let dir = TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+        let wf = Arc::new(minimal_workflow());
+
+        let handle = engine
+            .start_run(wf, HashMap::new(), "test", false)
+            .expect("start_run");
+        let mut rx = handle.event_rx;
+
+        let summary = handle.join.await.expect("join").expect("run ok");
+        assert_eq!(summary.status, "done");
+
+        // Drain the broadcast and verify the two started events.
+        let mut wf_started: Option<RunEvent> = None;
+        let mut node_started: Option<RunEvent> = None;
+        while let Ok(ev) = rx.try_recv() {
+            match ev.ty {
+                EventType::WorkflowStarted => wf_started = Some(ev),
+                EventType::NodeStarted => node_started = Some(ev),
+                _ => {},
+            }
+        }
+
+        let wf_ev = wf_started.expect("workflow:started event present");
+        assert_eq!(
+            wf_ev.payload.get("workflow_id").and_then(|v| v.as_str()),
+            Some("wf1"),
+            "workflow:started payload must include workflow_id",
+        );
+        assert_eq!(
+            wf_ev.payload.get("trigger_kind").and_then(|v| v.as_str()),
+            Some("test"),
+            "workflow:started payload must include trigger_kind",
+        );
+
+        let node_ev = node_started.expect("node:started event present");
+        assert_eq!(
+            node_ev.iteration,
+            Some(1),
+            "node:started must carry the real iteration (1), not 0",
+        );
+        assert_eq!(
+            node_ev.attempt,
+            Some(1),
+            "node:started must carry the real attempt (1), not 0",
+        );
+        assert_eq!(
+            node_ev.payload.get("node_type").and_then(|v| v.as_str()),
+            Some("delay"),
+            "node:started payload must include node_type",
         );
     }
 

@@ -14,6 +14,7 @@ use crate::types::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
 
@@ -54,6 +55,8 @@ pub(super) fn make_ctx() -> (RunContext, broadcast::Receiver<RunEvent>, TempDir)
         current_inputs: HashMap::new(),
         upstream_outputs: HashMap::new(),
         checkpoints: Arc::new(CheckpointRegistry::new()),
+        iteration: 1,
+        attempt: AtomicU32::new(1),
     };
     (ctx, rx, dir)
 }

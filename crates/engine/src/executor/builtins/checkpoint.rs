@@ -45,8 +45,14 @@ impl NodeExecutor for CheckpointExecutor {
 
         let mut paused_payload: HashMap<String, serde_json::Value> = HashMap::with_capacity(1);
         paused_payload.insert("message".into(), serde_json::Value::String(message));
-        ctx.emitter
-            .emit_node(EventType::NodePaused, node.id.clone(), 0, 0, paused_payload);
+        let attempt = ctx.attempt.load(std::sync::atomic::Ordering::Relaxed);
+        ctx.emitter.emit_node(
+            EventType::NodePaused,
+            node.id.clone(),
+            ctx.iteration,
+            attempt,
+            paused_payload,
+        );
 
         let rx = ctx.checkpoints.register(&ctx.run_id, &node.id);
 
@@ -58,8 +64,8 @@ impl NodeExecutor for CheckpointExecutor {
         ctx.emitter.emit_node(
             EventType::NodeResumed,
             node.id.clone(),
-            0,
-            0,
+            ctx.iteration,
+            attempt,
             HashMap::new(),
         );
 

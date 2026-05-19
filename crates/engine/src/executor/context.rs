@@ -13,6 +13,7 @@ use crate::types::PortValue;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 
 /// Shared env resolver type for [`RunContext::env`]. Send + Sync
 /// so executors holding `&RunContext` across threads stay happy.
@@ -66,6 +67,20 @@ pub struct RunContext {
     /// registers a receiver here and parks until an external
     /// caller (CLI / GUI) signals resume / cancel.
     pub checkpoints: Arc<CheckpointRegistry>,
+    /// Iteration of this node within the current run (1-indexed).
+    /// Bumped by the scheduler when a loop edge re-fires the node.
+    /// Read by executors that emit `node:output` / `node:paused`
+    /// events mid-dispatch so the event coordinates match what the
+    /// run loop will record for the surrounding `node_runs` row.
+    pub iteration: u32,
+    /// Attempt of this iteration (1-indexed). Updated per retry by
+    /// `run_with_retry` before each call into the executor, so any
+    /// in-attempt event emitted by the executor (line-by-line
+    /// `node:output` from subprocess, SSE delta from `llm`,
+    /// `node:paused` from `checkpoint`) reports the same attempt
+    /// number the run loop will later persist for the `node_runs`
+    /// row and the terminal `node:done` / `node:error` event.
+    pub attempt: AtomicU32,
 }
 
 /// Build the closure that `template::SubstitutionContext::secrets`

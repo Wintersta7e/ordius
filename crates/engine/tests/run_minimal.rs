@@ -87,6 +87,8 @@ async fn two_delay_nodes_run_end_to_end() {
         current_inputs: HashMap::new(),
         upstream_outputs: HashMap::new(),
         checkpoints: Arc::new(CheckpointRegistry::new()),
+        iteration: 1,
+        attempt: std::sync::atomic::AtomicU32::new(1),
     };
     let executor = InProcessExecutor::new();
     let mut sched = Scheduler::new(&wf);

@@ -233,8 +233,13 @@ fn process_sse_event(
             serde_json::Value::String(CHANNEL_LLM.into()),
         );
         payload.insert("text".into(), serde_json::Value::String(content.into()));
-        ctx.emitter
-            .emit_node(EventType::NodeOutput, node_id.to_string(), 0, 0, payload);
+        ctx.emitter.emit_node(
+            EventType::NodeOutput,
+            node_id.to_string(),
+            ctx.iteration,
+            ctx.attempt.load(std::sync::atomic::Ordering::Relaxed),
+            payload,
+        );
     }
     if let Some(fr) = value
         .pointer("/choices/0/finish_reason")

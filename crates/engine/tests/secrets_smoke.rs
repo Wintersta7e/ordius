@@ -72,6 +72,8 @@ async fn template_resolves_secret_and_redacts_in_event_log() {
         current_inputs: HashMap::new(),
         upstream_outputs: HashMap::new(),
         checkpoints: Arc::new(CheckpointRegistry::new()),
+        iteration: 1,
+        attempt: std::sync::atomic::AtomicU32::new(1),
     };
 
     let executor = InProcessExecutor::new();
