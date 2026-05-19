@@ -15,6 +15,7 @@ pub mod events;
 pub mod executor;
 pub mod loader;
 pub mod recorder;
+pub mod registry;
 pub mod scheduler;
 pub mod types;
 pub mod validation;

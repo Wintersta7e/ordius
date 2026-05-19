@@ -1,6 +1,7 @@
 //! `NodeExecutor` trait + backend implementations.
 //! Spec: `docs/02-engine-model.md` "The executor".
 
+pub mod builtins;
 pub mod context;
 
 pub use context::RunContext;
