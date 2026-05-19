@@ -4,8 +4,9 @@
 
 use crate::events::{EventType, RunEvent};
 use crate::recorder::RunRecorder;
+use crate::secrets::redact_secrets;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 /// Buffer depth of the broadcast channel. Slow consumers that fall
@@ -15,11 +16,16 @@ use tokio::sync::broadcast;
 /// concern.
 const CHANNEL_BUFFER: usize = 1024;
 
-/// Per-run event emitter. Combines persistence (via [`RunRecorder`])
-/// with live broadcasting to all subscribers.
+/// Per-run event emitter.
+///
+/// Combines persistence (via [`RunRecorder`]) with live
+/// broadcasting to all subscribers. Tracks accessed secrets so
+/// `node:output` events have their `text` payload redacted
+/// before reaching the recorder or the broadcast channel.
 pub struct Emitter {
     recorder: Arc<RunRecorder>,
     tx: broadcast::Sender<RunEvent>,
+    redaction: Mutex<Vec<(String, String)>>,
 }
 
 impl Emitter {
@@ -28,13 +34,34 @@ impl Emitter {
     #[must_use]
     pub fn new(recorder: Arc<RunRecorder>) -> (Self, broadcast::Receiver<RunEvent>) {
         let (tx, rx) = broadcast::channel(CHANNEL_BUFFER);
-        (Self { recorder, tx }, rx)
+        (
+            Self {
+                recorder,
+                tx,
+                redaction: Mutex::new(Vec::new()),
+            },
+            rx,
+        )
     }
 
     /// Subscribe an additional receiver to the broadcast channel.
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<RunEvent> {
         self.tx.subscribe()
+    }
+
+    /// Register a secret `(name, value)` pair so the emitter can
+    /// redact every occurrence of `value` from emitted
+    /// `node:output` `text` payloads. Duplicates by name are
+    /// silently ignored.
+    pub fn register_secret(&self, name: String, value: String) {
+        let mut lock = self
+            .redaction
+            .lock()
+            .expect("emitter redaction mutex poisoned");
+        if !lock.iter().any(|(n, _)| n == &name) {
+            lock.push((name, value));
+        }
     }
 
     /// Emit a workflow-level event with no associated node. Thin
@@ -74,8 +101,11 @@ impl Emitter {
         node_id: Option<String>,
         iteration: Option<u32>,
         attempt: Option<u32>,
-        payload: HashMap<String, serde_json::Value>,
+        mut payload: HashMap<String, serde_json::Value>,
     ) {
+        if ty == EventType::NodeOutput {
+            self.redact_node_output_text(&mut payload);
+        }
         let ev = RunEvent {
             ty,
             seq: self.recorder.next_seq(),
@@ -91,5 +121,26 @@ impl Emitter {
         }
         // No subscribers is fine — the recorder remains authoritative.
         drop(self.tx.send(ev));
+    }
+
+    fn redact_node_output_text(&self, payload: &mut HashMap<String, serde_json::Value>) {
+        let Some(text_val) = payload.get_mut("text") else {
+            return;
+        };
+        let Some(text) = text_val.as_str() else {
+            return;
+        };
+        let snapshot = {
+            let lock = self
+                .redaction
+                .lock()
+                .expect("emitter redaction mutex poisoned");
+            if lock.is_empty() {
+                return;
+            }
+            lock.clone()
+        };
+        let redacted = redact_secrets(text, &snapshot);
+        *text_val = serde_json::Value::String(redacted);
     }
 }
