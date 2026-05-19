@@ -61,10 +61,15 @@ const SECTIONS: Array<{
 interface Props {
   theme: "dark" | "light";
   onThemeToggle: () => void;
+  onThemeChange: (theme: "dark" | "light") => void;
   onNavigate: (route: Route) => void;
 }
 
-export function Settings({ theme, onThemeToggle }: Props): JSX.Element {
+export function Settings({
+  theme,
+  onThemeToggle,
+  onThemeChange,
+}: Props): JSX.Element {
   const [active, setActive] = useState<SectionId>("secrets");
   const [settings, setSettingsState] = useState<SettingsShape | null>(null);
   const [secrets, setSecretsState] = useState<SecretMeta[]>([]);
@@ -126,6 +131,9 @@ export function Settings({ theme, onThemeToggle }: Props): JSX.Element {
       if (!settings) return;
       const next = { ...settings, ...patch };
       setSettingsState(next);
+      if (patch.theme && patch.theme !== theme) {
+        onThemeChange(patch.theme);
+      }
       if (!insideTauri) return;
       try {
         await setSettings(next);
@@ -133,7 +141,7 @@ export function Settings({ theme, onThemeToggle }: Props): JSX.Element {
         setError(String(e));
       }
     },
-    [settings, insideTauri],
+    [settings, theme, onThemeChange, insideTauri],
   );
 
   return (

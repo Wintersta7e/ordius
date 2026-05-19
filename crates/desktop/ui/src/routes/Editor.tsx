@@ -65,6 +65,7 @@ export function Editor({
   const [error, setError] = useState<string | null>(null);
   const [runState, setRunState] = useState<LiveRunState>(emptyRunState);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [workspaceId, setWorkspaceId] = useState<string | null>(null);
   const [runDialogOpen, setRunDialogOpen] = useState(false);
 
   const insideTauri =
@@ -108,9 +109,23 @@ export function Editor({
     };
   }, [insideTauri]);
 
-  // Load the workflow when workflowId changes.
+  // Load the workflow when workflowId changes, or seed a fresh
+  // blank workflow when the editor is opened via "+ new workflow"
+  // (no id yet — user hasn't saved).
   useEffect(() => {
-    if (!workflowId) return;
+    if (!workflowId) {
+      const fresh = makeBlankWorkflow();
+      setWorkflow(fresh);
+      setTabs((existing) => {
+        if (existing.some((t) => t.id === fresh.id)) return existing;
+        return [
+          ...existing,
+          { id: fresh.id, name: fresh.name, dirty: true, running: false },
+        ];
+      });
+      setActiveId(fresh.id);
+      return;
+    }
     if (!insideTauri) {
       setError(
         "running in browser preview · engine commands disabled — launch via `tauri dev` to open real workflows",
@@ -382,6 +397,9 @@ export function Editor({
         onSave={handleSave}
         onValidate={() => console.warn("validate wired with engine `validate` in 1.5e")}
         onNavigate={onNavigate}
+        workspaces={workspaces}
+        workspaceId={workspaceId}
+        onWorkspaceChange={setWorkspaceId}
       />
       <WorkflowTabStrip
         tabs={tabs}
@@ -490,7 +508,7 @@ export function Editor({
         workflowName={workflow?.name ?? activeId ?? "(none)"}
         variableDefaults={workflow?.variables ?? {}}
         workspaces={workspaces}
-        defaultWorkspaceId={null}
+        defaultWorkspaceId={workspaceId}
         autoResume
         onConfirm={(input) => void handleRunConfirm(input)}
         onCancel={() => setRunDialogOpen(false)}
@@ -512,6 +530,23 @@ function synthesiseNodeId(
     candidate = `${typeId}-${counter}`;
   }
   return candidate;
+}
+
+/** Seed a fresh, unsaved workflow with a unique id + manual trigger. */
+function makeBlankWorkflow(): Workflow {
+  const stamp = new Date()
+    .toISOString()
+    .replace(/[-:T]/g, "")
+    .slice(0, 14);
+  return {
+    id: `new-${stamp}`,
+    name: "untitled",
+    schema_version: 1,
+    variables: {},
+    triggers: [{ type: "manual" }],
+    nodes: [],
+    edges: [],
+  };
 }
 
 /** Drop new nodes below the lowest existing node so they don't overlap. */

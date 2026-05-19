@@ -48,6 +48,7 @@ function App() {
         <Settings
           theme={theme}
           onThemeToggle={toggleTheme}
+          onThemeChange={setTheme}
           onNavigate={setRoute}
         />
       );
