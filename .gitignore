@@ -63,3 +63,6 @@ AGENTS.md
 
 # Spec, plans, briefs — internal-only, never tracked
 /docs/
+
+# Staged cross-built Windows binaries (not source)
+/dist-win/
