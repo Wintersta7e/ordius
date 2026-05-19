@@ -55,12 +55,11 @@ fn list_returns_empty_when_sidecar_absent() {
 }
 
 #[test]
+#[serial]
 fn list_creates_parent_directory_when_setting() {
+    init_sample_store();
     let dir = tempfile::TempDir::new().unwrap();
     let store = Store::with_index_path(dir.path().join("nested").join("index.json"));
-    // No keyring init needed — set will fail on the keyring side
-    // (no store) but the sidecar mutation path is still exercised.
-    init_sample_store();
     store.set("nested-test", "v").unwrap();
     assert!(dir.path().join("nested").join("index.json").exists());
 }
