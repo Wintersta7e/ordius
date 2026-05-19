@@ -12,6 +12,12 @@ use thiserror::Error;
 
 const ORDIUS_USER_PREFIX: &str = "ORDIUS_USER_";
 
+/// Maximum nesting depth of `{{json X}}` expressions. A malformed
+/// or adversarial template like `{{json json json … X}}` would
+/// otherwise recurse arbitrarily deep on a stack with no other
+/// bound. 16 is well above any legitimate use.
+const MAX_JSON_HELPER_DEPTH: usize = 16;
+
 /// Default env-var allowlist for `{{env.NAME}}` resolution.
 ///
 /// `PATH` is deliberately excluded — substituting `PATH` into a
@@ -68,12 +74,18 @@ pub struct SubstitutionContext<'a> {
 /// Failure modes for [`substitute`].
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TemplateError {
-    /// A reference could not be resolved.
+    /// A reference could not be resolved (name not present in
+    /// the supplied data).
     #[error("undefined: {0}")]
     Undefined(String),
-    /// Template surface syntax violation (unclosed `{{`, etc.).
+    /// Template surface syntax violation (unclosed `{{`, unknown
+    /// namespace, malformed expression, recursion limit hit).
     #[error("syntax: {0}")]
     Syntax(String),
+    /// Reference targeted a name the policy explicitly blocks
+    /// (e.g. `{{env.PATH}}` when `PATH` isn't on the allowlist).
+    #[error("not allowed: {0}")]
+    NotAllowed(String),
 }
 
 /// Substitute every `{{...}}` in `tmpl` using `ctx`.
@@ -98,7 +110,7 @@ pub fn substitute(tmpl: &str, ctx: &SubstitutionContext<'_>) -> Result<String, T
             .find("}}")
             .ok_or_else(|| TemplateError::Syntax("unclosed `{{`".into()))?;
         let inner = after_open[..end].trim();
-        let value = resolve(inner, ctx)?;
+        let value = resolve(inner, ctx, 0)?;
         out.push_str(&value);
         remaining = &after_open[end + 2..];
     }
@@ -106,9 +118,18 @@ pub fn substitute(tmpl: &str, ctx: &SubstitutionContext<'_>) -> Result<String, T
     Ok(out)
 }
 
-fn resolve(expr: &str, ctx: &SubstitutionContext<'_>) -> Result<String, TemplateError> {
+fn resolve(
+    expr: &str,
+    ctx: &SubstitutionContext<'_>,
+    depth: usize,
+) -> Result<String, TemplateError> {
     if let Some(rest) = expr.strip_prefix("json ") {
-        let inner = resolve(rest.trim(), ctx)?;
+        if depth >= MAX_JSON_HELPER_DEPTH {
+            return Err(TemplateError::Syntax(format!(
+                "json helper nested deeper than {MAX_JSON_HELPER_DEPTH}",
+            )));
+        }
+        let inner = resolve(rest.trim(), ctx, depth + 1)?;
         return serde_json::to_string(&inner)
             .map_err(|e| TemplateError::Syntax(format!("json helper: {e}")));
     }
@@ -144,9 +165,7 @@ fn resolve(expr: &str, ctx: &SubstitutionContext<'_>) -> Result<String, Template
         }),
         "env" => single_key(&mut parts, "env", |k| {
             if !ctx.env_allowlist.contains(k) && !k.starts_with(ORDIUS_USER_PREFIX) {
-                return Err(TemplateError::Undefined(format!(
-                    "env.{k} (not allowlisted)"
-                )));
+                return Err(TemplateError::NotAllowed(format!("env.{k}")));
             }
             (ctx.env)(k).ok_or_else(|| TemplateError::Undefined(format!("env.{k}")))
         }),

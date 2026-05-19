@@ -209,8 +209,8 @@ fn env_path_is_blocked_by_allowlist() {
         &ctx_for(&f, &empty_secrets, &empty_kv, &env),
     );
     match res {
-        Err(TemplateError::Undefined(msg)) => assert!(msg.contains("PATH")),
-        other => panic!("expected Undefined for PATH, got {other:?}"),
+        Err(TemplateError::NotAllowed(msg)) => assert!(msg.contains("PATH")),
+        other => panic!("expected NotAllowed for PATH, got {other:?}"),
     }
 }
 
@@ -222,7 +222,20 @@ fn env_ld_preload_is_blocked() {
         "{{env.LD_PRELOAD}}",
         &ctx_for(&f, &empty_secrets, &empty_kv, &env),
     );
-    assert!(matches!(res, Err(TemplateError::Undefined(_))));
+    assert!(matches!(res, Err(TemplateError::NotAllowed(_))));
+}
+
+#[test]
+fn deeply_nested_json_helper_is_capped() {
+    let mut f = Fixture::new();
+    f.vars.insert("x".into(), "v".into());
+    let env = map_env(&f.env_map);
+    let nested = "{{".to_string() + &"json ".repeat(64) + "vars.x}}";
+    let res = substitute(&nested, &ctx_for(&f, &empty_secrets, &empty_kv, &env));
+    match res {
+        Err(TemplateError::Syntax(msg)) => assert!(msg.contains("nested deeper")),
+        other => panic!("expected Syntax recursion-cap error, got {other:?}"),
+    }
 }
 
 #[test]

@@ -52,14 +52,16 @@ impl Emitter {
 
     /// Register a secret `(name, value)` pair so the emitter can
     /// redact every occurrence of `value` from emitted
-    /// `node:output` `text` payloads. Duplicates by name are
-    /// silently ignored.
+    /// `node:output` `text` payloads. Dedupes on the
+    /// `(name, value)` pair so a rotated secret keeps its prior
+    /// value on the redaction list — otherwise the old value
+    /// would leak in subsequent emits.
     pub fn register_secret(&self, name: String, value: String) {
         let mut lock = self
             .redaction
             .lock()
             .expect("emitter redaction mutex poisoned");
-        if !lock.iter().any(|(n, _)| n == &name) {
+        if !lock.iter().any(|(n, v)| n == &name && v == &value) {
             lock.push((name, value));
         }
     }
