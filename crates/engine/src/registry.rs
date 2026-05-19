@@ -406,3 +406,21 @@ fn shell_spec() -> NodeType {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_v1_0_builtins_registers_all_eight() {
+        let r = Registry::with_v1_0_builtins();
+        let mut ids = r.ids();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "checkpoint", "condition", "delay", "file", "http", "llm", "shell", "transform",
+            ],
+        );
+    }
+}
