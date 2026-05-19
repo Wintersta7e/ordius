@@ -222,7 +222,12 @@ async fn dispatch(cli: Cli) -> anyhow::Result<u8> {
         Cmd::Secrets { sub } => cmd_secrets(sub, &home),
         Cmd::Export { id } => cmd_export(&home, &id),
         Cmd::Import { as_id } => cmd_import(&home, as_id.as_deref()),
-        Cmd::Run(_) | Cmd::Runs { .. } | Cmd::Gui => {
+        Cmd::Gui => {
+            eprintln!("ordius-cli: GUI binary not installed yet (lands in v1.1)");
+            eprintln!("Until then, use 'ordius-cli run <id>' from the terminal.");
+            Ok(2)
+        },
+        Cmd::Run(_) | Cmd::Runs { .. } => {
             anyhow::bail!("subcommand not yet wired in this build");
         },
     }
