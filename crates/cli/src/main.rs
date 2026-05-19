@@ -10,9 +10,10 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ordius_engine::registry::Registry;
 use ordius_engine::types::{Category, NodeType};
-use ordius_engine::{load_workflow, validate};
+use ordius_engine::{Store, load_workflow, validate};
+use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -217,12 +218,8 @@ async fn dispatch(cli: Cli) -> anyhow::Result<u8> {
     match cli.cmd {
         Cmd::Workflows { sub } => cmd_workflows(sub, &home),
         Cmd::Nodes { sub } => cmd_nodes(sub, json),
-        Cmd::Run(_)
-        | Cmd::Runs { .. }
-        | Cmd::Secrets { .. }
-        | Cmd::Export { .. }
-        | Cmd::Import { .. }
-        | Cmd::Gui => {
+        Cmd::Secrets { sub } => cmd_secrets(sub, &home),
+        Cmd::Run(_) | Cmd::Runs { .. } | Cmd::Export { .. } | Cmd::Import { .. } | Cmd::Gui => {
             anyhow::bail!("subcommand not yet wired in this build");
         },
     }
@@ -417,6 +414,87 @@ fn nodes_show(registry: &Registry, ty: &str) -> anyhow::Result<u8> {
         .get(ty)
         .ok_or_else(|| anyhow::anyhow!("unknown node type: {ty}"))?;
     println!("{}", serde_json::to_string_pretty(nt.as_ref())?);
+    Ok(0)
+}
+
+fn cmd_secrets(sub: SecretsSub, home: &Path) -> anyhow::Result<u8> {
+    init_keyring()?;
+    let store = Store::with_index_path(home.join("secrets-index.json"));
+    match sub {
+        SecretsSub::Ls => secrets_ls(&store),
+        SecretsSub::Set { name } => secrets_set(&store, &name),
+        SecretsSub::Rm { name, force } => secrets_rm(&store, &name, force),
+    }
+}
+
+/// Pick a keyring backend for the process. `ORDIUS_TEST_KEYRING=1`
+/// installs an in-memory sample store so integration tests don't
+/// touch the host's real credential store; otherwise the native OS
+/// keyring is used (libsecret on Linux desktops, Credential Manager
+/// on Windows, Keychain on macOS).
+fn init_keyring() -> anyhow::Result<()> {
+    if std::env::var_os("ORDIUS_TEST_KEYRING").is_some() {
+        let cfg: HashMap<&str, &str> = HashMap::from([("persist", "false")]);
+        keyring::use_sample_store(&cfg).context("install sample keyring store")?;
+        return Ok(());
+    }
+    // not_keyutils=true prefers DBus secret-service over kernel
+    // keyutils on Linux — keyutils flushes secrets on logout.
+    keyring::use_native_store(true).context("install native keyring store")?;
+    Ok(())
+}
+
+fn secrets_ls(store: &Store) -> anyhow::Result<u8> {
+    let names = store.list().context("read secrets sidecar index")?;
+    if names.is_empty() {
+        println!("(no secrets known)");
+        return Ok(0);
+    }
+    for n in names {
+        println!("{n}");
+    }
+    Ok(0)
+}
+
+fn secrets_set(store: &Store, name: &str) -> anyhow::Result<u8> {
+    // On a TTY: `read_password` puts the terminal into raw mode so
+    // typing the value doesn't echo. On a pipe (the test path, or
+    // any non-interactive use): fall back to reading a line from
+    // stdin via `read_password_from_bufread`, which strips the
+    // trailing newline the same way.
+    eprint!("Value for {name}: ");
+    io::stderr().flush()?;
+    let stdin = io::stdin();
+    let value = if stdin.is_terminal() {
+        rpassword::read_password().context("read secret value")?
+    } else {
+        use std::io::BufRead;
+        let mut line = String::new();
+        stdin
+            .lock()
+            .read_line(&mut line)
+            .context("read secret value")?;
+        line.trim_end_matches(['\r', '\n']).to_string()
+    };
+    if value.is_empty() {
+        anyhow::bail!("refusing to store empty value for {name}");
+    }
+    store.set(name, &value).context("set secret in keyring")?;
+    println!("set {name}");
+    Ok(0)
+}
+
+fn secrets_rm(store: &Store, name: &str, force: bool) -> anyhow::Result<u8> {
+    let names = store.list().context("read secrets sidecar index")?;
+    if !names.iter().any(|n| n == name) {
+        anyhow::bail!("secret {name} not known to the sidecar index");
+    }
+    if !force && !confirm(&format!("Delete secret {name}?"))? {
+        eprintln!("aborted");
+        return Ok(1);
+    }
+    store.delete(name).context("delete secret from keyring")?;
+    println!("removed {name}");
     Ok(0)
 }
 

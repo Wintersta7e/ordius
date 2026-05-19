@@ -47,6 +47,7 @@ keyring-core = "1"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
+rpassword = "7"
 
 # Test-only (hoisted to workspace so all crates resolve the same version)
 tempfile = "3"
