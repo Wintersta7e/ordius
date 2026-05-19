@@ -13,6 +13,33 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
+/// Borrowing row payload for [`RunRecorder::record_node_run`].
+///
+/// Keyed by `(run_id, node_id, iteration, attempt)` — the same
+/// row is updated as a node transitions `running → done | error`.
+pub struct NodeRunRow<'a> {
+    /// Node id.
+    pub node_id: &'a str,
+    /// 1-based loop iteration index.
+    pub iteration: u32,
+    /// 1-based retry attempt index.
+    pub attempt: u32,
+    /// Built-in or manifest type name.
+    pub node_type: &'a str,
+    /// `pending` / `running` / `done` / `error` / `skipped`.
+    pub status: &'a str,
+    /// Wall-clock start time, Unix epoch milliseconds.
+    pub started_at: Option<i64>,
+    /// Wall-clock finish time, Unix epoch milliseconds.
+    pub finished_at: Option<i64>,
+    /// Difference between `finished_at` and `started_at`.
+    pub duration_ms: Option<i64>,
+    /// Short human-readable output summary (first line, truncated).
+    pub output_summary: Option<&'a str>,
+    /// Error message if `status == "error"`.
+    pub error: Option<&'a str>,
+}
+
 /// Per-run recorder. Persists the run snapshot, run row, per-node
 /// status updates, and the event stream into the `SQLite` database
 /// behind the supplied `r2d2` pool.
@@ -115,6 +142,73 @@ impl RunRecorder {
                 ev.attempt,
                 channel,
                 &payload_json,
+            ],
+        )
+        .map_err(|e| EngineError::Db(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Insert or update a row in `node_runs`. `INSERT OR REPLACE`
+    /// so the same `(run_id, node_id, iteration, attempt)` key
+    /// accepts updates as the node transitions through statuses.
+    pub fn record_node_run(&self, row: &NodeRunRow<'_>) -> Result<()> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| EngineError::Db(e.to_string()))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO node_runs \
+               (run_id, node_id, iteration, attempt, node_type, status, \
+                started_at, finished_at, duration_ms, output_summary, error) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            rusqlite::params![
+                &self.run_id,
+                row.node_id,
+                row.iteration,
+                row.attempt,
+                row.node_type,
+                row.status,
+                row.started_at,
+                row.finished_at,
+                row.duration_ms,
+                row.output_summary,
+                row.error,
+            ],
+        )
+        .map_err(|e| EngineError::Db(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Insert or update an entry in `node_outputs` for one
+    /// `(run, node, iteration, attempt, port_name)` tuple.
+    /// Exactly one of `value_inline` or `value_path` should be
+    /// provided — large values live on disk and `value_path`
+    /// points at them.
+    pub fn record_node_output(
+        &self,
+        node_id: &str,
+        iteration: u32,
+        attempt: u32,
+        port_name: &str,
+        value_inline: Option<&str>,
+        value_path: Option<&str>,
+    ) -> Result<()> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| EngineError::Db(e.to_string()))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO node_outputs \
+               (run_id, node_id, iteration, attempt, port_name, value_inline, value_path) \
+             VALUES (?,?,?,?,?,?,?)",
+            rusqlite::params![
+                &self.run_id,
+                node_id,
+                iteration,
+                attempt,
+                port_name,
+                value_inline,
+                value_path,
             ],
         )
         .map_err(|e| EngineError::Db(e.to_string()))?;
