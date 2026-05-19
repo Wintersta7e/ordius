@@ -1,0 +1,133 @@
+// Typed wrappers around the 18 Tauri commands `crates/desktop/src/commands.rs`
+// registers. Every screen calls into here rather than touching
+// `@tauri-apps/api` directly — that way command renames are caught
+// by tsc and the rest of the codebase doesn't import any Tauri
+// internals.
+
+import { invoke, Channel } from "@tauri-apps/api/core";
+import type {
+  NodeType,
+  RunDetail,
+  RunEvent,
+  RunRow,
+  RunStarted,
+  RunWorkflowArgs,
+  SavedWorkflow,
+  SecretMeta,
+  Settings,
+  SystemStatus,
+  Workflow,
+  Workspace,
+} from "./types";
+
+// ─── Workflows ───────────────────────────────────────────────────
+
+export function listWorkflows(): Promise<SavedWorkflow[]> {
+  return invoke("list_workflows");
+}
+
+export function loadWorkflow(id: string): Promise<Workflow> {
+  return invoke("load_workflow", { id });
+}
+
+export function saveWorkflow(workflow: Workflow): Promise<void> {
+  return invoke("save_workflow", { workflow });
+}
+
+export function deleteWorkflow(id: string): Promise<boolean> {
+  return invoke("delete_workflow", { id });
+}
+
+// ─── Runs ────────────────────────────────────────────────────────
+
+export interface RunHandle {
+  /** New run id. */
+  runId: string;
+  /** Streaming events for this run. Already wired to the backend. */
+  events: Channel<RunEvent>;
+}
+
+/**
+ * Start a workflow run. Returns the new id plus the event channel
+ * the backend will stream events through. The frontend should
+ * attach `.onmessage` to the channel BEFORE calling `runWorkflow`
+ * — Tauri channels buffer messages until a handler attaches, so
+ * the leading `workflow:started` event survives the round-trip.
+ */
+export async function runWorkflow(
+  args: RunWorkflowArgs,
+  onEvent: (ev: RunEvent) => void,
+): Promise<RunHandle> {
+  const channel = new Channel<RunEvent>();
+  channel.onmessage = onEvent;
+  const { runId } = await invoke<RunStarted>("run_workflow", { args, channel });
+  return { runId, events: channel };
+}
+
+export function stopRun(runId: string): Promise<boolean> {
+  return invoke("stop_run", { runId });
+}
+
+export function listRuns(
+  filters: {
+    workflow?: string;
+    status?: string;
+    limit?: number;
+  } = {},
+): Promise<RunRow[]> {
+  return invoke("list_runs", filters);
+}
+
+export function getRun(runId: string): Promise<RunDetail> {
+  return invoke("get_run", { runId });
+}
+
+// ─── Nodes ───────────────────────────────────────────────────────
+
+export function listNodeTypes(): Promise<NodeType[]> {
+  return invoke("list_node_types");
+}
+
+// ─── Workspaces ──────────────────────────────────────────────────
+
+export function listWorkspaces(): Promise<Workspace[]> {
+  return invoke("list_workspaces");
+}
+
+export function addWorkspace(name: string, path: string): Promise<Workspace> {
+  return invoke("add_workspace", { name, path });
+}
+
+export function removeWorkspace(id: string): Promise<void> {
+  return invoke("remove_workspace", { id });
+}
+
+// ─── Secrets ─────────────────────────────────────────────────────
+
+export function listSecrets(): Promise<SecretMeta[]> {
+  return invoke("list_secrets");
+}
+
+export function addSecret(name: string, value: string): Promise<void> {
+  return invoke("add_secret", { name, value });
+}
+
+export function removeSecret(name: string): Promise<void> {
+  return invoke("remove_secret", { name });
+}
+
+// ─── Settings ────────────────────────────────────────────────────
+
+export function getSettings(): Promise<Settings> {
+  return invoke("get_settings");
+}
+
+export function setSettings(settings: Settings): Promise<void> {
+  return invoke("set_settings", { settings });
+}
+
+// ─── System status ───────────────────────────────────────────────
+
+export function systemStatus(): Promise<SystemStatus> {
+  return invoke("system_status");
+}

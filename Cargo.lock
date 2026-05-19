@@ -3785,13 +3785,16 @@ dependencies = [
 name = "ordius-desktop"
 version = "0.1.0"
 dependencies = [
+ "keyring",
  "ordius-engine",
+ "rusqlite",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

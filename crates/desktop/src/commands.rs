@@ -1,0 +1,347 @@
+//! Tauri command surface the React UI calls into.
+//!
+//! Every handler accepts the managed `AppState` (Arc'd engine) and
+//! returns a camelCase DTO. Errors come back to JavaScript as plain
+//! strings — `Result<_, EngineError>` would force a custom serde
+//! impl and the frontend doesn't need the structured error today.
+
+// Tauri's invoke_handler deserialises every argument from JSON, so
+// commands take owned values rather than references. The frontend
+// sends a fresh JSON payload per call — clippy's
+// `needless_pass_by_value` would have us reference-style every
+// String, which doesn't make sense at this boundary.
+#![allow(clippy::needless_pass_by_value)]
+// Returning `Result<_, String>` is the canonical Tauri command
+// shape so the frontend always gets a Promise that rejects on
+// error. Some commands have no current failure path (`stop_run`'s
+// cancel-token lookup, `list_node_types`'s in-memory scan) but
+// keeping the Result preserves API stability when failure paths
+// land later.
+#![allow(clippy::unnecessary_wraps)]
+
+use crate::dto::{
+    EndpointStatusDto, ModelEndpointDto, NodeRunRowDto, NodeTypeDto, RunDetailDto, RunEventDto,
+    RunRowDto, RunStartedDto, RunWorkflowArgs, SavedWorkflowDto, SecretMetaDto, SettingsDto,
+    SystemStatusDto, WorkflowDto, WorkspaceDto,
+};
+use crate::state::AppState;
+use ordius_engine::settings::Settings as EngineSettings;
+use ordius_engine::types::Workflow;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+// ─── Workflows ───────────────────────────────────────────────────
+
+/// List every workflow in `<home>/workflows/`. Parse errors are
+/// logged via tracing but don't fail the command.
+#[tauri::command]
+pub fn list_workflows(state: tauri::State<'_, AppState>) -> Result<Vec<SavedWorkflowDto>, String> {
+    let home = state.engine.home();
+    let (wfs, errors) = ordius_engine::workflows::list(home).map_err(|e| e.to_string())?;
+    for (path, err) in &errors {
+        tracing::warn!(path = %path.display(), error = %err, "workflow parse failed");
+    }
+    Ok(wfs.iter().map(SavedWorkflowDto::from).collect())
+}
+
+/// Load a single workflow by id.
+#[tauri::command]
+pub fn load_workflow(state: tauri::State<'_, AppState>, id: String) -> Result<WorkflowDto, String> {
+    ordius_engine::workflows::load(state.engine.home(), &id).map_err(|e| e.to_string())
+}
+
+/// Persist a workflow to disk. Validates structure before saving;
+/// the editor's "Save" button gates on this.
+#[tauri::command]
+pub fn save_workflow(state: tauri::State<'_, AppState>, workflow: Workflow) -> Result<(), String> {
+    ordius_engine::validate(&workflow).map_err(|e| e.to_string())?;
+    ordius_engine::workflows::save(state.engine.home(), &workflow).map_err(|e| e.to_string())
+}
+
+/// Delete a workflow by id. The editor confirms before calling.
+#[tauri::command]
+pub fn delete_workflow(state: tauri::State<'_, AppState>, id: String) -> Result<bool, String> {
+    ordius_engine::workflows::delete(state.engine.home(), &id).map_err(|e| e.to_string())
+}
+
+// ─── Runs ────────────────────────────────────────────────────────
+
+/// Start a workflow run. Streams events back via the `Channel`
+/// argument — the frontend creates a `new Channel<RunEventDto>()`
+/// and passes it in; we drain the engine's broadcast into it.
+#[tauri::command]
+pub async fn run_workflow(
+    state: tauri::State<'_, AppState>,
+    args: RunWorkflowArgs,
+    channel: tauri::ipc::Channel<RunEventDto>,
+) -> Result<RunStartedDto, String> {
+    let engine = state.engine.clone();
+    let wf = ordius_engine::workflows::load(engine.home(), &args.workflow_id)
+        .map_err(|e| e.to_string())?;
+
+    // Workspace id is accepted but not yet wired into `RunContext.workspace`;
+    // the engine still uses its home dir as the per-run workspace root.
+    drop(args.workspace_id);
+
+    let handle = engine
+        .start_run(Arc::new(wf), args.variables, "gui", args.auto_resume)
+        .map_err(|e| e.to_string())?;
+    let run_id = handle.run_id.clone();
+    let mut rx = handle.event_rx;
+    let join = handle.join;
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(ev) => {
+                    if channel.send(RunEventDto::from(ev)).is_err() {
+                        // Frontend closed the channel — stop draining.
+                        break;
+                    }
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+            }
+        }
+        // Drain the join handle so panics surface in tracing rather
+        // than silent task leaks. We don't propagate the summary — the
+        // frontend reconstructs it from the workflow:done event.
+        match join.await {
+            Ok(Ok(_summary)) => {},
+            Ok(Err(e)) => tracing::error!(error = %e, "run loop returned error"),
+            Err(e) => tracing::error!(error = ?e, "run task panicked"),
+        }
+    });
+    Ok(RunStartedDto { run_id })
+}
+
+/// Cancel an active run via the engine's cancel-token registry.
+#[tauri::command]
+pub fn stop_run(state: tauri::State<'_, AppState>, run_id: String) -> Result<bool, String> {
+    Ok(state.engine.cancel_run(&run_id))
+}
+
+/// Recent runs for the History page. Filters mirror the CLI's
+/// `runs ls` options.
+#[tauri::command]
+pub fn list_runs(
+    state: tauri::State<'_, AppState>,
+    workflow: Option<String>,
+    status: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<RunRowDto>, String> {
+    let mut sql = String::from(
+        "SELECT id, workflow_id, status, started_at, finished_at, duration_ms, trigger_kind \
+         FROM runs WHERE 1=1",
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(w) = workflow {
+        sql.push_str(" AND workflow_id = ?");
+        params.push(Box::new(w));
+    }
+    if let Some(s) = status {
+        sql.push_str(" AND status = ?");
+        params.push(Box::new(s));
+    }
+    sql.push_str(" ORDER BY started_at DESC LIMIT ?");
+    params.push(Box::new(i64::try_from(limit.unwrap_or(50)).unwrap_or(50)));
+
+    let conn = state.engine.pool().get().map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |r| {
+            Ok(RunRowDto {
+                run_id: r.get(0)?,
+                workflow_id: r.get(1)?,
+                status: r.get(2)?,
+                started_at: r.get(3)?,
+                finished_at: r.get::<_, Option<i64>>(4)?,
+                duration_ms: r.get::<_, Option<i64>>(5)?,
+                trigger_kind: r.get(6)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+/// Detailed view of one run including every node-run row.
+#[tauri::command]
+pub fn get_run(state: tauri::State<'_, AppState>, run_id: String) -> Result<RunDetailDto, String> {
+    let conn = state.engine.pool().get().map_err(|e| e.to_string())?;
+    let row = conn
+        .prepare(
+            "SELECT id, workflow_id, status, started_at, finished_at, duration_ms, trigger_kind \
+             FROM runs WHERE id = ?",
+        )
+        .map_err(|e| e.to_string())?
+        .query_row(rusqlite::params![&run_id], |r| {
+            Ok(RunRowDto {
+                run_id: r.get(0)?,
+                workflow_id: r.get(1)?,
+                status: r.get(2)?,
+                started_at: r.get(3)?,
+                finished_at: r.get::<_, Option<i64>>(4)?,
+                duration_ms: r.get::<_, Option<i64>>(5)?,
+                trigger_kind: r.get(6)?,
+            })
+        })
+        .map_err(|e| format!("run {run_id} not found: {e}"))?;
+
+    let mut node_stmt = conn
+        .prepare(
+            "SELECT node_id, iteration, attempt, node_type, status, started_at, \
+                    finished_at, duration_ms, error \
+             FROM node_runs WHERE run_id = ? ORDER BY started_at",
+        )
+        .map_err(|e| e.to_string())?;
+    let node_runs = node_stmt
+        .query_map(rusqlite::params![&run_id], |r| {
+            Ok(NodeRunRowDto {
+                node_id: r.get(0)?,
+                iteration: r.get(1)?,
+                attempt: r.get(2)?,
+                node_type: r.get(3)?,
+                status: r.get(4)?,
+                started_at: r.get::<_, Option<i64>>(5)?,
+                finished_at: r.get::<_, Option<i64>>(6)?,
+                duration_ms: r.get::<_, Option<i64>>(7)?,
+                error: r.get::<_, Option<String>>(8)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+
+    Ok(RunDetailDto { row, node_runs })
+}
+
+// ─── Nodes ───────────────────────────────────────────────────────
+
+/// Every registered node-type — built-ins plus manifest-loaded
+/// custom types — for the palette and properties panel.
+#[tauri::command]
+pub fn list_node_types(state: tauri::State<'_, AppState>) -> Result<Vec<NodeTypeDto>, String> {
+    let registry = state.engine.registry();
+    let mut ids = registry.ids();
+    ids.sort();
+    Ok(ids
+        .iter()
+        .filter_map(|id| registry.get(id))
+        .map(|arc| (*arc).clone())
+        .collect())
+}
+
+// ─── Workspaces ──────────────────────────────────────────────────
+
+/// Every registered workspace.
+#[tauri::command]
+pub fn list_workspaces(state: tauri::State<'_, AppState>) -> Result<Vec<WorkspaceDto>, String> {
+    Ok(ordius_engine::workspaces::list(state.engine.home())
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(WorkspaceDto::from)
+        .collect())
+}
+
+/// Register a new workspace. `path` must already exist as a directory.
+#[tauri::command]
+pub fn add_workspace(
+    state: tauri::State<'_, AppState>,
+    name: String,
+    path: String,
+) -> Result<WorkspaceDto, String> {
+    let path = PathBuf::from(path);
+    let ws = ordius_engine::workspaces::add(state.engine.home(), &name, &path)
+        .map_err(|e| e.to_string())?;
+    Ok(ws.into())
+}
+
+/// Unregister a workspace.
+#[tauri::command]
+pub fn remove_workspace(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    ordius_engine::workspaces::remove(state.engine.home(), &id).map_err(|e| e.to_string())
+}
+
+// ─── Secrets ─────────────────────────────────────────────────────
+
+/// Names of every secret stored in the OS keyring (values never
+/// exposed).
+#[tauri::command]
+pub fn list_secrets(state: tauri::State<'_, AppState>) -> Result<Vec<SecretMetaDto>, String> {
+    let store = state.engine.secrets_store();
+    let names = store.list().map_err(|e| e.to_string())?;
+    Ok(names
+        .into_iter()
+        .map(|name| SecretMetaDto { name })
+        .collect())
+}
+
+/// Store a secret. Empty values are rejected to match the CLI's
+/// safety check.
+#[tauri::command]
+pub fn add_secret(
+    state: tauri::State<'_, AppState>,
+    name: String,
+    value: String,
+) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("refusing to store empty value for {name}"));
+    }
+    let store = state.engine.secrets_store();
+    store.set(&name, &value).map_err(|e| e.to_string())
+}
+
+/// Delete a secret.
+#[tauri::command]
+pub fn remove_secret(state: tauri::State<'_, AppState>, name: String) -> Result<(), String> {
+    let store = state.engine.secrets_store();
+    store.delete(&name).map_err(|e| e.to_string())
+}
+
+// ─── Settings ────────────────────────────────────────────────────
+
+/// Load current settings (returns defaults when no file exists).
+#[tauri::command]
+pub fn get_settings(state: tauri::State<'_, AppState>) -> Result<SettingsDto, String> {
+    Ok(ordius_engine::settings::load(state.engine.home())
+        .map_err(|e| e.to_string())?
+        .into())
+}
+
+/// Save settings, replacing the on-disk file.
+#[tauri::command]
+pub fn set_settings(
+    state: tauri::State<'_, AppState>,
+    settings: SettingsDto,
+) -> Result<(), String> {
+    let engine_settings: EngineSettings = settings.into();
+    ordius_engine::settings::save(state.engine.home(), &engine_settings).map_err(|e| e.to_string())
+}
+
+// ─── System status ───────────────────────────────────────────────
+
+/// Snapshot of engine-side state the GUI surfaces on Home + About.
+#[tauri::command]
+pub fn system_status(state: tauri::State<'_, AppState>) -> Result<SystemStatusDto, String> {
+    let snap = ordius_engine::system_status::snapshot(state.engine.home());
+    // Fold in registered endpoints from settings so the GUI can
+    // render placeholder reachability rows even before pings land.
+    let settings = ordius_engine::settings::load(state.engine.home()).map_err(|e| e.to_string())?;
+    let mut dto: SystemStatusDto = snap.into();
+    dto.endpoints = settings
+        .model_endpoints
+        .into_iter()
+        .map(|e| {
+            // Re-use the ModelEndpointDto conversion just for the
+            // id+name fields; reachability stays `unknown`.
+            let model_dto: ModelEndpointDto = e.into();
+            EndpointStatusDto {
+                id: model_dto.id,
+                name: model_dto.name,
+                state: "unknown".into(),
+            }
+        })
+        .collect();
+    Ok(dto)
+}

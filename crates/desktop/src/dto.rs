@@ -1,0 +1,451 @@
+//! camelCase DTOs at the Tauri boundary.
+//!
+//! The engine speaks `snake_case` on disk and on the wire; the
+//! TypeScript frontend wants `camelCase` per the design handoff
+//! (`docs/UI/Ordius - Handoff.html` §10). Every type exposed to a
+//! Tauri command lives here with `#[serde(rename_all =
+//! "camelCase")]` so the boundary conversion is centralised and
+//! the engine types stay untouched.
+
+use ordius_engine::events::RunEvent;
+use ordius_engine::settings::{ModelEndpoint, Settings};
+use ordius_engine::system_status::{EndpointStatus, SystemStatus};
+use ordius_engine::types::{NodeType, Workflow};
+use ordius_engine::workspaces::Workspace;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// One workflow row in the Home grid + recent-tab dropdown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedWorkflowDto {
+    /// Stable identifier (filename stem).
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Number of triggers declared. 0 → manual-only.
+    pub triggers_count: usize,
+    /// Number of nodes on the graph (for the dashboard subtitle).
+    pub nodes_count: usize,
+}
+
+impl From<&Workflow> for SavedWorkflowDto {
+    fn from(wf: &Workflow) -> Self {
+        Self {
+            id: wf.id.clone(),
+            name: wf.name.clone(),
+            triggers_count: wf.triggers.len(),
+            nodes_count: wf.nodes.len(),
+        }
+    }
+}
+
+/// Full workflow JSON the editor consumes.
+///
+/// Today the engine's `Workflow` already serialises in a way the
+/// frontend can consume (`snake_case` fields). Wrapping it
+/// preserves the camelCase contract: future engine rename pressure
+/// doesn't leak into the GUI, and we get a stable type id on the
+/// TypeScript side.
+pub type WorkflowDto = Workflow;
+
+/// Payload returned from `run_workflow` — the frontend immediately
+/// uses `runId` to subscribe to the live event stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunStartedDto {
+    /// Newly-created run id.
+    pub run_id: String,
+}
+
+/// One row in `runs ls` / history page list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunRowDto {
+    /// Run id.
+    pub run_id: String,
+    /// Workflow this run was executed against.
+    pub workflow_id: String,
+    /// Terminal status — `done` | `error` | `stopped` | `running`.
+    pub status: String,
+    /// Unix millis the run started.
+    pub started_at: i64,
+    /// Unix millis the run finished, or null if still running.
+    pub finished_at: Option<i64>,
+    /// Total run duration in milliseconds.
+    pub duration_ms: Option<i64>,
+    /// How the run was triggered (`cli` | `gui` | `schedule` | `webhook` | `file-watch` | `manual`).
+    pub trigger_kind: String,
+}
+
+/// One `node_runs` row inside a run's detail view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeRunRowDto {
+    /// Node id within the workflow.
+    pub node_id: String,
+    /// Loop iteration (1-based).
+    pub iteration: u32,
+    /// Retry attempt (1-based).
+    pub attempt: u32,
+    /// Node-type id at run time.
+    pub node_type: String,
+    /// Status string.
+    pub status: String,
+    /// Started timestamp (epoch ms).
+    pub started_at: Option<i64>,
+    /// Finished timestamp.
+    pub finished_at: Option<i64>,
+    /// Total duration.
+    pub duration_ms: Option<i64>,
+    /// Error string on failure.
+    pub error: Option<String>,
+}
+
+/// Full run detail returned by `get_run`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunDetailDto {
+    /// Header row.
+    #[serde(flatten)]
+    pub row: RunRowDto,
+    /// Per-node history rows, ordered by `started_at`.
+    pub node_runs: Vec<NodeRunRowDto>,
+}
+
+/// Camel-case node-type spec for the palette + properties panel.
+pub type NodeTypeDto = NodeType;
+
+/// One registered secret. Values are never exposed — just the name
+/// + a first/last 4-char preview the GUI can show.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretMetaDto {
+    /// Secret name as stored in the keyring.
+    pub name: String,
+}
+
+/// One workspace entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceDto {
+    /// UUID id.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Absolute path (already canonicalised).
+    pub path: String,
+}
+
+impl From<Workspace> for WorkspaceDto {
+    fn from(w: Workspace) -> Self {
+        Self {
+            id: w.id,
+            name: w.name,
+            path: w.path.display().to_string(),
+        }
+    }
+}
+
+/// Settings DTO. Mirrors `engine::settings::Settings` field-for-field
+/// but with camelCase serde rename.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsDto {
+    /// `dark` | `light`.
+    pub theme: String,
+    /// `left` | `right`.
+    pub palette_side: String,
+    /// `bezier` | `orthogonal` | `straight`.
+    pub edge_style: String,
+    /// `comfortable` | `rich`.
+    pub density: String,
+    /// `dots` | `lines` | `off`.
+    pub grid: String,
+    /// `jewel` | `citrus` | `glacier`.
+    pub color_scheme: String,
+    /// Max concurrent runs.
+    pub max_concurrent_runs: u32,
+    /// Retention days.
+    pub retention_days: u32,
+    /// Registered model endpoints.
+    pub model_endpoints: Vec<ModelEndpointDto>,
+}
+
+impl From<Settings> for SettingsDto {
+    fn from(s: Settings) -> Self {
+        Self {
+            theme: s.theme,
+            palette_side: s.palette_side,
+            edge_style: s.edge_style,
+            density: s.density,
+            grid: s.grid,
+            color_scheme: s.color_scheme,
+            max_concurrent_runs: s.max_concurrent_runs,
+            retention_days: s.retention_days,
+            model_endpoints: s
+                .model_endpoints
+                .into_iter()
+                .map(ModelEndpointDto::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<SettingsDto> for Settings {
+    fn from(s: SettingsDto) -> Self {
+        Self {
+            theme: s.theme,
+            palette_side: s.palette_side,
+            edge_style: s.edge_style,
+            density: s.density,
+            grid: s.grid,
+            color_scheme: s.color_scheme,
+            max_concurrent_runs: s.max_concurrent_runs,
+            retention_days: s.retention_days,
+            model_endpoints: s
+                .model_endpoints
+                .into_iter()
+                .map(ModelEndpoint::from)
+                .collect(),
+        }
+    }
+}
+
+/// Model endpoint DTO.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelEndpointDto {
+    /// UUID id.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Base URL.
+    pub base_url: String,
+    /// Optional `{{secrets.X}}` template referencing the API key.
+    pub api_key_secret: Option<String>,
+}
+
+impl From<ModelEndpoint> for ModelEndpointDto {
+    fn from(e: ModelEndpoint) -> Self {
+        Self {
+            id: e.id,
+            name: e.name,
+            base_url: e.base_url,
+            api_key_secret: e.api_key_secret,
+        }
+    }
+}
+
+impl From<ModelEndpointDto> for ModelEndpoint {
+    fn from(e: ModelEndpointDto) -> Self {
+        Self {
+            id: e.id,
+            name: e.name,
+            base_url: e.base_url,
+            api_key_secret: e.api_key_secret,
+        }
+    }
+}
+
+/// System status snapshot for the Home left-rail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemStatusDto {
+    /// `runs.db` byte size.
+    pub runs_db_bytes: u64,
+    /// Workspaces dir byte size.
+    pub workspaces_bytes: u64,
+    /// Engine version string.
+    pub engine_version: String,
+    /// Endpoint reachability hints.
+    pub endpoints: Vec<EndpointStatusDto>,
+}
+
+impl From<SystemStatus> for SystemStatusDto {
+    fn from(s: SystemStatus) -> Self {
+        Self {
+            runs_db_bytes: s.runs_db_bytes,
+            workspaces_bytes: s.workspaces_bytes,
+            engine_version: s.engine_version.to_string(),
+            endpoints: s
+                .endpoints
+                .into_iter()
+                .map(EndpointStatusDto::from)
+                .collect(),
+        }
+    }
+}
+
+/// Per-endpoint reachability DTO.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointStatusDto {
+    /// Endpoint id.
+    pub id: String,
+    /// Endpoint name.
+    pub name: String,
+    /// `ok` | `down` | `unknown`.
+    pub state: String,
+}
+
+impl From<EndpointStatus> for EndpointStatusDto {
+    fn from(e: EndpointStatus) -> Self {
+        Self {
+            id: e.id,
+            name: e.name,
+            state: e.state,
+        }
+    }
+}
+
+/// Args for `run_workflow`. Variables map keys are workflow var
+/// names, values come from the `RunDialog` form.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunWorkflowArgs {
+    /// Workflow id to run.
+    pub workflow_id: String,
+    /// Variable overrides (`{{vars.X}}` substitution targets).
+    #[serde(default)]
+    pub variables: HashMap<String, String>,
+    /// Workspace id to run against. `None` → use engine home.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    /// Auto-resume `checkpoint` nodes (`RunDialog` "Yes to all" check).
+    #[serde(default)]
+    pub auto_resume: bool,
+}
+
+/// camelCase `RunEvent` shape forwarded over the streaming channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunEventDto {
+    /// Wire-tag (`workflow:started`, `node:done`, …).
+    #[serde(rename = "type")]
+    pub ty: String,
+    /// Monotonic per-run sequence number.
+    pub seq: u64,
+    /// Wall-clock emission time, Unix epoch milliseconds.
+    pub emitted_at: i64,
+    /// Run id.
+    pub run_id: String,
+    /// Optional node id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    /// Loop iteration (1-based) the event was emitted under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iteration: Option<u32>,
+    /// Retry attempt (1-based) the event was emitted under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// Free-form payload. Keys arrive `snake_case` from the engine
+    /// (`workflow:started` → `workflow_id` / `workflow_name` /
+    /// `trigger_kind`) so we re-key here on emit.
+    #[serde(flatten)]
+    pub payload: HashMap<String, serde_json::Value>,
+}
+
+impl From<RunEvent> for RunEventDto {
+    fn from(ev: RunEvent) -> Self {
+        // Convert payload keys snake_case → camelCase shallowly. The
+        // engine payloads use snake_case so the recorder JSON column
+        // stays stable; the wire layer is camelCase per the handoff.
+        let payload = ev
+            .payload
+            .into_iter()
+            .map(|(k, v)| (snake_to_camel(&k), v))
+            .collect();
+        Self {
+            ty: ev.ty.wire_tag().to_string(),
+            seq: ev.seq,
+            emitted_at: ev.emitted_at,
+            run_id: ev.run_id,
+            node_id: ev.node_id,
+            iteration: ev.iteration,
+            attempt: ev.attempt,
+            payload,
+        }
+    }
+}
+
+/// Convert `snake_case` to `camelCase`. ASCII only.
+fn snake_to_camel(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut upper_next = false;
+    for ch in input.chars() {
+        if ch == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.extend(ch.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ordius_engine::events::EventType;
+
+    #[test]
+    fn snake_to_camel_handles_common_keys() {
+        assert_eq!(snake_to_camel("workflow_id"), "workflowId");
+        assert_eq!(snake_to_camel("node_type"), "nodeType");
+        assert_eq!(snake_to_camel("started_at"), "startedAt");
+        assert_eq!(snake_to_camel("text"), "text");
+        assert_eq!(snake_to_camel("__double"), "Double");
+    }
+
+    #[test]
+    fn run_event_dto_renames_top_level_fields() {
+        let ev = RunEvent {
+            ty: EventType::NodeDone,
+            seq: 7,
+            emitted_at: 1_700_000_000_000,
+            run_id: "r1".into(),
+            node_id: Some("n1".into()),
+            iteration: Some(2),
+            attempt: Some(3),
+            payload: HashMap::from([
+                (
+                    "finished_at".to_string(),
+                    serde_json::json!(1_700_000_001_000_i64),
+                ),
+                ("duration_ms".to_string(), serde_json::json!(1000_i64)),
+            ]),
+        };
+        let dto: RunEventDto = ev.into();
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(json.contains(r#""runId":"r1""#));
+        assert!(json.contains(r#""nodeId":"n1""#));
+        assert!(json.contains(r#""emittedAt":1700000000000"#));
+        assert!(json.contains(r#""finishedAt":1700000001000"#));
+        assert!(json.contains(r#""durationMs":1000"#));
+        assert!(json.contains(r#""type":"node:done""#));
+    }
+
+    #[test]
+    fn settings_round_trip_preserves_fields() {
+        let original = Settings {
+            theme: "light".into(),
+            max_concurrent_runs: 16,
+            ..Settings::default()
+        };
+        let dto: SettingsDto = original.clone().into();
+        let back: Settings = dto.into();
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn secret_meta_serializes_camel_case() {
+        let dto = SecretMetaDto {
+            name: "API_KEY".into(),
+        };
+        let json = serde_json::to_string(&dto).unwrap();
+        assert_eq!(json, r#"{"name":"API_KEY"}"#);
+    }
+}
