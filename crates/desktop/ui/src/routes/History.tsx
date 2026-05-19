@@ -16,6 +16,7 @@ import { StatusRibbon } from "../components/home/StatusRibbon";
 import { fmtDuration } from "../lib/format";
 import type { Route } from "../lib/router";
 import { demoHistoryRuns } from "../data/demoHistory";
+import { NoticeBanner } from "../components/NoticeBanner";
 
 interface Props {
   theme: "dark" | "light";
@@ -179,20 +180,8 @@ export function History({ theme, onThemeToggle, onNavigate }: Props): JSX.Elemen
           </h1>
 
           {error ? (
-            <div
-              style={{
-                margin: "16px 0",
-                padding: "8px 12px",
-                fontFamily: "var(--mono)",
-                fontSize: 11,
-                color: "var(--warn)",
-                background: "var(--bg-canvas)",
-                border: "1px dashed var(--line)",
-                borderRadius: 3,
-              }}
-            >
-              <span style={{ color: "var(--warn)" }}>! </span>
-              {error}
+            <div style={{ marginTop: 16 }}>
+              <NoticeBanner message={error} />
             </div>
           ) : null}
 

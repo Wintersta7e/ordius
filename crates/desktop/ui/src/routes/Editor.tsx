@@ -40,6 +40,7 @@ import {
   type LiveRunState,
 } from "../components/run";
 import { RunDialog } from "../components/dialogs";
+import { NoticeBanner } from "../components/NoticeBanner";
 import type { Route } from "../lib/router";
 
 interface Props {
@@ -441,27 +442,7 @@ export function Editor({
                 : `loading ${activeId}…`}
             </div>
           )}
-          {error ? (
-            <div
-              style={{
-                position: "absolute",
-                top: 10,
-                left: 10,
-                right: 10,
-                padding: "8px 12px",
-                fontFamily: "var(--mono)",
-                fontSize: 11,
-                color: "var(--warn)",
-                background: "var(--bg-canvas)",
-                border: "1px dashed var(--line)",
-                borderRadius: 3,
-                pointerEvents: "none",
-              }}
-            >
-              <span style={{ color: "var(--warn)" }}>! </span>
-              {error}
-            </div>
-          ) : null}
+          {error ? <NoticeBanner message={error} variant="overlay" /> : null}
         </section>
 
         {/* Right column — Properties in editor mode, RunPanel in run mode */}

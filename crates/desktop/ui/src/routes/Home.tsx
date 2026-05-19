@@ -39,6 +39,7 @@ import { RecentRunRow } from "../components/home/RecentRunRow";
 import { SectionTitle } from "../components/SectionTitle";
 import { StatusRibbon } from "../components/home/StatusRibbon";
 import { demoHomeData } from "../data/demoHome";
+import { NoticeBanner } from "../components/NoticeBanner";
 
 type SortKey = "recent" | "name" | "runs";
 
@@ -246,19 +247,10 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
               maxWidth: 1280,
               margin: "8px auto 0",
               width: "100%",
-              padding: "8px 12px",
-              fontFamily: "var(--mono)",
-              fontSize: 11,
-              color: "var(--warn)",
-              background: "var(--bg-canvas)",
-              border: "1px dashed var(--line)",
-              borderRadius: 3,
-              maxInlineSize: 1208,
-              marginInline: "auto",
+              paddingInline: 36,
             }}
           >
-            <span style={{ color: "var(--warn)" }}>! </span>
-            {error}
+            <NoticeBanner message={error} />
           </div>
         ) : null}
 

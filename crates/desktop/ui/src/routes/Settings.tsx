@@ -23,6 +23,7 @@ import {
 import { TopBar } from "../components/chrome/TopBar";
 import { SectionTitle } from "../components/SectionTitle";
 import { StatusRibbon } from "../components/home/StatusRibbon";
+import { NoticeBanner } from "../components/NoticeBanner";
 import {
   Field,
   KV,
@@ -264,23 +265,7 @@ export function Settings({ theme, onThemeToggle }: Props): JSX.Element {
             margin: "0 auto",
           }}
         >
-          {error ? (
-            <div
-              style={{
-                margin: "8px 0 18px",
-                padding: "8px 12px",
-                fontFamily: "var(--mono)",
-                fontSize: 11,
-                color: "var(--warn)",
-                background: "var(--bg-canvas)",
-                border: "1px dashed var(--line)",
-                borderRadius: 3,
-              }}
-            >
-              <span style={{ color: "var(--warn)" }}>! </span>
-              {error}
-            </div>
-          ) : null}
+          {error ? <NoticeBanner message={error} /> : null}
 
           {(() => {
             const idx = SECTIONS.findIndex((s) => s.id === active);
