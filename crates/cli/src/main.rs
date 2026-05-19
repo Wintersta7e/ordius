@@ -9,6 +9,7 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ordius_engine::registry::Registry;
+use ordius_engine::types::Workflow;
 use ordius_engine::types::{Category, NodeType};
 use ordius_engine::{Store, load_workflow, validate};
 use std::collections::HashMap;
@@ -219,7 +220,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<u8> {
         Cmd::Workflows { sub } => cmd_workflows(sub, &home),
         Cmd::Nodes { sub } => cmd_nodes(sub, json),
         Cmd::Secrets { sub } => cmd_secrets(sub, &home),
-        Cmd::Run(_) | Cmd::Runs { .. } | Cmd::Export { .. } | Cmd::Import { .. } | Cmd::Gui => {
+        Cmd::Export { id } => cmd_export(&home, &id),
+        Cmd::Import { as_id } => cmd_import(&home, as_id.as_deref()),
+        Cmd::Run(_) | Cmd::Runs { .. } | Cmd::Gui => {
             anyhow::bail!("subcommand not yet wired in this build");
         },
     }
@@ -496,6 +499,50 @@ fn secrets_rm(store: &Store, name: &str, force: bool) -> anyhow::Result<u8> {
     store.delete(name).context("delete secret from keyring")?;
     println!("removed {name}");
     Ok(0)
+}
+
+fn cmd_export(home: &Path, id: &str) -> anyhow::Result<u8> {
+    let path = workflow_path(home, id);
+    let wf = load_workflow(&path)
+        .with_context(|| format!("load workflow {id} from {}", path.display()))?;
+    let json =
+        serde_json::to_string_pretty(&wf).with_context(|| format!("serialise workflow {id}"))?;
+    println!("{json}");
+    Ok(0)
+}
+
+fn cmd_import(home: &Path, as_id: Option<&str>) -> anyhow::Result<u8> {
+    use std::io::Read;
+    let mut buf = String::new();
+    io::stdin()
+        .read_to_string(&mut buf)
+        .context("read workflow from stdin")?;
+    let mut wf = parse_workflow_str(&buf).context("parse stdin workflow")?;
+    if let Some(new_id) = as_id {
+        wf.id = new_id.to_string();
+    }
+    validate(&wf).with_context(|| format!("validate workflow {}", wf.id))?;
+    let dir = workflows_dir(home);
+    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = workflow_path(home, &wf.id);
+    let json = serde_json::to_string_pretty(&wf)
+        .with_context(|| format!("serialise workflow {}", wf.id))?;
+    fs::write(&path, json).with_context(|| format!("write {}", path.display()))?;
+    println!("imported {} → {}", wf.id, path.display());
+    Ok(0)
+}
+
+fn parse_workflow_str(body: &str) -> anyhow::Result<Workflow> {
+    // Sniff by first non-whitespace char: `{` or `[` is JSON, anything
+    // else is YAML. JSON is a strict subset of YAML 1.2 so we could
+    // route everything through serde_yaml, but that obscures parse
+    // errors for JSON-only callers.
+    let first = body.trim_start().chars().next();
+    if matches!(first, Some('{' | '[')) {
+        serde_json::from_str(body).context("parse as JSON")
+    } else {
+        serde_yaml::from_str(body).context("parse as YAML")
+    }
 }
 
 fn confirm(prompt: &str) -> anyhow::Result<bool> {

@@ -2591,6 +2591,7 @@ dependencies = [
  "predicates",
  "rpassword",
  "serde_json",
+ "serde_yaml_ng",
  "tempfile",
  "tokio",
  "tracing",
