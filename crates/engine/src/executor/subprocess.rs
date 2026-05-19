@@ -316,7 +316,10 @@ where
         let mut acc = Vec::new();
         let mut reader = BufReader::new(p).lines();
         while let Ok(Some(line)) = reader.next_line().await {
-            let mut payload: HashMap<String, serde_json::Value> = HashMap::new();
+            // Pre-size for the exact (channel, text) pair we insert
+            // below — avoids the default 0 → 4 grow on a per-line
+            // hot path.
+            let mut payload: HashMap<String, serde_json::Value> = HashMap::with_capacity(2);
             payload.insert(
                 KEY_CHANNEL.into(),
                 serde_json::Value::String(channel.into()),
