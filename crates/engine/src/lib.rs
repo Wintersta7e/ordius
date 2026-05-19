@@ -83,11 +83,11 @@ pub struct Engine {
 impl Engine {
     /// Construct the engine: open `runs.db` in `home`, apply
     /// migrations, sweep stale `workflow_locks` from prior
-    /// crashes, and pre-load the v1.0 built-ins.
+    /// crashes, pre-load the v1.0 built-ins, and merge any custom
+    /// manifests from `<home>/node-types/`.
     ///
-    /// The signature is async because future custom-manifest
-    /// loading (`~/.ordius/node-types/`) will await disk IO; the
-    /// body is sync today.
+    /// The signature is async because future manifest loading may
+    /// want to await disk IO; the body is sync today.
     #[allow(clippy::unused_async)]
     pub async fn new(home: PathBuf) -> Result<Self> {
         let db_path = home.join("runs.db");
@@ -103,9 +103,17 @@ impl Engine {
             tracing::warn!(swept, "swept stale workflow locks from prior crash");
         }
         let secrets_store = Arc::new(Store::with_index_path(home.join("secrets-index.json")));
+        // Built-ins land first; manifests register on top of them.
+        // Duplicate-id checks inside load_into ensure a manifest
+        // cannot overwrite a built-in spec.
+        let mut registry = Registry::with_v1_0_builtins();
+        let manifest_errs = manifests::load_into(&mut registry, home.join("node-types"));
+        for err in &manifest_errs {
+            tracing::warn!(error = %err, "manifest load issue");
+        }
         Ok(Self {
             pool,
-            registry: Arc::new(Registry::with_v1_0_builtins()),
+            registry: Arc::new(registry),
             checkpoints: Arc::new(CheckpointRegistry::new()),
             home,
             secrets_store,
