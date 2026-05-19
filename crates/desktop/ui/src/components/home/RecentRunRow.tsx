@@ -112,7 +112,7 @@ export function RecentRunRow({ run, workflowName, last, now }: Props): JSX.Eleme
         className="num"
         title={run.runId}
       >
-        {run.runId.slice(0, 8)}
+        {run.runId.length > 14 ? `${run.runId.slice(0, 12)}…` : run.runId}
       </span>
     </div>
   );

@@ -38,6 +38,7 @@ import {
 import { RecentRunRow } from "../components/home/RecentRunRow";
 import { SectionTitle } from "../components/SectionTitle";
 import { StatusRibbon } from "../components/home/StatusRibbon";
+import { demoHomeData } from "../data/demoHome";
 
 type SortKey = "recent" | "name" | "runs";
 
@@ -82,6 +83,11 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
       setError(
         "running in browser preview · engine commands disabled — launch via `tauri dev` to load real data",
       );
+      const demo = demoHomeData(Date.now());
+      setWorkflows(demo.workflows);
+      setRuns(demo.runs);
+      setWorkspaces(demo.workspaces);
+      setStatus(demo.status);
       return;
     }
     try {
@@ -122,12 +128,12 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
       return {
         id: wf.id,
         name: wf.name,
-        // Workflow shape doesn't carry desc/category yet — derive a
-        // useful one-liner from the data we do have.
-        desc: `${wf.nodesCount} nodes · ${
-          wf.triggersCount === 0 ? "manual-only" : `${wf.triggersCount} triggers`
-        }`,
-        category: "control",
+        desc:
+          wf.description ??
+          `${wf.nodesCount} nodes · ${
+            wf.triggersCount === 0 ? "manual-only" : `${wf.triggersCount} triggers`
+          }`,
+        category: wf.category ?? "control",
         triggerKinds:
           wf.triggersCount === 0
             ? ["manual"]

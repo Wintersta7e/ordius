@@ -267,9 +267,9 @@ export function WorkflowCard({ workflow, onOpen, onRun }: Props): JSX.Element {
               manual
             </span>
           ) : (
-            w.triggerKinds.map((trigger) => (
+            w.triggerKinds.map((trigger, i) => (
               <span
-                key={trigger}
+                key={`${trigger}-${i}`}
                 style={{
                   padding: "1px 6px",
                   borderRadius: 2,

@@ -21,6 +21,10 @@ export default defineConfig({
     watch: {
       // Tauri's Rust side has its own watcher; don't double-watch.
       ignored: ["**/src-tauri/**"],
+      // /mnt/c lives on the Windows side under WSL2 — inotify doesn't
+      // see writes there, so polling is required for HMR.
+      usePolling: true,
+      interval: 400,
     },
   },
   envPrefix: ["VITE_", "TAURI_ENV_*"],

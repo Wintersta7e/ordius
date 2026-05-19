@@ -139,6 +139,10 @@ export interface SavedWorkflow {
   name: string;
   triggersCount: number;
   nodesCount: number;
+  /** Dominant category from contained nodes — used for card accent. */
+  category?: Category;
+  /** Optional one-liner shown under the card title. */
+  description?: string;
 }
 
 export interface RunStarted {

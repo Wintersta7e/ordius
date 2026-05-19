@@ -19,6 +19,8 @@
 
 # Phase screenshots (visual verification artefacts, not source)
 /phase-*.png
+/ordius-*.png
+/mockup-*.png
 
 # Distribution
 /dist/

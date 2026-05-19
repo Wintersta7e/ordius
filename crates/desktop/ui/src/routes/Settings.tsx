@@ -73,6 +73,23 @@ export function Settings({ theme, onThemeToggle }: Props): JSX.Element {
       setError(
         "running in browser preview · engine commands disabled — launch via `tauri dev` to edit real settings",
       );
+      setSettingsState({
+        theme,
+        paletteSide: "left",
+        edgeStyle: "bezier",
+        density: "comfortable",
+        grid: "dots",
+        colorScheme: "jewel",
+        maxConcurrentRuns: 3,
+        retentionDays: 30,
+        modelEndpoints: [],
+      });
+      setStatus({
+        runsDbBytes: 0,
+        workspacesBytes: 0,
+        engineVersion: "preview",
+        endpoints: [],
+      });
       return;
     }
     try {
