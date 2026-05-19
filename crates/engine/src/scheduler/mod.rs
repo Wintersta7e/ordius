@@ -22,7 +22,6 @@ pub struct Scheduler<'a> {
     pub(crate) loops_by_condition: HashMap<&'a str, Vec<&'a Edge>>,
     pub(crate) state: HashMap<String, NodeState>,
     pub(crate) loop_counters: HashMap<String, u32>,
-    #[expect(dead_code, reason = "consumed by skip-event drainer")]
     pub(crate) emitted_skipped: HashSet<String>,
 }
 
@@ -249,6 +248,22 @@ impl<'a> Scheduler<'a> {
                 }
             }
             out.push(cur);
+        }
+        out
+    }
+
+    /// Return ids of nodes that have transitioned to `Skipped`
+    /// since the last call. Each id is reported at most once
+    /// across the lifetime of the scheduler — the run-loop uses
+    /// this to emit exactly one `node:skipped` event per
+    /// transition.
+    pub fn drain_newly_skipped(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        for n in self.nodes {
+            if self.state_of(&n.id) == NodeState::Skipped && !self.emitted_skipped.contains(&n.id) {
+                self.emitted_skipped.insert(n.id.clone());
+                out.push(n.id.clone());
+            }
         }
         out
     }

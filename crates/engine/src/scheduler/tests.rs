@@ -187,6 +187,40 @@ fn try_loop_returns_none_for_node_with_no_loop_edges() {
 }
 
 #[test]
+fn drain_newly_skipped_is_idempotent() {
+    let w = wf(
+        vec![node("a"), node("b"), node("c")],
+        vec![fwd("e1", "a", "b"), fwd("e2", "b", "c")],
+    );
+    let mut s = Scheduler::new(&w);
+    s.fail_node("a");
+    let first = s.drain_newly_skipped();
+    assert!(first.iter().any(|id| id == "b"));
+    assert!(first.iter().any(|id| id == "c"));
+    assert!(s.drain_newly_skipped().is_empty());
+}
+
+#[test]
+fn drain_newly_skipped_reports_each_id_once_across_calls() {
+    // Two disconnected chains so each fail affects only one of
+    // them — confirms the second call doesn't re-report ids that
+    // were already drained in the first.
+    let w = wf(
+        vec![node("a"), node("b"), node("c"), node("d")],
+        vec![fwd("e1", "a", "b"), fwd("e2", "c", "d")],
+    );
+    let mut s = Scheduler::new(&w);
+    s.fail_node("a");
+    let first = s.drain_newly_skipped();
+    assert!(first.iter().any(|id| id == "b"));
+    assert!(first.iter().all(|id| id != "d"));
+    s.fail_node("c");
+    let second = s.drain_newly_skipped();
+    assert!(second.iter().any(|id| id == "d"));
+    assert!(second.iter().all(|id| id != "b"));
+}
+
+#[test]
 fn is_done_when_all_terminal() {
     let w = wf(vec![node("a"), node("b")], vec![fwd("e", "a", "b")]);
     let mut s = Scheduler::new(&w);
