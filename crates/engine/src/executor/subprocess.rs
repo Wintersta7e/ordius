@@ -148,6 +148,25 @@ impl NodeExecutor for SubprocessExecutor {
 // Shared types
 // =====================================================================
 
+/// Wrap a user-authored shell script into the per-platform argv
+/// that runs it: `bash -c <script>` on Unix, `cmd /C <script>` on
+/// Windows. The script reaches the shell verbatim so compound
+/// forms (`for` / `if` / pipes) parse correctly.
+#[cfg(unix)]
+fn shell_argv_for_platform(script: String) -> Vec<String> {
+    vec!["bash".into(), "-c".into(), script]
+}
+
+#[cfg(windows)]
+fn shell_argv_for_platform(script: String) -> Vec<String> {
+    vec!["cmd".into(), "/C".into(), script]
+}
+
+#[cfg(not(any(unix, windows)))]
+fn shell_argv_for_platform(_script: String) -> Vec<String> {
+    Vec::new()
+}
+
 /// Owned substitution outputs handed from the sync prep phase
 /// into the async spawn phase.
 struct ResolvedInputs {
@@ -187,12 +206,28 @@ fn resolve_templated_inputs(
         workflow_name: &ctx.workflow_name,
     };
 
-    let argv: Vec<String> = nt
-        .execution
-        .command
-        .iter()
-        .map(|s| substitute(s, &subctx).map_err(|e| NodeError::Template(e.to_string())))
-        .collect::<Result<_, _>>()?;
+    let argv: Vec<String> = if nt.id == "shell" {
+        // shell built-in: config.command is the user's free-form
+        // shell script, substituted once and then handed to the
+        // platform shell as -c / /C.
+        //
+        // We pass cmd_str as the script (not via positional $1)
+        // so compound shell forms (for/while/if/pipes) parse the
+        // text as code, with parameter expansion happening after.
+        let raw = node
+            .config
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| NodeError::Config("shell: config.command (string) required".into()))?;
+        let cmd_str = substitute(raw, &subctx).map_err(|e| NodeError::Template(e.to_string()))?;
+        shell_argv_for_platform(cmd_str)
+    } else {
+        nt.execution
+            .command
+            .iter()
+            .map(|s| substitute(s, &subctx).map_err(|e| NodeError::Template(e.to_string())))
+            .collect::<Result<_, _>>()?
+    };
 
     let env_pairs: Vec<(String, String)> = nt
         .execution
@@ -929,6 +964,92 @@ mod tests {
         match err {
             NodeError::Other(msg) => assert!(msg.contains("json"), "msg = {msg}"),
             other => panic!("expected NodeError::Other, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shell_builtin_runs_bash_with_substituted_command() {
+        use crate::registry::Registry;
+
+        let (ctx, _rx, _dir) = test_ctx();
+        let reg = Registry::with_v1_0_builtins();
+        let nt = reg.get("shell").expect("shell built-in registered");
+
+        let mut node = trivial_node();
+        node.ty = "shell".into();
+        node.config.insert(
+            "command".into(),
+            serde_json::Value::String("echo hello {{vars.who}}".into()),
+        );
+
+        let mut ctx_owned = ctx;
+        ctx_owned.variables.insert("who".into(), "ordius".into());
+
+        let res = SubprocessExecutor
+            .run(&node, &nt, &ctx_owned, CancellationToken::new())
+            .await
+            .expect("shell should exit 0");
+
+        assert_eq!(
+            res.get("text"),
+            Some(&PortValue::String("hello ordius".into()))
+        );
+        assert_eq!(res.get("exit_code"), Some(&PortValue::Number(0.0)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shell_builtin_supports_compound_forms() {
+        use crate::registry::Registry;
+
+        let (ctx, _rx, _dir) = test_ctx();
+        let reg = Registry::with_v1_0_builtins();
+        let nt = reg.get("shell").expect("shell built-in registered");
+
+        let mut node = trivial_node();
+        node.ty = "shell".into();
+        node.config.insert(
+            "command".into(),
+            serde_json::Value::String("for i in 1 2 3; do echo \"row $i\"; done | wc -l".into()),
+        );
+
+        let res = SubprocessExecutor
+            .run(&node, &nt, &ctx, CancellationToken::new())
+            .await
+            .expect("compound shell should run");
+
+        // `wc -l` prints a count; strip surrounding whitespace then compare.
+        let text = match res.get("text") {
+            Some(PortValue::String(s)) => s.trim().to_string(),
+            other => panic!("expected text port, got {other:?}"),
+        };
+        assert_eq!(text, "3");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shell_builtin_missing_command_errors() {
+        use crate::registry::Registry;
+
+        let (ctx, _rx, _dir) = test_ctx();
+        let reg = Registry::with_v1_0_builtins();
+        let nt = reg.get("shell").expect("shell built-in registered");
+
+        let mut node = trivial_node();
+        node.ty = "shell".into();
+        // config.command intentionally absent.
+
+        let err = SubprocessExecutor
+            .run(&node, &nt, &ctx, CancellationToken::new())
+            .await
+            .expect_err("missing command must fail");
+
+        match err {
+            NodeError::Config(msg) => {
+                assert!(msg.contains("command"), "msg = {msg}");
+            },
+            other => panic!("expected NodeError::Config, got {other:?}"),
         }
     }
 

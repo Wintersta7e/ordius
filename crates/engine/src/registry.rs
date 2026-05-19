@@ -3,7 +3,10 @@
 //! Built-ins are inserted at startup via [`Registry::with_v1_0_builtins`];
 //! manifest-loaded types land here once the manifest loader ships.
 
-use crate::types::{Category, ExecutionBackend, ExecutionSpec, NodeType, OutputParse};
+use crate::types::{
+    Category, ConfigFieldDef, ConfigFieldType, ExecutionBackend, ExecutionSpec, NodeType,
+    OutputParse, PortDef, PortType,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -49,6 +52,7 @@ impl Registry {
         r.register(delay_spec());
         r.register(transform_spec());
         r.register(condition_spec());
+        r.register(shell_spec());
         r
     }
 }
@@ -107,5 +111,54 @@ fn condition_spec() -> NodeType {
         outputs: vec![],
         config: vec![],
         execution: in_process_execution_spec(),
+    }
+}
+
+/// `shell` built-in: run a free-form shell command via `bash -c`
+/// on Unix and `cmd /C` on Windows. The user's `config.command` is
+/// passed as the shell's `-c` / `/C` argument (so compound forms
+/// like `for`/`if`/pipes work), after going through the unified
+/// template engine first.
+fn shell_spec() -> NodeType {
+    NodeType {
+        id: "shell".into(),
+        name: "Shell".into(),
+        category: Category::Execution,
+        tags: vec![],
+        icon: "terminal".into(),
+        description: "Run a shell command (bash on Unix, cmd on Windows). \
+                      Captures stdout/stderr + exit code."
+            .into(),
+        inputs: vec![],
+        outputs: vec![
+            PortDef {
+                name: "text".into(),
+                ty: PortType::String,
+                required: false,
+            },
+            PortDef {
+                name: "exit_code".into(),
+                ty: PortType::Number,
+                required: false,
+            },
+        ],
+        config: vec![ConfigFieldDef {
+            name: "command".into(),
+            label: "Command".into(),
+            ty: ConfigFieldType::Textarea,
+            default: None,
+            required: true,
+        }],
+        execution: ExecutionSpec {
+            backend: ExecutionBackend::Subprocess,
+            // SubprocessExecutor special-cases `id == "shell"` and
+            // wraps config.command in the per-platform shell argv.
+            command: vec![],
+            stdin_template: None,
+            env: HashMap::new(),
+            timeout_ms: None,
+            output_parse: OutputParse::Text,
+            output_map: HashMap::new(),
+        },
     }
 }
