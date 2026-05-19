@@ -260,7 +260,7 @@ impl Engine {
                     variables: variables.clone(),
                     recorder: recorder.clone(),
                     emitter: emitter.clone(),
-                    secrets_store: None,
+                    secrets_store: Some(self.secrets_store()),
                     env: wrap_process_env(),
                     current_inputs,
                     upstream_outputs: upstream_outputs.clone(),
@@ -291,6 +291,7 @@ impl Engine {
                     Ok(outputs) => {
                         persist_node_outputs(
                             &recorder,
+                            &emitter,
                             &mut upstream_outputs,
                             &node.id,
                             iteration,
@@ -581,16 +582,28 @@ const fn retry_matches(retry_on: RetryOn, err: &NodeError) -> bool {
 /// `node:done` event the run loop emits with `attempt=2`. Earlier
 /// failed attempts have their own `node_runs` rows but no
 /// `node_outputs` (failures don't produce outputs).
+///
+/// Persisted values are redacted against the emitter's accumulated
+/// secret values the same way `node:output` events are — otherwise
+/// a `{{secrets.X}}` substitution that lands on a port would leak
+/// the raw secret into `node_outputs.value_inline`.
 fn persist_node_outputs(
     recorder: &RunRecorder,
+    emitter: &Emitter,
     upstream_outputs: &mut HashMap<(String, String), PortValue>,
     node_id: &str,
     iteration: u32,
     attempt: u32,
     outputs: &crate::executor::NodeOutputs,
 ) -> Result<()> {
+    let secrets = emitter.accumulated_secrets();
     for (port_name, value) in outputs {
-        let value_json = serde_json::to_string(value)
+        let value_for_storage = if secrets.is_empty() {
+            value.clone()
+        } else {
+            redact_port_value(value, &secrets)
+        };
+        let value_json = serde_json::to_string(&value_for_storage)
             .map_err(|e| EngineError::Db(format!("encode output: {e}")))?;
         recorder.record_node_output(
             node_id,
@@ -600,9 +613,48 @@ fn persist_node_outputs(
             Some(&value_json),
             None,
         )?;
+        // upstream_outputs feeds downstream executors verbatim — we
+        // need the original (un-redacted) value there, otherwise a
+        // chained transform that consumes the secret can't see it.
+        // Redaction is a presentation/persistence concern only.
         upstream_outputs.insert((node_id.to_string(), port_name.clone()), value.clone());
     }
     Ok(())
+}
+
+/// Apply `redact_secrets` to every string anywhere inside a
+/// `PortValue`. Numbers / bools / null are returned verbatim; JSON
+/// values walk recursively. The recursion depth is bounded by
+/// `serde_json`'s own depth limit, so adversarial inputs can't blow
+/// the stack here any more than they can during deserialisation.
+fn redact_port_value(value: &PortValue, secrets: &[(String, String)]) -> PortValue {
+    match value {
+        PortValue::String(s) => PortValue::String(crate::secrets::redact_secrets(s, secrets)),
+        PortValue::Json(j) => PortValue::Json(redact_json_value(j, secrets)),
+        other => other.clone(),
+    }
+}
+
+fn redact_json_value(value: &serde_json::Value, secrets: &[(String, String)]) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => {
+            serde_json::Value::String(crate::secrets::redact_secrets(s, secrets))
+        },
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|i| redact_json_value(i, secrets))
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                out.insert(k.clone(), redact_json_value(v, secrets));
+            }
+            serde_json::Value::Object(out)
+        },
+        other => other.clone(),
+    }
 }
 
 /// Shared `done` / `error` finalisation: update the `node_runs`
@@ -706,6 +758,94 @@ mod tests {
         }
     }
 
+    /// Regression test for Codex finding D: `persist_node_outputs`
+    /// must redact `PortValue::String` against the emitter's
+    /// accumulated secrets, otherwise a `{{secrets.X}}` substitution
+    /// that lands on a port would persist the raw value in
+    /// `node_outputs.value_inline`. The emitter already redacts
+    /// `node:output` events, but the recorder write path was
+    /// silently bypassing redaction.
+    #[test]
+    fn persist_node_outputs_redacts_secrets_in_string_ports() {
+        let dir = TempDir::new().unwrap();
+        let pool = crate::db::open(dir.path().join("runs.db")).unwrap();
+        let wf = minimal_workflow();
+        let recorder =
+            RunRecorder::start(pool.clone(), &wf, "{}", &HashMap::new(), "test").unwrap();
+        let run_id = recorder.run_id.clone();
+        recorder
+            .record_node_run(&NodeRunRow {
+                node_id: "n1",
+                iteration: 1,
+                attempt: 1,
+                node_type: "transform",
+                status: "done",
+                started_at: Some(0),
+                finished_at: Some(1),
+                duration_ms: Some(1),
+                output_summary: None,
+                error: None,
+            })
+            .unwrap();
+        let (em, _rx) = Emitter::new(Arc::new(recorder));
+        em.register_secret("MY_KEY".into(), "deadbeef".into());
+
+        // Output port carries a value that contains the secret as a
+        // substring. The persisted value_inline must come out
+        // redacted; upstream_outputs feeds downstream executors and
+        // stays verbatim so dataflow keeps working.
+        let mut outputs: crate::executor::NodeOutputs = HashMap::new();
+        outputs.insert(
+            "text".to_string(),
+            PortValue::String("key=deadbeef trailing".into()),
+        );
+        let mut upstream: HashMap<(String, String), PortValue> = HashMap::new();
+        let recorder2 =
+            RunRecorder::start(pool.clone(), &wf, "{}", &HashMap::new(), "test").unwrap();
+        let run_id2 = recorder2.run_id.clone();
+        recorder2
+            .record_node_run(&NodeRunRow {
+                node_id: "n1",
+                iteration: 1,
+                attempt: 1,
+                node_type: "transform",
+                status: "done",
+                started_at: Some(0),
+                finished_at: Some(1),
+                duration_ms: Some(1),
+                output_summary: None,
+                error: None,
+            })
+            .unwrap();
+        persist_node_outputs(&recorder2, &em, &mut upstream, "n1", 1, 1, &outputs).unwrap();
+
+        let conn = pool.get().unwrap();
+        let stored: String = conn
+            .prepare("SELECT value_inline FROM node_outputs WHERE run_id=? AND node_id=? AND port_name=?")
+            .unwrap()
+            .query_row(rusqlite::params![&run_id2, "n1", "text"], |r| r.get(0))
+            .unwrap();
+        assert!(
+            !stored.contains("deadbeef"),
+            "raw secret leaked into node_outputs row: {stored}",
+        );
+        assert!(
+            stored.contains("<redacted:MY_KEY>"),
+            "expected redaction marker, got: {stored}",
+        );
+        // upstream_outputs is the inter-node dataflow channel — it
+        // must NOT be redacted, otherwise a chained transform that
+        // consumes the secret would read the redaction marker.
+        let still_raw = upstream
+            .get(&("n1".to_string(), "text".to_string()))
+            .unwrap();
+        match still_raw {
+            PortValue::String(s) => assert!(s.contains("deadbeef"), "upstream got redacted: {s}"),
+            other => panic!("expected PortValue::String, got {other:?}"),
+        }
+        drop(run_id);
+    }
+
     /// Regression test for the bug Codex flagged: `persist_node_outputs`
     /// hard-coded `attempt=1` when recording `node_outputs`. After a
     /// retry that succeeds on attempt 2 the `node:done` event reported
@@ -744,7 +884,10 @@ mod tests {
         let mut outputs: crate::executor::NodeOutputs = HashMap::new();
         outputs.insert("text".to_string(), PortValue::String("hello".into()));
         let mut upstream: HashMap<(String, String), PortValue> = HashMap::new();
-        persist_node_outputs(&recorder, &mut upstream, "n1", 1, 2, &outputs).unwrap();
+        let (em, _rx) = Emitter::new(Arc::new(
+            RunRecorder::start(pool.clone(), &wf, "{}", &HashMap::new(), "test").unwrap(),
+        ));
+        persist_node_outputs(&recorder, &em, &mut upstream, "n1", 1, 2, &outputs).unwrap();
 
         let conn = pool.get().unwrap();
         let attempt: u32 = conn

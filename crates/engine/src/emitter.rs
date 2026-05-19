@@ -75,6 +75,19 @@ impl Emitter {
         }
     }
 
+    /// Snapshot of every secret the run has touched so far. The
+    /// run loop reuses this list to redact `node_outputs` writes
+    /// the same way emitted events get redacted — otherwise a
+    /// `{{secrets.X}}` value ending up in a port's `PortValue::String`
+    /// would land in `SQLite` verbatim.
+    #[must_use]
+    pub fn accumulated_secrets(&self) -> Vec<(String, String)> {
+        self.redaction
+            .lock()
+            .expect("emitter redaction mutex poisoned")
+            .clone()
+    }
+
     /// Emit a workflow-level event with no associated node. Thin
     /// wrapper around [`Self::emit`] that fills the node-scoped
     /// positional fields with `None`.

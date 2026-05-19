@@ -70,6 +70,7 @@ pub struct Engine {
     registry: Arc<Registry>,
     checkpoints: Arc<CheckpointRegistry>,
     home: PathBuf,
+    secrets_store: Arc<Store>,
     /// Active-run broadcast senders so subscribers (CLI
     /// `--json-events`, GUI Tauri commands) can stream events for
     /// any run that this process started.
@@ -100,14 +101,26 @@ impl Engine {
         if swept > 0 {
             tracing::warn!(swept, "swept stale workflow locks from prior crash");
         }
+        let secrets_store = Arc::new(Store::with_index_path(home.join("secrets-index.json")));
         Ok(Self {
             pool,
             registry: Arc::new(Registry::with_v1_0_builtins()),
             checkpoints: Arc::new(CheckpointRegistry::new()),
             home,
+            secrets_store,
             run_senders: Arc::new(Mutex::new(HashMap::new())),
             run_tokens: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Shared secrets store. Backed by `<home>/secrets-index.json`
+    /// plus whatever credential builder the host has installed for
+    /// `keyring_core` (libsecret / Credential Manager / Keychain /
+    /// sample). Cloned into every `RunContext` so executors can
+    /// resolve `{{secrets.X}}` template references.
+    #[must_use]
+    pub fn secrets_store(&self) -> Arc<Store> {
+        self.secrets_store.clone()
     }
 
     /// `SQLite` pool. Cloning a pool is cheap (it's an `Arc`).
