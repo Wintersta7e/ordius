@@ -215,6 +215,51 @@ impl RunRecorder {
         Ok(())
     }
 
+    /// Try to acquire the workflow-level lock for this run's
+    /// workflow id. Returns `Ok(true)` if the lock was claimed,
+    /// `Ok(false)` if another run already holds it. The lock is
+    /// the `workflow_id` `PRIMARY KEY` in `workflow_locks`; the
+    /// implementation relies on `INSERT` raising a constraint
+    /// violation when the key is taken.
+    pub fn try_acquire_lock(&self) -> Result<bool> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| EngineError::Db(e.to_string()))?;
+        let now = Utc::now().timestamp_millis();
+        let pid = i64::from(std::process::id());
+        let res = conn.execute(
+            "INSERT INTO workflow_locks (workflow_id, run_id, holder_pid, acquired_at) \
+             VALUES (?,?,?,?)",
+            rusqlite::params![&self.workflow_id, &self.run_id, pid, now],
+        );
+        match res {
+            Ok(_) => Ok(true),
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Ok(false)
+            },
+            Err(e) => Err(EngineError::Db(e.to_string())),
+        }
+    }
+
+    /// Release the workflow lock held by this run. No-op if the
+    /// lock has already been released or was never held by this
+    /// `run_id`.
+    pub fn release_lock(&self) -> Result<()> {
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| EngineError::Db(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM workflow_locks WHERE workflow_id=? AND run_id=?",
+            rusqlite::params![&self.workflow_id, &self.run_id],
+        )
+        .map_err(|e| EngineError::Db(e.to_string()))?;
+        Ok(())
+    }
+
     /// Mark the run finished. Updates `status`, `finished_at`,
     /// `duration_ms`, and optionally `error_tail`.
     pub fn finalize(&self, status: &str, error_tail: Option<&str>) -> Result<()> {

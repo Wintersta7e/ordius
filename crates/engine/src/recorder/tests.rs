@@ -161,6 +161,28 @@ fn record_node_run_updates_in_place() {
 }
 
 #[test]
+fn second_lock_acquisition_fails_until_release() {
+    let f = tempfile::NamedTempFile::new().unwrap();
+    let pool = open(f.path()).unwrap();
+    let rec1 =
+        RunRecorder::start(pool.clone(), &empty_wf(), "{}", &HashMap::new(), "manual").unwrap();
+    assert!(rec1.try_acquire_lock().unwrap());
+    let rec2 = RunRecorder::start(pool, &empty_wf(), "{}", &HashMap::new(), "manual").unwrap();
+    assert!(!rec2.try_acquire_lock().unwrap());
+    rec1.release_lock().unwrap();
+    assert!(rec2.try_acquire_lock().unwrap());
+}
+
+#[test]
+fn release_lock_is_no_op_when_not_held() {
+    let f = tempfile::NamedTempFile::new().unwrap();
+    let pool = open(f.path()).unwrap();
+    let rec = RunRecorder::start(pool, &empty_wf(), "{}", &HashMap::new(), "manual").unwrap();
+    // No prior acquire — release should silently succeed.
+    rec.release_lock().unwrap();
+}
+
+#[test]
 fn record_event_persists_with_type_tag() {
     let f = tempfile::NamedTempFile::new().unwrap();
     let pool = open(f.path()).unwrap();
