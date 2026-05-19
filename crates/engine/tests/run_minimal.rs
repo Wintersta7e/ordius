@@ -4,6 +4,7 @@
 //! scheduler + `InProcessExecutor` + recorder stack and assert
 //! `SQLite` ends up with two `node_runs` rows and `runs.status` = `done`.
 
+use ordius_engine::checkpoints::CheckpointRegistry;
 use ordius_engine::db::open;
 use ordius_engine::emitter::Emitter;
 use ordius_engine::events::EventType;
@@ -85,6 +86,7 @@ async fn two_delay_nodes_run_end_to_end() {
         env: wrap_process_env(),
         current_inputs: HashMap::new(),
         upstream_outputs: HashMap::new(),
+        checkpoints: Arc::new(CheckpointRegistry::new()),
     };
     let executor = InProcessExecutor::new();
     let mut sched = Scheduler::new(&wf);

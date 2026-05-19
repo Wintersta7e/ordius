@@ -2,6 +2,7 @@
 //! resolved value is redacted in `node:output` events before they
 //! reach `SQLite`.
 
+use ordius_engine::checkpoints::CheckpointRegistry;
 use ordius_engine::db::open;
 use ordius_engine::emitter::Emitter;
 use ordius_engine::events::EventType;
@@ -70,6 +71,7 @@ async fn template_resolves_secret_and_redacts_in_event_log() {
         env: wrap_process_env(),
         current_inputs: HashMap::new(),
         upstream_outputs: HashMap::new(),
+        checkpoints: Arc::new(CheckpointRegistry::new()),
     };
 
     let executor = InProcessExecutor::new();

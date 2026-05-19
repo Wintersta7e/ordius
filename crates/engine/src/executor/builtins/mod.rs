@@ -1,5 +1,6 @@
 //! In-process built-in executors.
 
+mod checkpoint;
 mod condition;
 mod delay;
 mod file;
@@ -8,6 +9,7 @@ mod llm;
 mod transform;
 mod util;
 
+pub use checkpoint::CheckpointExecutor;
 pub use condition::ConditionExecutor;
 pub use delay::DelayExecutor;
 pub use file::FileExecutor;

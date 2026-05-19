@@ -8,6 +8,7 @@
 //! - templates: substitute, redact
 //! - secrets: keyring read/write
 
+pub mod checkpoints;
 pub mod db;
 pub mod emitter;
 pub mod error;
@@ -22,6 +23,7 @@ pub mod template;
 pub mod types;
 pub mod validation;
 
+pub use checkpoints::{CheckpointRegistry, Resume};
 pub use emitter::Emitter;
 pub use error::{EngineError, Result};
 pub use events::{EventType, RunEvent};

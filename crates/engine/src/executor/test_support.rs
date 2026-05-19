@@ -3,6 +3,7 @@
 //! `pub(crate)` so any test under `executor/` can pull them in
 //! without each child module re-declaring its own copy.
 
+use crate::checkpoints::CheckpointRegistry;
 use crate::db::open;
 use crate::emitter::Emitter;
 use crate::events::RunEvent;
@@ -52,6 +53,7 @@ pub(super) fn make_ctx() -> (RunContext, broadcast::Receiver<RunEvent>, TempDir)
         env: wrap_process_env(),
         current_inputs: HashMap::new(),
         upstream_outputs: HashMap::new(),
+        checkpoints: Arc::new(CheckpointRegistry::new()),
     };
     (ctx, rx, dir)
 }

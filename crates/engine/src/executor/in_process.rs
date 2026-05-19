@@ -1,7 +1,8 @@
 //! In-process dispatcher: routes nodes to the right built-in executor.
 
 use crate::executor::builtins::{
-    ConditionExecutor, DelayExecutor, FileExecutor, HttpExecutor, LlmExecutor, TransformExecutor,
+    CheckpointExecutor, ConditionExecutor, DelayExecutor, FileExecutor, HttpExecutor, LlmExecutor,
+    TransformExecutor,
 };
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::types::{ExecutionBackend, Node, NodeType};
@@ -32,6 +33,7 @@ impl InProcessExecutor {
                 Box::new(HttpExecutor),
                 Box::new(LlmExecutor),
                 Box::new(FileExecutor),
+                Box::new(CheckpointExecutor),
             ],
         }
     }

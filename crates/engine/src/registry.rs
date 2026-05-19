@@ -57,6 +57,7 @@ impl Registry {
         r.register(http_spec());
         r.register(llm_spec());
         r.register(file_spec());
+        r.register(checkpoint_spec());
         r
     }
 }
@@ -172,6 +173,38 @@ fn http_spec() -> NodeType {
                 label: "Timeout (ms)".into(),
                 ty: ConfigFieldType::Number,
                 default: Some(serde_json::json!(30_000)),
+                required: false,
+            },
+        ],
+        execution: in_process_execution_spec(),
+    }
+}
+
+fn checkpoint_spec() -> NodeType {
+    NodeType {
+        id: "checkpoint".into(),
+        name: "Checkpoint".into(),
+        category: Category::Control,
+        tags: vec![],
+        icon: "pause-circle".into(),
+        description: "Pause the run until an external caller resumes via the \
+                      CheckpointRegistry. auto_resume=true skips the pause."
+            .into(),
+        inputs: vec![],
+        outputs: vec![],
+        config: vec![
+            ConfigFieldDef {
+                name: "message".into(),
+                label: "Message".into(),
+                ty: ConfigFieldType::String,
+                default: Some(serde_json::json!("Waiting for user to continue...")),
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "auto_resume".into(),
+                label: "Auto-resume (testing)".into(),
+                ty: ConfigFieldType::Boolean,
+                default: Some(serde_json::json!(false)),
                 required: false,
             },
         ],

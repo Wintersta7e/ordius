@@ -5,6 +5,7 @@
 //! assembled by the run-loop from upstream forward edges into
 //! the current node.
 
+use crate::checkpoints::CheckpointRegistry;
 use crate::emitter::Emitter;
 use crate::recorder::RunRecorder;
 use crate::secrets::Store;
@@ -61,4 +62,8 @@ pub struct RunContext {
     /// keyed by `(node_id, port_name)`. Snapshot at dispatch time;
     /// updated by the run-loop after each successful node completion.
     pub upstream_outputs: HashMap<(String, String), PortValue>,
+    /// Live checkpoint registry — the `checkpoint` built-in
+    /// registers a receiver here and parks until an external
+    /// caller (CLI / GUI) signals resume / cancel.
+    pub checkpoints: Arc<CheckpointRegistry>,
 }
