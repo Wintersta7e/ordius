@@ -118,7 +118,37 @@ impl<'a> Scheduler<'a> {
     /// `Pending` or `Ready`.
     pub fn fail_node(&mut self, node_id: &str) {
         self.state.insert(node_id.into(), NodeState::Error);
-        self.cascade_skip(node_id);
+        let children: Vec<String> = self
+            .outgoing
+            .get(node_id)
+            .map(|outs| outs.iter().map(|e| e.to_node_id.clone()).collect())
+            .unwrap_or_default();
+        for child in &children {
+            self.skip_subtree(child);
+        }
+    }
+
+    /// Resolve a condition node's chosen branch. Outgoing edges
+    /// whose `branch` label differs from `branch` have their
+    /// downstream subtree (target + descendants) cascaded to
+    /// `Skipped`; the matching branch and any unbranched edges
+    /// then activate normally.
+    pub fn resolve_condition(&mut self, node_id: &str, branch: &str) {
+        let to_skip: Vec<String> = self
+            .outgoing
+            .get(node_id)
+            .map(|outs| {
+                outs.iter()
+                    .filter(|e| e.branch.as_deref().is_some_and(|b| b != branch))
+                    .map(|e| e.to_node_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for target in &to_skip {
+            self.skip_subtree(target);
+        }
+        self.state.insert(node_id.into(), NodeState::Done);
+        self.promote_downstream(node_id);
     }
 
     fn promote_downstream(&mut self, node_id: &str) {
@@ -141,12 +171,14 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    fn cascade_skip(&mut self, node_id: &str) {
-        let mut stack: Vec<String> = self
-            .outgoing
-            .get(node_id)
-            .map(|v| v.iter().map(|e| e.to_node_id.clone()).collect())
-            .unwrap_or_default();
+    /// Mark `root` and its transitive forward-edge descendants as
+    /// `Skipped`, stopping at nodes already in a terminal or
+    /// `Running` state. Used by [`Self::fail_node`] (iterated
+    /// over children, not the failed node itself) and
+    /// [`Self::resolve_condition`] (over unselected branch
+    /// targets).
+    fn skip_subtree(&mut self, root: &str) {
+        let mut stack: Vec<String> = vec![root.to_string()];
         while let Some(id) = stack.pop() {
             if !matches!(self.state_of(&id), NodeState::Pending | NodeState::Ready) {
                 continue;

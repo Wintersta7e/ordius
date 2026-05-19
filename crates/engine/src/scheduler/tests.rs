@@ -28,6 +28,12 @@ fn fwd(id: &str, from: &str, to: &str) -> Edge {
     }
 }
 
+fn fwd_branch(id: &str, from: &str, to: &str, branch: &str) -> Edge {
+    let mut e = fwd(id, from, to);
+    e.branch = Some(branch.into());
+    e
+}
+
 fn wf(nodes: Vec<Node>, edges: Vec<Edge>) -> Workflow {
     Workflow {
         id: "w".into(),
@@ -91,6 +97,37 @@ fn convergent_nodes_wait_for_all_upstream() {
     s.complete_node("a");
     assert_eq!(s.state_of("c"), NodeState::Pending);
     s.complete_node("b");
+    assert_eq!(s.state_of("c"), NodeState::Ready);
+}
+
+#[test]
+fn condition_skips_unused_branch() {
+    let w = wf(
+        vec![node("cond"), node("b"), node("c")],
+        vec![
+            fwd_branch("e1", "cond", "b", "true"),
+            fwd_branch("e2", "cond", "c", "false"),
+        ],
+    );
+    let mut s = Scheduler::new(&w);
+    s.resolve_condition("cond", "true");
+    assert_eq!(s.state_of("cond"), NodeState::Done);
+    assert_eq!(s.state_of("b"), NodeState::Ready);
+    assert_eq!(s.state_of("c"), NodeState::Skipped);
+}
+
+#[test]
+fn condition_promotes_unbranched_edges() {
+    let w = wf(
+        vec![node("cond"), node("b"), node("c")],
+        vec![
+            fwd_branch("e1", "cond", "b", "true"),
+            fwd("e2", "cond", "c"),
+        ],
+    );
+    let mut s = Scheduler::new(&w);
+    s.resolve_condition("cond", "false");
+    assert_eq!(s.state_of("b"), NodeState::Skipped);
     assert_eq!(s.state_of("c"), NodeState::Ready);
 }
 
