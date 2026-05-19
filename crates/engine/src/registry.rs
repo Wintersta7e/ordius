@@ -56,6 +56,7 @@ impl Registry {
         r.register(shell_spec());
         r.register(http_spec());
         r.register(llm_spec());
+        r.register(file_spec());
         r
     }
 }
@@ -171,6 +172,54 @@ fn http_spec() -> NodeType {
                 label: "Timeout (ms)".into(),
                 ty: ConfigFieldType::Number,
                 default: Some(serde_json::json!(30_000)),
+                required: false,
+            },
+        ],
+        execution: in_process_execution_spec(),
+    }
+}
+
+fn file_spec() -> NodeType {
+    NodeType {
+        id: "file".into(),
+        name: "File".into(),
+        category: Category::Data,
+        tags: vec![],
+        icon: "file".into(),
+        description: "Read / write / append / list / glob / stat. Paths relative to \
+                      the run workspace unless absolute."
+            .into(),
+        inputs: vec![],
+        outputs: vec![],
+        config: vec![
+            ConfigFieldDef {
+                name: "op".into(),
+                label: "Operation".into(),
+                ty: ConfigFieldType::Select,
+                default: Some(serde_json::json!([
+                    "read", "write", "append", "list", "glob", "stat"
+                ])),
+                required: true,
+            },
+            ConfigFieldDef {
+                name: "path".into(),
+                label: "Path".into(),
+                ty: ConfigFieldType::String,
+                default: None,
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "content".into(),
+                label: "Content (write / append)".into(),
+                ty: ConfigFieldType::Textarea,
+                default: None,
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "pattern".into(),
+                label: "Glob pattern".into(),
+                ty: ConfigFieldType::String,
+                default: None,
                 required: false,
             },
         ],

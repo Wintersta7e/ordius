@@ -1,5 +1,5 @@
-use crate::executor::test_support::{dummy_node_type, make_ctx};
 use super::*;
+use crate::executor::test_support::{dummy_node_type, make_ctx};
 use crate::types::{Category, Pos};
 use std::collections::HashMap;
 use std::time::Instant;
