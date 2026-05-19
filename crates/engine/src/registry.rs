@@ -54,6 +54,7 @@ impl Registry {
         r.register(transform_spec());
         r.register(condition_spec());
         r.register(shell_spec());
+        r.register(http_spec());
         r
     }
 }
@@ -96,6 +97,82 @@ fn transform_spec() -> NodeType {
         inputs: vec![],
         outputs: vec![],
         config: vec![],
+        execution: in_process_execution_spec(),
+    }
+}
+
+fn http_spec() -> NodeType {
+    NodeType {
+        id: "http".into(),
+        name: "HTTP".into(),
+        category: Category::Integration,
+        tags: vec![],
+        icon: "globe".into(),
+        description: "Make an HTTP request. 4xx/5xx are NOT errors — they surface on the \
+                      `status` port. Only network failures raise NodeError."
+            .into(),
+        inputs: vec![],
+        outputs: vec![
+            PortDef {
+                name: "status".into(),
+                ty: PortType::Number,
+                required: false,
+            },
+            PortDef {
+                name: "body".into(),
+                ty: PortType::Json,
+                required: false,
+            },
+            PortDef {
+                name: "headers".into(),
+                ty: PortType::Json,
+                required: false,
+            },
+        ],
+        config: vec![
+            ConfigFieldDef {
+                name: "url".into(),
+                label: "URL".into(),
+                ty: ConfigFieldType::String,
+                default: None,
+                required: true,
+            },
+            ConfigFieldDef {
+                name: "method".into(),
+                label: "Method".into(),
+                ty: ConfigFieldType::String,
+                default: Some(serde_json::json!("GET")),
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "headers".into(),
+                label: "Headers".into(),
+                ty: ConfigFieldType::Textarea,
+                default: None,
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "body".into(),
+                label: "Body".into(),
+                ty: ConfigFieldType::Textarea,
+                default: None,
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "query".into(),
+                label: "Query".into(),
+                ty: ConfigFieldType::Textarea,
+                default: None,
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "timeout_ms".into(),
+                label: "Timeout (ms)".into(),
+                ty: ConfigFieldType::Number,
+                default: Some(serde_json::json!(30_000)),
+                required: false,
+            },
+        ],
         execution: in_process_execution_spec(),
     }
 }
