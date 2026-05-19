@@ -43,6 +43,7 @@ r2d2_sqlite = "0.34"
 reqwest = { version = "0.13", features = ["json", "stream"] }
 jsonpath-rust = "1"
 keyring = "4"
+keyring-core = "1"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

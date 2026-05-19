@@ -27,6 +27,7 @@ regex = { workspace = true }
 glob = { workspace = true }
 reqwest = { workspace = true }
 keyring = { workspace = true }
+keyring-core = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 

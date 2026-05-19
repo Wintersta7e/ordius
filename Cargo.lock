@@ -2497,6 +2497,7 @@ dependencies = [
  "glob",
  "jsonpath-rust",
  "keyring",
+ "keyring-core",
  "r2d2",
  "r2d2_sqlite",
  "regex",
