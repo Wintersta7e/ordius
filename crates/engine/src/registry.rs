@@ -3,6 +3,7 @@
 //! Built-ins are inserted at startup via [`Registry::with_v1_0_builtins`];
 //! manifest-loaded types land here once the manifest loader ships.
 
+use crate::executor::subprocess::{PORT_EXIT_CODE, PORT_TEXT, SHELL_NODE_TYPE_ID};
 use crate::types::{
     Category, ConfigFieldDef, ConfigFieldType, ExecutionBackend, ExecutionSpec, NodeType,
     OutputParse, PortDef, PortType,
@@ -121,7 +122,7 @@ fn condition_spec() -> NodeType {
 /// template engine first.
 fn shell_spec() -> NodeType {
     NodeType {
-        id: "shell".into(),
+        id: SHELL_NODE_TYPE_ID.into(),
         name: "Shell".into(),
         category: Category::Execution,
         tags: vec![],
@@ -132,12 +133,12 @@ fn shell_spec() -> NodeType {
         inputs: vec![],
         outputs: vec![
             PortDef {
-                name: "text".into(),
+                name: PORT_TEXT.into(),
                 ty: PortType::String,
                 required: false,
             },
             PortDef {
-                name: "exit_code".into(),
+                name: PORT_EXIT_CODE.into(),
                 ty: PortType::Number,
                 required: false,
             },
@@ -151,7 +152,7 @@ fn shell_spec() -> NodeType {
         }],
         execution: ExecutionSpec {
             backend: ExecutionBackend::Subprocess,
-            // SubprocessExecutor special-cases `id == "shell"` and
+            // SubprocessExecutor keys off SHELL_NODE_TYPE_ID and
             // wraps config.command in the per-platform shell argv.
             command: vec![],
             stdin_template: None,

@@ -15,12 +15,13 @@
 //! Every argv element, environment value, and stdin template is
 //! resolved through the unified [`crate::template::substitute`]
 //! engine before spawn. Stdout/stderr are line-buffered and
-//! forwarded to the run's [`Emitter`] as `node:output` events; the
-//! full stdout is also accumulated for the eventual `output_parse`
-//! step.
+//! forwarded to the run's [`Emitter`] as `node:output` events.
+//! [`parse_outputs`] then maps the accumulated stdout + exit status
+//! onto the node's declared output ports.
 //!
-//! The OS-level guarantees replace the `taskkill /T` workarounds
-//! the engine used in earlier prototypes.
+//! The crate-level `unsafe_code = "deny"` lint is overridden here —
+//! `pre_exec` on Unix and the Win32 Job-Object / Toolhelp32 calls
+//! on Windows both need raw FFI.
 #![allow(unsafe_code)]
 
 use crate::emitter::Emitter;
@@ -49,6 +50,31 @@ use tokio_util::sync::CancellationToken;
 #[cfg(unix)]
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
 
+// ---- Contract strings shared with the registry + downstream consumers ----
+
+/// `NodeType.id` of the `shell` built-in. The executor special-cases
+/// this id to wrap `config.command` in a per-platform shell argv;
+/// the registry uses it as the registration key.
+pub(crate) const SHELL_NODE_TYPE_ID: &str = "shell";
+
+/// Output-port name carrying trimmed stdout in `Text` mode.
+pub(crate) const PORT_TEXT: &str = "text";
+
+/// Output-port name carrying the child's exit status as a `Number`.
+pub(crate) const PORT_EXIT_CODE: &str = "exit_code";
+
+/// `node:output` payload key tagging the originating stream.
+const KEY_CHANNEL: &str = "channel";
+
+/// `node:output` payload key carrying the line text.
+const KEY_TEXT: &str = "text";
+
+/// `KEY_CHANNEL` value for stdout-sourced events.
+const CHANNEL_STDOUT: &str = "stdout";
+
+/// `KEY_CHANNEL` value for stderr-sourced events.
+const CHANNEL_STDERR: &str = "stderr";
+
 /// Executor for nodes whose `ExecutionSpec::backend` is
 /// [`ExecutionBackend::Subprocess`].
 pub struct SubprocessExecutor;
@@ -76,7 +102,6 @@ impl NodeExecutor for SubprocessExecutor {
             stdin_body,
         } = resolve_templated_inputs(node, nt, ctx)?;
 
-        // ---- Build the command --------------------------------------------
         let (program, argv_rest) = argv
             .split_first()
             .ok_or_else(|| NodeError::Config("execution.command is empty".into()))?;
@@ -97,14 +122,12 @@ impl NodeExecutor for SubprocessExecutor {
         #[cfg(windows)]
         configure_windows_command(&mut cmd);
 
-        // ---- Spawn (platform-specific) ------------------------------------
         let mut sup = platform_spawn(cmd)?;
 
-        // ---- Stdin writer (if templated) ----------------------------------
         if let (Some(body), Some(mut stdin)) = (stdin_body, sup.child.stdin.take()) {
-            // Writer runs on its own task so a child that reads
-            // stdin fully before producing stdout can't deadlock
-            // us (we're holding the read loop for stdout below).
+            // Writer runs on its own task so a child that reads stdin
+            // fully before producing stdout can't deadlock us (we
+            // hold the stdout read loop below).
             tokio::spawn(async move {
                 let write_res = stdin.write_all(body.as_bytes()).await;
                 drop(write_res);
@@ -113,18 +136,20 @@ impl NodeExecutor for SubprocessExecutor {
             });
         }
 
-        // ---- Stream stdout/stderr -----------------------------------------
         let emitter = ctx.emitter.clone();
         let stdout_handle = spawn_line_reader(
             sup.child.stdout.take(),
             emitter.clone(),
             node.id.clone(),
-            "stdout",
+            CHANNEL_STDOUT,
         );
-        let stderr_handle =
-            spawn_line_reader(sup.child.stderr.take(), emitter, node.id.clone(), "stderr");
+        let stderr_handle = spawn_line_reader(
+            sup.child.stderr.take(),
+            emitter,
+            node.id.clone(),
+            CHANNEL_STDERR,
+        );
 
-        // ---- Wait / cancel ------------------------------------------------
         let outcome = tokio::select! {
             wait_res = sup.child.wait() => Outcome::Exit(wait_res),
             () = cancel.cancelled() => {
@@ -196,7 +221,9 @@ fn resolve_templated_inputs(
         emitter.register_secret(name.to_string(), value.clone());
         Some(value)
     };
-    let kv_resolver = |_: &str| -> Option<String> { None }; // KV node arrives in Phase 7
+    // KV-store lookups are not yet wired; the resolver always
+    // returns None so `{{kv.X}}` fails loud via TemplateError::Undefined.
+    let kv_resolver = |_: &str| -> Option<String> { None };
     let env_allowlist = default_env_allowlist();
 
     let subctx = SubstitutionContext {
@@ -215,7 +242,7 @@ fn resolve_templated_inputs(
         workflow_name: &ctx.workflow_name,
     };
 
-    let argv: Vec<String> = if nt.id == "shell" {
+    let argv: Vec<String> = if nt.id == SHELL_NODE_TYPE_ID {
         // shell built-in: config.command is the user's free-form
         // shell script, substituted once and then handed to the
         // platform shell as -c / /C.
@@ -290,8 +317,11 @@ where
         let mut reader = BufReader::new(p).lines();
         while let Ok(Some(line)) = reader.next_line().await {
             let mut payload: HashMap<String, serde_json::Value> = HashMap::new();
-            payload.insert("channel".into(), serde_json::Value::String(channel.into()));
-            payload.insert("text".into(), serde_json::Value::String(line.clone()));
+            payload.insert(
+                KEY_CHANNEL.into(),
+                serde_json::Value::String(channel.into()),
+            );
+            payload.insert(KEY_TEXT.into(), serde_json::Value::String(line.clone()));
             emitter.emit_node(EventType::NodeOutput, node_id.clone(), 0, 0, payload);
             acc.push(line);
         }
@@ -318,14 +348,14 @@ fn parse_outputs(
     let mut outputs = NodeOutputs::new();
 
     let code = status.code().unwrap_or(-1);
-    outputs.insert("exit_code".into(), PortValue::Number(f64::from(code)));
+    outputs.insert(PORT_EXIT_CODE.into(), PortValue::Number(f64::from(code)));
 
     let joined = stdout_lines.join("\n");
 
     match nt.execution.output_parse {
         OutputParse::Text => {
             outputs.insert(
-                "text".into(),
+                PORT_TEXT.into(),
                 PortValue::String(joined.trim_end().to_string()),
             );
         },
@@ -491,8 +521,7 @@ mod win_job {
     //! `KILL_ON_JOB_CLOSE` limit before its main thread runs means
     //! every descendant the program later spawns inherits the job
     //! membership automatically. Closing or terminating the job then
-    //! terminates the whole tree atomically — no `taskkill /T`
-    //! workarounds, no race with grand-children we can't see.
+    //! terminates the whole tree atomically.
 
     use super::{Command, NodeError, Supervised};
     use windows::Win32::Foundation::{CloseHandle, FALSE, HANDLE};
@@ -514,7 +543,10 @@ mod win_job {
             .spawn()
             .map_err(|e| NodeError::Subprocess(format!("spawn: {e}")))?;
 
-        // SAFETY: CreateJobObjectW returns an owned kernel handle.
+        // SAFETY: both args are `None` (no SECURITY_ATTRIBUTES, no
+        // name), so there are no pointer preconditions to satisfy.
+        // The returned HANDLE is owned by us and closed on every
+        // error path below + on `Supervised::drop` on success.
         let job = unsafe { CreateJobObjectW(None, None) }
             .map_err(|e| NodeError::Subprocess(format!("CreateJobObjectW: {e}")))?;
 
