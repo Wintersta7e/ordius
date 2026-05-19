@@ -47,7 +47,20 @@ impl Registry {
     pub fn with_v1_0_builtins() -> Self {
         let mut r = Self::new();
         r.register(delay_spec());
+        r.register(transform_spec());
         r
+    }
+}
+
+fn in_process_execution_spec() -> ExecutionSpec {
+    ExecutionSpec {
+        backend: ExecutionBackend::InProcess,
+        command: vec![],
+        stdin_template: None,
+        env: HashMap::new(),
+        timeout_ms: None,
+        output_parse: OutputParse::Text,
+        output_map: HashMap::new(),
     }
 }
 
@@ -62,14 +75,21 @@ fn delay_spec() -> NodeType {
         inputs: vec![],
         outputs: vec![],
         config: vec![],
-        execution: ExecutionSpec {
-            backend: ExecutionBackend::InProcess,
-            command: vec![],
-            stdin_template: None,
-            env: HashMap::new(),
-            timeout_ms: None,
-            output_parse: OutputParse::Text,
-            output_map: HashMap::new(),
-        },
+        execution: in_process_execution_spec(),
+    }
+}
+
+fn transform_spec() -> NodeType {
+    NodeType {
+        id: "transform".into(),
+        name: "Transform".into(),
+        category: Category::Data,
+        tags: vec![],
+        icon: "shuffle".into(),
+        description: "JSONPath / regex extraction and replacement".into(),
+        inputs: vec![],
+        outputs: vec![],
+        config: vec![],
+        execution: in_process_execution_spec(),
     }
 }
