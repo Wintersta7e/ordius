@@ -1,0 +1,420 @@
+// Home route — workflow grid + left rail + recent runs.
+//
+// Wires real engine data through the Tauri command layer:
+//   * listWorkflows  → grid cards (joined with listRuns for last-run badge)
+//   * listRuns       → recent-runs strip + per-workflow last-run join
+//   * systemStatus   → left-rail "system" card
+//   * listWorkspaces → left-rail "workspace" card
+//
+// The engine doesn't model per-workflow category / description /
+// star yet (Workflow has id + name only). Until that lands the
+// card derives a category from the first node on the graph
+// (which we'd have to load) — for the Home grid we settle for
+// "control" as a neutral default. The desc field is derived from
+// the trigger + node counts.
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import type { JSX } from "react";
+
+import {
+  type RunRow,
+  type SavedWorkflow,
+  type SystemStatus,
+  type Workspace,
+  listRuns,
+  listWorkflows,
+  listWorkspaces,
+  systemStatus,
+} from "../engine";
+import { TopBar } from "../components/chrome/TopBar";
+import { Hero } from "../components/home/Hero";
+import { LeftRail, type RunningWorkflow } from "../components/home/LeftRail";
+import {
+  NewWorkflowCard,
+  WorkflowCard,
+  type WorkflowCardData,
+} from "../components/home/WorkflowCard";
+import { RecentRunRow } from "../components/home/RecentRunRow";
+import { SectionTitle } from "../components/SectionTitle";
+import { StatusRibbon } from "../components/home/StatusRibbon";
+
+type SortKey = "recent" | "name" | "runs";
+
+interface SortOption {
+  id: SortKey;
+  label: string;
+}
+
+const SORT_OPTIONS: SortOption[] = [
+  { id: "recent", label: "recent" },
+  { id: "name", label: "a → z" },
+  { id: "runs", label: "runs" },
+];
+
+interface Props {
+  theme: "dark" | "light";
+  onThemeToggle: () => void;
+}
+
+export function Home({ theme, onThemeToggle }: Props): JSX.Element {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const [workflows, setWorkflows] = useState<SavedWorkflow[]>([]);
+  const [runs, setRuns] = useState<RunRow[]>([]);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [status, setStatus] = useState<SystemStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [sort, setSort] = useState<SortKey>("recent");
+
+  const reload = useCallback(async () => {
+    // When the page is loaded outside Tauri (plain Vite dev preview
+    // in a browser, no host injecting window.__TAURI_INTERNALS__),
+    // every invoke throws. Friendly banner > raw TypeError stack.
+    const insideTauri =
+      typeof window !== "undefined" &&
+      "__TAURI_INTERNALS__" in window;
+    if (!insideTauri) {
+      setError(
+        "running in browser preview · engine commands disabled — launch via `tauri dev` to load real data",
+      );
+      return;
+    }
+    try {
+      const [wfs, allRuns, wsList, sys] = await Promise.all([
+        listWorkflows(),
+        listRuns({ limit: 100 }),
+        listWorkspaces(),
+        systemStatus(),
+      ]);
+      setWorkflows(wfs);
+      setRuns(allRuns);
+      setWorkspaces(wsList);
+      setStatus(sys);
+      setError(null);
+    } catch (e: unknown) {
+      setError(String(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  const runsByWorkflow = useMemo(() => {
+    const map = new Map<string, RunRow[]>();
+    for (const run of runs) {
+      const arr = map.get(run.workflowId) ?? [];
+      arr.push(run);
+      map.set(run.workflowId, arr);
+    }
+    return map;
+  }, [runs]);
+
+  const cards: WorkflowCardData[] = useMemo(() => {
+    return workflows.map((wf) => {
+      const workflowRuns = runsByWorkflow.get(wf.id) ?? [];
+      const last = workflowRuns[0]; // already sorted DESC by startedAt
+      return {
+        id: wf.id,
+        name: wf.name,
+        // Workflow shape doesn't carry desc/category yet — derive a
+        // useful one-liner from the data we do have.
+        desc: `${wf.nodesCount} nodes · ${
+          wf.triggersCount === 0 ? "manual-only" : `${wf.triggersCount} triggers`
+        }`,
+        category: "control",
+        triggerKinds:
+          wf.triggersCount === 0
+            ? ["manual"]
+            : new Array(wf.triggersCount).fill("manual"),
+        nodeCount: wf.nodesCount,
+        lastRun: last
+          ? {
+              status: last.status,
+              startedAt: last.startedAt,
+              durationMs: last.durationMs,
+            }
+          : null,
+        totalRuns: workflowRuns.length,
+      };
+    });
+  }, [workflows, runsByWorkflow]);
+
+  const sortedCards = useMemo(() => {
+    const arr = [...cards];
+    switch (sort) {
+      case "name":
+        arr.sort((a, b) => a.name.localeCompare(b.name));
+        break;
+      case "runs":
+        arr.sort((a, b) => b.totalRuns - a.totalRuns);
+        break;
+      case "recent":
+      default:
+        arr.sort((a, b) => {
+          const ta = a.lastRun?.startedAt ?? 0;
+          const tb = b.lastRun?.startedAt ?? 0;
+          return tb - ta;
+        });
+        break;
+    }
+    return arr;
+  }, [cards, sort]);
+
+  const runningWorkflows: RunningWorkflow[] = useMemo(() => {
+    return runs
+      .filter((r) => r.status === "running")
+      .map((r) => {
+        const wf = workflows.find((w) => w.id === r.workflowId);
+        return {
+          id: r.workflowId,
+          name: wf?.name ?? r.workflowId,
+          runId: r.runId,
+          startedAt: r.startedAt,
+        };
+      });
+  }, [runs, workflows]);
+
+  const recentRuns = useMemo(() => runs.slice(0, 10), [runs]);
+  const activeWorkspace = workspaces[0] ?? null;
+
+  const handleOpen = useCallback((id: string) => {
+    console.warn("editor route lands in Phase 1.5", { id });
+  }, []);
+  const handleRun = useCallback((id: string) => {
+    console.warn("run dialog lands in Phase 1.9", { id });
+  }, []);
+  const handleImport = useCallback(() => {
+    console.warn("import flow lands in Phase 1.9");
+  }, []);
+  const handleNewWorkflow = useCallback(() => {
+    console.warn("new-workflow flow lands in Phase 1.5");
+  }, []);
+
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateRows: "44px 1fr 22px",
+        height: "100vh",
+        minHeight: 720,
+        background: "var(--bg)",
+      }}
+    >
+      <TopBar pageLabel="home" theme={theme} onThemeToggle={onThemeToggle} />
+
+      <main
+        style={{
+          overflow: "hidden",
+          display: "flex",
+          flexDirection: "column",
+        }}
+      >
+        <div
+          style={{
+            maxWidth: 1280,
+            margin: "0 auto",
+            width: "100%",
+            padding: "32px 36px 0",
+            flexShrink: 0,
+          }}
+        >
+          <Hero
+            workspaceName={activeWorkspace?.name ?? "default"}
+            workflowCount={workflows.length}
+            runCount={runs.length}
+            runningCount={runningWorkflows.length}
+            onImport={handleImport}
+            onNew={handleNewWorkflow}
+          />
+        </div>
+
+        {error ? (
+          <div
+            style={{
+              maxWidth: 1280,
+              margin: "8px auto 0",
+              width: "100%",
+              padding: "8px 12px",
+              fontFamily: "var(--mono)",
+              fontSize: 11,
+              color: "var(--warn)",
+              background: "var(--bg-canvas)",
+              border: "1px dashed var(--line)",
+              borderRadius: 3,
+              maxInlineSize: 1208,
+              marginInline: "auto",
+            }}
+          >
+            <span style={{ color: "var(--warn)" }}>! </span>
+            {error}
+          </div>
+        ) : null}
+
+        <div
+          style={{
+            maxWidth: 1280,
+            margin: "0 auto",
+            width: "100%",
+            padding: "24px 36px 0",
+            flex: 1,
+            minHeight: 0,
+            display: "grid",
+            gridTemplateColumns: "260px 1fr",
+            gap: 28,
+          }}
+        >
+          <LeftRail
+            running={runningWorkflows}
+            workspace={activeWorkspace}
+            status={status}
+            now={now}
+          />
+
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              minHeight: 0,
+              overflow: "hidden",
+            }}
+          >
+            <SectionTitle
+              label="workflows"
+              count={`${sortedCards.length} saved`}
+              right={
+                <FilterSeg value={sort} options={SORT_OPTIONS} onChange={setSort} />
+              }
+            />
+
+            <div
+              style={{
+                flex: 1,
+                minHeight: 0,
+                overflow: "auto",
+                marginTop: 14,
+                paddingRight: 4,
+                marginRight: -4,
+              }}
+            >
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fill, minmax(340px, 1fr))",
+                  gap: 14,
+                  paddingBottom: 4,
+                }}
+              >
+                {sortedCards.map((card) => (
+                  <WorkflowCard
+                    key={card.id}
+                    workflow={card}
+                    onOpen={handleOpen}
+                    onRun={handleRun}
+                  />
+                ))}
+                <NewWorkflowCard onClick={handleNewWorkflow} />
+              </div>
+            </div>
+
+            <section style={{ marginTop: 24, marginBottom: 24, flexShrink: 0 }}>
+              <SectionTitle
+                label="recent runs"
+                count={`last ${recentRuns.length}`}
+              />
+              <div
+                style={{
+                  marginTop: 14,
+                  background: "var(--bg-panel)",
+                  border: "1px solid var(--line)",
+                  borderRadius: 3,
+                  overflow: "hidden",
+                  maxHeight: 220,
+                  overflowY: "auto",
+                }}
+              >
+                {recentRuns.length === 0 ? (
+                  <div
+                    style={{
+                      padding: "20px 16px",
+                      fontFamily: "var(--mono)",
+                      fontSize: 11,
+                      color: "var(--txt-faint)",
+                    }}
+                  >
+                    no runs yet — trigger a workflow and they'll land here.
+                  </div>
+                ) : (
+                  recentRuns.map((run, idx) => {
+                    const wf = workflows.find((w) => w.id === run.workflowId);
+                    return (
+                      <RecentRunRow
+                        key={run.runId}
+                        run={run}
+                        workflowName={wf?.name ?? run.workflowId}
+                        last={idx === recentRuns.length - 1}
+                        now={now}
+                      />
+                    );
+                  })
+                )}
+              </div>
+            </section>
+          </div>
+        </div>
+      </main>
+
+      <StatusRibbon workflowCount={workflows.length} runCount={runs.length} />
+    </div>
+  );
+}
+
+interface FilterSegProps {
+  value: SortKey;
+  options: SortOption[];
+  onChange: (id: SortKey) => void;
+}
+
+function FilterSeg({ value, options, onChange }: FilterSegProps): JSX.Element {
+  return (
+    <div
+      style={{
+        display: "inline-flex",
+        background: "var(--bg-input)",
+        border: "1px solid var(--line)",
+        borderRadius: 3,
+        padding: 2,
+        fontFamily: "var(--mono)",
+      }}
+    >
+      {options.map((o) => {
+        const active = o.id === value;
+        return (
+          <button
+            key={o.id}
+            type="button"
+            onClick={() => onChange(o.id)}
+            style={{
+              appearance: "none",
+              border: 0,
+              background: active ? "var(--bg-active)" : "transparent",
+              color: active ? "var(--txt)" : "var(--txt-dim)",
+              fontFamily: "var(--mono)",
+              fontSize: 11,
+              padding: "3px 10px",
+              height: 20,
+              borderRadius: 2,
+              cursor: "pointer",
+            }}
+          >
+            {o.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
