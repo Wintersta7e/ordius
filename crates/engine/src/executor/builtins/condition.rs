@@ -82,18 +82,19 @@ fn eval_exit_code(cfg: &HashMap<String, serde_json::Value>) -> Result<bool, Node
 fn eval_regex(cfg: &HashMap<String, serde_json::Value>) -> Result<bool, NodeError> {
     let input = config_str(cfg, "input", "condition")?;
     let pattern = config_str(cfg, "pattern", "condition")?;
-    let re = regex::Regex::new(pattern).map_err(|e| NodeError::Other(format!("regex: {e}")))?;
+    let re = regex::Regex::new(pattern)
+        .map_err(|e| NodeError::Config(format!("condition.regex: invalid pattern: {e}")))?;
     Ok(re.is_match(input))
 }
 
 fn eval_jsonpath(cfg: &HashMap<String, serde_json::Value>) -> Result<bool, NodeError> {
     let input = config_str(cfg, "input", "condition")?;
     let expr = config_str(cfg, "expr", "condition")?;
-    let val: serde_json::Value =
-        serde_json::from_str(input).map_err(|e| NodeError::Other(format!("input parse: {e}")))?;
+    let val: serde_json::Value = serde_json::from_str(input)
+        .map_err(|e| NodeError::Config(format!("condition.jsonpath: invalid input JSON: {e}")))?;
     let matched = val
         .query(expr)
-        .map_err(|e| NodeError::Other(format!("jsonpath: {e}")))?;
+        .map_err(|e| NodeError::Config(format!("condition.jsonpath: invalid expression: {e}")))?;
     Ok(!matched.is_empty()
         && !matched
             .iter()

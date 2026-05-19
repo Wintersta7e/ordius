@@ -61,17 +61,18 @@ fn apply_jsonpath(cfg: &HashMap<String, serde_json::Value>) -> Result<String, No
     let input = config_str(cfg, "input", "transform")?;
     let expr = config_str(cfg, "expr", "transform")?;
     let val: serde_json::Value = serde_json::from_str(input)
-        .map_err(|e| NodeError::Other(format!("jsonpath input: {e}")))?;
+        .map_err(|e| NodeError::Config(format!("transform.jsonpath: invalid input JSON: {e}")))?;
     let matched = val
         .query(expr)
-        .map_err(|e| NodeError::Other(format!("jsonpath: {e}")))?;
+        .map_err(|e| NodeError::Config(format!("transform.jsonpath: invalid expression: {e}")))?;
     serde_json::to_string(&matched).map_err(|e| NodeError::Other(format!("encode: {e}")))
 }
 
 fn apply_regex_extract(cfg: &HashMap<String, serde_json::Value>) -> Result<String, NodeError> {
     let input = config_str(cfg, "input", "transform")?;
     let pattern = config_str(cfg, "pattern", "transform")?;
-    let re = regex::Regex::new(pattern).map_err(|e| NodeError::Other(format!("regex: {e}")))?;
+    let re = regex::Regex::new(pattern)
+        .map_err(|e| NodeError::Config(format!("transform.regex_extract: invalid pattern: {e}")))?;
     Ok(re
         .find(input)
         .map(|m| m.as_str().to_string())
@@ -85,7 +86,8 @@ fn apply_regex_replace(cfg: &HashMap<String, serde_json::Value>) -> Result<Strin
         .get("replacement")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let re = regex::Regex::new(pattern).map_err(|e| NodeError::Other(format!("regex: {e}")))?;
+    let re = regex::Regex::new(pattern)
+        .map_err(|e| NodeError::Config(format!("transform.regex_replace: invalid pattern: {e}")))?;
     Ok(re.replace_all(input, replacement).into_owned())
 }
 
