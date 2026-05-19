@@ -15,6 +15,7 @@ import { SectionTitle } from "../components/SectionTitle";
 import { StatusRibbon } from "../components/home/StatusRibbon";
 import { fmtDuration } from "../lib/format";
 import type { Route } from "../lib/router";
+import { demoHistoryRuns } from "../data/demoHistory";
 
 interface Props {
   theme: "dark" | "light";
@@ -23,6 +24,19 @@ interface Props {
 }
 
 type StatusFilter = "all" | "done" | "error" | "stopped" | "running";
+type TimeRange = "24h" | "7d" | "all";
+const RANGE_MS: Record<TimeRange, number | null> = {
+  "24h": 24 * 60 * 60 * 1000,
+  "7d": 7 * 24 * 60 * 60 * 1000,
+  all: null,
+};
+
+const TRIGGER_GLYPH: Record<string, string> = {
+  manual: "•",
+  cli: "$",
+  schedule: "@",
+  api: "▦",
+};
 
 const STATUS_COLOR: Record<string, string> = {
   done: "var(--ok)",
@@ -35,6 +49,8 @@ export function History({ theme, onThemeToggle, onNavigate }: Props): JSX.Elemen
   const [runs, setRuns] = useState<RunRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [timeRange, setTimeRange] = useState<TimeRange>("7d");
+  const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<string | null>(null);
   const [details, setDetails] = useState<Record<string, RunDetail>>({});
 
@@ -46,6 +62,7 @@ export function History({ theme, onThemeToggle, onNavigate }: Props): JSX.Elemen
       setError(
         "running in browser preview · engine commands disabled — launch via `tauri dev` to see real runs",
       );
+      setRuns(demoHistoryRuns(Date.now()));
       return;
     }
     let cancelled = false;
@@ -67,13 +84,36 @@ export function History({ theme, onThemeToggle, onNavigate }: Props): JSX.Elemen
     const done = runs.filter((r) => r.status === "done").length;
     const failed = runs.filter((r) => r.status === "error").length;
     const stopped = runs.filter((r) => r.status === "stopped").length;
-    return { total, done, failed, stopped };
+    const finished = runs.filter(
+      (r) => r.status === "done" || r.status === "error",
+    );
+    const successRate =
+      finished.length === 0 ? null : (done / finished.length) * 100;
+    const durations = finished
+      .map((r) => r.durationMs ?? 0)
+      .filter((d) => d > 0);
+    const avgDurationMs =
+      durations.length === 0
+        ? null
+        : durations.reduce((a, b) => a + b, 0) / durations.length;
+    return { total, done, failed, stopped, successRate, avgDurationMs };
   }, [runs]);
 
   const filtered = useMemo(() => {
-    if (statusFilter === "all") return runs;
-    return runs.filter((r) => r.status === statusFilter);
-  }, [runs, statusFilter]);
+    const now = Date.now();
+    const rangeMs = RANGE_MS[timeRange];
+    const cutoff = rangeMs == null ? null : now - rangeMs;
+    const q = query.trim().toLowerCase();
+    return runs.filter((r) => {
+      if (statusFilter !== "all" && r.status !== statusFilter) return false;
+      if (cutoff != null && r.startedAt < cutoff) return false;
+      if (q.length > 0) {
+        const hay = `${r.workflowId} ${r.runId} ${r.triggerKind}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [runs, statusFilter, timeRange, query]);
 
   const byDay = useMemo(() => {
     const groups = new Map<string, RunRow[]>();
@@ -166,10 +206,118 @@ export function History({ theme, onThemeToggle, onNavigate }: Props): JSX.Elemen
               marginBottom: 22,
             }}
           >
-            <StatCell label="total" value={stats.total} />
-            <StatCell label="done" value={stats.done} color="var(--ok)" />
-            <StatCell label="errors" value={stats.failed} color="var(--err)" />
-            <StatCell label="stopped" value={stats.stopped} color="var(--warn)" />
+            <StatCell label="total runs" value={String(stats.total)} />
+            <StatCell
+              label="success rate"
+              value={
+                stats.successRate == null
+                  ? "—"
+                  : `${Math.round(stats.successRate)}%`
+              }
+              color="var(--warn)"
+            />
+            <StatCell
+              label="avg duration"
+              value={
+                stats.avgDurationMs == null
+                  ? "—"
+                  : fmtDuration(stats.avgDurationMs)
+              }
+            />
+            <StatCell
+              label="errors"
+              value={String(stats.failed)}
+              color="var(--err)"
+            />
+          </div>
+
+          {/* Search + time-range row */}
+          <div
+            style={{
+              display: "flex",
+              gap: 12,
+              alignItems: "center",
+              marginBottom: 14,
+              padding: "10px 12px",
+              background: "var(--bg-panel)",
+              border: "1px solid var(--line)",
+              borderRadius: 3,
+            }}
+          >
+            <div style={{ position: "relative", flex: 1 }}>
+              <span
+                style={{
+                  position: "absolute",
+                  left: 10,
+                  top: "50%",
+                  transform: "translateY(-50%)",
+                  color: "var(--txt-faint)",
+                  fontSize: 11,
+                  fontFamily: "var(--mono)",
+                }}
+              >
+                ⌕
+              </span>
+              <input
+                type="search"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="search workflow, run id, or trigger…"
+                style={{
+                  width: "100%",
+                  height: 28,
+                  padding: "0 10px 0 28px",
+                  background: "var(--bg-input)",
+                  border: "1px solid var(--line)",
+                  borderRadius: 3,
+                  fontFamily: "var(--mono)",
+                  fontSize: 11.5,
+                  color: "var(--txt)",
+                }}
+              />
+            </div>
+            <span
+              style={{
+                fontSize: 10,
+                color: "var(--txt-faint)",
+                letterSpacing: "0.08em",
+                textTransform: "uppercase",
+              }}
+            >
+              range
+            </span>
+            <div
+              style={{
+                display: "inline-flex",
+                background: "var(--bg-input)",
+                border: "1px solid var(--line)",
+                borderRadius: 3,
+                padding: 2,
+              }}
+            >
+              {(["24h", "7d", "all"] as TimeRange[]).map((r) => (
+                <button
+                  key={r}
+                  type="button"
+                  onClick={() => setTimeRange(r)}
+                  style={{
+                    appearance: "none",
+                    border: 0,
+                    background:
+                      timeRange === r ? "var(--bg-active)" : "transparent",
+                    color: timeRange === r ? "var(--txt)" : "var(--txt-dim)",
+                    fontFamily: "var(--mono)",
+                    fontSize: 11,
+                    padding: "3px 10px",
+                    height: 20,
+                    borderRadius: 2,
+                    cursor: "pointer",
+                  }}
+                >
+                  {r === "24h" ? "24h" : r === "7d" ? "7 days" : "all time"}
+                </button>
+              ))}
+            </div>
           </div>
 
           {/* Filter bar */}
@@ -295,7 +443,7 @@ function StatCell({
   color,
 }: {
   label: string;
-  value: number;
+  value: string;
   color?: string;
 }): JSX.Element {
   return (
@@ -365,7 +513,7 @@ function RunRowView({
           textAlign: "left",
           cursor: "pointer",
           display: "grid",
-          gridTemplateColumns: "24px 1.4fr 1fr 120px 100px 140px",
+          gridTemplateColumns: "24px 1.4fr 1fr 120px 100px 100px 140px",
           gap: 10,
           alignItems: "center",
           fontFamily: "var(--mono)",
@@ -404,6 +552,20 @@ function RunRowView({
           {fmtDuration(run.durationMs)}
         </span>
         <span
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            color: "var(--txt-dim)",
+            fontSize: 11.5,
+          }}
+        >
+          <span style={{ color: "var(--accent)" }}>
+            {TRIGGER_GLYPH[run.triggerKind] ?? "·"}
+          </span>
+          {run.triggerKind}
+        </span>
+        <span
           className="num"
           style={{
             color: "var(--txt-faint)",
@@ -413,7 +575,7 @@ function RunRowView({
           }}
           title={run.runId}
         >
-          {run.runId.slice(0, 8)}
+          {run.runId.length > 14 ? `${run.runId.slice(0, 12)}…` : run.runId}
         </span>
       </button>
       {expanded ? (
