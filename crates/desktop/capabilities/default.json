@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capabilities the Ordius window needs to talk to the Rust side.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

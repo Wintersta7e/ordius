@@ -7,10 +7,18 @@
 /ui/node_modules/
 /ui/dist/
 /ui/.vite/
+/crates/desktop/ui/node_modules/
+/crates/desktop/ui/dist/
+/crates/desktop/ui/.vite/
+.playwright-mcp/
 
 # Tauri build output
 /crates/desktop/target/
+/crates/desktop/gen/
 /src-tauri/target/
+
+# Phase screenshots (visual verification artefacts, not source)
+/phase-*.png
 
 # Distribution
 /dist/

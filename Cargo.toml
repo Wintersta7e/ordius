@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/engine", "crates/cli"]
+members = ["crates/engine", "crates/cli", "crates/desktop"]
 
 [workspace.package]
 version = "0.1.0"
@@ -49,6 +49,10 @@ keyring-core = "1"
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 rpassword = "7"
+
+# Desktop (Tauri 2)
+tauri = { version = "2", features = [] }
+tauri-build = { version = "2", features = [] }
 
 # Test-only (hoisted to workspace so all crates resolve the same version)
 tempfile = "3"
