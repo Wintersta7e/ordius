@@ -14,6 +14,9 @@ import {
   listNodeTypes,
   listWorkflows,
   loadWorkflow,
+  runWorkflow,
+  saveWorkflow,
+  stopRun,
 } from "../engine";
 import { Canvas } from "../components/canvas";
 import {
@@ -28,6 +31,12 @@ import {
 import { StatusRibbon } from "../components/home/StatusRibbon";
 import { Palette } from "../components/palette";
 import { PropertiesPanel } from "../components/properties";
+import {
+  RunPanel,
+  emptyRunState,
+  reduceRunEvent,
+  type LiveRunState,
+} from "../components/run";
 import type { Route } from "../lib/router";
 
 interface Props {
@@ -50,6 +59,7 @@ export function Editor({
   const [nodeTypes, setNodeTypes] = useState<NodeType[]>([]);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [runState, setRunState] = useState<LiveRunState>(emptyRunState);
 
   const insideTauri =
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -236,6 +246,56 @@ export function Editor({
   // For Phase 1.5c the new node lands below the lowest existing
   // node so it's always visible; drag-from-palette with a
   // cursor-tracking ghost is a v1.x polish item.
+  const handleRun = useCallback(async () => {
+    if (!workflow) return;
+    if (!insideTauri) {
+      console.warn("run requires the Tauri host");
+      return;
+    }
+    setRunState(emptyRunState());
+    setMode("run");
+    try {
+      await runWorkflow(
+        {
+          workflowId: workflow.id,
+          variables: {},
+          autoResume: true,
+        },
+        (event) => {
+          setRunState((current) => reduceRunEvent(current, event));
+        },
+      );
+    } catch (e: unknown) {
+      setError(String(e));
+    }
+  }, [workflow, insideTauri]);
+
+  const handleStop = useCallback(async () => {
+    if (!runState.runId) return;
+    if (!insideTauri) return;
+    try {
+      await stopRun(runState.runId);
+    } catch (e: unknown) {
+      setError(String(e));
+    }
+  }, [runState.runId, insideTauri]);
+
+  const handleSave = useCallback(async () => {
+    if (!workflow) return;
+    if (!insideTauri) {
+      console.warn("save requires the Tauri host");
+      return;
+    }
+    try {
+      await saveWorkflow(workflow);
+      setTabs((existing) =>
+        existing.map((t) => (t.id === activeId ? { ...t, dirty: false } : t)),
+      );
+    } catch (e: unknown) {
+      setError(String(e));
+    }
+  }, [workflow, activeId, insideTauri]);
+
   const handleAddNode = useCallback(
     (typeId: string) => {
       const nodeType = nodeTypes.find((t) => t.id === typeId);
@@ -282,11 +342,11 @@ export function Editor({
         onModeChange={setMode}
         theme={theme}
         onThemeToggle={onThemeToggle}
-        running={false}
-        onRun={() => console.warn("run dialog lands in Phase 1.9", activeId)}
-        onStop={() => console.warn("stop wired in Phase 1.6", activeId)}
-        onSave={() => console.warn("save wired in Phase 1.5e", activeId)}
-        onValidate={() => console.warn("validate wired in Phase 1.5e", activeId)}
+        running={runState.status === "running"}
+        onRun={handleRun}
+        onStop={handleStop}
+        onSave={handleSave}
+        onValidate={() => console.warn("validate wired with engine `validate` in 1.5e")}
         onNavigate={onNavigate}
       />
       <WorkflowTabStrip
@@ -319,6 +379,15 @@ export function Editor({
               onMoveNode={handleMoveNode}
               density="standard"
               edgeStyle="orthogonal"
+              runState={
+                runState.status != null
+                  ? {
+                      statusByNode: runState.statusByNode,
+                      activeEdges: runState.activeEdges,
+                      traveledEdges: runState.traveledEdges,
+                    }
+                  : undefined
+              }
             />
           ) : (
             <div
@@ -362,8 +431,10 @@ export function Editor({
           ) : null}
         </section>
 
-        {/* Properties — Phase 1.5d */}
-        {workflow ? (
+        {/* Right column — Properties in editor mode, RunPanel in run mode */}
+        {mode === "run" ? (
+          <RunPanel state={runState} onStop={handleStop} />
+        ) : workflow ? (
           <PropertiesPanel
             workflow={workflow}
             selectedNode={
