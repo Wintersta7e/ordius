@@ -282,6 +282,7 @@ impl Engine {
                             &mut upstream_outputs,
                             &node.id,
                             iteration,
+                            attempt,
                             &outputs,
                         )?;
                         finalize_node_run(
@@ -551,17 +552,32 @@ const fn retry_matches(retry_on: RetryOn, err: &NodeError) -> bool {
 /// Persist every output port + populate the run-loop's
 /// authoritative `upstream_outputs` map. Inline JSON only today;
 /// the >8 KB file-back fallback is not yet wired.
+///
+/// `attempt` is the attempt number that produced these outputs —
+/// not always `1`. A node that succeeds on its second retry stores
+/// its outputs under `(run, node, iteration, 2)`, matching the
+/// `node:done` event the run loop emits with `attempt=2`. Earlier
+/// failed attempts have their own `node_runs` rows but no
+/// `node_outputs` (failures don't produce outputs).
 fn persist_node_outputs(
     recorder: &RunRecorder,
     upstream_outputs: &mut HashMap<(String, String), PortValue>,
     node_id: &str,
     iteration: u32,
+    attempt: u32,
     outputs: &crate::executor::NodeOutputs,
 ) -> Result<()> {
     for (port_name, value) in outputs {
         let value_json = serde_json::to_string(value)
             .map_err(|e| EngineError::Db(format!("encode output: {e}")))?;
-        recorder.record_node_output(node_id, iteration, 1, port_name, Some(&value_json), None)?;
+        recorder.record_node_output(
+            node_id,
+            iteration,
+            attempt,
+            port_name,
+            Some(&value_json),
+            None,
+        )?;
         upstream_outputs.insert((node_id.to_string(), port_name.clone()), value.clone());
     }
     Ok(())
@@ -666,6 +682,60 @@ mod tests {
             }],
             edges: vec![],
         }
+    }
+
+    /// Regression test for the bug Codex flagged: `persist_node_outputs`
+    /// hard-coded `attempt=1` when recording `node_outputs`. After a
+    /// retry that succeeds on attempt 2 the `node:done` event reported
+    /// `attempt=2` but the persisted row was still keyed under
+    /// `(run, node, iteration, 1)`. With the fix the attempt threaded
+    /// from `run_with_retry`'s return propagates into the row, so
+    /// `runs show <id>` and the new wire-level subscribers can
+    /// reconcile event attempt numbers against persisted output rows.
+    #[test]
+    fn persist_node_outputs_records_actual_attempt() {
+        let dir = TempDir::new().unwrap();
+        let pool = crate::db::open(dir.path().join("runs.db")).unwrap();
+        let wf = minimal_workflow();
+        let recorder =
+            RunRecorder::start(pool.clone(), &wf, "{}", &HashMap::new(), "test").unwrap();
+        let run_id = recorder.run_id.clone();
+
+        // Seed the node_runs row for (iteration=1, attempt=2) so the
+        // foreign-key on node_outputs is satisfied if the schema
+        // enforces it.
+        recorder
+            .record_node_run(&NodeRunRow {
+                node_id: "n1",
+                iteration: 1,
+                attempt: 2,
+                node_type: "delay",
+                status: "done",
+                started_at: Some(0),
+                finished_at: Some(1),
+                duration_ms: Some(1),
+                output_summary: None,
+                error: None,
+            })
+            .unwrap();
+
+        let mut outputs: crate::executor::NodeOutputs = HashMap::new();
+        outputs.insert("text".to_string(), PortValue::String("hello".into()));
+        let mut upstream: HashMap<(String, String), PortValue> = HashMap::new();
+        persist_node_outputs(&recorder, &mut upstream, "n1", 1, 2, &outputs).unwrap();
+
+        let conn = pool.get().unwrap();
+        let attempt: u32 = conn
+            .prepare(
+                "SELECT attempt FROM node_outputs WHERE run_id=? AND node_id=? AND port_name=?",
+            )
+            .unwrap()
+            .query_row(rusqlite::params![&run_id, "n1", "text"], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            attempt, 2,
+            "persisted output's attempt column must reflect the attempt that produced it, not a hard-coded 1",
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
