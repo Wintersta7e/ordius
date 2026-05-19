@@ -74,6 +74,7 @@ async fn template_resolves_secret_and_redacts_in_event_log() {
         checkpoints: Arc::new(CheckpointRegistry::new()),
         iteration: 1,
         attempt: std::sync::atomic::AtomicU32::new(1),
+        auto_resume: false,
     };
 
     let executor = InProcessExecutor::new();

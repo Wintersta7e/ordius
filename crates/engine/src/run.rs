@@ -201,7 +201,7 @@ impl Engine {
         workspace: PathBuf,
         variables: HashMap<String, String>,
         cancel: CancellationToken,
-        _auto_resume: bool,
+        auto_resume: bool,
     ) -> Result<RunSummary> {
         let mut upstream_outputs: HashMap<(String, String), PortValue> = HashMap::new();
         let mut iterations: HashMap<String, u32> = HashMap::new();
@@ -267,6 +267,7 @@ impl Engine {
                     checkpoints: self.checkpoints(),
                     iteration,
                     attempt: std::sync::atomic::AtomicU32::new(1),
+                    auto_resume,
                 };
 
                 sched.start_node(&node.id);
@@ -756,6 +757,53 @@ mod tests {
             }],
             edges: vec![],
         }
+    }
+
+    /// Regression test for Codex finding G: the `auto_resume` flag
+    /// passed to `start_run` must reach `CheckpointExecutor` so
+    /// `ordius run --yes` actually short-circuits checkpoint nodes
+    /// without a per-node `config.auto_resume`. Run loop name was
+    /// `_auto_resume`, the value was discarded, and the executor
+    /// only consulted node-level config — so the flag was a no-op
+    /// from the CLI surface.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_level_auto_resume_short_circuits_checkpoint() {
+        let dir = TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+
+        // Single checkpoint node WITHOUT config.auto_resume — the
+        // only thing that should let this finish is run-level
+        // auto_resume reaching the executor. Without the fix the
+        // node would park forever waiting for an external resume.
+        let wf = Arc::new(Workflow {
+            id: "wf_autoresume".into(),
+            name: "auto".into(),
+            schema_version: 1,
+            created_at: None,
+            updated_at: None,
+            variables: HashMap::new(),
+            triggers: vec![],
+            nodes: vec![Node {
+                id: "cp".into(),
+                ty: "checkpoint".into(),
+                name: String::new(),
+                config: HashMap::new(),
+                pos: Pos::default(),
+                timeout_ms: None,
+                retry: None,
+                continue_on_error: false,
+            }],
+            edges: vec![],
+        });
+
+        let summary = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            engine.run_workflow(wf, HashMap::new(), "test", true),
+        )
+        .await
+        .expect("must not park — auto_resume should short-circuit")
+        .expect("run completes");
+        assert_eq!(summary.status, "done");
     }
 
     /// Regression test for Codex finding D: `persist_node_outputs`

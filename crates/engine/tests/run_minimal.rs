@@ -89,6 +89,7 @@ async fn two_delay_nodes_run_end_to_end() {
         checkpoints: Arc::new(CheckpointRegistry::new()),
         iteration: 1,
         attempt: std::sync::atomic::AtomicU32::new(1),
+        auto_resume: false,
     };
     let executor = InProcessExecutor::new();
     let mut sched = Scheduler::new(&wf);

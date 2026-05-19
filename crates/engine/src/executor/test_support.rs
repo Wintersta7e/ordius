@@ -57,6 +57,7 @@ pub(super) fn make_ctx() -> (RunContext, broadcast::Receiver<RunEvent>, TempDir)
         checkpoints: Arc::new(CheckpointRegistry::new()),
         iteration: 1,
         attempt: AtomicU32::new(1),
+        auto_resume: false,
     };
     (ctx, rx, dir)
 }

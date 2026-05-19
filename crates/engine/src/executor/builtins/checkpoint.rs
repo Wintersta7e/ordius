@@ -36,7 +36,11 @@ impl NodeExecutor for CheckpointExecutor {
         ctx: &RunContext,
         cancel: CancellationToken,
     ) -> Result<NodeOutputs, NodeError> {
-        let auto_resume = config_bool_or(&node.config, "auto_resume", false);
+        // Run-level auto-resume (CLI `--yes`) OR per-node override.
+        // Per-node config wins when both are set so workflows that
+        // mark a checkpoint as test-only can short-circuit even on
+        // an interactive run.
+        let auto_resume = ctx.auto_resume || config_bool_or(&node.config, "auto_resume", false);
         if auto_resume {
             return Ok(NodeOutputs::new());
         }

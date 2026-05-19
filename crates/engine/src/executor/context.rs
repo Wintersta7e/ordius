@@ -67,6 +67,12 @@ pub struct RunContext {
     /// registers a receiver here and parks until an external
     /// caller (CLI / GUI) signals resume / cancel.
     pub checkpoints: Arc<CheckpointRegistry>,
+    /// Run-level auto-resume flag. When `true`, every `checkpoint`
+    /// node short-circuits without parking — set by the CLI's
+    /// `run --yes`. Per-node `config.auto_resume` still overrides
+    /// when present, so a workflow can mark specific checkpoints
+    /// as test-only auto-resume regardless of the run flag.
+    pub auto_resume: bool,
     /// Iteration of this node within the current run (1-indexed).
     /// Bumped by the scheduler when a loop edge re-fires the node.
     /// Read by executors that emit `node:output` / `node:paused`
