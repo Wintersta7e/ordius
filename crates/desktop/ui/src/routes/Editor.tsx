@@ -27,6 +27,7 @@ import {
 } from "../components/chrome/WorkflowTabStrip";
 import { StatusRibbon } from "../components/home/StatusRibbon";
 import { Palette } from "../components/palette";
+import { PropertiesPanel } from "../components/properties";
 import type { Route } from "../lib/router";
 
 interface Props {
@@ -185,6 +186,52 @@ export function Editor({
     [activeId],
   );
 
+  const handlePatchNode = useCallback(
+    (id: string, patch: Partial<Workflow["nodes"][number]>) => {
+      setWorkflow((wf) => {
+        if (!wf) return wf;
+        return {
+          ...wf,
+          nodes: wf.nodes.map((n) => (n.id === id ? { ...n, ...patch } : n)),
+        };
+      });
+      setTabs((existing) =>
+        existing.map((t) => (t.id === activeId ? { ...t, dirty: true } : t)),
+      );
+    },
+    [activeId],
+  );
+
+  const handlePatchWorkflow = useCallback(
+    (patch: Partial<Workflow>) => {
+      setWorkflow((wf) => (wf ? { ...wf, ...patch } : wf));
+      setTabs((existing) =>
+        existing.map((t) => (t.id === activeId ? { ...t, dirty: true } : t)),
+      );
+    },
+    [activeId],
+  );
+
+  const handleDeleteNode = useCallback(
+    (id: string) => {
+      setWorkflow((wf) => {
+        if (!wf) return wf;
+        return {
+          ...wf,
+          nodes: wf.nodes.filter((n) => n.id !== id),
+          edges: wf.edges.filter(
+            (e) => e.from_node_id !== id && e.to_node_id !== id,
+          ),
+        };
+      });
+      setSelectedNodeId((current) => (current === id ? null : current));
+      setTabs((existing) =>
+        existing.map((t) => (t.id === activeId ? { ...t, dirty: true } : t)),
+      );
+    },
+    [activeId],
+  );
+
   // Drop a fresh node from the palette into the open workflow.
   // For Phase 1.5c the new node lands below the lowest existing
   // node so it's always visible; drag-from-palette with a
@@ -315,44 +362,34 @@ export function Editor({
           ) : null}
         </section>
 
-        {/* Properties placeholder — Phase 1.5d */}
-        <aside
-          style={{
-            background: "var(--bg-panel)",
-            borderLeft: "1px solid var(--line)",
-            display: "flex",
-            flexDirection: "column",
-            minHeight: 0,
-          }}
-        >
-          <ColumnHeader label="properties" suffix="phase 1.5d" />
-          <div
+        {/* Properties — Phase 1.5d */}
+        {workflow ? (
+          <PropertiesPanel
+            workflow={workflow}
+            selectedNode={
+              selectedNodeId
+                ? workflow.nodes.find((n) => n.id === selectedNodeId) ?? null
+                : null
+            }
+            nodeTypes={nodeTypes}
+            onPatchNode={handlePatchNode}
+            onPatchWorkflow={handlePatchWorkflow}
+            onDeleteNode={handleDeleteNode}
+          />
+        ) : (
+          <aside
             style={{
-              flex: 1,
+              background: "var(--bg-panel)",
+              borderLeft: "1px solid var(--line)",
               padding: 14,
               fontFamily: "var(--mono)",
               fontSize: 11,
               color: "var(--txt-faint)",
-              lineHeight: 1.55,
             }}
           >
-            {selectedNodeId ? (
-              <>
-                selected node:{" "}
-                <span style={{ color: "var(--accent)" }}>{selectedNodeId}</span>
-                <br />
-                datasheet panel + per-config field renderers land in 1.5d.
-              </>
-            ) : (
-              <>
-                datasheet panel for the selected node, or workflow
-                properties when nothing is selected. pin tables + per-
-                config field renderers from the engine's NodeType.config
-                spec.
-              </>
-            )}
-          </div>
-        </aside>
+            no workflow open
+          </aside>
+        )}
       </main>
 
       <StatusRibbon
@@ -362,54 +399,6 @@ export function Editor({
           workflow?.nodes.length ?? 0
         }n ${workflow?.edges.length ?? 0}e`}
       />
-    </div>
-  );
-}
-
-function ColumnHeader({
-  label,
-  suffix,
-}: {
-  label: string;
-  suffix?: string;
-}): JSX.Element {
-  return (
-    <div
-      style={{
-        padding: "10px 14px",
-        borderBottom: "1px solid var(--line-soft)",
-        display: "flex",
-        alignItems: "center",
-        gap: 8,
-        background: "var(--bg-elevated)",
-      }}
-    >
-      <span style={{ color: "var(--accent)", fontSize: 12 }}>┌</span>
-      <span
-        style={{
-          fontFamily: "var(--mono)",
-          fontSize: 10,
-          fontWeight: 700,
-          color: "var(--txt)",
-          letterSpacing: "0.18em",
-          textTransform: "uppercase",
-        }}
-      >
-        {label}
-      </span>
-      <div style={{ flex: 1 }} />
-      {suffix ? (
-        <span
-          className="num"
-          style={{
-            fontFamily: "var(--mono)",
-            fontSize: 9.5,
-            color: "var(--txt-faint)",
-          }}
-        >
-          {suffix}
-        </span>
-      ) : null}
     </div>
   );
 }
