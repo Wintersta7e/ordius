@@ -13,8 +13,10 @@
 
 use crate::emitter::Emitter;
 use crate::events::{EventType, RunEvent};
-use crate::recorder::RunRecorder;
-use crate::types::Workflow;
+use crate::executor::{Dispatcher, NodeExecutor, RunContext, wrap_process_env};
+use crate::recorder::{NodeRunRow, RunRecorder};
+use crate::scheduler::Scheduler;
+use crate::types::{EdgeType, PortValue, Workflow};
 use crate::{Engine, EngineError, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -156,33 +158,196 @@ impl Engine {
             .map_err(|e| EngineError::Db(format!("run task join: {e}")))?
     }
 
-    /// Stub run loop — finalises immediately as `stopped`. The
-    /// real scheduler-driven dispatch lands in the next commit;
-    /// the async signature is kept because that body awaits node
-    /// dispatches and the cancellation token.
-    #[allow(clippy::unused_async)]
+    /// Scheduler-driven dispatch loop.
+    ///
+    /// For each batch of ready nodes:
+    ///   1. Assemble `current_inputs` from incoming forward edges
+    ///      against the run's authoritative `upstream_outputs`.
+    ///   2. Insert a `node_runs` row with status `running`.
+    ///   3. Dispatch via [`Dispatcher`].
+    ///   4. On Ok: persist outputs + update the upstream map +
+    ///      mark the row `done` + emit `node:done`. Then call
+    ///      `sched.complete_node`.
+    ///   5. On Err: mark the row `error` + emit `node:error`.
+    ///      Honor `continue_on_error` by still calling
+    ///      `complete_node` (logically done for scheduling).
+    ///
+    /// Condition / loop handling and terminal-event selection
+    /// arrive in subsequent commits.
+    #[allow(clippy::too_many_lines)] // dispatch + persistence + event emission all live here
     async fn run_loop_inner(
         &self,
-        _wf: Arc<Workflow>,
+        wf: Arc<Workflow>,
         recorder: Arc<RunRecorder>,
         emitter: Arc<Emitter>,
-        _workspace: PathBuf,
-        _variables: HashMap<String, String>,
-        _cancel: CancellationToken,
+        workspace: PathBuf,
+        variables: HashMap<String, String>,
+        cancel: CancellationToken,
         _auto_resume: bool,
     ) -> Result<RunSummary> {
-        emitter.emit(
-            EventType::WorkflowStopped,
-            None,
-            None,
-            None,
-            HashMap::new(),
-        );
-        recorder.finalize("stopped", Some("run loop not yet implemented"))?;
+        let mut upstream_outputs: HashMap<(String, String), PortValue> = HashMap::new();
+        let mut node_runs_count: usize = 0;
+
+        let mut sched = Scheduler::new(&wf);
+        let dispatcher = Dispatcher::new();
+
+        while !sched.is_done() && !sched.is_stalled() {
+            if cancel.is_cancelled() {
+                emitter.emit(EventType::WorkflowStopped, None, None, None, HashMap::new());
+                recorder.finalize("stopped", None)?;
+                return Ok(RunSummary {
+                    run_id: recorder.run_id.clone(),
+                    status: "stopped".into(),
+                    node_runs: node_runs_count,
+                });
+            }
+
+            let ready: Vec<crate::types::Node> = sched.ready().into_iter().cloned().collect();
+            if ready.is_empty() {
+                break;
+            }
+
+            for node in ready {
+                let mut current_inputs: HashMap<String, PortValue> = HashMap::new();
+                for edge in wf
+                    .edges
+                    .iter()
+                    .filter(|e| e.to_node_id == node.id && e.kind == EdgeType::Forward)
+                {
+                    let key = (edge.from_node_id.clone(), edge.from_port.clone());
+                    if let Some(v) = upstream_outputs.get(&key) {
+                        current_inputs.insert(edge.to_port.clone(), v.clone());
+                    }
+                }
+
+                let ctx = RunContext {
+                    run_id: recorder.run_id.clone(),
+                    workflow_id: wf.id.clone(),
+                    workflow_name: wf.name.clone(),
+                    started_at_iso: String::new(),
+                    workspace: workspace.clone(),
+                    variables: variables.clone(),
+                    recorder: recorder.clone(),
+                    emitter: emitter.clone(),
+                    secrets_store: None,
+                    env: wrap_process_env(),
+                    current_inputs,
+                    upstream_outputs: upstream_outputs.clone(),
+                    checkpoints: self.checkpoints(),
+                };
+
+                let nt = self
+                    .registry()
+                    .get(&node.ty)
+                    .ok_or_else(|| EngineError::Node {
+                        node_id: node.id.clone(),
+                        message: format!("unknown node type '{}'", node.ty),
+                    })?;
+
+                let started_at = chrono::Utc::now().timestamp_millis();
+                sched.start_node(&node.id);
+                recorder.record_node_run(&NodeRunRow {
+                    node_id: &node.id,
+                    iteration: 1,
+                    attempt: 1,
+                    node_type: &node.ty,
+                    status: "running",
+                    started_at: Some(started_at),
+                    finished_at: None,
+                    duration_ms: None,
+                    output_summary: None,
+                    error: None,
+                })?;
+                node_runs_count += 1;
+                emitter.emit_node(
+                    EventType::NodeStarted,
+                    node.id.clone(),
+                    1,
+                    1,
+                    HashMap::new(),
+                );
+
+                let res = dispatcher.run(&node, &nt, &ctx, cancel.clone()).await;
+                let finished_at = chrono::Utc::now().timestamp_millis();
+                let duration = finished_at - started_at;
+
+                match res {
+                    Ok(outputs) => {
+                        for (port_name, value) in &outputs {
+                            let value_json = serde_json::to_string(value)
+                                .map_err(|e| EngineError::Db(format!("encode output: {e}")))?;
+                            recorder.record_node_output(
+                                &node.id,
+                                1,
+                                1,
+                                port_name,
+                                Some(&value_json),
+                                None,
+                            )?;
+                            upstream_outputs
+                                .insert((node.id.clone(), port_name.clone()), value.clone());
+                        }
+                        recorder.record_node_run(&NodeRunRow {
+                            node_id: &node.id,
+                            iteration: 1,
+                            attempt: 1,
+                            node_type: &node.ty,
+                            status: "done",
+                            started_at: Some(started_at),
+                            finished_at: Some(finished_at),
+                            duration_ms: Some(duration),
+                            output_summary: None,
+                            error: None,
+                        })?;
+                        emitter.emit_node(
+                            EventType::NodeDone,
+                            node.id.clone(),
+                            1,
+                            1,
+                            HashMap::from([
+                                ("finished_at".into(), serde_json::json!(finished_at)),
+                                ("duration_ms".into(), serde_json::json!(duration)),
+                            ]),
+                        );
+                        sched.complete_node(&node.id);
+                    },
+                    Err(e) => {
+                        let msg = e.to_string();
+                        recorder.record_node_run(&NodeRunRow {
+                            node_id: &node.id,
+                            iteration: 1,
+                            attempt: 1,
+                            node_type: &node.ty,
+                            status: "error",
+                            started_at: Some(started_at),
+                            finished_at: Some(finished_at),
+                            duration_ms: Some(duration),
+                            output_summary: None,
+                            error: Some(&msg),
+                        })?;
+                        emitter.emit_node(
+                            EventType::NodeError,
+                            node.id.clone(),
+                            1,
+                            1,
+                            HashMap::from([("error".into(), serde_json::json!(msg))]),
+                        );
+                        if node.continue_on_error {
+                            sched.complete_node(&node.id);
+                        } else {
+                            sched.fail_node(&node.id);
+                        }
+                    },
+                }
+            }
+        }
+
+        let status = if sched.is_done() { "done" } else { "error" };
+        recorder.finalize(status, None)?;
         Ok(RunSummary {
             run_id: recorder.run_id.clone(),
-            status: "stopped".into(),
-            node_runs: 0,
+            status: status.into(),
+            node_runs: node_runs_count,
         })
     }
 }
@@ -217,7 +382,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn start_run_returns_handle_and_completes_as_stopped() {
+    async fn start_run_dispatches_minimal_workflow_to_done() {
         let dir = TempDir::new().unwrap();
         let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
         let wf = Arc::new(minimal_workflow());
@@ -226,7 +391,53 @@ mod tests {
             .start_run(wf, HashMap::new(), "test", false)
             .expect("start_run");
         let summary = handle.join.await.expect("join").expect("run ok");
-        assert_eq!(summary.status, "stopped");
+        assert_eq!(summary.status, "done");
+        assert_eq!(summary.node_runs, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn three_node_chain_runs_in_order_with_three_node_runs_rows() {
+        let dir = TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+
+        let mk_delay = |id: &str| Node {
+            id: id.into(),
+            ty: "delay".into(),
+            name: String::new(),
+            config: HashMap::from([("ms".into(), serde_json::json!(5))]),
+            pos: Pos::default(),
+            timeout_ms: None,
+            retry: None,
+            continue_on_error: false,
+        };
+        let mk_edge = |id: &str, from: &str, to: &str| crate::types::Edge {
+            id: id.into(),
+            from_node_id: from.into(),
+            from_port: "out".into(),
+            to_node_id: to.into(),
+            to_port: "in".into(),
+            kind: EdgeType::Forward,
+            max_iterations: None,
+            branch: None,
+        };
+        let wf = Arc::new(Workflow {
+            id: "wf_chain".into(),
+            name: "chain".into(),
+            schema_version: 1,
+            created_at: None,
+            updated_at: None,
+            variables: HashMap::new(),
+            triggers: vec![],
+            nodes: vec![mk_delay("a"), mk_delay("b"), mk_delay("c")],
+            edges: vec![mk_edge("e1", "a", "b"), mk_edge("e2", "b", "c")],
+        });
+
+        let summary = engine
+            .run_workflow(wf, HashMap::new(), "test", false)
+            .await
+            .expect("run ok");
+        assert_eq!(summary.status, "done");
+        assert_eq!(summary.node_runs, 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -240,7 +451,7 @@ mod tests {
             .expect("first run starts");
         let second = engine.start_run(wf.clone(), HashMap::new(), "test", false);
         match second {
-            Err(EngineError::AlreadyRunning { .. }) => {}
+            Err(EngineError::AlreadyRunning { .. }) => {},
             Ok(_) => panic!("expected AlreadyRunning, got Ok(RunHandle)"),
             Err(e) => panic!("expected AlreadyRunning, got Err({e})"),
         }
