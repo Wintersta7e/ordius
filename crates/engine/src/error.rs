@@ -67,5 +67,17 @@ pub enum EngineError {
     NotImplemented(&'static str),
 }
 
+impl From<rusqlite::Error> for EngineError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Db(e.to_string())
+    }
+}
+
+impl From<r2d2::Error> for EngineError {
+    fn from(e: r2d2::Error) -> Self {
+        Self::Db(e.to_string())
+    }
+}
+
 /// Engine-wide `Result` alias — every public engine fn returns this.
 pub type Result<T> = std::result::Result<T, EngineError>;

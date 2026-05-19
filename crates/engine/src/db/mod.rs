@@ -2,7 +2,7 @@
 
 mod migrations;
 
-use crate::{EngineError, Result};
+use crate::Result;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use std::path::Path;
@@ -18,12 +18,9 @@ pub type DbPool = Pool<SqliteConnectionManager>;
 pub fn open<P: AsRef<Path>>(path: P) -> Result<DbPool> {
     let mgr = SqliteConnectionManager::file(path)
         .with_init(|c| c.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;"));
-    let pool = Pool::builder()
-        .max_size(8)
-        .build(mgr)
-        .map_err(|e| EngineError::Db(e.to_string()))?;
-    let conn = pool.get().map_err(|e| EngineError::Db(e.to_string()))?;
-    migrations::apply(&conn).map_err(|e| EngineError::Db(e.to_string()))?;
+    let pool = Pool::builder().max_size(8).build(mgr)?;
+    let conn = pool.get()?;
+    migrations::apply(&conn)?;
     Ok(pool)
 }
 

@@ -84,5 +84,30 @@ pub enum EventType {
     NodeResumed,
 }
 
+impl EventType {
+    /// Wire-format tag for this event, e.g. `"node:started"`.
+    /// Pinned by the `#[serde(rename = "...")]` attributes — the
+    /// match arms here MUST stay aligned with them
+    /// (`wire_tag_matches_serde` test guards the parity).
+    #[must_use]
+    pub const fn wire_tag(self) -> &'static str {
+        match self {
+            Self::WorkflowStarted => "workflow:started",
+            Self::WorkflowDone => "workflow:done",
+            Self::WorkflowError => "workflow:error",
+            Self::WorkflowStopped => "workflow:stopped",
+            Self::NodeStarted => "node:started",
+            Self::NodeOutput => "node:output",
+            Self::NodeDone => "node:done",
+            Self::NodeError => "node:error",
+            Self::NodeSkipped => "node:skipped",
+            Self::NodeRetry => "node:retry",
+            Self::NodeLoop => "node:loop",
+            Self::NodePaused => "node:paused",
+            Self::NodeResumed => "node:resumed",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

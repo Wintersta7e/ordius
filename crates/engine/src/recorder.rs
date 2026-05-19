@@ -72,13 +72,12 @@ impl RunRecorder {
         let wf_json = serde_json::to_string(wf).map_err(|e| EngineError::Db(e.to_string()))?;
         let vars_json =
             serde_json::to_string(variables).map_err(|e| EngineError::Db(e.to_string()))?;
-        let conn = pool.get().map_err(|e| EngineError::Db(e.to_string()))?;
+        let conn = pool.get()?;
         conn.execute(
             "INSERT INTO run_snapshots (id, workflow_id, created_at, workflow_json, node_specs_json) \
              VALUES (?,?,?,?,?)",
             rusqlite::params![&snapshot_id, &wf.id, now, &wf_json, node_specs_json],
-        )
-        .map_err(|e| EngineError::Db(e.to_string()))?;
+        )?;
         conn.execute(
             "INSERT INTO runs (id, workflow_id, workflow_name, status, started_at, \
                                variables_json, trigger_kind, workflow_snapshot_id) \
@@ -93,8 +92,7 @@ impl RunRecorder {
                 trigger_kind,
                 &snapshot_id,
             ],
-        )
-        .map_err(|e| EngineError::Db(e.to_string()))?;
+        )?;
         Ok(Self {
             pool,
             run_id,
@@ -113,21 +111,13 @@ impl RunRecorder {
     pub fn record_event(&self, ev: &RunEvent) -> Result<()> {
         let payload_json =
             serde_json::to_string(&ev.payload).map_err(|e| EngineError::Db(e.to_string()))?;
-        let ty_str = serde_json::to_value(ev.ty)
-            .map_err(|e| EngineError::Db(e.to_string()))?
-            .as_str()
-            .expect("EventType serialises to a JSON string")
-            .to_string();
         let seq_i64 =
             i64::try_from(ev.seq).map_err(|e| EngineError::Db(format!("seq overflow: {e}")))?;
         let channel = ev
             .payload
             .get("channel")
             .and_then(serde_json::Value::as_str);
-        let conn = self
-            .pool
-            .get()
-            .map_err(|e| EngineError::Db(e.to_string()))?;
+        let conn = self.pool.get()?;
         conn.execute(
             "INSERT INTO run_events \
                (run_id, seq, emitted_at, type, node_id, iteration, attempt, channel, payload_json) \
@@ -136,15 +126,14 @@ impl RunRecorder {
                 &self.run_id,
                 seq_i64,
                 ev.emitted_at,
-                &ty_str,
+                ev.ty.wire_tag(),
                 &ev.node_id,
                 ev.iteration,
                 ev.attempt,
                 channel,
                 &payload_json,
             ],
-        )
-        .map_err(|e| EngineError::Db(e.to_string()))?;
+        )?;
         Ok(())
     }
 
@@ -152,10 +141,7 @@ impl RunRecorder {
     /// so the same `(run_id, node_id, iteration, attempt)` key
     /// accepts updates as the node transitions through statuses.
     pub fn record_node_run(&self, row: &NodeRunRow<'_>) -> Result<()> {
-        let conn = self
-            .pool
-            .get()
-            .map_err(|e| EngineError::Db(e.to_string()))?;
+        let conn = self.pool.get()?;
         conn.execute(
             "INSERT OR REPLACE INTO node_runs \
                (run_id, node_id, iteration, attempt, node_type, status, \
@@ -174,8 +160,7 @@ impl RunRecorder {
                 row.output_summary,
                 row.error,
             ],
-        )
-        .map_err(|e| EngineError::Db(e.to_string()))?;
+        )?;
         Ok(())
     }
 
@@ -193,10 +178,7 @@ impl RunRecorder {
         value_inline: Option<&str>,
         value_path: Option<&str>,
     ) -> Result<()> {
-        let conn = self
-            .pool
-            .get()
-            .map_err(|e| EngineError::Db(e.to_string()))?;
+        let conn = self.pool.get()?;
         conn.execute(
             "INSERT OR REPLACE INTO node_outputs \
                (run_id, node_id, iteration, attempt, port_name, value_inline, value_path) \
@@ -210,8 +192,7 @@ impl RunRecorder {
                 value_inline,
                 value_path,
             ],
-        )
-        .map_err(|e| EngineError::Db(e.to_string()))?;
+        )?;
         Ok(())
     }
 
@@ -222,10 +203,7 @@ impl RunRecorder {
     /// implementation relies on `INSERT` raising a constraint
     /// violation when the key is taken.
     pub fn try_acquire_lock(&self) -> Result<bool> {
-        let conn = self
-            .pool
-            .get()
-            .map_err(|e| EngineError::Db(e.to_string()))?;
+        let conn = self.pool.get()?;
         let now = Utc::now().timestamp_millis();
         let pid = i64::from(std::process::id());
         let res = conn.execute(
@@ -240,7 +218,7 @@ impl RunRecorder {
             {
                 Ok(false)
             },
-            Err(e) => Err(EngineError::Db(e.to_string())),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -248,15 +226,11 @@ impl RunRecorder {
     /// lock has already been released or was never held by this
     /// `run_id`.
     pub fn release_lock(&self) -> Result<()> {
-        let conn = self
-            .pool
-            .get()
-            .map_err(|e| EngineError::Db(e.to_string()))?;
+        let conn = self.pool.get()?;
         conn.execute(
             "DELETE FROM workflow_locks WHERE workflow_id=? AND run_id=?",
             rusqlite::params![&self.workflow_id, &self.run_id],
-        )
-        .map_err(|e| EngineError::Db(e.to_string()))?;
+        )?;
         Ok(())
     }
 
@@ -264,16 +238,12 @@ impl RunRecorder {
     /// `duration_ms`, and optionally `error_tail`.
     pub fn finalize(&self, status: &str, error_tail: Option<&str>) -> Result<()> {
         let finished_at = Utc::now().timestamp_millis();
-        let conn = self
-            .pool
-            .get()
-            .map_err(|e| EngineError::Db(e.to_string()))?;
+        let conn = self.pool.get()?;
         conn.execute(
             "UPDATE runs SET status=?, finished_at=?, duration_ms=?-started_at, error_tail=? \
              WHERE id=?",
             rusqlite::params![status, finished_at, finished_at, error_tail, &self.run_id],
-        )
-        .map_err(|e| EngineError::Db(e.to_string()))?;
+        )?;
         Ok(())
     }
 }
@@ -288,15 +258,12 @@ impl RunRecorder {
 /// viewer reflects them correctly. Returns the number of locks
 /// swept.
 pub fn sweep_stale_locks(pool: &DbPool, max_age_ms: i64) -> Result<usize> {
-    let conn = pool.get().map_err(|e| EngineError::Db(e.to_string()))?;
+    let conn = pool.get()?;
     let now = Utc::now().timestamp_millis();
     let rows: Vec<(String, String, i64, i64)> = {
         let mut stmt = conn
-            .prepare("SELECT workflow_id, run_id, holder_pid, acquired_at FROM workflow_locks")
-            .map_err(|e| EngineError::Db(e.to_string()))?;
-        let iter = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-            .map_err(|e| EngineError::Db(e.to_string()))?;
+            .prepare("SELECT workflow_id, run_id, holder_pid, acquired_at FROM workflow_locks")?;
+        let iter = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
         iter.filter_map(std::result::Result::ok).collect()
     };
     let mut swept = 0;
@@ -304,15 +271,13 @@ pub fn sweep_stale_locks(pool: &DbPool, max_age_ms: i64) -> Result<usize> {
         let pid_alive = u32::try_from(pid_i64).ok().is_some_and(pid_is_ordius);
         let stale = (now - acquired) > max_age_ms || !pid_alive;
         if stale {
-            conn.execute("DELETE FROM workflow_locks WHERE workflow_id=?", [&wf_id])
-                .map_err(|e| EngineError::Db(e.to_string()))?;
+            conn.execute("DELETE FROM workflow_locks WHERE workflow_id=?", [&wf_id])?;
             conn.execute(
                 "UPDATE runs SET status='stopped', \
                                   error_tail='engine crashed during run' \
                  WHERE id=? AND status='running'",
                 [&run_id],
-            )
-            .map_err(|e| EngineError::Db(e.to_string()))?;
+            )?;
             swept += 1;
         }
     }

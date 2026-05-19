@@ -72,30 +72,30 @@ fn payload_fields_flatten_to_top_level() {
 
 #[test]
 fn all_thirteen_variants_have_distinct_tags() {
-    let variants = [
-        EventType::WorkflowStarted,
-        EventType::WorkflowDone,
-        EventType::WorkflowError,
-        EventType::WorkflowStopped,
-        EventType::NodeStarted,
-        EventType::NodeOutput,
-        EventType::NodeDone,
-        EventType::NodeError,
-        EventType::NodeSkipped,
-        EventType::NodeRetry,
-        EventType::NodeLoop,
-        EventType::NodePaused,
-        EventType::NodeResumed,
-    ];
-    let tags: std::collections::HashSet<String> = variants
-        .iter()
-        .map(|v| {
-            serde_json::to_value(v)
-                .unwrap()
-                .as_str()
-                .unwrap()
-                .to_string()
-        })
-        .collect();
+    let tags: std::collections::HashSet<&str> = ALL_VARIANTS.iter().map(|v| v.wire_tag()).collect();
     assert_eq!(tags.len(), 13);
+}
+
+const ALL_VARIANTS: &[EventType] = &[
+    EventType::WorkflowStarted,
+    EventType::WorkflowDone,
+    EventType::WorkflowError,
+    EventType::WorkflowStopped,
+    EventType::NodeStarted,
+    EventType::NodeOutput,
+    EventType::NodeDone,
+    EventType::NodeError,
+    EventType::NodeSkipped,
+    EventType::NodeRetry,
+    EventType::NodeLoop,
+    EventType::NodePaused,
+    EventType::NodeResumed,
+];
+
+#[test]
+fn wire_tag_matches_serde_rename() {
+    for v in ALL_VARIANTS {
+        let serde_tag = serde_json::to_value(v).unwrap();
+        assert_eq!(serde_tag.as_str(), Some(v.wire_tag()));
+    }
 }
