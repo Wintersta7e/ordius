@@ -262,3 +262,71 @@ fn record_event_persists_with_type_tag() {
     assert_eq!(ty, "node:started");
     assert_eq!(node_id, "n1");
 }
+
+/// Regression: `record_node_run` used `INSERT OR REPLACE`, whose
+/// REPLACE step is "delete the conflicting row, then insert" —
+/// which cascades through `node_outputs`'s `ON DELETE CASCADE` FK
+/// and wipes every output that landed between the running and
+/// done writes. The fix is to use `ON CONFLICT DO UPDATE` so the
+/// status transition updates the row in place without deletion.
+#[test]
+fn status_transition_does_not_cascade_delete_outputs() {
+    let f = tempfile::NamedTempFile::new().unwrap();
+    let pool = open(f.path()).unwrap();
+    let rec =
+        RunRecorder::start(pool.clone(), &empty_wf(), "{}", &HashMap::new(), "manual").unwrap();
+
+    // Mimic the run loop: write the running row, then a port, then
+    // the done row. The output must survive the running→done
+    // transition.
+    rec.record_node_run(&NodeRunRow {
+        node_id: "n1",
+        iteration: 1,
+        attempt: 1,
+        node_type: "shell",
+        status: "running",
+        started_at: Some(1),
+        finished_at: None,
+        duration_ms: None,
+        output_summary: None,
+        error: None,
+    })
+    .unwrap();
+    rec.record_node_output("n1", 1, 1, "text", Some("\"hello\""), None)
+        .unwrap();
+    rec.record_node_run(&NodeRunRow {
+        node_id: "n1",
+        iteration: 1,
+        attempt: 1,
+        node_type: "shell",
+        status: "done",
+        started_at: Some(1),
+        finished_at: Some(2),
+        duration_ms: Some(1),
+        output_summary: None,
+        error: None,
+    })
+    .unwrap();
+
+    let conn = pool.get().unwrap();
+    let outputs_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM node_outputs WHERE run_id=? AND node_id='n1'",
+            [&rec.run_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        outputs_count, 1,
+        "running→done transition must not cascade-delete the output row",
+    );
+    // node_runs row should now reflect the new status (UPDATE in place).
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM node_runs WHERE run_id=? AND node_id='n1'",
+            [&rec.run_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "done");
+}

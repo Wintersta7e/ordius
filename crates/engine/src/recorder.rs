@@ -155,13 +155,27 @@ impl RunRecorder {
     /// Insert or update a row in `node_runs`. `INSERT OR REPLACE`
     /// so the same `(run_id, node_id, iteration, attempt)` key
     /// accepts updates as the node transitions through statuses.
+    ///
+    /// Uses `INSERT ... ON CONFLICT DO UPDATE` rather than
+    /// `INSERT OR REPLACE`: the latter deletes the conflicting row
+    /// first, which would cascade through `node_outputs`'s
+    /// `ON DELETE CASCADE` FK and wipe the per-port output rows
+    /// the run loop wrote between the running→done transition.
     pub fn record_node_run(&self, row: &NodeRunRow<'_>) -> Result<()> {
         let conn = self.pool.get()?;
         conn.prepare_cached(
-            "INSERT OR REPLACE INTO node_runs \
+            "INSERT INTO node_runs \
                (run_id, node_id, iteration, attempt, node_type, status, \
                 started_at, finished_at, duration_ms, output_summary, error) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+             VALUES (?,?,?,?,?,?,?,?,?,?,?) \
+             ON CONFLICT(run_id, node_id, iteration, attempt) DO UPDATE SET \
+               node_type = excluded.node_type, \
+               status = excluded.status, \
+               started_at = excluded.started_at, \
+               finished_at = excluded.finished_at, \
+               duration_ms = excluded.duration_ms, \
+               output_summary = excluded.output_summary, \
+               error = excluded.error",
         )?
         .execute(rusqlite::params![
             &self.run_id,
