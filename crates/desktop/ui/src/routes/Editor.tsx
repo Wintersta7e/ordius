@@ -1,20 +1,25 @@
 // Editor route — workflow authoring centerpiece.
 //
-// Phase 1.5a wires the shell: top bar, tab strip, three-column
-// palette / canvas / properties layout, and the editor/run mode
-// toggle. Canvas content + palette items + properties form live
-// in subsequent sub-phases (1.5b/c/d). For now each column shows
-// a placeholder consistent with the design tokens so the layout
-// can be reviewed visually.
+// Phase 1.5a wired the chrome shell. Phase 1.5b adds the working
+// canvas: pan/zoom, dot grid, render nodes/edges from the loaded
+// workflow, single-click select, drag-to-move. Palette + properties
+// land in 1.5c / 1.5d.
 
 import { useCallback, useEffect, useState } from "react";
 import type { JSX } from "react";
 
 import {
+  type NodeType,
   type Workflow,
-  loadWorkflow,
+  listNodeTypes,
   listWorkflows,
+  loadWorkflow,
 } from "../engine";
+import { Canvas } from "../components/canvas";
+import {
+  DEMO_NODE_TYPES,
+  DEMO_WORKFLOW,
+} from "../components/canvas/demoWorkflow";
 import { EditorTopBar, type EditorMode } from "../components/chrome/EditorTopBar";
 import {
   WorkflowTabStrip,
@@ -40,27 +45,57 @@ export function Editor({
   const [tabs, setTabs] = useState<WorkflowTab[]>([]);
   const [activeId, setActiveId] = useState<string | null>(workflowId ?? null);
   const [workflow, setWorkflow] = useState<Workflow | null>(null);
+  const [nodeTypes, setNodeTypes] = useState<NodeType[]>([]);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const insideTauri =
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
+  // Load node-type catalog once (under Tauri) — used by the Canvas
+  // for port lookup and category tinting.
+  useEffect(() => {
+    if (!insideTauri) {
+      setNodeTypes(DEMO_NODE_TYPES);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const types = await listNodeTypes();
+        if (!cancelled) setNodeTypes(types);
+      } catch (e: unknown) {
+        if (!cancelled) setError(String(e));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [insideTauri]);
+
+  // Load the workflow when workflowId changes.
   useEffect(() => {
     if (!workflowId) return;
     if (!insideTauri) {
       setError(
         "running in browser preview · engine commands disabled — launch via `tauri dev` to open real workflows",
       );
-      // Synthesise a placeholder tab so the chrome has something
-      // to render even in browser-preview mode.
+      // Fall back to a baked-in demo workflow so the canvas has
+      // something to render for visual review.
+      setWorkflow(DEMO_WORKFLOW);
       setTabs((existing) => {
-        if (existing.some((t) => t.id === workflowId)) return existing;
+        if (existing.some((t) => t.id === DEMO_WORKFLOW.id)) return existing;
         return [
           ...existing,
-          { id: workflowId, name: workflowId, dirty: false, running: false },
+          {
+            id: DEMO_WORKFLOW.id,
+            name: DEMO_WORKFLOW.name,
+            dirty: false,
+            running: false,
+          },
         ];
       });
-      setActiveId(workflowId);
+      setActiveId(DEMO_WORKFLOW.id);
       return;
     }
     let cancelled = false;
@@ -87,22 +122,24 @@ export function Editor({
     };
   }, [workflowId, insideTauri]);
 
-  // No tabs at all → ask the engine for the first available workflow
-  // so the editor isn't visually empty on entry.
+  // No tabs yet → ask the engine for the first available workflow
+  // so the editor lands on something instead of empty.
   useEffect(() => {
     if (tabs.length > 0 || workflowId) return;
-    if (!insideTauri) return;
+    if (!insideTauri) {
+      // In browser preview, surface the demo workflow.
+      onNavigate({ kind: "editor", workflowId: DEMO_WORKFLOW.id });
+      return;
+    }
     let cancelled = false;
     void (async () => {
       try {
         const wfs = await listWorkflows();
         if (cancelled || wfs.length === 0) return;
         const first = wfs[0];
-        if (first) {
-          onNavigate({ kind: "editor", workflowId: first.id });
-        }
+        if (first) onNavigate({ kind: "editor", workflowId: first.id });
       } catch {
-        // ignored — empty state is fine here.
+        /* empty workflow list is fine */
       }
     })();
     return () => {
@@ -110,9 +147,7 @@ export function Editor({
     };
   }, [tabs.length, workflowId, insideTauri, onNavigate]);
 
-  const handleActivate = useCallback((id: string) => {
-    setActiveId(id);
-  }, []);
+  const handleActivate = useCallback((id: string) => setActiveId(id), []);
 
   const handleClose = useCallback(
     (id: string) => {
@@ -128,16 +163,26 @@ export function Editor({
   );
 
   const handleNewTab = useCallback(() => {
-    // Real new-workflow flow lands in Phase 1.5 final tasks.
     onNavigate({ kind: "editor" });
   }, [onNavigate]);
 
-  const placeholderMessage =
-    activeId == null
-      ? "no workflow open — pick one from Home or hit + to start blank"
-      : workflow
-        ? `canvas for ${workflow.name} (${workflow.nodes.length} nodes) — Phase 1.5b`
-        : `loading ${activeId}…`;
+  const handleMoveNode = useCallback(
+    (id: string, pos: { x: number; y: number }) => {
+      setWorkflow((wf) => {
+        if (!wf) return wf;
+        return {
+          ...wf,
+          nodes: wf.nodes.map((n) => (n.id === id ? { ...n, pos } : n)),
+        };
+      });
+      setTabs((existing) =>
+        existing.map((t) =>
+          t.id === activeId ? { ...t, dirty: true } : t,
+        ),
+      );
+    },
+    [activeId],
+  );
 
   return (
     <div
@@ -177,7 +222,7 @@ export function Editor({
           overflow: "hidden",
         }}
       >
-        {/* Palette placeholder */}
+        {/* Palette placeholder — Phase 1.5c */}
         <aside
           style={{
             background: "var(--bg-panel)",
@@ -203,75 +248,61 @@ export function Editor({
           </div>
         </aside>
 
-        {/* Canvas placeholder */}
-        <section
-          style={{
-            background: "var(--bg-canvas)",
-            position: "relative",
-            backgroundImage:
-              "radial-gradient(var(--grid-minor) 1px, transparent 1px)",
-            backgroundSize: "24px 24px",
-            backgroundPosition: "12px 12px",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            overflow: "hidden",
-            minWidth: 0,
-          }}
-        >
-          {/* Corner registration marks (the canvas's identity) */}
-          <Corner pos="tl" />
-          <Corner pos="tr" />
-          <Corner pos="bl" />
-          <Corner pos="br" />
-
+        {/* Canvas — Phase 1.5b */}
+        <section style={{ position: "relative", minWidth: 0 }}>
+          {workflow ? (
+            <Canvas
+              workflow={workflow}
+              nodeTypes={nodeTypes}
+              selectedId={selectedNodeId}
+              onSelect={setSelectedNodeId}
+              onMoveNode={handleMoveNode}
+              density="standard"
+              edgeStyle="orthogonal"
+            />
+          ) : (
+            <div
+              style={{
+                position: "absolute",
+                inset: 0,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                background: "var(--bg-canvas)",
+                color: "var(--txt-faint)",
+                fontFamily: "var(--mono)",
+                fontSize: 12,
+              }}
+            >
+              {activeId == null
+                ? "no workflow open — pick one from Home or hit + to start blank"
+                : `loading ${activeId}…`}
+            </div>
+          )}
           {error ? (
             <div
               style={{
-                maxWidth: 540,
-                padding: "12px 14px",
+                position: "absolute",
+                top: 10,
+                left: 10,
+                right: 10,
+                padding: "8px 12px",
                 fontFamily: "var(--mono)",
                 fontSize: 11,
                 color: "var(--warn)",
                 background: "var(--bg-canvas)",
                 border: "1px dashed var(--line)",
                 borderRadius: 3,
+                pointerEvents: "none",
               }}
             >
               <span style={{ color: "var(--warn)" }}>! </span>
               {error}
             </div>
-          ) : (
-            <div
-              style={{
-                textAlign: "center",
-                fontFamily: "var(--mono)",
-                fontSize: 12,
-                color: "var(--txt-faint)",
-                maxWidth: 460,
-              }}
-            >
-              <div
-                style={{
-                  fontSize: 14,
-                  color: "var(--txt-dim)",
-                  marginBottom: 8,
-                  letterSpacing: "0.04em",
-                }}
-              >
-                {placeholderMessage}
-              </div>
-              <div>
-                ┌ CANVAS ─────────── phase 1.5b ─┐ <br />
-                │ pan + zoom · render nodes/edges │ <br />
-                │ pin ports · loop edges · grid   │ <br />
-                └─────────────────────────────────┘
-              </div>
-            </div>
-          )}
+          ) : null}
         </section>
 
-        {/* Properties placeholder */}
+        {/* Properties placeholder — Phase 1.5d */}
         <aside
           style={{
             background: "var(--bg-panel)",
@@ -292,9 +323,21 @@ export function Editor({
               lineHeight: 1.55,
             }}
           >
-            datasheet panel for the selected node, or workflow
-            properties when nothing is selected. pin tables + per-config
-            field renderers from the engine's NodeType.config spec.
+            {selectedNodeId ? (
+              <>
+                selected node:{" "}
+                <span style={{ color: "var(--accent)" }}>{selectedNodeId}</span>
+                <br />
+                datasheet panel + per-config field renderers land in 1.5d.
+              </>
+            ) : (
+              <>
+                datasheet panel for the selected node, or workflow
+                properties when nothing is selected. pin tables + per-
+                config field renderers from the engine's NodeType.config
+                spec.
+              </>
+            )}
           </div>
         </aside>
       </main>
@@ -302,7 +345,9 @@ export function Editor({
       <StatusRibbon
         workflowCount={tabs.length}
         runCount={0}
-        tail={`mode: ${mode} · ${activeId ?? "no workflow"}`}
+        tail={`mode: ${mode} · ${activeId ?? "no workflow"} · ${
+          workflow?.nodes.length ?? 0
+        }n ${workflow?.edges.length ?? 0}e`}
       />
     </div>
   );
@@ -353,31 +398,5 @@ function ColumnHeader({
         </span>
       ) : null}
     </div>
-  );
-}
-
-function Corner({ pos }: { pos: "tl" | "tr" | "bl" | "br" }): JSX.Element {
-  const at = {
-    tl: { top: 8, left: 8 },
-    tr: { top: 8, right: 8, transform: "scaleX(-1)" },
-    bl: { bottom: 8, left: 8, transform: "scaleY(-1)" },
-    br: { bottom: 8, right: 8, transform: "scale(-1, -1)" },
-  } as const;
-  return (
-    <svg
-      width="14"
-      height="14"
-      viewBox="0 0 14 14"
-      style={{ position: "absolute", ...at[pos] }}
-      aria-hidden="true"
-    >
-      <polyline
-        points="1 1 1 6 6 6 6 1 1 1"
-        fill="none"
-        stroke="var(--grid-major)"
-        strokeWidth="1.2"
-      />
-      <circle cx="3.5" cy="3.5" r="1.2" fill="var(--grid-major)" />
-    </svg>
   );
 }
