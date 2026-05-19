@@ -12,6 +12,7 @@ pub mod db;
 pub mod error;
 pub mod events;
 pub mod loader;
+pub mod recorder;
 pub mod scheduler;
 pub mod types;
 pub mod validation;
