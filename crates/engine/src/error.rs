@@ -17,9 +17,20 @@ pub enum EngineError {
     /// Workflow failed structural validation.
     #[error("validation: {0}")]
     Validation(#[from] crate::validation::ValidationError),
-    /// Generic IO failure (subprocess pipes, filesystem reads outside the loader, etc.).
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
+    /// IO failure with caller-provided context (subprocess pipes,
+    /// filesystem reads outside the loader, etc.). The `context`
+    /// string is required at every construction site — there is no
+    /// `#[from]` conversion, so `?` cannot silently route an
+    /// `io::Error` into a context-less variant.
+    #[error("io: {context}: {source}")]
+    Io {
+        /// Caller-supplied description of what was being attempted
+        /// (e.g. `"opening run database"`, `"spawning shell node"`).
+        context: String,
+        /// Underlying `io::Error`.
+        #[source]
+        source: std::io::Error,
+    },
     /// Storage layer failure (`SQLite` operations, connection pool, etc.).
     #[error("db: {0}")]
     Db(String),
