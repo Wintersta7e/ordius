@@ -7,7 +7,7 @@
 use ordius_engine::db::open;
 use ordius_engine::emitter::Emitter;
 use ordius_engine::events::EventType;
-use ordius_engine::executor::{InProcessExecutor, NodeExecutor, RunContext};
+use ordius_engine::executor::{InProcessExecutor, NodeExecutor, RunContext, wrap_process_env};
 use ordius_engine::recorder::{NodeRunRow, RunRecorder};
 use ordius_engine::registry::Registry;
 use ordius_engine::scheduler::Scheduler;
@@ -82,6 +82,7 @@ async fn two_delay_nodes_run_end_to_end() {
         recorder: rec.clone(),
         emitter: em.clone(),
         secrets_store: None,
+        env: wrap_process_env(),
         current_inputs: HashMap::new(),
         upstream_outputs: HashMap::new(),
     };

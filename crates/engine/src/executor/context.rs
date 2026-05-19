@@ -13,6 +13,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Shared env resolver type for [`RunContext::env`]. Send + Sync
+/// so executors holding `&RunContext` across threads stay happy.
+pub type EnvResolver = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// Build an env resolver that reads the current process env via
+/// [`std::env::var`]. Use as the default `RunContext::env`.
+#[must_use]
+pub fn wrap_process_env() -> EnvResolver {
+    Arc::new(|name: &str| std::env::var(name).ok())
+}
+
 /// Shared per-run state.
 pub struct RunContext {
     /// Run id this context belongs to.
@@ -36,6 +47,11 @@ pub struct RunContext {
     /// secret lookups always fail (useful for tests that don't
     /// touch secrets).
     pub secrets_store: Option<Arc<Store>>,
+    /// Resolver for `{{env.NAME}}` lookups after the allowlist
+    /// guard. Production callers pass [`wrap_process_env`];
+    /// tests inject a map-backed closure so they don't depend on
+    /// process env state.
+    pub env: EnvResolver,
     /// Wired input data assembled by the run-loop from upstream
     /// forward edges into this node. Read by executors via
     /// `ctx.current_inputs.get(port_name)` and by the template

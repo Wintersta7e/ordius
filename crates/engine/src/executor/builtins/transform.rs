@@ -72,8 +72,9 @@ fn apply_template(node: &Node, ctx: &RunContext) -> Result<String, NodeError> {
         emitter.register_secret(name.to_string(), value.clone());
         Some(value)
     };
-    let env_resolver = |name: &str| std::env::var(name).ok();
     let kv_resolver = |_: &str| None;
+    let env_arc = ctx.env.clone();
+    let env_resolver = move |name: &str| env_arc(name);
     let env_allow = crate::template::default_env_allowlist();
     let sub_ctx = crate::template::SubstitutionContext {
         vars: &ctx.variables,

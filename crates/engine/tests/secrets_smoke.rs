@@ -5,7 +5,7 @@
 use ordius_engine::db::open;
 use ordius_engine::emitter::Emitter;
 use ordius_engine::events::EventType;
-use ordius_engine::executor::{InProcessExecutor, NodeExecutor, RunContext};
+use ordius_engine::executor::{InProcessExecutor, NodeExecutor, RunContext, wrap_process_env};
 use ordius_engine::recorder::RunRecorder;
 use ordius_engine::registry::Registry;
 use ordius_engine::secrets::Store;
@@ -67,6 +67,7 @@ async fn template_resolves_secret_and_redacts_in_event_log() {
         recorder: rec.clone(),
         emitter: em.clone(),
         secrets_store: Some(secrets.clone()),
+        env: wrap_process_env(),
         current_inputs: HashMap::new(),
         upstream_outputs: HashMap::new(),
     };

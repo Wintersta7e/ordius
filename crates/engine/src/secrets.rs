@@ -150,7 +150,12 @@ pub fn redact_secrets(text: &str, named_secrets: &[(String, String)]) -> String 
     entries.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
     let mut out = text.to_string();
     for (name, value) in entries {
-        if !value.is_empty() {
+        // Skip empty values (would match every position) and
+        // anything not actually present — `String::replace`
+        // allocates a fresh String even when it finds no
+        // matches, and most lines won't contain any given
+        // secret.
+        if !value.is_empty() && out.contains(value.as_str()) {
             out = out.replace(value.as_str(), &format!("<redacted:{name}>"));
         }
     }

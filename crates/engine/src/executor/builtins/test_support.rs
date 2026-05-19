@@ -2,7 +2,7 @@
 
 use crate::db::open;
 use crate::emitter::Emitter;
-use crate::executor::RunContext;
+use crate::executor::{RunContext, wrap_process_env};
 use crate::recorder::RunRecorder;
 use crate::types::{Category, ExecutionBackend, ExecutionSpec, NodeType, OutputParse, Workflow};
 use std::collections::HashMap;
@@ -43,6 +43,7 @@ pub(super) fn make_ctx() -> (RunContext, TempDir) {
         recorder: rec,
         emitter: Arc::new(em),
         secrets_store: None,
+        env: wrap_process_env(),
         current_inputs: HashMap::new(),
         upstream_outputs: HashMap::new(),
     };

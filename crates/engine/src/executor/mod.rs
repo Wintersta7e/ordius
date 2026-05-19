@@ -5,7 +5,7 @@ pub mod builtins;
 pub mod context;
 pub mod in_process;
 
-pub use context::RunContext;
+pub use context::{EnvResolver, RunContext, wrap_process_env};
 pub use in_process::InProcessExecutor;
 
 use crate::types::{Node, NodeType, PortValue};
