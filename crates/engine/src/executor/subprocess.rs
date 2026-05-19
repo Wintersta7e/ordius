@@ -195,12 +195,16 @@ async fn run_windows(
             Ok(NodeOutputs::new())
         }
         () = cancel.cancelled() => {
-            // Real TerminateJobObject swap-in lands in Task 6.5;
-            // today we kill just the leader. Dropping `sup` then
-            // closes the job which kills any survivors via
-            // KILL_ON_JOB_CLOSE.
-            let killed = sup.child.kill().await;
-            drop(killed);
+            // TerminateJobObject hard-kills every process in the
+            // job atomically — the analog of `kill(-pgid, SIGKILL)`.
+            // No grace period because the call is unconditional;
+            // workflows that need cooperative shutdown should
+            // honor cancellation in their own scripts.
+            win_job::terminate_job(sup.job);
+            // Reap so the OS releases the child's handles before
+            // run finalization. Supervised's Drop closes the job.
+            let reap = sup.child.wait().await;
+            drop(reap);
             Err(NodeError::Cancelled)
         }
     }
@@ -226,7 +230,7 @@ mod win_job {
     use windows::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject,
+        SetInformationJobObject, TerminateJobObject,
     };
     use windows::Win32::System::Threading::{
         CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
@@ -384,6 +388,17 @@ mod win_job {
             return Err(NodeError::Subprocess("ResumeThread failed".into()));
         }
         Ok(())
+    }
+
+    /// Terminate every process in `job` with exit code 1. The
+    /// child's `wait()` future then resolves naturally with an
+    /// abnormal exit status.
+    pub(super) fn terminate_job(job: HANDLE) {
+        // SAFETY: `job` is a live kernel handle the caller owns.
+        // Errors from TerminateJobObject (e.g. job already empty)
+        // are not actionable — we cancel best-effort.
+        let res = unsafe { TerminateJobObject(job, 1) };
+        drop(res);
     }
 }
 
