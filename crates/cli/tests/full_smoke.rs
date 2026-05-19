@@ -171,7 +171,45 @@ edges:
         .success()
         .stdout(predicate::str::contains("removed"));
 
-    // 14. gui stub still exits 2 with the v1.0 explanation.
+    // 14. Drop a manifest into <home>/node-types/. `nodes ls`
+    //     must merge built-ins with manifest-loaded types; the
+    //     manifest's category is "data" so it shows up alongside
+    //     the `transform` and `file` built-ins.
+    let node_types_dir = home.path().join("node-types");
+    std::fs::create_dir_all(&node_types_dir).unwrap();
+    std::fs::write(
+        node_types_dir.join("echoer.yaml"),
+        r"
+id: echoer
+name: Echoer
+category: data
+inputs:
+  - { name: text, type: string }
+outputs:
+  - { name: text, type: string }
+config: []
+execution:
+  backend: subprocess
+  command: [echo, hi]
+  output_parse: text
+",
+    )
+    .unwrap();
+    cli(&home)
+        .args(["nodes", "ls", "--category", "data"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("echoer"))
+        .stdout(predicate::str::contains("transform"))
+        .stdout(predicate::str::contains("file"));
+    cli(&home)
+        .args(["nodes", "show", "echoer"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""id": "echoer""#))
+        .stdout(predicate::str::contains(r#""backend": "subprocess""#));
+
+    // 15. gui stub still exits 2 with the v1.0 explanation.
     cli(&home)
         .args(["gui"])
         .assert()

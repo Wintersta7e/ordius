@@ -215,7 +215,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<u8> {
     let json = cli.json;
     match cli.cmd {
         Cmd::Workflows { sub } => cmd_workflows(sub, &home),
-        Cmd::Nodes { sub } => cmd_nodes(sub, json),
+        Cmd::Nodes { sub } => cmd_nodes(sub, &home, json),
         Cmd::Secrets { sub } => cmd_secrets(sub, &home),
         Cmd::Export { id } => cmd_export(&home, &id),
         Cmd::Import { as_id } => cmd_import(&home, as_id.as_deref()),
@@ -343,8 +343,16 @@ fn resolve_id_or_path(home: &Path, id_or_path: &str) -> PathBuf {
     }
 }
 
-fn cmd_nodes(sub: NodesSub, json_out: bool) -> anyhow::Result<u8> {
-    let registry = Registry::with_v1_0_builtins();
+fn cmd_nodes(sub: NodesSub, home: &Path, json_out: bool) -> anyhow::Result<u8> {
+    // Same merge order Engine::new uses: built-ins first, then
+    // manifests from <home>/node-types/. Surfacing manifest errors
+    // on stderr here mirrors the tracing::warn emitted at engine
+    // startup — the CLI user sees them either way.
+    let mut registry = Registry::with_v1_0_builtins();
+    let errs = ordius_engine::manifests::load_into(&mut registry, home.join("node-types"));
+    for err in &errs {
+        eprintln!("warn: {err}");
+    }
     match sub {
         NodesSub::Ls { category, tag } => nodes_ls(&registry, category.as_deref(), &tag, json_out),
         NodesSub::Show { ty } => nodes_show(&registry, &ty),
