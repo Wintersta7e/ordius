@@ -1,63 +1,11 @@
+use super::super::test_support::{dummy_node_type, make_ctx};
 use super::*;
-use crate::db::open;
-use crate::emitter::Emitter;
-use crate::recorder::RunRecorder;
-use crate::types::{Category, ExecutionBackend, ExecutionSpec, OutputParse, Pos, Workflow};
+use crate::types::{Category, Pos};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Instant;
-use tempfile::TempDir;
-
-fn make_ctx() -> (RunContext, TempDir) {
-    let dir = TempDir::new().unwrap();
-    let pool = open(dir.path().join("t.db")).unwrap();
-    let wf = Workflow {
-        id: "w".into(),
-        name: String::new(),
-        schema_version: 1,
-        created_at: None,
-        updated_at: None,
-        variables: HashMap::new(),
-        triggers: vec![],
-        nodes: vec![],
-        edges: vec![],
-    };
-    let rec = Arc::new(RunRecorder::start(pool, &wf, "{}", &HashMap::new(), "test").unwrap());
-    let (em, _rx) = Emitter::new(rec.clone());
-    let ctx = RunContext {
-        run_id: rec.run_id.clone(),
-        workflow_id: "w".into(),
-        workspace: dir.path().to_path_buf(),
-        variables: HashMap::new(),
-        recorder: rec,
-        emitter: Arc::new(em),
-        current_inputs: HashMap::new(),
-        upstream_outputs: HashMap::new(),
-    };
-    (ctx, dir)
-}
 
 fn delay_node_type() -> NodeType {
-    NodeType {
-        id: "delay".into(),
-        name: String::new(),
-        category: Category::Control,
-        tags: vec![],
-        icon: String::new(),
-        description: String::new(),
-        inputs: vec![],
-        outputs: vec![],
-        config: vec![],
-        execution: ExecutionSpec {
-            backend: ExecutionBackend::InProcess,
-            command: vec![],
-            stdin_template: None,
-            env: HashMap::new(),
-            timeout_ms: None,
-            output_parse: OutputParse::Text,
-            output_map: HashMap::new(),
-        },
-    }
+    dummy_node_type("delay", Category::Control)
 }
 
 fn delay_node(ms: u64) -> Node {

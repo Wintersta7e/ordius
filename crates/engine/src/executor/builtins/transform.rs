@@ -4,6 +4,7 @@
 //! The `template` op lands in Phase 5 alongside the unified
 //! substitution engine. Single primary output: `text` (string).
 
+use super::util::config_str;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::types::{Node, NodeType, PortValue};
 use async_trait::async_trait;
@@ -56,18 +57,9 @@ impl NodeExecutor for TransformExecutor {
     }
 }
 
-fn config_str<'a>(
-    cfg: &'a HashMap<String, serde_json::Value>,
-    key: &str,
-) -> Result<&'a str, NodeError> {
-    cfg.get(key)
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| NodeError::Config(format!("transform: '{key}' (string) required")))
-}
-
 fn apply_jsonpath(cfg: &HashMap<String, serde_json::Value>) -> Result<String, NodeError> {
-    let input = config_str(cfg, "input")?;
-    let expr = config_str(cfg, "expr")?;
+    let input = config_str(cfg, "input", "transform")?;
+    let expr = config_str(cfg, "expr", "transform")?;
     let val: serde_json::Value = serde_json::from_str(input)
         .map_err(|e| NodeError::Other(format!("jsonpath input: {e}")))?;
     let matched = val
@@ -77,8 +69,8 @@ fn apply_jsonpath(cfg: &HashMap<String, serde_json::Value>) -> Result<String, No
 }
 
 fn apply_regex_extract(cfg: &HashMap<String, serde_json::Value>) -> Result<String, NodeError> {
-    let input = config_str(cfg, "input")?;
-    let pattern = config_str(cfg, "pattern")?;
+    let input = config_str(cfg, "input", "transform")?;
+    let pattern = config_str(cfg, "pattern", "transform")?;
     let re = regex::Regex::new(pattern).map_err(|e| NodeError::Other(format!("regex: {e}")))?;
     Ok(re
         .find(input)
@@ -87,8 +79,8 @@ fn apply_regex_extract(cfg: &HashMap<String, serde_json::Value>) -> Result<Strin
 }
 
 fn apply_regex_replace(cfg: &HashMap<String, serde_json::Value>) -> Result<String, NodeError> {
-    let input = config_str(cfg, "input")?;
-    let pattern = config_str(cfg, "pattern")?;
+    let input = config_str(cfg, "input", "transform")?;
+    let pattern = config_str(cfg, "pattern", "transform")?;
     let replacement = cfg
         .get("replacement")
         .and_then(serde_json::Value::as_str)

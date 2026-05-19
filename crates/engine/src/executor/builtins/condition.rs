@@ -3,6 +3,7 @@
 //! `resolve_condition` consumes that string to pick edges with a
 //! matching `branch` label.
 
+use super::util::config_str;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::types::{Node, NodeType, PortValue};
 use async_trait::async_trait;
@@ -62,15 +63,6 @@ impl NodeExecutor for ConditionExecutor {
     }
 }
 
-fn config_str<'a>(
-    cfg: &'a HashMap<String, serde_json::Value>,
-    key: &str,
-) -> Result<&'a str, NodeError> {
-    cfg.get(key)
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| NodeError::Config(format!("condition: '{key}' (string) required")))
-}
-
 fn eval_boolean(cfg: &HashMap<String, serde_json::Value>) -> Result<bool, NodeError> {
     cfg.get("value")
         .and_then(serde_json::Value::as_bool)
@@ -88,15 +80,15 @@ fn eval_exit_code(cfg: &HashMap<String, serde_json::Value>) -> Result<bool, Node
 }
 
 fn eval_regex(cfg: &HashMap<String, serde_json::Value>) -> Result<bool, NodeError> {
-    let input = config_str(cfg, "input")?;
-    let pattern = config_str(cfg, "pattern")?;
+    let input = config_str(cfg, "input", "condition")?;
+    let pattern = config_str(cfg, "pattern", "condition")?;
     let re = regex::Regex::new(pattern).map_err(|e| NodeError::Other(format!("regex: {e}")))?;
     Ok(re.is_match(input))
 }
 
 fn eval_jsonpath(cfg: &HashMap<String, serde_json::Value>) -> Result<bool, NodeError> {
-    let input = config_str(cfg, "input")?;
-    let expr = config_str(cfg, "expr")?;
+    let input = config_str(cfg, "input", "condition")?;
+    let expr = config_str(cfg, "expr", "condition")?;
     let val: serde_json::Value =
         serde_json::from_str(input).map_err(|e| NodeError::Other(format!("input parse: {e}")))?;
     let matched = val
