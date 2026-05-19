@@ -188,19 +188,19 @@ impl Engine {
         let mut upstream_outputs: HashMap<(String, String), PortValue> = HashMap::new();
         let mut iterations: HashMap<String, u32> = HashMap::new();
         let mut node_runs_count: usize = 0;
+        // Tracks whether any unhandled node failure occurred (i.e.
+        // a NodeError on a node without continue_on_error). The
+        // scheduler's `is_done()` returns true once no Ready /
+        // Running nodes remain, which a failure also satisfies, so
+        // we need our own bit to distinguish "done" from "error".
+        let mut had_unhandled_failure = false;
 
         let mut sched = Scheduler::new(&wf);
         let dispatcher = Dispatcher::new();
 
         while !sched.is_done() && !sched.is_stalled() {
             if cancel.is_cancelled() {
-                emitter.emit(EventType::WorkflowStopped, None, None, None, HashMap::new());
-                recorder.finalize("stopped", None)?;
-                return Ok(RunSummary {
-                    run_id: recorder.run_id.clone(),
-                    status: "stopped".into(),
-                    node_runs: node_runs_count,
-                });
+                break;
             }
 
             let ready: Vec<crate::types::Node> = sched.ready().into_iter().cloned().collect();
@@ -367,14 +367,49 @@ impl Engine {
                             sched.complete_node(&node.id);
                         } else {
                             sched.fail_node(&node.id);
+                            had_unhandled_failure = true;
                         }
                     },
                 }
             }
+
+            // Drain freshly-skipped nodes between batches so events
+            // arrive in roughly causal order (a condition that just
+            // selected its branch immediately skips the other).
+            for skipped_id in sched.drain_newly_skipped() {
+                emitter.emit_node(EventType::NodeSkipped, skipped_id, 1, 1, HashMap::new());
+            }
         }
 
-        let status = if sched.is_done() { "done" } else { "error" };
-        recorder.finalize(status, None)?;
+        // Final flush in case nodes transitioned to Skipped on the
+        // very last batch (or via fail_node's cascade).
+        for skipped_id in sched.drain_newly_skipped() {
+            emitter.emit_node(EventType::NodeSkipped, skipped_id, 1, 1, HashMap::new());
+        }
+
+        let (status, terminal_event, error_tail) = if cancel.is_cancelled() {
+            ("stopped", EventType::WorkflowStopped, None)
+        } else if had_unhandled_failure {
+            ("error", EventType::WorkflowError, Some("node failed"))
+        } else if sched.is_done() {
+            ("done", EventType::WorkflowDone, None)
+        } else {
+            // Loop exited with at least one node still in a non-
+            // terminal state — the scheduler reports stalled.
+            (
+                "error",
+                EventType::WorkflowError,
+                Some("workflow stalled: no Ready or Running nodes"),
+            )
+        };
+
+        let mut payload: HashMap<String, serde_json::Value> = HashMap::new();
+        if let Some(reason) = error_tail {
+            payload.insert("error".into(), serde_json::json!(reason));
+        }
+        emitter.emit(terminal_event, None, None, None, payload);
+        recorder.finalize(status, error_tail)?;
+
         Ok(RunSummary {
             run_id: recorder.run_id.clone(),
             status: status.into(),
@@ -487,5 +522,81 @@ mod tests {
             Err(e) => panic!("expected AlreadyRunning, got Err({e})"),
         }
         h1.join.await.expect("join").expect("first run completes");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failing_node_finalises_run_as_error() {
+        let dir = TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+
+        // delay node missing required `ms` → NodeError::Config → run = error.
+        let wf = Arc::new(Workflow {
+            id: "wf_fail".into(),
+            name: "fail".into(),
+            schema_version: 1,
+            created_at: None,
+            updated_at: None,
+            variables: HashMap::new(),
+            triggers: vec![],
+            nodes: vec![Node {
+                id: "broken".into(),
+                ty: "delay".into(),
+                name: String::new(),
+                config: HashMap::new(),
+                pos: Pos::default(),
+                timeout_ms: None,
+                retry: None,
+                continue_on_error: false,
+            }],
+            edges: vec![],
+        });
+
+        let summary = engine
+            .run_workflow(wf, HashMap::new(), "test", false)
+            .await
+            .expect("run completes (even on node failure)");
+        assert_eq!(summary.status, "error");
+        assert_eq!(summary.node_runs, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_run_finalises_as_stopped() {
+        let dir = TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+
+        // long delay so cancellation arrives before it finishes
+        let wf = Arc::new(Workflow {
+            id: "wf_cancel".into(),
+            name: "cancel".into(),
+            schema_version: 1,
+            created_at: None,
+            updated_at: None,
+            variables: HashMap::new(),
+            triggers: vec![],
+            nodes: vec![Node {
+                id: "slow".into(),
+                ty: "delay".into(),
+                name: String::new(),
+                config: HashMap::from([("ms".into(), serde_json::json!(5_000))]),
+                pos: Pos::default(),
+                timeout_ms: None,
+                retry: None,
+                continue_on_error: false,
+            }],
+            edges: vec![],
+        });
+
+        let handle = engine
+            .start_run(wf, HashMap::new(), "test", false)
+            .expect("start_run");
+        let run_id = handle.run_id.clone();
+        // Let dispatch start before cancelling.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            engine.cancel_run(&run_id),
+            "cancel_run should find the active run"
+        );
+        let summary = handle.join.await.expect("join").expect("run ok");
+        assert_eq!(summary.status, "stopped");
     }
 }
