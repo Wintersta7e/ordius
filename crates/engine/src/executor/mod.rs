@@ -3,6 +3,7 @@
 
 pub mod builtins;
 pub mod context;
+pub mod dispatcher;
 pub mod in_process;
 pub mod subprocess;
 
@@ -10,6 +11,7 @@ pub mod subprocess;
 mod test_support;
 
 pub use context::{EnvResolver, RunContext, wrap_process_env};
+pub use dispatcher::Dispatcher;
 pub use in_process::InProcessExecutor;
 pub use subprocess::SubprocessExecutor;
 
