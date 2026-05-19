@@ -21,9 +21,13 @@ pub mod registry;
 pub mod run;
 pub mod scheduler;
 pub mod secrets;
+pub mod settings;
+pub mod system_status;
 pub mod template;
 pub mod types;
 pub mod validation;
+pub mod workflows;
+pub mod workspaces;
 
 pub use checkpoints::{CheckpointRegistry, Resume};
 pub use emitter::Emitter;
