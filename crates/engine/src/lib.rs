@@ -20,7 +20,7 @@ pub mod validation;
 pub use error::{EngineError, Result};
 pub use events::{EventType, RunEvent};
 pub use loader::{LoadError, load_workflow};
-pub use recorder::{NodeRunRow, RunRecorder};
+pub use recorder::{NodeRunRow, RunRecorder, sweep_stale_locks};
 pub use scheduler::{LoopFire, NodeState, Scheduler};
 pub use types::{
     BackoffStrategy, Category, ConfigFieldDef, ConfigFieldType, Edge, EdgeType, ExecutionBackend,

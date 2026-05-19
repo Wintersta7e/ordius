@@ -278,5 +278,61 @@ impl RunRecorder {
     }
 }
 
+/// Sweep `workflow_locks` for stale entries.
+///
+/// A lock is considered stale if its holder PID no longer belongs
+/// to an ordius process, or if it was acquired more than
+/// `max_age_ms` milliseconds ago. Stale locks are deleted and any
+/// associated runs that are still in status `running` are
+/// post-hoc marked `stopped` with an error tail so the history
+/// viewer reflects them correctly. Returns the number of locks
+/// swept.
+pub fn sweep_stale_locks(pool: &DbPool, max_age_ms: i64) -> Result<usize> {
+    let conn = pool.get().map_err(|e| EngineError::Db(e.to_string()))?;
+    let now = Utc::now().timestamp_millis();
+    let rows: Vec<(String, String, i64, i64)> = {
+        let mut stmt = conn
+            .prepare("SELECT workflow_id, run_id, holder_pid, acquired_at FROM workflow_locks")
+            .map_err(|e| EngineError::Db(e.to_string()))?;
+        let iter = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .map_err(|e| EngineError::Db(e.to_string()))?;
+        iter.filter_map(std::result::Result::ok).collect()
+    };
+    let mut swept = 0;
+    for (wf_id, run_id, pid_i64, acquired) in rows {
+        let pid_alive = u32::try_from(pid_i64).ok().is_some_and(pid_is_ordius);
+        let stale = (now - acquired) > max_age_ms || !pid_alive;
+        if stale {
+            conn.execute("DELETE FROM workflow_locks WHERE workflow_id=?", [&wf_id])
+                .map_err(|e| EngineError::Db(e.to_string()))?;
+            conn.execute(
+                "UPDATE runs SET status='stopped', \
+                                  error_tail='engine crashed during run' \
+                 WHERE id=? AND status='running'",
+                [&run_id],
+            )
+            .map_err(|e| EngineError::Db(e.to_string()))?;
+            swept += 1;
+        }
+    }
+    Ok(swept)
+}
+
+#[cfg(unix)]
+fn pid_is_ordius(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|s| s.contains("ordius"))
+}
+
+#[cfg(windows)]
+fn pid_is_ordius(pid: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output();
+    matches!(out, Ok(o) if !o.stdout.is_empty())
+}
+
 #[cfg(test)]
 mod tests;

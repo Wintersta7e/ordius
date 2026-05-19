@@ -183,6 +183,58 @@ fn release_lock_is_no_op_when_not_held() {
 }
 
 #[test]
+fn sweep_removes_old_lock_and_marks_run_stopped() {
+    let f = tempfile::NamedTempFile::new().unwrap();
+    let pool = open(f.path()).unwrap();
+    let rec =
+        RunRecorder::start(pool.clone(), &empty_wf(), "{}", &HashMap::new(), "manual").unwrap();
+    assert!(rec.try_acquire_lock().unwrap());
+    let two_days_ms: i64 = 2 * 24 * 3600 * 1000;
+    pool.get()
+        .unwrap()
+        .execute(
+            "UPDATE workflow_locks SET acquired_at = acquired_at - ?",
+            [two_days_ms],
+        )
+        .unwrap();
+    let one_day_ms: i64 = 24 * 3600 * 1000;
+    let swept = super::sweep_stale_locks(&pool, one_day_ms).unwrap();
+    assert_eq!(swept, 1);
+    let status: String = pool
+        .get()
+        .unwrap()
+        .query_row("SELECT status FROM runs WHERE id=?", [&rec.run_id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(status, "stopped");
+    let lock_count: i64 = pool
+        .get()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM workflow_locks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(lock_count, 0);
+}
+
+#[test]
+fn sweep_leaves_fresh_lock_alone() {
+    let f = tempfile::NamedTempFile::new().unwrap();
+    let pool = open(f.path()).unwrap();
+    let rec =
+        RunRecorder::start(pool.clone(), &empty_wf(), "{}", &HashMap::new(), "manual").unwrap();
+    assert!(rec.try_acquire_lock().unwrap());
+    let one_day_ms: i64 = 24 * 3600 * 1000;
+    let swept = super::sweep_stale_locks(&pool, one_day_ms).unwrap();
+    assert_eq!(swept, 0);
+    let lock_count: i64 = pool
+        .get()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM workflow_locks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(lock_count, 1);
+}
+
+#[test]
 fn record_event_persists_with_type_tag() {
     let f = tempfile::NamedTempFile::new().unwrap();
     let pool = open(f.path()).unwrap();
