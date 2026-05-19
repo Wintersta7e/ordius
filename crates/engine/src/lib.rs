@@ -83,9 +83,9 @@ impl Engine {
     /// migrations, sweep stale `workflow_locks` from prior
     /// crashes, and pre-load the v1.0 built-ins.
     ///
-    /// Custom-manifest loading (later phase) will extend the
-    /// registry from `~/.ordius/node-types/`; that's why the
-    /// constructor is async even though the body is sync today.
+    /// The signature is async because future custom-manifest
+    /// loading (`~/.ordius/node-types/`) will await disk IO; the
+    /// body is sync today.
     #[allow(clippy::unused_async)]
     pub async fn new(home: PathBuf) -> Result<Self> {
         let db_path = home.join("runs.db");
@@ -161,13 +161,12 @@ impl Engine {
     }
 
     /// Graceful shutdown — drain active runs within `drain_timeout`
-    /// before forcing cancellation. Wired in a later phase; the
-    /// signature is async today because the drain loop will await
-    /// the per-run join handles.
+    /// before forcing cancellation. Async because the eventual
+    /// drain loop awaits the per-run join handles.
     #[allow(clippy::unused_async)]
     pub async fn shutdown(&self, _drain_timeout: Duration) -> Result<()> {
         Err(EngineError::NotImplemented(
-            "Engine::shutdown — graceful drain lands in Phase 8",
+            "Engine::shutdown — graceful drain not yet implemented",
         ))
     }
 }

@@ -1,15 +1,19 @@
 //! `Engine::start_run` and `Engine::run_workflow` — the workflow
 //! run entry points.
 //!
-//! `start_run` is non-async, validates + acquires the workflow
-//! lock + spawns the run loop, returning a `RunHandle` the caller
-//! can subscribe to or join. `run_workflow` is the convenience
-//! wrapper that just awaits `handle.join`.
+//! `start_run` is non-async: validates, acquires the workflow
+//! lock, registers the run's broadcast sender + cancel token on
+//! the engine, and spawns the run loop, returning a `RunHandle`.
+//! `run_workflow` is the convenience wrapper that awaits
+//! `handle.join`.
 //!
-//! The run loop itself (`run_loop_inner`) is a stub at this
-//! checkpoint — it emits `workflow:stopped` and finalises the
-//! recorder. Dispatch, condition / loop handling, and terminal
-//! event selection arrive in subsequent commits.
+//! `run_loop_inner` drives the scheduler to completion: for each
+//! ready batch it dispatches via [`crate::executor::Dispatcher`],
+//! persists outputs into `node_outputs`, updates the run-loop's
+//! authoritative `upstream_outputs`, emits node lifecycle events,
+//! routes `condition` branches + bumps loop iteration counters,
+//! drains skipped nodes, and finally selects one of
+//! `workflow:done` / `workflow:error` / `workflow:stopped`.
 
 use crate::emitter::Emitter;
 use crate::events::{EventType, RunEvent};
@@ -158,22 +162,16 @@ impl Engine {
             .map_err(|e| EngineError::Db(format!("run task join: {e}")))?
     }
 
-    /// Scheduler-driven dispatch loop.
+    /// Drives the scheduler to completion: dispatches each ready
+    /// batch through [`Dispatcher`], persists outputs, emits node
+    /// lifecycle events, routes condition branches + loop fires,
+    /// and selects the terminal `workflow:*` event.
     ///
-    /// For each batch of ready nodes:
-    ///   1. Assemble `current_inputs` from incoming forward edges
-    ///      against the run's authoritative `upstream_outputs`.
-    ///   2. Insert a `node_runs` row with status `running`.
-    ///   3. Dispatch via [`Dispatcher`].
-    ///   4. On Ok: persist outputs + update the upstream map +
-    ///      mark the row `done` + emit `node:done`. Then call
-    ///      `sched.complete_node`.
-    ///   5. On Err: mark the row `error` + emit `node:error`.
-    ///      Honor `continue_on_error` by still calling
-    ///      `complete_node` (logically done for scheduling).
-    ///
-    /// Condition / loop handling and terminal-event selection
-    /// arrive in subsequent commits.
+    /// `continue_on_error` advances the scheduler even on
+    /// failure; the `had_unhandled_failure` bit distinguishes
+    /// `done` from `error` at the end because
+    /// [`Scheduler::is_done`] returns true once no Ready/Running
+    /// nodes remain, which a cascaded failure also satisfies.
     #[allow(clippy::too_many_lines)] // dispatch + persistence + event emission all live here
     async fn run_loop_inner(
         &self,
@@ -313,7 +311,6 @@ impl Engine {
                         );
                         sched.complete_node(&node.id);
 
-                        // condition node: route branch + maybe fire a loop.
                         if node.ty == "condition"
                             && let Some(PortValue::String(branch)) = outputs.get("branch")
                         {
@@ -373,16 +370,13 @@ impl Engine {
                 }
             }
 
-            // Drain freshly-skipped nodes between batches so events
-            // arrive in roughly causal order (a condition that just
-            // selected its branch immediately skips the other).
+            // Mid-loop drain so node:skipped events arrive in
+            // causal order with the condition that triggered them.
             for skipped_id in sched.drain_newly_skipped() {
                 emitter.emit_node(EventType::NodeSkipped, skipped_id, 1, 1, HashMap::new());
             }
         }
 
-        // Final flush in case nodes transitioned to Skipped on the
-        // very last batch (or via fail_node's cascade).
         for skipped_id in sched.drain_newly_skipped() {
             emitter.emit_node(EventType::NodeSkipped, skipped_id, 1, 1, HashMap::new());
         }

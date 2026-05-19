@@ -28,7 +28,7 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const NODE_TYPE_ID: &str = "llm";
 const SSE_DONE: &str = "[DONE]";
 const SSE_DATA_PREFIX: &str = "data:";
-const LLM_CHANNEL: &str = "llm";
+const CHANNEL_LLM: &str = "llm";
 
 /// Shared HTTP client. Separate from the `http` builtin's client
 /// only to avoid coupling timeouts / pooling between the two; in
@@ -261,7 +261,7 @@ fn process_sse_event(
         let mut payload: HashMap<String, serde_json::Value> = HashMap::with_capacity(2);
         payload.insert(
             "channel".into(),
-            serde_json::Value::String(LLM_CHANNEL.into()),
+            serde_json::Value::String(CHANNEL_LLM.into()),
         );
         payload.insert("text".into(), serde_json::Value::String(content.into()));
         ctx.emitter
