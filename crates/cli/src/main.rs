@@ -220,13 +220,11 @@ async fn dispatch(cli: Cli) -> anyhow::Result<u8> {
         Cmd::Export { id } => cmd_export(&home, &id),
         Cmd::Import { as_id } => cmd_import(&home, as_id.as_deref()),
         Cmd::Run(args) => cmd_run(&home, args).await,
+        Cmd::Runs { sub } => cmd_runs(&home, sub, json).await,
         Cmd::Gui => {
             eprintln!("ordius-cli: GUI binary not installed yet (lands in v1.1)");
             eprintln!("Until then, use 'ordius-cli run <id>' from the terminal.");
             Ok(2)
-        },
-        Cmd::Runs { .. } => {
-            anyhow::bail!("subcommand not yet wired in this build");
         },
     }
 }
@@ -501,6 +499,322 @@ fn secrets_rm(store: &Store, name: &str, force: bool) -> anyhow::Result<u8> {
     }
     store.delete(name).context("delete secret from keyring")?;
     println!("removed {name}");
+    Ok(0)
+}
+
+async fn cmd_runs(home: &Path, sub: RunsSub, json_out: bool) -> anyhow::Result<u8> {
+    let engine = Engine::new(home.to_path_buf())
+        .await
+        .context("open engine")?;
+    let pool = engine.pool();
+    match sub {
+        RunsSub::Ls {
+            workflow,
+            status,
+            since,
+            limit,
+        } => runs_ls(
+            &pool,
+            workflow.as_deref(),
+            status.as_deref(),
+            since.as_deref(),
+            limit,
+            json_out,
+        ),
+        RunsSub::Show { run_id } => runs_show(&pool, &run_id, json_out),
+        RunsSub::Logs {
+            run_id,
+            node,
+            follow,
+        } => runs_logs(&pool, &run_id, node.as_deref(), follow).await,
+        RunsSub::Rm { run_id, force } => runs_rm(&pool, &run_id, force),
+    }
+}
+
+fn runs_ls(
+    pool: &ordius_engine::db::DbPool,
+    workflow: Option<&str>,
+    status: Option<&str>,
+    since: Option<&str>,
+    limit: usize,
+    json_out: bool,
+) -> anyhow::Result<u8> {
+    let mut sql = String::from(
+        "SELECT id, workflow_id, status, started_at, duration_ms, trigger_kind \
+         FROM runs WHERE 1=1",
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(wf) = workflow {
+        sql.push_str(" AND workflow_id = ?");
+        params.push(Box::new(wf.to_string()));
+    }
+    if let Some(st) = status {
+        sql.push_str(" AND status = ?");
+        params.push(Box::new(st.to_string()));
+    }
+    if let Some(s) = since {
+        let dur = humantime::parse_duration(s)
+            .with_context(|| format!("parse --since duration '{s}'"))?;
+        let cutoff_ms = chrono::Utc::now().timestamp_millis()
+            - i64::try_from(dur.as_millis()).unwrap_or(i64::MAX);
+        sql.push_str(" AND started_at >= ?");
+        params.push(Box::new(cutoff_ms));
+    }
+    sql.push_str(" ORDER BY started_at DESC LIMIT ?");
+    params.push(Box::new(i64::try_from(limit).unwrap_or(20)));
+
+    let conn = pool.get().context("acquire DB connection")?;
+    let mut stmt = conn.prepare(&sql).context("prepare runs ls query")?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if json_out {
+        let arr: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(id, wf, st, sa, dur, tk)| {
+                serde_json::json!({
+                    "run_id": id,
+                    "workflow_id": wf,
+                    "status": st,
+                    "started_at": sa,
+                    "duration_ms": dur,
+                    "trigger_kind": tk,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+        return Ok(0);
+    }
+    if rows.is_empty() {
+        println!("(no runs yet)");
+        return Ok(0);
+    }
+    println!(
+        "{:<36} {:<20} {:<10} {:<14} TRIGGER",
+        "RUN_ID", "WORKFLOW", "STATUS", "DURATION_MS",
+    );
+    for (id, wf, st, _sa, dur, tk) in rows {
+        let dur_s = dur.map_or_else(|| "-".to_string(), |d| d.to_string());
+        println!("{id:<36} {wf:<20} {st:<10} {dur_s:<14} {tk}");
+    }
+    Ok(0)
+}
+
+fn runs_show(pool: &ordius_engine::db::DbPool, run_id: &str, json_out: bool) -> anyhow::Result<u8> {
+    let conn = pool.get().context("acquire DB connection")?;
+    let run = conn
+        .prepare(
+            "SELECT workflow_id, status, started_at, finished_at, duration_ms, trigger_kind \
+             FROM runs WHERE id = ?",
+        )?
+        .query_row(rusqlite::params![run_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })
+        .with_context(|| format!("run {run_id} not found"))?;
+
+    let mut node_stmt = conn.prepare(
+        "SELECT node_id, iteration, attempt, status, started_at, finished_at, duration_ms, error \
+         FROM node_runs WHERE run_id = ? ORDER BY started_at",
+    )?;
+    let node_rows: Vec<_> = node_stmt
+        .query_map(rusqlite::params![run_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, u32>(1)?,
+                r.get::<_, u32>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if json_out {
+        let nodes: Vec<serde_json::Value> = node_rows
+            .iter()
+            .map(|(nid, it, at, st, sa, fa, d, err)| {
+                serde_json::json!({
+                    "node_id": nid,
+                    "iteration": it,
+                    "attempt": at,
+                    "status": st,
+                    "started_at": sa,
+                    "finished_at": fa,
+                    "duration_ms": d,
+                    "error": err,
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "run_id": run_id,
+            "workflow_id": run.0,
+            "status": run.1,
+            "started_at": run.2,
+            "finished_at": run.3,
+            "duration_ms": run.4,
+            "trigger_kind": run.5,
+            "node_runs": nodes,
+        });
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        return Ok(0);
+    }
+
+    println!("run_id      {run_id}");
+    println!("workflow_id {}", run.0);
+    println!("status      {}", run.1);
+    println!("started_at  {}", run.2);
+    if let Some(f) = run.3 {
+        println!("finished_at {f}");
+    }
+    if let Some(d) = run.4 {
+        println!("duration_ms {d}");
+    }
+    println!("trigger     {}", run.5);
+    println!();
+    println!(
+        "{:<16} {:<5} {:<5} {:<10} ERROR",
+        "NODE", "ITER", "ATTMT", "STATUS",
+    );
+    for (nid, it, at, st, _sa, _fa, _dur, err) in node_rows {
+        let err_str = err.unwrap_or_default();
+        println!("{nid:<16} {it:<5} {at:<5} {st:<10} {err_str}");
+    }
+    Ok(0)
+}
+
+type RunEventRow = (
+    i64,
+    String,
+    Option<String>,
+    Option<u32>,
+    Option<u32>,
+    String,
+    i64,
+);
+
+fn fetch_run_events_after(
+    pool: &ordius_engine::db::DbPool,
+    run_id: &str,
+    last_seq: i64,
+    node: Option<&str>,
+) -> anyhow::Result<Vec<RunEventRow>> {
+    let conn = pool.get().context("acquire DB connection")?;
+    let mut sql = String::from(
+        "SELECT seq, type, node_id, iteration, attempt, payload_json, emitted_at \
+         FROM run_events WHERE run_id = ? AND seq > ?",
+    );
+    if node.is_some() {
+        sql.push_str(" AND node_id = ?");
+    }
+    sql.push_str(" ORDER BY seq");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+        vec![Box::new(run_id.to_string()), Box::new(last_seq)];
+    if let Some(n) = node {
+        params.push(Box::new(n.to_string()));
+    }
+    let rows: Vec<RunEventRow> = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<u32>>(3)?,
+                r.get::<_, Option<u32>>(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+async fn runs_logs(
+    pool: &ordius_engine::db::DbPool,
+    run_id: &str,
+    node: Option<&str>,
+    follow: bool,
+) -> anyhow::Result<u8> {
+    // Connection is scoped inside fetch_run_events_after so the
+    // rusqlite::Connection (which isn't Send) isn't held across the
+    // sleep await in follow mode.
+    let mut last_seq: i64 = -1;
+    loop {
+        let rows = fetch_run_events_after(pool, run_id, last_seq, node)?;
+
+        let mut saw_terminal = false;
+        for (seq, ty, node_id, it, at, payload, emitted_at) in rows {
+            last_seq = seq;
+            let payload_val: serde_json::Value =
+                serde_json::from_str(&payload).unwrap_or_else(|_| serde_json::json!({}));
+            let mut obj = serde_json::Map::new();
+            obj.insert("type".into(), serde_json::json!(ty));
+            obj.insert("seq".into(), serde_json::json!(seq));
+            obj.insert("emitted_at".into(), serde_json::json!(emitted_at));
+            obj.insert("run_id".into(), serde_json::json!(run_id));
+            if let Some(n) = node_id {
+                obj.insert("node_id".into(), serde_json::json!(n));
+            }
+            if let Some(i) = it {
+                obj.insert("iteration".into(), serde_json::json!(i));
+            }
+            if let Some(a) = at {
+                obj.insert("attempt".into(), serde_json::json!(a));
+            }
+            if let serde_json::Value::Object(p) = payload_val {
+                for (k, v) in p {
+                    obj.entry(k).or_insert(v);
+                }
+            }
+            println!("{}", serde_json::to_string(&obj)?);
+            if matches!(
+                ty.as_str(),
+                "workflow:done" | "workflow:error" | "workflow:stopped"
+            ) {
+                saw_terminal = true;
+            }
+        }
+        if !follow || saw_terminal {
+            return Ok(0);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn runs_rm(pool: &ordius_engine::db::DbPool, run_id: &str, force: bool) -> anyhow::Result<u8> {
+    let conn = pool.get().context("acquire DB connection")?;
+    let exists: bool = conn
+        .prepare("SELECT 1 FROM runs WHERE id = ?")?
+        .query_row(rusqlite::params![run_id], |_| Ok(true))
+        .unwrap_or(false);
+    if !exists {
+        anyhow::bail!("run {run_id} not found");
+    }
+    if !force && !confirm(&format!("Delete run {run_id}?"))? {
+        eprintln!("aborted");
+        return Ok(1);
+    }
+    let deleted = conn.execute("DELETE FROM runs WHERE id = ?", rusqlite::params![run_id])?;
+    println!("removed {run_id} ({deleted} row)");
     Ok(0)
 }
 
