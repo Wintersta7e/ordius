@@ -7,6 +7,7 @@
 //! Retry-on-status is a workflow-graph concern (downstream
 //! `condition` node), not an executor concern.
 
+use super::util::{config_str, config_str_or, config_u64_or};
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::types::{Node, NodeType, PortValue};
 use async_trait::async_trait;
@@ -34,23 +35,11 @@ impl NodeExecutor for HttpExecutor {
         _ctx: &RunContext,
         cancel: CancellationToken,
     ) -> Result<NodeOutputs, NodeError> {
-        let url = node
-            .config
-            .get("url")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| NodeError::Config("http: 'url' (string) required".into()))?;
-        let method = node
-            .config
-            .get("method")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("GET");
-        let method = Method::from_bytes(method.as_bytes())
-            .map_err(|e| NodeError::Config(format!("http: invalid method '{method}': {e}")))?;
-        let timeout_ms = node
-            .config
-            .get("timeout_ms")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(DEFAULT_TIMEOUT_MS);
+        let url = config_str(&node.config, "url", "http")?;
+        let method_str = config_str_or(&node.config, "method", "GET");
+        let method = Method::from_bytes(method_str.as_bytes())
+            .map_err(|e| NodeError::Config(format!("http: invalid method '{method_str}': {e}")))?;
+        let timeout_ms = config_u64_or(&node.config, "timeout_ms", DEFAULT_TIMEOUT_MS);
 
         let mut req = super::super::http_client::shared()
             .request(method, url)

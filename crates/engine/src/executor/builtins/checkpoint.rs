@@ -7,6 +7,7 @@
 //! for unit tests that exercise the rest of the graph without
 //! actually pausing.
 
+use super::util::{config_bool_or, config_str_or};
 use crate::checkpoints::Resume;
 use crate::events::EventType;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
@@ -35,21 +36,12 @@ impl NodeExecutor for CheckpointExecutor {
         ctx: &RunContext,
         cancel: CancellationToken,
     ) -> Result<NodeOutputs, NodeError> {
-        let auto_resume = node
-            .config
-            .get("auto_resume")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let auto_resume = config_bool_or(&node.config, "auto_resume", false);
         if auto_resume {
             return Ok(NodeOutputs::new());
         }
 
-        let message = node
-            .config
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(DEFAULT_MESSAGE)
-            .to_string();
+        let message = config_str_or(&node.config, "message", DEFAULT_MESSAGE).to_string();
 
         let mut paused_payload: HashMap<String, serde_json::Value> = HashMap::with_capacity(1);
         paused_payload.insert("message".into(), serde_json::Value::String(message));

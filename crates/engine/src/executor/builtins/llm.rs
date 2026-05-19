@@ -11,6 +11,9 @@
 //! event tagged `channel: "llm"`; the full text is also
 //! accumulated into the `text` output port.
 
+use super::util::{
+    config_bool_or, config_f64_or, config_str, config_str_opt, config_str_or, config_u64_or,
+};
 use crate::events::EventType;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::types::{Node, NodeType, PortValue};
@@ -46,43 +49,18 @@ impl NodeExecutor for LlmExecutor {
         ctx: &RunContext,
         cancel: CancellationToken,
     ) -> Result<NodeOutputs, NodeError> {
-        let base_url = node
-            .config
-            .get("url")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(DEFAULT_URL)
-            .trim_end_matches('/');
-        let model = node
-            .config
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| NodeError::Config("llm: 'model' (string) required".into()))?;
+        let base_url = config_str_or(&node.config, "url", DEFAULT_URL).trim_end_matches('/');
+        let model = config_str(&node.config, "model", "llm")?;
         let messages = node
             .config
             .get("messages")
             .cloned()
             .ok_or_else(|| NodeError::Config("llm: 'messages' (array) required".into()))?;
-        let temperature = node
-            .config
-            .get("temperature")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(DEFAULT_MODEL_TEMP);
+        let temperature = config_f64_or(&node.config, "temperature", DEFAULT_MODEL_TEMP);
         let max_tokens = node.config.get("max_tokens").cloned();
-        let stream = node
-            .config
-            .get("stream")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(true);
-        let api_key = node
-            .config
-            .get("api_key")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let timeout_ms = node
-            .config
-            .get("timeout_ms")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(DEFAULT_TIMEOUT_MS);
+        let stream = config_bool_or(&node.config, "stream", true);
+        let api_key = config_str_opt(&node.config, "api_key").map(str::to_string);
+        let timeout_ms = config_u64_or(&node.config, "timeout_ms", DEFAULT_TIMEOUT_MS);
 
         let mut body = serde_json::Map::new();
         body.insert("model".into(), serde_json::Value::String(model.into()));

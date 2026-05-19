@@ -50,12 +50,8 @@ impl NodeExecutor for FileExecutor {
     }
 }
 
-fn config_path(node: &Node, key: &str, op: &str) -> Result<String, NodeError> {
-    node.config
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| NodeError::Config(format!("file.{op}: '{key}' (string) required")))
+fn config_path<'a>(node: &'a Node, key: &str, op: &str) -> Result<&'a str, NodeError> {
+    super::util::config_str(&node.config, key, &format!("file.{op}"))
 }
 
 fn resolve(ctx: &RunContext, raw: &str) -> PathBuf {
@@ -69,7 +65,7 @@ fn resolve(ctx: &RunContext, raw: &str) -> PathBuf {
 
 async fn op_read(node: &Node, ctx: &RunContext) -> Result<NodeOutputs, NodeError> {
     let raw = config_path(node, "path", "read")?;
-    let path = resolve(ctx, &raw);
+    let path = resolve(ctx, raw);
     let bytes = tokio::fs::read(&path).await.map_err(|e| NodeError::Io {
         context: format!("file.read: open {}", path.display()),
         source: e,
@@ -91,12 +87,8 @@ async fn op_read(node: &Node, ctx: &RunContext) -> Result<NodeOutputs, NodeError
 async fn op_write(node: &Node, ctx: &RunContext, append: bool) -> Result<NodeOutputs, NodeError> {
     let op_name = if append { "append" } else { "write" };
     let raw = config_path(node, "path", op_name)?;
-    let content = node
-        .config
-        .get("content")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| NodeError::Config(format!("file.{op_name}: 'content' (string) required")))?;
-    let path = resolve(ctx, &raw);
+    let content = super::util::config_str(&node.config, "content", &format!("file.{op_name}"))?;
+    let path = resolve(ctx, raw);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -137,7 +129,7 @@ async fn op_write(node: &Node, ctx: &RunContext, append: bool) -> Result<NodeOut
 
 async fn op_list(node: &Node, ctx: &RunContext) -> Result<NodeOutputs, NodeError> {
     let raw = config_path(node, "path", "list")?;
-    let path = resolve(ctx, &raw);
+    let path = resolve(ctx, raw);
     let mut rd = tokio::fs::read_dir(&path)
         .await
         .map_err(|e| NodeError::Io {
@@ -164,7 +156,7 @@ async fn op_list(node: &Node, ctx: &RunContext) -> Result<NodeOutputs, NodeError
 
 fn op_glob(node: &Node, ctx: &RunContext) -> Result<NodeOutputs, NodeError> {
     let raw = config_path(node, "pattern", "glob")?;
-    let pattern_path = resolve(ctx, &raw);
+    let pattern_path = resolve(ctx, raw);
     let pattern = pattern_path.to_string_lossy().into_owned();
     let glob_iter = glob::glob(&pattern)
         .map_err(|e| NodeError::Config(format!("file.glob: invalid pattern: {e}")))?;
@@ -187,7 +179,7 @@ fn op_glob(node: &Node, ctx: &RunContext) -> Result<NodeOutputs, NodeError> {
 
 async fn op_stat(node: &Node, ctx: &RunContext) -> Result<NodeOutputs, NodeError> {
     let raw = config_path(node, "path", "stat")?;
-    let path = resolve(ctx, &raw);
+    let path = resolve(ctx, raw);
     let md = tokio::fs::metadata(&path)
         .await
         .map_err(|e| NodeError::Io {
