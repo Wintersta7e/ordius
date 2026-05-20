@@ -18,6 +18,15 @@ name = "ordius_desktop"
 path = "src/lib.rs"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Production builds must embed the frontend assets via Tauri's
+# `custom-protocol`, otherwise the runtime falls back to `devUrl`
+# (http://localhost:1420) and the webview shows ERR_CONNECTION_REFUSED
+# on a host with no Vite dev server. `cargo tauri dev` passes
+# `--no-default-features` so dev mode still works.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 [dependencies]
 ordius-engine = { path = "../engine" }
 tauri = { workspace = true }
