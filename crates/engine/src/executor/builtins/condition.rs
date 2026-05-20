@@ -8,10 +8,11 @@ use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::types::{Node, NodeType, PortValue};
 use async_trait::async_trait;
 use jsonpath_rust::JsonPath;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use tokio_util::sync::CancellationToken;
 
-/// Four modes: `boolean`, `exit_code`, `regex`, `jsonpath`.
+/// Modes: `boolean`, `exit_code`, `regex`, `jsonpath`, `compare`.
 #[allow(unreachable_pub)]
 pub const NODE_TYPE_ID: &str = "condition";
 
@@ -41,7 +42,7 @@ impl NodeExecutor for ConditionExecutor {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| {
                 NodeError::Config(
-                    "condition: 'mode' required: boolean|exit_code|regex|jsonpath".into(),
+                    "condition: 'mode' required: boolean|exit_code|regex|jsonpath|compare".into(),
                 )
             })?;
         let truthy = match mode {
@@ -49,6 +50,7 @@ impl NodeExecutor for ConditionExecutor {
             "exit_code" => eval_exit_code(&node.config)?,
             "regex" => eval_regex(&node.config)?,
             "jsonpath" => eval_jsonpath(&node.config)?,
+            "compare" => eval_compare(&node.config)?,
             other => {
                 return Err(NodeError::Config(format!(
                     "condition: unknown mode '{other}'"
@@ -90,6 +92,75 @@ fn eval_regex(cfg: &HashMap<String, serde_json::Value>) -> Result<bool, NodeErro
     let re = regex::Regex::new(pattern)
         .map_err(|e| NodeError::Config(format!("condition.regex: invalid pattern: {e}")))?;
     Ok(re.is_match(input))
+}
+
+/// `compare` mode: `op` selects the operator, `left`/`right` are the
+/// values. Strings compare lexicographically; numbers compare
+/// numerically; mixed types are a config error. `contains` /
+/// `starts_with` / `ends_with` are string-only.
+fn eval_compare(cfg: &HashMap<String, serde_json::Value>) -> Result<bool, NodeError> {
+    let op = config_str(cfg, "op", "condition.compare")?;
+    let left = cfg
+        .get("left")
+        .ok_or_else(|| NodeError::Config("condition.compare: 'left' required".into()))?;
+    let right = cfg
+        .get("right")
+        .ok_or_else(|| NodeError::Config("condition.compare: 'right' required".into()))?;
+    match op {
+        "eq" => Ok(left == right),
+        "neq" => Ok(left != right),
+        "lt" | "le" | "gt" | "ge" => compare_ordered(left, right, op),
+        "contains" => string_op(left, right, |a, b| a.contains(b)),
+        "starts_with" => string_op(left, right, |a, b| a.starts_with(b)),
+        "ends_with" => string_op(left, right, |a, b| a.ends_with(b)),
+        other => Err(NodeError::Config(format!(
+            "condition.compare: unknown op '{other}'"
+        ))),
+    }
+}
+
+fn compare_ordered(
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+    op: &str,
+) -> Result<bool, NodeError> {
+    let ord = if let (Some(a), Some(b)) = (left.as_f64(), right.as_f64()) {
+        a.partial_cmp(&b)
+    } else if let (Some(a), Some(b)) = (left.as_str(), right.as_str()) {
+        Some(a.cmp(b))
+    } else {
+        return Err(NodeError::Config(format!(
+            "condition.compare.{op}: left and right must both be numbers or both strings"
+        )));
+    };
+    let Some(ord) = ord else {
+        // NaN comparisons fall here; any ordering predicate is false.
+        return Ok(false);
+    };
+    Ok(match op {
+        "lt" => ord == Ordering::Less,
+        "le" => ord != Ordering::Greater,
+        "gt" => ord == Ordering::Greater,
+        "ge" => ord != Ordering::Less,
+        _ => unreachable!("op was validated above"),
+    })
+}
+
+fn string_op<F>(
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+    f: F,
+) -> Result<bool, NodeError>
+where
+    F: FnOnce(&str, &str) -> bool,
+{
+    let a = left.as_str().ok_or_else(|| {
+        NodeError::Config("condition.compare: left must be a string for this op".into())
+    })?;
+    let b = right.as_str().ok_or_else(|| {
+        NodeError::Config("condition.compare: right must be a string for this op".into())
+    })?;
+    Ok(f(a, b))
 }
 
 fn eval_jsonpath(cfg: &HashMap<String, serde_json::Value>) -> Result<bool, NodeError> {

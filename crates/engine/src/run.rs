@@ -276,6 +276,7 @@ impl Engine {
                     current_inputs,
                     upstream_outputs: upstream_outputs.clone(),
                     checkpoints: self.checkpoints(),
+                    events: self.events(),
                     iteration,
                     attempt: std::sync::atomic::AtomicU32::new(1),
                     auto_resume,

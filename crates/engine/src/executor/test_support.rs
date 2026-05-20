@@ -55,6 +55,7 @@ pub(super) fn make_ctx() -> (RunContext, broadcast::Receiver<RunEvent>, TempDir)
         current_inputs: HashMap::new(),
         upstream_outputs: HashMap::new(),
         checkpoints: Arc::new(CheckpointRegistry::new()),
+        events: Arc::new(crate::events_registry::EventRegistry::new()),
         iteration: 1,
         attempt: AtomicU32::new(1),
         auto_resume: false,

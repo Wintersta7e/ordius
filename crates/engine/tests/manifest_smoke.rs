@@ -43,7 +43,11 @@ async fn engine_starts_when_node_types_dir_absent() {
     let dir = TempDir::new().unwrap();
     // No node-types/ dir at all.
     let engine = Engine::new(dir.path().to_path_buf()).await.unwrap();
-    assert_eq!(engine.registry().ids().len(), 8, "8 builtins, no manifests");
+    // v1.0 (8) + v1.1 in-progress (kv at minimum).
+    assert!(
+        engine.registry().ids().len() >= 8,
+        "expected the v1.0+ built-ins to be registered with no manifests",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

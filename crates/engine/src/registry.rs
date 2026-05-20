@@ -3,13 +3,19 @@
 //! Built-ins are inserted at startup via [`Registry::with_v1_0_builtins`];
 //! manifest-loaded types land here once the manifest loader ships.
 
-use crate::executor::builtins::checkpoint::NODE_TYPE_ID as CHECKPOINT_NODE_TYPE_ID;
+use crate::executor::builtins::checkpoint::{
+    NODE_TYPE_ID as CHECKPOINT_NODE_TYPE_ID, PAUSE_NODE_TYPE_ID,
+};
 use crate::executor::builtins::condition::NODE_TYPE_ID as CONDITION_NODE_TYPE_ID;
 use crate::executor::builtins::delay::NODE_TYPE_ID as DELAY_NODE_TYPE_ID;
 use crate::executor::builtins::file::NODE_TYPE_ID as FILE_NODE_TYPE_ID;
 use crate::executor::builtins::http::NODE_TYPE_ID as HTTP_NODE_TYPE_ID;
+use crate::executor::builtins::kv::NODE_TYPE_ID as KV_NODE_TYPE_ID;
 use crate::executor::builtins::llm::NODE_TYPE_ID as LLM_NODE_TYPE_ID;
+use crate::executor::builtins::loop_for::NODE_TYPE_ID as LOOP_FOR_NODE_TYPE_ID;
+use crate::executor::builtins::notify::NODE_TYPE_ID as NOTIFY_NODE_TYPE_ID;
 use crate::executor::builtins::transform::NODE_TYPE_ID as TRANSFORM_NODE_TYPE_ID;
+use crate::executor::builtins::wait_event::NODE_TYPE_ID as WAIT_EVENT_NODE_TYPE_ID;
 use crate::executor::subprocess::{PORT_EXIT_CODE, PORT_TEXT, SHELL_NODE_TYPE_ID};
 use crate::types::{
     Category, ConfigFieldDef, ConfigFieldType, ExecutionBackend, ExecutionSpec, NodeType,
@@ -65,6 +71,20 @@ impl Registry {
         r.register(llm_spec());
         r.register(file_spec());
         r.register(checkpoint_spec());
+        r
+    }
+
+    /// Registry pre-populated with the v1.0 + v1.1 built-ins. Engine
+    /// constructors use this; `with_v1_0_builtins` stays for tests that
+    /// pin the v1.0 surface.
+    #[must_use]
+    pub fn with_v1_1_builtins() -> Self {
+        let mut r = Self::with_v1_0_builtins();
+        r.register(kv_spec());
+        r.register(notify_spec());
+        r.register(pause_spec());
+        r.register(loop_for_spec());
+        r.register(wait_event_spec());
         r
     }
 }
@@ -212,6 +232,207 @@ fn checkpoint_spec() -> NodeType {
                 label: "Auto-resume (testing)".into(),
                 ty: ConfigFieldType::Boolean,
                 default: Some(serde_json::json!(false)),
+                required: false,
+            },
+        ],
+        execution: in_process_execution_spec(),
+    }
+}
+
+fn wait_event_spec() -> NodeType {
+    NodeType {
+        id: WAIT_EVENT_NODE_TYPE_ID.into(),
+        name: "Wait Event".into(),
+        category: Category::Control,
+        tags: vec![],
+        icon: "bell".into(),
+        description: "Park until an external caller delivers an event with the \
+                      matching name via Engine::deliver_event."
+            .into(),
+        inputs: vec![],
+        outputs: vec![PortDef {
+            name: "payload".into(),
+            ty: PortType::Json,
+            required: false,
+        }],
+        config: vec![ConfigFieldDef {
+            name: "event".into(),
+            label: "Event name".into(),
+            ty: ConfigFieldType::String,
+            default: None,
+            required: true,
+        }],
+        execution: in_process_execution_spec(),
+    }
+}
+
+fn loop_for_spec() -> NodeType {
+    NodeType {
+        id: LOOP_FOR_NODE_TYPE_ID.into(),
+        name: "Loop For".into(),
+        category: Category::Control,
+        tags: vec![],
+        icon: "repeat".into(),
+        description: "Bounded iteration counter. Emits branch='loop' while \
+                      iteration < count, then 'exit'. Pair with a loop edge \
+                      whose max_iterations matches count."
+            .into(),
+        inputs: vec![],
+        outputs: vec![
+            PortDef {
+                name: "branch".into(),
+                ty: PortType::String,
+                required: false,
+            },
+            PortDef {
+                name: "iteration".into(),
+                ty: PortType::Number,
+                required: false,
+            },
+        ],
+        config: vec![ConfigFieldDef {
+            name: "count".into(),
+            label: "Iterations".into(),
+            ty: ConfigFieldType::Number,
+            default: Some(serde_json::json!(1)),
+            required: true,
+        }],
+        execution: in_process_execution_spec(),
+    }
+}
+
+fn pause_spec() -> NodeType {
+    NodeType {
+        id: PAUSE_NODE_TYPE_ID.into(),
+        name: "Pause".into(),
+        category: Category::Control,
+        tags: vec![],
+        icon: "pause".into(),
+        description: "Human-approval gate. Run halts until an external caller resumes \
+                      via the engine's checkpoint registry."
+            .into(),
+        inputs: vec![],
+        outputs: vec![],
+        config: vec![
+            ConfigFieldDef {
+                name: "message".into(),
+                label: "Prompt".into(),
+                ty: ConfigFieldType::Textarea,
+                default: None,
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "auto_resume".into(),
+                label: "Auto-resume (test-only)".into(),
+                ty: ConfigFieldType::Boolean,
+                default: Some(serde_json::json!(false)),
+                required: false,
+            },
+        ],
+        execution: in_process_execution_spec(),
+    }
+}
+
+fn notify_spec() -> NodeType {
+    NodeType {
+        id: NOTIFY_NODE_TYPE_ID.into(),
+        name: "Notify".into(),
+        category: Category::Integration,
+        tags: vec![],
+        icon: "bell".into(),
+        description: "POST a {title, message} body to a webhook URL — Slack / Discord / \
+                      Mattermost compatible."
+            .into(),
+        inputs: vec![],
+        outputs: vec![
+            PortDef {
+                name: "status".into(),
+                ty: PortType::Number,
+                required: false,
+            },
+            PortDef {
+                name: "ok".into(),
+                ty: PortType::Boolean,
+                required: false,
+            },
+        ],
+        config: vec![
+            ConfigFieldDef {
+                name: "url".into(),
+                label: "Webhook URL".into(),
+                ty: ConfigFieldType::String,
+                default: None,
+                required: true,
+            },
+            ConfigFieldDef {
+                name: "title".into(),
+                label: "Title".into(),
+                ty: ConfigFieldType::String,
+                default: None,
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "message".into(),
+                label: "Message".into(),
+                ty: ConfigFieldType::Textarea,
+                default: None,
+                required: true,
+            },
+            ConfigFieldDef {
+                name: "timeout_ms".into(),
+                label: "Timeout (ms)".into(),
+                ty: ConfigFieldType::Number,
+                default: Some(serde_json::json!(10000)),
+                required: false,
+            },
+        ],
+        execution: in_process_execution_spec(),
+    }
+}
+
+fn kv_spec() -> NodeType {
+    NodeType {
+        id: KV_NODE_TYPE_ID.into(),
+        name: "KV".into(),
+        category: Category::Data,
+        tags: vec![],
+        icon: "database".into(),
+        description: "Persistent per-workflow key-value store backed by SQLite. \
+                      Survives across runs of the same workflow."
+            .into(),
+        inputs: vec![],
+        outputs: vec![
+            PortDef {
+                name: "value".into(),
+                ty: PortType::String,
+                required: false,
+            },
+            PortDef {
+                name: "exists".into(),
+                ty: PortType::Boolean,
+                required: false,
+            },
+        ],
+        config: vec![
+            ConfigFieldDef {
+                name: "op".into(),
+                label: "Operation".into(),
+                ty: ConfigFieldType::Select,
+                default: Some(serde_json::json!(["get", "set", "delete"])),
+                required: true,
+            },
+            ConfigFieldDef {
+                name: "key".into(),
+                label: "Key".into(),
+                ty: ConfigFieldType::String,
+                default: None,
+                required: true,
+            },
+            ConfigFieldDef {
+                name: "value".into(),
+                label: "Value (set only)".into(),
+                ty: ConfigFieldType::String,
+                default: None,
                 required: false,
             },
         ],

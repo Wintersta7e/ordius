@@ -113,6 +113,13 @@ impl RunRecorder {
         self.seq.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// Shared `r2d2` pool — built-ins (`kv`, future side-effecting nodes)
+    /// reach `SQLite` through here without each one having to thread a
+    /// separate connection arg.
+    pub const fn pool(&self) -> &DbPool {
+        &self.pool
+    }
+
     /// Persist an emitted event to the `run_events` table.
     pub fn record_event(&self, ev: &RunEvent) -> Result<()> {
         // Empty payload is the common case (workflow lifecycle +

@@ -13,6 +13,7 @@ pub mod db;
 pub mod emitter;
 pub mod error;
 pub mod events;
+pub mod events_registry;
 pub mod executor;
 pub mod loader;
 pub mod manifests;
@@ -74,6 +75,7 @@ pub struct Engine {
     pool: DbPool,
     registry: Arc<Registry>,
     checkpoints: Arc<CheckpointRegistry>,
+    events: Arc<events_registry::EventRegistry>,
     home: PathBuf,
     secrets_store: Arc<Store>,
     /// Active-run broadcast senders so subscribers (CLI
@@ -110,7 +112,7 @@ impl Engine {
         // Built-ins land first; manifests register on top of them.
         // Duplicate-id checks inside load_into ensure a manifest
         // cannot overwrite a built-in spec.
-        let mut registry = Registry::with_v1_0_builtins();
+        let mut registry = Registry::with_v1_1_builtins();
         let manifest_errs = manifests::load_into(&mut registry, home.join("node-types"));
         for err in &manifest_errs {
             tracing::warn!(error = %err, "manifest load issue");
@@ -119,6 +121,7 @@ impl Engine {
             pool,
             registry: Arc::new(registry),
             checkpoints: Arc::new(CheckpointRegistry::new()),
+            events: Arc::new(events_registry::EventRegistry::new()),
             home,
             secrets_store,
             run_senders: Arc::new(Mutex::new(HashMap::new())),
@@ -152,6 +155,26 @@ impl Engine {
     #[must_use]
     pub fn checkpoints(&self) -> Arc<CheckpointRegistry> {
         self.checkpoints.clone()
+    }
+
+    /// Shared event registry — pass into `RunContext`. Used by
+    /// `wait_event` to park until an external caller delivers an
+    /// event via [`Self::deliver_event`].
+    #[must_use]
+    pub fn events(&self) -> Arc<events_registry::EventRegistry> {
+        self.events.clone()
+    }
+
+    /// Deliver an event payload to a parked `wait_event` waiter.
+    /// Returns `true` if a waiter was present and accepted the
+    /// payload, `false` if no waiter exists or has already dropped.
+    pub fn deliver_event(
+        &self,
+        run_id: &str,
+        event_name: &str,
+        payload: serde_json::Value,
+    ) -> bool {
+        self.events.deliver(run_id, event_name, payload)
     }
 
     /// Engine home directory (run workspaces land in
@@ -236,13 +259,24 @@ mod engine_tests {
     async fn new_opens_db_and_seeds_registry() {
         let dir = TempDir::new().unwrap();
         let eng = Engine::new(dir.path().to_path_buf()).await.unwrap();
-        // 8 v1.0 built-ins should be registered.
-        assert_eq!(
-            eng.registry().ids().len(),
-            8,
-            "got {:?}",
-            eng.registry().ids()
-        );
+        // v1.0 (8) + v1.1 in-progress (kv) = 9 built-ins.
+        let ids = eng.registry().ids();
+        for required in [
+            "delay",
+            "transform",
+            "condition",
+            "shell",
+            "http",
+            "llm",
+            "file",
+            "checkpoint",
+            "kv",
+        ] {
+            assert!(
+                ids.iter().any(|id| id == required),
+                "missing built-in {required:?} in {ids:?}",
+            );
+        }
         assert!(eng.subscribe_run("nope").is_none());
         assert!(!eng.cancel_run("nope"));
     }

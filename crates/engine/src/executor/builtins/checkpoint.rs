@@ -18,6 +18,12 @@ use tokio_util::sync::CancellationToken;
 
 #[allow(unreachable_pub)]
 pub const NODE_TYPE_ID: &str = "checkpoint";
+
+/// Type id of the v1.1 `pause` built-in, which shares this executor.
+/// `pause` is semantically "human-approval gate" while `checkpoint`
+/// is the generic pause/resume primitive; runtime behaviour matches.
+#[allow(unreachable_pub)]
+pub const PAUSE_NODE_TYPE_ID: &str = "pause";
 const DEFAULT_MESSAGE: &str = "Waiting for user to continue...";
 
 /// Built-in `checkpoint` executor — see module docs.
@@ -26,7 +32,7 @@ pub struct CheckpointExecutor;
 #[async_trait]
 impl NodeExecutor for CheckpointExecutor {
     fn supports(&self, nt: &NodeType) -> bool {
-        nt.id == NODE_TYPE_ID
+        nt.id == NODE_TYPE_ID || nt.id == PAUSE_NODE_TYPE_ID
     }
 
     async fn run(

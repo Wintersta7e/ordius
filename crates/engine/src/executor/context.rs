@@ -67,6 +67,10 @@ pub struct RunContext {
     /// registers a receiver here and parks until an external
     /// caller (CLI / GUI) signals resume / cancel.
     pub checkpoints: Arc<CheckpointRegistry>,
+    /// Live event registry — the `wait_event` built-in registers
+    /// a waiter here and parks until an external caller delivers
+    /// the matching event via `Engine::deliver_event`.
+    pub events: Arc<crate::events_registry::EventRegistry>,
     /// Run-level auto-resume flag. When `true`, every `checkpoint`
     /// node short-circuits without parking — set by the CLI's
     /// `run --yes`. Per-node `config.auto_resume` still overrides

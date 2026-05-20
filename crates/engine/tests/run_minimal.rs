@@ -87,6 +87,7 @@ async fn two_delay_nodes_run_end_to_end() {
         current_inputs: HashMap::new(),
         upstream_outputs: HashMap::new(),
         checkpoints: Arc::new(CheckpointRegistry::new()),
+        events: Arc::new(ordius_engine::events_registry::EventRegistry::new()),
         iteration: 1,
         attempt: std::sync::atomic::AtomicU32::new(1),
         auto_resume: false,
