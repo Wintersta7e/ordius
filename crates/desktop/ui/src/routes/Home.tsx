@@ -13,18 +13,21 @@
 // "control" as a neutral default. The desc field is derived from
 // the trigger + node counts.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { JSX } from "react";
 
 import {
   type RunRow,
   type SavedWorkflow,
   type SystemStatus,
+  type Workflow,
   type Workspace,
   listRuns,
   listWorkflows,
   listWorkspaces,
+  saveWorkflow,
   systemStatus,
+  validateWorkflow,
 } from "../engine";
 import { navigate as navigateRoute } from "../lib/router";
 import { TopBar } from "../components/chrome/TopBar";
@@ -197,9 +200,38 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
   const handleRun = useCallback((id: string) => {
     console.warn("run dialog lands in Phase 1.9", { id });
   }, []);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const handleImport = useCallback(() => {
-    console.warn("import flow lands in Phase 1.9");
+    fileInputRef.current?.click();
   }, []);
+
+  const handleImportFile = useCallback(
+    async (event: React.ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0];
+      // Reset so re-importing the same file fires onChange again.
+      event.target.value = "";
+      if (!file) return;
+      const insideTauri =
+        typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+      if (!insideTauri) {
+        setError("import requires the desktop host");
+        return;
+      }
+      try {
+        const text = await file.text();
+        const parsed: Workflow = JSON.parse(text);
+        await validateWorkflow(parsed);
+        await saveWorkflow(parsed);
+        setError(null);
+        // Refresh the workflow grid so the new card appears.
+        const next = await listWorkflows();
+        setWorkflows(next);
+      } catch (e: unknown) {
+        setError(`import failed: ${String(e)}`);
+      }
+    },
+    [],
+  );
   const handleNewWorkflow = useCallback(() => {
     navigateRoute({ kind: "editor" });
   }, []);
@@ -369,6 +401,14 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
       </main>
 
       <StatusRibbon workflowCount={workflows.length} runCount={runs.length} />
+
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="application/json,.json,.yaml,.yml"
+        style={{ display: "none" }}
+        onChange={(event) => void handleImportFile(event)}
+      />
     </div>
   );
 }
