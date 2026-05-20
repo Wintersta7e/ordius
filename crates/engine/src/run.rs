@@ -435,6 +435,7 @@ impl Engine {
                             iteration,
                             attempt,
                             &outputs,
+                            self.home(),
                         )?;
                         finalize_node_run(
                             &recorder,
@@ -728,6 +729,14 @@ const fn retry_matches(retry_on: RetryOn, err: &NodeError) -> bool {
 /// secret values the same way `node:output` events are — otherwise
 /// a `{{secrets.X}}` substitution that lands on a port would leak
 /// the raw secret into `node_outputs.value_inline`.
+/// Outputs that serialise larger than this byte count get spilled to
+/// disk rather than inlined into the `node_outputs.value_inline`
+/// column. The threshold is per-spec ("v1.x outputs > 8 KB spill to
+/// disk"). The dispatch loop still holds the full value in
+/// `upstream_outputs` so downstream nodes see no difference; spill is
+/// purely a persistence / history-viewer concern.
+const OUTPUT_SPILL_THRESHOLD_BYTES: usize = 8 * 1024;
+
 fn persist_node_outputs(
     recorder: &RunRecorder,
     emitter: &Emitter,
@@ -736,6 +745,7 @@ fn persist_node_outputs(
     iteration: u32,
     attempt: u32,
     outputs: &crate::executor::NodeOutputs,
+    home: &std::path::Path,
 ) -> Result<()> {
     let secrets = emitter.accumulated_secrets();
     for (port_name, value) in outputs {
@@ -746,14 +756,37 @@ fn persist_node_outputs(
         };
         let value_json = serde_json::to_string(&value_for_storage)
             .map_err(|e| EngineError::Db(format!("encode output: {e}")))?;
-        recorder.record_node_output(
+        let spilled_path = maybe_spill_output(
+            home,
+            &recorder.run_id,
             node_id,
+            port_name,
             iteration,
             attempt,
-            port_name,
-            Some(&value_json),
-            None,
-        )?;
+            &value_json,
+        );
+        match spilled_path {
+            Some(path) => {
+                recorder.record_node_output(
+                    node_id,
+                    iteration,
+                    attempt,
+                    port_name,
+                    None,
+                    Some(&path),
+                )?;
+            },
+            None => {
+                recorder.record_node_output(
+                    node_id,
+                    iteration,
+                    attempt,
+                    port_name,
+                    Some(&value_json),
+                    None,
+                )?;
+            },
+        }
         // upstream_outputs feeds downstream executors verbatim — we
         // need the original (un-redacted) value there, otherwise a
         // chained transform that consumes the secret can't see it.
@@ -761,6 +794,58 @@ fn persist_node_outputs(
         upstream_outputs.insert((node_id.to_string(), port_name.clone()), value.clone());
     }
     Ok(())
+}
+
+/// If `value_json` exceeds [`OUTPUT_SPILL_THRESHOLD_BYTES`], write it
+/// to `<home>/output-cache/<run_id>/<node>-<port>-<iter>-<attempt>.json`
+/// and return the absolute path as a string. Returns `None` for small
+/// values (keep inline) or when the write fails (fall back to inline —
+/// the recorder won't crash the run if disk is full).
+fn maybe_spill_output(
+    home: &std::path::Path,
+    run_id: &str,
+    node_id: &str,
+    port: &str,
+    iteration: u32,
+    attempt: u32,
+    value_json: &str,
+) -> Option<String> {
+    if value_json.len() <= OUTPUT_SPILL_THRESHOLD_BYTES {
+        return None;
+    }
+    let dir = home.join("output-cache").join(run_id);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(
+            error = ?e, path = %dir.display(),
+            "output spill: could not create cache dir; falling back to inline",
+        );
+        return None;
+    }
+    let safe_node = sanitise_for_filename(node_id);
+    let safe_port = sanitise_for_filename(port);
+    let path = dir.join(format!(
+        "{safe_node}-{safe_port}-{iteration}-{attempt}.json"
+    ));
+    if let Err(e) = std::fs::write(&path, value_json) {
+        tracing::warn!(
+            error = ?e, path = %path.display(),
+            "output spill: write failed; falling back to inline",
+        );
+        return None;
+    }
+    Some(path.to_string_lossy().into_owned())
+}
+
+fn sanitise_for_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Apply `redact_secrets` to every string anywhere inside a
@@ -1048,7 +1133,17 @@ mod tests {
                 error: None,
             })
             .unwrap();
-        persist_node_outputs(&recorder2, &em, &mut upstream, "n1", 1, 1, &outputs).unwrap();
+        persist_node_outputs(
+            &recorder2,
+            &em,
+            &mut upstream,
+            "n1",
+            1,
+            1,
+            &outputs,
+            dir.path(),
+        )
+        .unwrap();
 
         let conn = pool.get().unwrap();
         let stored: String = conn
@@ -1118,7 +1213,17 @@ mod tests {
         let (em, _rx) = Emitter::new(Arc::new(
             RunRecorder::start(pool.clone(), &wf, "{}", &HashMap::new(), "test").unwrap(),
         ));
-        persist_node_outputs(&recorder, &em, &mut upstream, "n1", 1, 2, &outputs).unwrap();
+        persist_node_outputs(
+            &recorder,
+            &em,
+            &mut upstream,
+            "n1",
+            1,
+            2,
+            &outputs,
+            dir.path(),
+        )
+        .unwrap();
 
         let conn = pool.get().unwrap();
         let attempt: u32 = conn
