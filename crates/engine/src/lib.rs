@@ -25,6 +25,7 @@ pub mod secrets;
 pub mod settings;
 pub mod system_status;
 pub mod template;
+pub mod triggers;
 pub mod types;
 pub mod validation;
 pub mod workflows;
