@@ -301,7 +301,7 @@ function eventColor(type: string): string {
   if (type === "node:error" || type === "workflow:error") return "var(--err)";
   if (type === "node:retry") return "var(--warn)";
   if (type === "node:output") return "var(--accent)";
-  if (type === "workflow:stopped") return "var(--warn)";
+  if (type === "workflow:stopped" || type === "stream:lagged") return "var(--warn)";
   if (type === "node:started" || type === "workflow:started") return "var(--info)";
   return "var(--txt-dim)";
 }
@@ -330,6 +330,12 @@ function summariseEvent(event: RunEvent): string {
     case "node:retry": {
       const attempt = event["nextAttempt"];
       return attempt != null ? ` · attempt ${String(attempt)}` : "";
+    }
+    case "stream:lagged": {
+      const dropped = event["dropped"];
+      return dropped != null
+        ? ` · ${String(dropped)} dropped — refresh from history for accuracy`
+        : "";
     }
     default:
       return "";

@@ -240,7 +240,10 @@ export type RunEventType =
   | "node:retry"
   | "node:loop"
   | "node:paused"
-  | "node:resumed";
+  | "node:resumed"
+  // Synthesized by the desktop crate when the broadcast subscriber
+  // falls behind; payload carries `dropped: number`.
+  | "stream:lagged";
 
 export interface RunEvent {
   type: RunEventType;
