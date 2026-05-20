@@ -22,6 +22,7 @@ pub mod registry;
 pub mod run;
 pub mod scheduler;
 pub mod secrets;
+pub mod seeds;
 pub mod settings;
 pub mod system_status;
 pub mod template;
@@ -117,6 +118,10 @@ impl Engine {
         let manifest_errs = manifests::load_into(&mut registry, home.join("node-types"));
         for err in &manifest_errs {
             tracing::warn!(error = %err, "manifest load issue");
+        }
+        let seeded = seeds::install_if_empty(&home);
+        if seeded > 0 {
+            tracing::info!(count = seeded, "installed starter workflows");
         }
         Ok(Self {
             pool,

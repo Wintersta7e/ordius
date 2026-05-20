@@ -1,0 +1,57 @@
+{
+  "id": "starter-pipeline",
+  "name": "Starter — Pipeline (shell → transform → shell)",
+  "schema_version": 1,
+  "variables": {
+    "WHO": "world"
+  },
+  "triggers": [
+    { "type": "manual" }
+  ],
+  "nodes": [
+    {
+      "id": "source",
+      "type": "shell",
+      "name": "Emit a value",
+      "config": {
+        "command": "echo {{vars.WHO}}"
+      },
+      "pos": { "x": 200, "y": 200 }
+    },
+    {
+      "id": "wrap",
+      "type": "transform",
+      "name": "Wrap in greeting",
+      "config": {
+        "op": "template",
+        "template": "Greetings, {{inputs.text}}!"
+      },
+      "pos": { "x": 520, "y": 200 }
+    },
+    {
+      "id": "emit",
+      "type": "shell",
+      "name": "Echo final",
+      "config": {
+        "command": "echo {{inputs.text}}"
+      },
+      "pos": { "x": 840, "y": 200 }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e_source_wrap",
+      "from_node_id": "source",
+      "from_port": "text",
+      "to_node_id": "wrap",
+      "to_port": "text"
+    },
+    {
+      "id": "e_wrap_emit",
+      "from_node_id": "wrap",
+      "from_port": "text",
+      "to_node_id": "emit",
+      "to_port": "text"
+    }
+  ]
+}

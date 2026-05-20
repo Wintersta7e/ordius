@@ -1,0 +1,21 @@
+{
+  "id": "starter-schedule",
+  "name": "Starter — Scheduled heartbeat",
+  "schema_version": 1,
+  "variables": {},
+  "triggers": [
+    { "type": "schedule", "cron": "0 */15 * * * *" }
+  ],
+  "nodes": [
+    {
+      "id": "beat",
+      "type": "shell",
+      "name": "Heartbeat",
+      "config": {
+        "command": "echo heartbeat"
+      },
+      "pos": { "x": 240, "y": 200 }
+    }
+  ],
+  "edges": []
+}

@@ -1,0 +1,23 @@
+{
+  "id": "starter-hello",
+  "name": "Starter — Hello",
+  "schema_version": 1,
+  "variables": {
+    "NAME": "world"
+  },
+  "triggers": [
+    { "type": "manual" }
+  ],
+  "nodes": [
+    {
+      "id": "say",
+      "type": "shell",
+      "name": "Say hello",
+      "config": {
+        "command": "echo Hello, {{vars.NAME}}!"
+      },
+      "pos": { "x": 240, "y": 200 }
+    }
+  ],
+  "edges": []
+}
