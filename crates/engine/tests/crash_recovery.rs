@@ -4,8 +4,8 @@
 //! `sweep_stale_locks` into `Engine::new`; this test verifies the
 //! behaviour against a pre-seeded post-crash database state.
 
-use ordius_engine::db::open;
 use ordius_engine::Engine;
+use ordius_engine::db::open;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn engine_startup_sweeps_stale_locks() {
@@ -54,7 +54,9 @@ async fn engine_startup_sweeps_stale_locks() {
     assert_eq!(status, "stopped", "orphaned run should be marked stopped");
 
     let error_tail: Option<String> = conn
-        .query_row("SELECT error_tail FROM runs WHERE id='r1'", [], |r| r.get(0))
+        .query_row("SELECT error_tail FROM runs WHERE id='r1'", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert!(
         error_tail.is_some_and(|s| s.contains("crashed")),
