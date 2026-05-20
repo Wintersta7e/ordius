@@ -197,7 +197,18 @@ export function Editor({
     };
   }, [tabs.length, workflowId, insideTauri, onNavigate]);
 
-  const handleActivate = useCallback((id: string) => setActiveId(id), []);
+  const handleActivate = useCallback(
+    (id: string) => {
+      setActiveId(id);
+      // Navigate so the load useEffect refires against the activated
+      // tab's workflow id. Without this, switching tabs leaves the
+      // canvas showing the previously-loaded workflow.
+      if (id !== workflowId) {
+        onNavigate({ kind: "editor", workflowId: id });
+      }
+    },
+    [workflowId, onNavigate],
+  );
 
   const handleClose = useCallback(
     (id: string) => {
