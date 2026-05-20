@@ -27,7 +27,6 @@ import { NoticeBanner } from "../components/NoticeBanner";
 import {
   Field,
   KV,
-  Mono,
   NumberInput,
   SegRow,
   TextInput,
@@ -315,7 +314,13 @@ export function Settings({
           {active === "concurrency" ? (
             <ConcurrencySection settings={settings} onPatch={patchSettings} />
           ) : null}
-          {active === "models" ? <ModelsSection settings={settings} /> : null}
+          {active === "models" ? (
+            <ModelsSection
+              settings={settings}
+              secrets={secrets}
+              onPatch={patchSettings}
+            />
+          ) : null}
           {active === "about" ? <AboutSection status={status} /> : null}
         </section>
       </main>
@@ -745,18 +750,111 @@ function RetentionSection({
 
 function ModelsSection({
   settings,
+  secrets,
+  onPatch,
 }: {
   settings: SettingsShape | null;
+  secrets: SecretMeta[];
+  onPatch: (patch: Partial<SettingsShape>) => Promise<void>;
 }): JSX.Element {
+  const [name, setName] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [apiKeySecret, setApiKeySecret] = useState("");
+  const [busy, setBusy] = useState(false);
+
   if (!settings) return <Loading />;
+
+  const endpoints = settings.modelEndpoints;
+
+  const handleAdd = async () => {
+    if (!name.trim() || !baseUrl.trim() || busy) return;
+    setBusy(true);
+    try {
+      const newId = `ep-${Date.now().toString(36)}`;
+      const next = [
+        ...endpoints,
+        {
+          id: newId,
+          name: name.trim(),
+          baseUrl: baseUrl.trim(),
+          apiKeySecret: apiKeySecret.trim() || null,
+        },
+      ];
+      await onPatch({ modelEndpoints: next });
+      setName("");
+      setBaseUrl("");
+      setApiKeySecret("");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRemove = async (id: string) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await onPatch({
+        modelEndpoints: endpoints.filter((e) => e.id !== id),
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div>
       <Heading
         text="Model endpoints"
-        sub="OpenAI-compatible URLs the llm node can target. Adding endpoints is a Phase 1.10 polish item."
+        sub="OpenAI-compatible URLs the llm node can target."
       />
-      {settings.modelEndpoints.length === 0 ? (
-        <Card>
+      <Card>
+        <Field label="name">
+          <TextInput
+            value={name}
+            onChange={setName}
+            placeholder="openai-prod"
+          />
+        </Field>
+        <Field label="base url">
+          <TextInput
+            value={baseUrl}
+            onChange={setBaseUrl}
+            placeholder="https://api.openai.com/v1"
+          />
+        </Field>
+        <Field label="api key secret" hint="name of a stored secret (optional)">
+          <SecretPicker
+            value={apiKeySecret}
+            secrets={secrets}
+            onChange={setApiKeySecret}
+          />
+        </Field>
+        <div style={{ padding: "8px 16px 14px" }}>
+          <button
+            type="button"
+            className="btn primary"
+            disabled={!name.trim() || !baseUrl.trim() || busy}
+            onClick={() => void handleAdd()}
+            style={{ height: 28 }}
+          >
+            add endpoint
+          </button>
+        </div>
+      </Card>
+
+      <SectionTitle
+        label="registered"
+        count={`${endpoints.length} endpoint${endpoints.length === 1 ? "" : "s"}`}
+      />
+      <div
+        style={{
+          marginTop: 12,
+          background: "var(--bg-panel)",
+          border: "1px solid var(--line)",
+          borderRadius: 3,
+        }}
+      >
+        {endpoints.length === 0 ? (
           <div
             style={{
               padding: "16px",
@@ -765,26 +863,83 @@ function ModelsSection({
               fontFamily: "var(--mono)",
             }}
           >
-            no endpoints registered. point the llm node at any
-            OpenAI-compatible URL via `{`{{secrets.OPENAI_KEY}}`}` for now.
+            no endpoints registered.
           </div>
-        </Card>
-      ) : (
-        settings.modelEndpoints.map((endpoint) => (
-          <Card key={endpoint.id}>
-            <Field label="name">
-              <Mono value={endpoint.name} />
-            </Field>
-            <Field label="base url">
-              <Mono value={endpoint.baseUrl} />
-            </Field>
-            <Field label="api key secret">
-              <Mono value={endpoint.apiKeySecret ?? "(none)"} />
-            </Field>
-          </Card>
-        ))
-      )}
+        ) : (
+          endpoints.map((endpoint) => (
+            <div
+              key={endpoint.id}
+              style={{
+                display: "grid",
+                gridTemplateColumns: "1fr 1fr 1fr 80px",
+                gap: 10,
+                alignItems: "center",
+                padding: "10px 14px",
+                borderBottom: "1px solid var(--line-soft)",
+                fontFamily: "var(--mono)",
+                fontSize: 12,
+                color: "var(--txt)",
+              }}
+            >
+              <span>{endpoint.name}</span>
+              <span style={{ color: "var(--txt-dim)" }}>{endpoint.baseUrl}</span>
+              <span style={{ color: "var(--txt-dim)" }}>
+                {endpoint.apiKeySecret ?? "(no secret)"}
+              </span>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => void handleRemove(endpoint.id)}
+                disabled={busy}
+                style={{
+                  height: 22,
+                  padding: "0 10px",
+                  color: "var(--err)",
+                  borderColor: "var(--err)",
+                }}
+              >
+                remove
+              </button>
+            </div>
+          ))
+        )}
+      </div>
     </div>
+  );
+}
+
+function SecretPicker({
+  value,
+  secrets,
+  onChange,
+}: {
+  value: string;
+  secrets: SecretMeta[];
+  onChange: (v: string) => void;
+}): JSX.Element {
+  return (
+    <select
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+      style={{
+        width: "100%",
+        background: "var(--bg-input)",
+        border: "1px solid var(--line)",
+        color: "var(--txt)",
+        fontFamily: "var(--mono)",
+        fontSize: 12,
+        padding: "7px 10px",
+        borderRadius: 3,
+        outline: "none",
+      }}
+    >
+      <option value="">(none)</option>
+      {secrets.map((s) => (
+        <option key={s.name} value={s.name}>
+          {s.name}
+        </option>
+      ))}
+    </select>
   );
 }
 
