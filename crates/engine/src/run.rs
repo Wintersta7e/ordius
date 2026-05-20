@@ -310,7 +310,7 @@ impl Engine {
                 break;
             }
 
-            for node in ready {
+            for mut node in ready {
                 let mut current_inputs: HashMap<String, PortValue> = HashMap::new();
                 for edge in wf
                     .edges
@@ -321,6 +321,56 @@ impl Engine {
                     if let Some(v) = upstream_outputs.get(&key) {
                         current_inputs.insert(edge.to_port.clone(), v.clone());
                     }
+                }
+
+                // Apply config-level template substitution uniformly so every
+                // built-in's string fields can reference {{vars.X}} /
+                // {{inputs.X}} / {{nodes.A.outputs.B}} etc. without the
+                // executor opting in. Strings without `{{` skip the parser
+                // (no cost). NodeTypes can opt out via
+                // `skip_config_templates` when their config holds deferred
+                // templates (the `agent` built-in's body_template, etc.).
+                // Wrapped in a sync helper to keep non-Send &dyn Fn
+                // closures from tainting the run-loop future.
+                let nt_for_skip = self.registry().get(&node.ty);
+                let skip = nt_for_skip
+                    .as_ref()
+                    .is_some_and(|n| n.skip_config_templates);
+                let template_result = if skip {
+                    Ok(node.config.clone())
+                } else {
+                    substitute_node_config(
+                        &node.config,
+                        &variables,
+                        &upstream_outputs,
+                        &current_inputs,
+                        &self.secrets_store(),
+                        &emitter,
+                        &recorder.run_id,
+                        &workspace,
+                        &wf.id,
+                        &wf.name,
+                    )
+                };
+                match template_result {
+                    Ok(resolved) => node.config = resolved,
+                    Err(e) => {
+                        emitter.emit_node(
+                            EventType::NodeError,
+                            node.id.clone(),
+                            iterations.get(&node.id).copied().unwrap_or(1),
+                            1,
+                            HashMap::from([(
+                                "error".into(),
+                                serde_json::json!(format!("template: {e}")),
+                            )]),
+                        );
+                        sched.fail_node(&node.id);
+                        if !node.continue_on_error {
+                            had_unhandled_failure = true;
+                        }
+                        continue;
+                    },
                 }
 
                 let nt = self
@@ -818,6 +868,49 @@ fn route_condition_outputs(
         let entry = iterations.entry(reset_id).or_insert(1);
         *entry += 1;
     }
+}
+
+/// Sync helper that builds a `SubstitutionContext` and applies it to a
+/// node's config in a single stack frame — keeps the non-Send `&dyn Fn`
+/// resolvers from tainting the surrounding async run-loop future.
+#[allow(clippy::too_many_arguments)]
+fn substitute_node_config(
+    config: &HashMap<String, serde_json::Value>,
+    variables: &HashMap<String, String>,
+    upstream_outputs: &HashMap<(String, String), PortValue>,
+    current_inputs: &HashMap<String, PortValue>,
+    secrets_store: &Arc<crate::secrets::Store>,
+    emitter: &Arc<crate::emitter::Emitter>,
+    run_id: &str,
+    workspace: &std::path::Path,
+    workflow_id: &str,
+    workflow_name: &str,
+) -> std::result::Result<HashMap<String, serde_json::Value>, crate::template::TemplateError> {
+    let secrets_resolver = |name: &str| -> Option<String> {
+        let value = secrets_store.get(name).ok()?;
+        emitter.register_secret(name.to_string(), value.clone());
+        Some(value)
+    };
+    let kv_resolver = |_: &str| None;
+    let env_resolver = wrap_process_env();
+    let env_allow = crate::template::default_env_allowlist();
+    let original_config = config.clone();
+    let sub_ctx = crate::template::SubstitutionContext {
+        vars: variables,
+        secrets: &secrets_resolver,
+        upstream_outputs,
+        current_inputs,
+        current_config: &original_config,
+        kv: &kv_resolver,
+        env: &*env_resolver,
+        env_allowlist: &env_allow,
+        run_id,
+        workspace,
+        started_at_iso: "",
+        workflow_id,
+        workflow_name,
+    };
+    crate::template::substitute_in_config(&original_config, &sub_ctx)
 }
 
 #[cfg(test)]

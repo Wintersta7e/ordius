@@ -88,6 +88,7 @@ pub(super) fn dummy_node_type(id: &str, category: Category) -> NodeType {
             output_parse: OutputParse::Text,
             output_map: HashMap::new(),
         },
+        skip_config_templates: false,
     }
 }
 
@@ -114,6 +115,7 @@ pub(super) fn subprocess_node_type(command: Vec<String>) -> NodeType {
             output_parse: OutputParse::Text,
             output_map: HashMap::new(),
         },
+        skip_config_templates: false,
     }
 }
 

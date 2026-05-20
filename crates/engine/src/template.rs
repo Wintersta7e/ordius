@@ -258,5 +258,52 @@ fn json_value_to_string(v: &serde_json::Value) -> String {
     }
 }
 
+/// Recursively substitute templates inside string values in a JSON value.
+///
+/// Strings that don't contain `{{` are passed through unchanged (no parse
+/// cost). Used by the dispatch loop to apply templates to arbitrary
+/// config fields uniformly — `http.url`, `file.path`, header values,
+/// etc. — without each built-in having to opt in.
+pub fn substitute_in_value(
+    value: serde_json::Value,
+    ctx: &SubstitutionContext<'_>,
+) -> Result<serde_json::Value, TemplateError> {
+    match value {
+        serde_json::Value::String(s) if s.contains("{{") => {
+            Ok(serde_json::Value::String(substitute(&s, ctx)?))
+        },
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(substitute_in_value(item, ctx)?);
+            }
+            Ok(serde_json::Value::Array(out))
+        },
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                out.insert(k, substitute_in_value(v, ctx)?);
+            }
+            Ok(serde_json::Value::Object(out))
+        },
+        other => Ok(other),
+    }
+}
+
+/// Substitute templates in every string value of a node-config map.
+/// Convenience wrapper around [`substitute_in_value`] for the dispatch
+/// loop, which keeps the input shape `HashMap<String, Value>`.
+#[allow(clippy::implicit_hasher)]
+pub fn substitute_in_config(
+    config: &HashMap<String, serde_json::Value>,
+    ctx: &SubstitutionContext<'_>,
+) -> Result<HashMap<String, serde_json::Value>, TemplateError> {
+    let mut out = HashMap::with_capacity(config.len());
+    for (k, v) in config {
+        out.insert(k.clone(), substitute_in_value(v.clone(), ctx)?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests;

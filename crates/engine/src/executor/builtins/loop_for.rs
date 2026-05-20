@@ -82,6 +82,7 @@ mod tests {
                 output_parse: OutputParse::Text,
                 output_map: HashMap::new(),
             },
+            skip_config_templates: false,
         }
     }
 

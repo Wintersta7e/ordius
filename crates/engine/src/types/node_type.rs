@@ -38,6 +38,13 @@ pub struct NodeType {
     pub config: Vec<ConfigFieldDef>,
     /// How the engine runs this type.
     pub execution: ExecutionSpec,
+    /// When true, the dispatch loop skips universal `{{...}}` config
+    /// template substitution for this node type. Use for built-ins
+    /// whose config holds template-like strings meant to be evaluated
+    /// later by the executor itself (e.g. `agent`'s tool
+    /// `body_template`, which is substituted per tool invocation).
+    #[serde(default)]
+    pub skip_config_templates: bool,
 }
 
 /// Primary palette category. Every node type belongs to exactly one.

@@ -120,6 +120,7 @@ fn delay_spec() -> NodeType {
         outputs: vec![],
         config: vec![],
         execution: in_process_execution_spec(),
+        skip_config_templates: false,
     }
 }
 
@@ -135,6 +136,7 @@ fn transform_spec() -> NodeType {
         outputs: vec![],
         config: vec![],
         execution: in_process_execution_spec(),
+        skip_config_templates: false,
     }
 }
 
@@ -211,6 +213,7 @@ fn http_spec() -> NodeType {
             },
         ],
         execution: in_process_execution_spec(),
+        skip_config_templates: false,
     }
 }
 
@@ -243,6 +246,7 @@ fn checkpoint_spec() -> NodeType {
             },
         ],
         execution: in_process_execution_spec(),
+        skip_config_templates: false,
     }
 }
 
@@ -337,6 +341,7 @@ fn container_spec() -> NodeType {
             output_parse: crate::types::OutputParse::Text,
             output_map: HashMap::new(),
         },
+        skip_config_templates: false,
     }
 }
 
@@ -438,6 +443,10 @@ fn agent_spec() -> NodeType {
             },
         ],
         execution: in_process_execution_spec(),
+        // Agent's tool body_template / result_path are evaluated per
+        // invocation by the executor itself; pre-substitution at
+        // dispatch would resolve {{args | json}} as a missing reference.
+        skip_config_templates: true,
     }
 }
 
@@ -507,6 +516,7 @@ fn parallel_spec() -> NodeType {
             },
         ],
         execution: in_process_execution_spec(),
+        skip_config_templates: false,
     }
 }
 
@@ -570,6 +580,7 @@ fn compose_spec() -> NodeType {
             },
         ],
         execution: in_process_execution_spec(),
+        skip_config_templates: false,
     }
 }
 
@@ -597,6 +608,7 @@ fn wait_event_spec() -> NodeType {
             required: true,
         }],
         execution: in_process_execution_spec(),
+        skip_config_templates: false,
     }
 }
 
@@ -632,6 +644,7 @@ fn loop_for_spec() -> NodeType {
             required: true,
         }],
         execution: in_process_execution_spec(),
+        skip_config_templates: false,
     }
 }
 
@@ -664,6 +677,7 @@ fn pause_spec() -> NodeType {
             },
         ],
         execution: in_process_execution_spec(),
+        skip_config_templates: false,
     }
 }
 
@@ -721,6 +735,7 @@ fn notify_spec() -> NodeType {
             },
         ],
         execution: in_process_execution_spec(),
+        skip_config_templates: false,
     }
 }
 
@@ -771,6 +786,7 @@ fn kv_spec() -> NodeType {
             },
         ],
         execution: in_process_execution_spec(),
+        skip_config_templates: false,
     }
 }
 
@@ -819,6 +835,7 @@ fn file_spec() -> NodeType {
             },
         ],
         execution: in_process_execution_spec(),
+        skip_config_templates: false,
     }
 }
 
@@ -902,6 +919,7 @@ fn llm_spec() -> NodeType {
             },
         ],
         execution: in_process_execution_spec(),
+        skip_config_templates: false,
     }
 }
 
@@ -917,6 +935,7 @@ fn condition_spec() -> NodeType {
         outputs: vec![],
         config: vec![],
         execution: in_process_execution_spec(),
+        skip_config_templates: false,
     }
 }
 
@@ -966,6 +985,10 @@ fn shell_spec() -> NodeType {
             output_parse: OutputParse::Text,
             output_map: HashMap::new(),
         },
+        // Shell argv / env / stdin are substituted by the subprocess
+        // executor itself per-spawn; skip the universal dispatch-time
+        // pass to avoid double-resolving the same templates.
+        skip_config_templates: true,
     }
 }
 
