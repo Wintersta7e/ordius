@@ -91,7 +91,10 @@ interface TabProps {
 function Tab({ tab, active, onClick, onClose }: TabProps): JSX.Element {
   const [hover, setHover] = useState(false);
   return (
-    <div
+    <button
+      type="button"
+      role="tab"
+      aria-selected={active}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       onClick={onClick}
@@ -113,7 +116,9 @@ function Tab({ tab, active, onClick, onClose }: TabProps): JSX.Element {
         color: active ? "var(--txt)" : "var(--txt-dim)",
         fontFamily: "var(--mono)",
         fontSize: 11.5,
+        border: "none",
         borderRight: "1px solid var(--line-soft)",
+        textAlign: "left",
       }}
     >
       {active ? (
@@ -159,9 +164,9 @@ function Tab({ tab, active, onClick, onClose }: TabProps): JSX.Element {
         {tab.name}
       </span>
       {hover || active ? (
-        <span
-          role="button"
-          tabIndex={-1}
+        <button
+          type="button"
+          aria-label={`close ${tab.name}`}
           onClick={(event) => {
             event.stopPropagation();
             onClose();
@@ -177,11 +182,15 @@ function Tab({ tab, active, onClick, onClose }: TabProps): JSX.Element {
             color: "var(--txt-faint)",
             fontSize: 14,
             lineHeight: 1,
+            background: "transparent",
+            border: "none",
+            padding: 0,
+            cursor: "pointer",
           }}
         >
           ×
-        </span>
+        </button>
       ) : null}
-    </div>
+    </button>
   );
 }
