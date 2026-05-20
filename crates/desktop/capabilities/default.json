@@ -1,7 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capabilities the Ordius window needs to talk to the Rust side.",
+  "description": "Capabilities the Ordius window needs. Narrower than `core:default` — drops tray/menu/image/path/resources permissions the UI doesn't use; keeps app/event/webview/window so invoke + Channel + the standard window chrome continue to work.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:app:default",
+    "core:event:default",
+    "core:webview:default",
+    "core:window:default"
+  ]
 }
