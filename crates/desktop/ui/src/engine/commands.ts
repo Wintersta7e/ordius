@@ -68,6 +68,18 @@ export async function runWorkflow(
   return { runId, events: channel };
 }
 
+/**
+ * Deliver an event payload to a `wait_event` node parked in this run.
+ * Returns true if the payload was delivered to an active waiter.
+ */
+export function deliverEvent(
+  runId: string,
+  event: string,
+  payload: unknown,
+): Promise<boolean> {
+  return invoke("deliver_event", { runId, event, payload });
+}
+
 export function stopRun(runId: string): Promise<boolean> {
   return invoke("stop_run", { runId });
 }

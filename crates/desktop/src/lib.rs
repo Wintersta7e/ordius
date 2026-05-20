@@ -36,6 +36,7 @@ pub fn run() {
             commands::delete_workflow,
             commands::run_workflow,
             commands::stop_run,
+            commands::deliver_event,
             commands::list_runs,
             commands::get_run,
             commands::list_node_types,

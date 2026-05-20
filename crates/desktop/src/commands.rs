@@ -210,6 +210,18 @@ pub fn stop_run(state: tauri::State<'_, AppState>, run_id: String) -> Result<boo
     Ok(state.engine.cancel_run(&run_id))
 }
 
+/// Deliver an event payload to a parked `wait_event` waiter in `run_id`.
+/// Returns true if the payload was delivered to an active waiter.
+#[tauri::command]
+pub fn deliver_event(
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+    event: String,
+    payload: serde_json::Value,
+) -> Result<bool, String> {
+    Ok(state.engine.deliver_event(&run_id, &event, payload))
+}
+
 /// Recent runs for the History page. Filters mirror the CLI's
 /// `runs ls` options.
 #[tauri::command]
