@@ -331,6 +331,13 @@ fn container_spec() -> NodeType {
                 default: Some(serde_json::json!(5)),
                 required: false,
             },
+            ConfigFieldDef {
+                name: "pull".into(),
+                label: "Image pull".into(),
+                ty: ConfigFieldType::Select,
+                default: Some(serde_json::json!(["missing", "always", "never"])),
+                required: false,
+            },
         ],
         execution: crate::types::ExecutionSpec {
             backend: crate::types::ExecutionBackend::Container,
