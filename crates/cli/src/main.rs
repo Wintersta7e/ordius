@@ -76,6 +76,9 @@ enum Cmd {
     },
     /// Launch the GUI binary (lands in v1.1).
     Gui,
+    /// Run forever, firing workflow triggers (schedule + file-watch).
+    /// Stops on Ctrl-C with a graceful engine shutdown.
+    Daemon,
 }
 
 #[derive(clap::Args, Debug)]
@@ -226,7 +229,33 @@ async fn dispatch(cli: Cli) -> anyhow::Result<u8> {
             eprintln!("Until then, use 'ordius-cli run <id>' from the terminal.");
             Ok(2)
         },
+        Cmd::Daemon => cmd_daemon(&home).await,
     }
+}
+
+/// `ordius daemon`: open an Engine, start the trigger runner, then
+/// block until Ctrl-C. Ctrl-C stops the trigger runner and runs a
+/// graceful `Engine::shutdown` so any active runs finalise.
+async fn cmd_daemon(home: &std::path::Path) -> anyhow::Result<u8> {
+    let engine = Arc::new(
+        Engine::new(home.to_path_buf())
+            .await
+            .context("opening engine for daemon")?,
+    );
+    let triggers = engine.start_triggers();
+    eprintln!(
+        "ordius daemon: trigger runner started; watching {}/workflows/",
+        home.display()
+    );
+    eprintln!("ordius daemon: press Ctrl-C to stop.");
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        tracing::warn!(error = %e, "daemon: failed to install ctrl-c handler");
+    }
+    eprintln!("ordius daemon: shutting down...");
+    triggers.stop();
+    drop(triggers.join.await);
+    drop(engine.shutdown(std::time::Duration::from_secs(10)).await);
+    Ok(0)
 }
 
 /// Resolve the engine home directory: explicit `--home` wins,
