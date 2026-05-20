@@ -7,6 +7,7 @@ import type { JSX } from "react";
 
 import {
   type SecretMeta,
+  type EnvironmentReport,
   type Settings as SettingsShape,
   type SystemStatus,
   type Workspace,
@@ -18,6 +19,7 @@ import {
   removeSecret,
   removeWorkspace,
   setSettings,
+  systemEnvironment,
   systemStatus,
 } from "../engine";
 import { TopBar } from "../components/chrome/TopBar";
@@ -74,6 +76,9 @@ export function Settings({
   const [secrets, setSecretsState] = useState<SecretMeta[]>([]);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [status, setStatus] = useState<SystemStatus | null>(null);
+  const [environment, setEnvironment] = useState<EnvironmentReport | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
 
   const activeIndex = SECTIONS.findIndex((s) => s.id === active);
@@ -102,19 +107,32 @@ export function Settings({
         engineVersion: "preview",
         endpoints: [],
       });
+      setEnvironment({
+        platform: "wsl",
+        wslDistro: "Ubuntu-24.04",
+        endpoints: [
+          {
+            kind: "ollama",
+            name: "Ollama (127.0.0.1:11434)",
+            baseUrl: "http://127.0.0.1:11434",
+          },
+        ],
+      });
       return;
     }
     try {
-      const [s, sec, ws, sys] = await Promise.all([
+      const [s, sec, ws, sys, env] = await Promise.all([
         getSettings(),
         listSecrets(),
         listWorkspaces(),
         systemStatus(),
+        systemEnvironment(),
       ]);
       setSettingsState(s);
       setSecretsState(sec);
       setWorkspaces(ws);
       setStatus(sys);
+      setEnvironment(env);
       setError(null);
     } catch (e: unknown) {
       setError(String(e));
@@ -318,6 +336,7 @@ export function Settings({
             <ModelsSection
               settings={settings}
               secrets={secrets}
+              environment={environment}
               onPatch={patchSettings}
             />
           ) : null}
@@ -751,10 +770,12 @@ function RetentionSection({
 function ModelsSection({
   settings,
   secrets,
+  environment,
   onPatch,
 }: {
   settings: SettingsShape | null;
   secrets: SecretMeta[];
+  environment: EnvironmentReport | null;
   onPatch: (patch: Partial<SettingsShape>) => Promise<void>;
 }): JSX.Element {
   const [name, setName] = useState("");
@@ -801,8 +822,79 @@ function ModelsSection({
     }
   };
 
+  const registeredUrls = new Set(endpoints.map((e) => e.baseUrl));
+  const handleSaveDiscovered = async (
+    kind: string,
+    baseUrl: string,
+  ) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const next = [
+        ...endpoints,
+        {
+          id: `ep-${Date.now().toString(36)}`,
+          name: kind,
+          baseUrl,
+          apiKeySecret: null,
+        },
+      ];
+      await onPatch({ modelEndpoints: next });
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div>
+      {environment && environment.endpoints.length > 0 ? (
+        <>
+          <Heading
+            text="Detected on this host"
+            sub={`probed at boot · platform: ${environment.platform}${environment.wslDistro ? ` (${environment.wslDistro})` : ""}`}
+          />
+          <Card>
+            {environment.endpoints.map((ep) => {
+              const saved = registeredUrls.has(ep.baseUrl);
+              return (
+                <div
+                  key={ep.baseUrl}
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "1fr 1fr 110px",
+                    gap: 10,
+                    alignItems: "center",
+                    padding: "10px 14px",
+                    borderBottom: "1px solid var(--line-soft)",
+                    fontFamily: "var(--mono)",
+                    fontSize: 12,
+                    color: "var(--txt)",
+                  }}
+                >
+                  <span>{ep.name}</span>
+                  <span style={{ color: "var(--txt-dim)" }}>{ep.baseUrl}</span>
+                  {saved ? (
+                    <span style={{ color: "var(--accent)", fontSize: 11 }}>
+                      ✓ saved
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => void handleSaveDiscovered(ep.kind, ep.baseUrl)}
+                      disabled={busy}
+                      style={{ height: 22, padding: "0 10px" }}
+                    >
+                      save endpoint
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </Card>
+        </>
+      ) : null}
+
       <Heading
         text="Model endpoints"
         sub="OpenAI-compatible URLs the llm node can target."
