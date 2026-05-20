@@ -114,6 +114,10 @@ interface InputProps {
   onChange?: ((v: string) => void) | undefined;
   placeholder?: string;
   disabled?: boolean;
+  /** `"password"` masks input; `"text"` (default) shows characters. */
+  type?: "text" | "password";
+  /** `autocomplete` attribute. Defaults to `"off"`. */
+  autoComplete?: string;
 }
 
 export function TextInput({
@@ -121,10 +125,14 @@ export function TextInput({
   onChange,
   placeholder,
   disabled,
+  type = "text",
+  autoComplete = "off",
 }: InputProps): JSX.Element {
   const [focused, setFocused] = useState(false);
   return (
     <input
+      type={type}
+      autoComplete={autoComplete}
       value={value}
       onChange={(event: ChangeEvent<HTMLInputElement>) =>
         onChange?.(event.target.value)

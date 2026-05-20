@@ -27,7 +27,10 @@ export default defineConfig({
       interval: 400,
     },
   },
-  envPrefix: ["VITE_", "TAURI_ENV_*"],
+  // `envPrefix` entries are literal string prefixes, NOT globs — a
+  // trailing `*` would match `TAURI_ENV_*` verbatim and miss
+  // `TAURI_ENV_PLATFORM` / `TAURI_ENV_DEBUG`.
+  envPrefix: ["VITE_", "TAURI_ENV_"],
   build: {
     target:
       process.env["TAURI_ENV_PLATFORM"] === "windows"
