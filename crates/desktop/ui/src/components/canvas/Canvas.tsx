@@ -392,16 +392,16 @@ function renderEdge(
   density: Density,
   runState?: RunState | undefined,
 ): JSX.Element | null {
-  const from = nodes.find((n) => n.id === edge.from_node_id);
-  const to = nodes.find((n) => n.id === edge.to_node_id);
+  const from = nodes.find((n) => n.id === edge.fromNodeId);
+  const to = nodes.find((n) => n.id === edge.toNodeId);
   if (!from || !to) return null;
   const fromType = typesById.get(from.type);
   const toType = typesById.get(to.type);
-  const fromPorts = fromType?.outputs.map((p) => p.name) ?? [edge.from_port];
-  const toPorts = toType?.inputs.map((p) => p.name) ?? [edge.to_port];
-  const a = portTip(from, fromPorts, edge.from_port, "out", density);
-  const b = portTip(to, toPorts, edge.to_port, "in", density);
-  const isLoop = edge.edge_type === "loop";
+  const fromPorts = fromType?.outputs.map((p) => p.name) ?? [edge.fromPort];
+  const toPorts = toType?.inputs.map((p) => p.name) ?? [edge.toPort];
+  const a = portTip(from, fromPorts, edge.fromPort, "out", density);
+  const b = portTip(to, toPorts, edge.toPort, "in", density);
+  const isLoop = edge.edgeType === "loop";
   const active = runState?.activeEdges.has(edge.id) ?? false;
   const traveled = runState?.traveledEdges.has(edge.id) ?? false;
 
@@ -495,7 +495,7 @@ function CanvasWatermark({ workflow }: { workflow: Workflow }): JSX.Element {
       <div style={{ marginTop: 4, opacity: 0.7 }}>workflow:{workflow.name}</div>
       <div style={{ opacity: 0.7 }} className="num">
         {workflow.nodes.length}n · {workflow.edges.length}e · schema v
-        {workflow.schema_version}
+        {workflow.schemaVersion}
       </div>
     </div>
   );

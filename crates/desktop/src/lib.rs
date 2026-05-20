@@ -32,6 +32,7 @@ pub fn run() {
             commands::list_workflows,
             commands::load_workflow,
             commands::save_workflow,
+            commands::validate_workflow,
             commands::delete_workflow,
             commands::run_workflow,
             commands::stop_run,

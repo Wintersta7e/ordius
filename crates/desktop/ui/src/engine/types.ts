@@ -53,11 +53,11 @@ export interface ConfigFieldDef {
 export interface ExecutionSpec {
   backend: ExecutionBackend;
   command: string[];
-  stdin_template?: string | null;
+  stdinTemplate?: string | null;
   env: Record<string, string>;
-  timeout_ms?: number | null;
-  output_parse: OutputParse;
-  output_map: Record<string, string>;
+  timeoutMs?: number | null;
+  outputParse: OutputParse;
+  outputMap: Record<string, string>;
 }
 
 export interface NodeType {
@@ -79,10 +79,10 @@ export interface Pos {
 }
 
 export interface RetryPolicy {
-  max_attempts: number;
-  backoff_ms: number;
-  backoff_strategy: "exponential" | "linear" | "fixed";
-  retry_on: "error" | "timeout" | "both";
+  maxAttempts: number;
+  backoffMs: number;
+  backoffStrategy: "exponential" | "linear" | "fixed";
+  retryOn: "error" | "timeout" | "both";
 }
 
 export interface Node {
@@ -91,21 +91,21 @@ export interface Node {
   name: string;
   config: Record<string, unknown>;
   pos: Pos;
-  timeout_ms?: number | null;
+  timeoutMs?: number | null;
   retry?: RetryPolicy | null;
-  continue_on_error: boolean;
+  continueOnError: boolean;
 }
 
 export type EdgeType = "forward" | "loop";
 
 export interface Edge {
   id: string;
-  from_node_id: string;
-  from_port: string;
-  to_node_id: string;
-  to_port: string;
-  edge_type: EdgeType;
-  max_iterations?: number | null;
+  fromNodeId: string;
+  fromPort: string;
+  toNodeId: string;
+  toPort: string;
+  edgeType: EdgeType;
+  maxIterations?: number | null;
   branch?: string | null;
 }
 
@@ -115,17 +115,17 @@ export type Trigger =
   | {
       type: "file-watch";
       paths: string[];
-      debounce_ms?: number;
+      debounceMs?: number;
       vars?: Record<string, string>;
     }
-  | { type: "webhook"; secret_token?: string };
+  | { type: "webhook"; secretToken?: string };
 
 export interface Workflow {
   id: string;
   name: string;
-  schema_version: number;
-  created_at?: string | null;
-  updated_at?: string | null;
+  schemaVersion: number;
+  createdAt?: string | null;
+  updatedAt?: string | null;
   variables: Record<string, string>;
   triggers: Trigger[];
   nodes: Node[];

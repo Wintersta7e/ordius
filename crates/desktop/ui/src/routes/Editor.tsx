@@ -19,6 +19,7 @@ import {
   runWorkflow,
   saveWorkflow,
   stopRun,
+  validateWorkflow,
 } from "../engine";
 import { Canvas } from "../components/canvas";
 import {
@@ -63,6 +64,7 @@ export function Editor({
   const [nodeTypes, setNodeTypes] = useState<NodeType[]>([]);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [validateNotice, setValidateNotice] = useState<string | null>(null);
   const [runState, setRunState] = useState<LiveRunState>(emptyRunState);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [workspaceId, setWorkspaceId] = useState<string | null>(null);
@@ -279,7 +281,7 @@ export function Editor({
           ...wf,
           nodes: wf.nodes.filter((n) => n.id !== id),
           edges: wf.edges.filter(
-            (e) => e.from_node_id !== id && e.to_node_id !== id,
+            (e) => e.fromNodeId !== id && e.toNodeId !== id,
           ),
         };
       });
@@ -330,6 +332,23 @@ export function Editor({
     [workflow, insideTauri],
   );
 
+  const handleValidate = useCallback(async () => {
+    if (!workflow) return;
+    if (!insideTauri) {
+      setError("validate requires the desktop host");
+      return;
+    }
+    try {
+      await validateWorkflow(workflow);
+      setError(null);
+      setValidateNotice("workflow validation passed");
+      window.setTimeout(() => setValidateNotice(null), 2500);
+    } catch (e: unknown) {
+      setValidateNotice(null);
+      setError(String(e));
+    }
+  }, [workflow, insideTauri]);
+
   const handleStop = useCallback(async () => {
     if (!runState.runId) return;
     if (!insideTauri) return;
@@ -347,14 +366,47 @@ export function Editor({
       return;
     }
     try {
-      await saveWorkflow(workflow);
-      setTabs((existing) =>
-        existing.map((t) => (t.id === activeId ? { ...t, dirty: false } : t)),
-      );
+      let toSave = workflow;
+      // Fresh blank workflows ship with id `new-<ts>` so the editor
+      // has something to point at; rename to a slug of the user's
+      // chosen name on first save so the on-disk filename is stable.
+      if (workflow.id.startsWith("new-")) {
+        const slug = slugify(workflow.name);
+        if (!slug) {
+          setError("rename the workflow before saving (id is empty)");
+          return;
+        }
+        const existing = await listWorkflows();
+        const taken = new Set(existing.map((w) => w.id));
+        let candidate = slug;
+        let counter = 2;
+        while (taken.has(candidate)) {
+          candidate = `${slug}-${counter}`;
+          counter += 1;
+          if (counter > 999) {
+            setError("could not find a free id; rename the workflow");
+            return;
+          }
+        }
+        toSave = { ...workflow, id: candidate };
+        setWorkflow(toSave);
+        setActiveId(candidate);
+        setTabs((existing) =>
+          existing.map((t) =>
+            t.id === workflow.id ? { ...t, id: candidate, dirty: false } : t,
+          ),
+        );
+        onNavigate({ kind: "editor", workflowId: candidate });
+      } else {
+        setTabs((existing) =>
+          existing.map((t) => (t.id === activeId ? { ...t, dirty: false } : t)),
+        );
+      }
+      await saveWorkflow(toSave);
     } catch (e: unknown) {
       setError(String(e));
     }
-  }, [workflow, activeId, insideTauri]);
+  }, [workflow, activeId, insideTauri, onNavigate]);
 
   const handleAddNode = useCallback(
     (typeId: string) => {
@@ -373,7 +425,7 @@ export function Editor({
               name: nodeType?.name ?? typeId,
               config: {},
               pos,
-              continue_on_error: false,
+              continueOnError: false,
             },
           ],
         };
@@ -406,7 +458,7 @@ export function Editor({
         onRun={handleRun}
         onStop={handleStop}
         onSave={handleSave}
-        onValidate={() => console.warn("validate wired with engine `validate` in 1.5e")}
+        onValidate={handleValidate}
         onNavigate={onNavigate}
         workspaces={workspaces}
         workspaceId={workspaceId}
@@ -471,7 +523,15 @@ export function Editor({
                 : `loading ${activeId}…`}
             </div>
           )}
-          {error ? <NoticeBanner message={error} variant="overlay" /> : null}
+          {error ? (
+            <NoticeBanner message={error} variant="overlay" />
+          ) : validateNotice ? (
+            <NoticeBanner
+              message={validateNotice}
+              variant="overlay"
+              tone="ok"
+            />
+          ) : null}
         </section>
 
         {/* Right column — Properties in editor mode, RunPanel in run mode */}
@@ -552,7 +612,7 @@ function makeBlankWorkflow(): Workflow {
   return {
     id: `new-${stamp}`,
     name: "untitled",
-    schema_version: 1,
+    schemaVersion: 1,
     variables: {},
     triggers: [{ type: "manual" }],
     nodes: [],
@@ -567,4 +627,17 @@ function nextDropPosition(
   if (existing.length === 0) return { x: 80, y: 80 };
   const maxY = existing.reduce((acc, n) => Math.max(acc, n.pos.y), 0);
   return { x: 80, y: maxY + 220 };
+}
+
+/**
+ * ASCII slug for a workflow name. Lowercases, collapses non-alnum to
+ * single `-`, trims edges, caps at 128 chars to match the engine
+ * boundary validator.
+ */
+function slugify(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 128);
 }

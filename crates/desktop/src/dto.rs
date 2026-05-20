@@ -12,8 +12,127 @@ use ordius_engine::settings::{ModelEndpoint, Settings};
 use ordius_engine::system_status::{EndpointStatus, SystemStatus};
 use ordius_engine::types::{NodeType, Workflow};
 use ordius_engine::workspaces::Workspace;
-use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
+
+/// Re-keys an inner engine type to/from `camelCase` on the wire.
+///
+/// Keeps the inner type's on-disk `snake_case` format untouched. Used
+/// for `Workflow`/`NodeType`/etc. where defining a parallel DTO tree
+/// would balloon to hundreds of lines of trivial field-by-field
+/// `From` impls.
+#[derive(Debug, Clone)]
+pub struct JsonCamel<T>(pub T);
+
+impl<T: Serialize> Serialize for JsonCamel<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let v = serde_json::to_value(&self.0).map_err(serde::ser::Error::custom)?;
+        rename_keys(v, snake_to_camel).serialize(serializer)
+    }
+}
+
+impl<'de, T: DeserializeOwned> Deserialize<'de> for JsonCamel<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(deserializer)?;
+        let renamed = rename_keys(v, camel_to_snake);
+        let inner: T = serde_json::from_value(renamed).map_err(serde::de::Error::custom)?;
+        Ok(Self(inner))
+    }
+}
+
+/// Walk a JSON value and rename every object key through `f`. Arrays
+/// recurse; primitives pass through.
+fn rename_keys(value: serde_json::Value, f: fn(&str) -> String) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (f(&k), rename_keys(v, f)))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(|v| rename_keys(v, f)).collect())
+        },
+        other => other,
+    }
+}
+
+/// `snake_case` → `camelCase`. Only converts canonical `snake_case`
+/// identifiers (lowercase ASCII alnum + underscores, starting with a
+/// lowercase letter). Any other shape — uppercase, hyphens, dots,
+/// non-ASCII — passes through unchanged so user-controlled map keys
+/// (e.g. variable names like `API_KEY`, kebab-case slugs, env var
+/// names) round-trip safely.
+fn snake_to_camel(input: &str) -> String {
+    if !is_canonical_snake(input) {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut upper_next = false;
+    for ch in input.chars() {
+        if ch == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.extend(ch.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// `camelCase` → `snake_case`. Only converts canonical camelCase
+/// identifiers (ASCII alnum, lowercase start, at least one uppercase
+/// boundary). Non-camel inputs round-trip as-is.
+fn camel_to_snake(input: &str) -> String {
+    if !is_canonical_camel(input) {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len() + 2);
+    for (i, ch) in input.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.extend(ch.to_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn is_canonical_snake(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+fn is_canonical_camel(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    let mut has_upper = false;
+    for c in chars {
+        if !c.is_ascii_alphanumeric() {
+            return false;
+        }
+        if c.is_ascii_uppercase() {
+            has_upper = true;
+        }
+    }
+    has_upper
+}
 
 /// One workflow row in the Home grid + recent-tab dropdown.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,14 +159,10 @@ impl From<&Workflow> for SavedWorkflowDto {
     }
 }
 
-/// Full workflow JSON the editor consumes.
-///
-/// Today the engine's `Workflow` already serialises in a way the
-/// frontend can consume (`snake_case` fields). Wrapping it
-/// preserves the camelCase contract: future engine rename pressure
-/// doesn't leak into the GUI, and we get a stable type id on the
-/// TypeScript side.
-pub type WorkflowDto = Workflow;
+/// Full workflow JSON the editor consumes. Serialises with
+/// `camelCase` keys via [`JsonCamel`]; the engine type retains its
+/// `snake_case` on-disk format.
+pub type WorkflowDto = JsonCamel<Workflow>;
 
 /// Payload returned from `run_workflow` — the frontend immediately
 /// uses `runId` to subscribe to the live event stream.
@@ -114,7 +229,7 @@ pub struct RunDetailDto {
 }
 
 /// Camel-case node-type spec for the palette + properties panel.
-pub type NodeTypeDto = NodeType;
+pub type NodeTypeDto = JsonCamel<NodeType>;
 
 /// One registered secret. Values are never exposed — just the name
 /// + a first/last 4-char preview the GUI can show.
@@ -369,23 +484,6 @@ impl From<RunEvent> for RunEventDto {
     }
 }
 
-/// Convert `snake_case` to `camelCase`. ASCII only.
-fn snake_to_camel(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut upper_next = false;
-    for ch in input.chars() {
-        if ch == '_' {
-            upper_next = true;
-        } else if upper_next {
-            out.extend(ch.to_uppercase());
-            upper_next = false;
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,7 +495,9 @@ mod tests {
         assert_eq!(snake_to_camel("node_type"), "nodeType");
         assert_eq!(snake_to_camel("started_at"), "startedAt");
         assert_eq!(snake_to_camel("text"), "text");
-        assert_eq!(snake_to_camel("__double"), "Double");
+        // Non-canonical inputs (starts with underscore) round-trip unchanged
+        // so user-defined keys aren't mangled.
+        assert_eq!(snake_to_camel("__double"), "__double");
     }
 
     #[test]
@@ -447,5 +547,71 @@ mod tests {
         };
         let json = serde_json::to_string(&dto).unwrap();
         assert_eq!(json, r#"{"name":"API_KEY"}"#);
+    }
+
+    #[test]
+    fn camel_to_snake_roundtrip() {
+        assert_eq!(camel_to_snake("workflowId"), "workflow_id");
+        assert_eq!(camel_to_snake("nodeType"), "node_type");
+        assert_eq!(camel_to_snake("fromNodeId"), "from_node_id");
+        assert_eq!(camel_to_snake("text"), "text");
+        // Round-trip: snake -> camel -> snake is identity for canonical inputs.
+        for s in ["workflow_id", "from_port", "continue_on_error", "x"] {
+            assert_eq!(camel_to_snake(&snake_to_camel(s)), s);
+        }
+    }
+
+    #[test]
+    fn json_camel_renames_workflow_keys() {
+        use ordius_engine::types::{Trigger, Workflow};
+        let wf = Workflow {
+            id: "w1".into(),
+            name: "n".into(),
+            schema_version: 1,
+            variables: HashMap::new(),
+            triggers: vec![Trigger::Manual],
+            nodes: vec![],
+            edges: vec![],
+            created_at: None,
+            updated_at: None,
+        };
+        let dto = JsonCamel(wf);
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(json.contains(r#""schemaVersion":1"#));
+        assert!(!json.contains("schema_version"));
+        // And deserialize back from camelCase JSON.
+        let parsed: JsonCamel<Workflow> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.0.schema_version, 1);
+        assert_eq!(parsed.0.id, "w1");
+    }
+
+    #[test]
+    fn json_camel_renames_nested_object_keys() {
+        // Object keys at every depth get re-keyed, not just the top level.
+        let inner = serde_json::json!({"snake_case_key": {"nested_snake": 1}});
+        let renamed = rename_keys(inner, snake_to_camel);
+        assert_eq!(
+            renamed,
+            serde_json::json!({"snakeCaseKey": {"nestedSnake": 1}})
+        );
+    }
+
+    #[test]
+    fn rename_preserves_user_defined_keys() {
+        // Variable names like API_KEY (uppercase), env vars like HOME,
+        // kebab-case slugs ("file-watch"), and arbitrary user keys must
+        // round-trip unchanged through the walker.
+        assert_eq!(snake_to_camel("API_KEY"), "API_KEY");
+        assert_eq!(snake_to_camel("HOME"), "HOME");
+        assert_eq!(snake_to_camel("file-watch"), "file-watch");
+        assert_eq!(snake_to_camel("MY_VAR_2"), "MY_VAR_2");
+        assert_eq!(camel_to_snake("API_KEY"), "API_KEY");
+        assert_eq!(camel_to_snake("file-watch"), "file-watch");
+        // Identifiers that look like canonical snake/camel still convert.
+        assert_eq!(snake_to_camel("workflow_id"), "workflowId");
+        assert_eq!(camel_to_snake("workflowId"), "workflow_id");
+        // No-underscore lowercase: nothing to do either way.
+        assert_eq!(snake_to_camel("text"), "text");
+        assert_eq!(camel_to_snake("text"), "text");
     }
 }

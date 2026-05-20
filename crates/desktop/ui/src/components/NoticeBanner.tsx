@@ -11,18 +11,23 @@ interface Props {
   variant?: "inline" | "overlay";
   /** When true, the user can interact with the banner (eg copy text). */
   interactive?: boolean;
+  /** `warn` (default) renders a `!` accent; `ok` renders a `✓` accent. */
+  tone?: "warn" | "ok";
 }
 
 export function NoticeBanner({
   message,
   variant = "inline",
   interactive = false,
+  tone = "warn",
 }: Props): JSX.Element {
+  const accent = tone === "ok" ? "var(--ok)" : "var(--warn)";
+  const glyph = tone === "ok" ? "✓ " : "! ";
   const baseStyle: CSSProperties = {
     padding: "8px 12px",
     fontFamily: "var(--mono)",
     fontSize: 11,
-    color: "var(--warn)",
+    color: accent,
     background: "var(--bg-canvas)",
     border: "1px dashed var(--line)",
     borderRadius: 3,
@@ -40,7 +45,7 @@ export function NoticeBanner({
           pointerEvents: interactive ? "auto" : "none",
         }}
       >
-        <span style={{ color: "var(--warn)" }}>! </span>
+        <span style={{ color: accent }}>{glyph}</span>
         {message}
       </div>
     );
@@ -48,7 +53,7 @@ export function NoticeBanner({
 
   return (
     <div style={{ ...baseStyle, marginBottom: 18 }}>
-      <span style={{ color: "var(--warn)" }}>! </span>
+      <span style={{ color: accent }}>{glyph}</span>
       {message}
     </div>
   );

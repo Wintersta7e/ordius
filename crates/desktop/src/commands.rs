@@ -20,13 +20,12 @@
 #![allow(clippy::unnecessary_wraps)]
 
 use crate::dto::{
-    EndpointStatusDto, ModelEndpointDto, NodeRunRowDto, NodeTypeDto, RunDetailDto, RunEventDto,
-    RunRowDto, RunStartedDto, RunWorkflowArgs, SavedWorkflowDto, SecretMetaDto, SettingsDto,
-    SystemStatusDto, WorkflowDto, WorkspaceDto,
+    EndpointStatusDto, JsonCamel, ModelEndpointDto, NodeRunRowDto, NodeTypeDto, RunDetailDto,
+    RunEventDto, RunRowDto, RunStartedDto, RunWorkflowArgs, SavedWorkflowDto, SecretMetaDto,
+    SettingsDto, SystemStatusDto, WorkflowDto, WorkspaceDto,
 };
 use crate::state::AppState;
 use ordius_engine::settings::Settings as EngineSettings;
-use ordius_engine::types::Workflow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -82,16 +81,28 @@ pub fn list_workflows(state: tauri::State<'_, AppState>) -> Result<Vec<SavedWork
 #[tauri::command]
 pub fn load_workflow(state: tauri::State<'_, AppState>, id: String) -> Result<WorkflowDto, String> {
     validate_workflow_id(&id)?;
-    ordius_engine::workflows::load(state.engine.home(), &id).map_err(|e| e.to_string())
+    let wf = ordius_engine::workflows::load(state.engine.home(), &id).map_err(|e| e.to_string())?;
+    Ok(JsonCamel(wf))
 }
 
 /// Persist a workflow to disk. Validates structure before saving;
 /// the editor's "Save" button gates on this.
 #[tauri::command]
-pub fn save_workflow(state: tauri::State<'_, AppState>, workflow: Workflow) -> Result<(), String> {
+pub fn save_workflow(
+    state: tauri::State<'_, AppState>,
+    workflow: WorkflowDto,
+) -> Result<(), String> {
+    let workflow = workflow.0;
     validate_workflow_id(&workflow.id)?;
     ordius_engine::validate(&workflow).map_err(|e| e.to_string())?;
     ordius_engine::workflows::save(state.engine.home(), &workflow).map_err(|e| e.to_string())
+}
+
+/// Run the engine's structural validation pass over a workflow without
+/// persisting it. Used by the editor's `validate` button.
+#[tauri::command]
+pub fn validate_workflow(workflow: WorkflowDto) -> Result<(), String> {
+    ordius_engine::validate(&workflow.0).map_err(|e| e.to_string())
 }
 
 /// Delete a workflow by id. The editor confirms before calling.
@@ -307,7 +318,7 @@ pub fn list_node_types(state: tauri::State<'_, AppState>) -> Result<Vec<NodeType
     Ok(ids
         .iter()
         .filter_map(|id| registry.get(id))
-        .map(|arc| (*arc).clone())
+        .map(|arc| JsonCamel((*arc).clone()))
         .collect())
 }
 

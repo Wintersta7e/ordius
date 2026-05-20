@@ -285,17 +285,17 @@ function NodeProps({
       <Section label="execution">
         <Field label="continue on error">
           <Toggle
-            value={node.continue_on_error}
+            value={node.continueOnError}
             onChange={(value) =>
-              onPatch(node.id, { continue_on_error: value })
+              onPatch(node.id, { continueOnError: value })
             }
           />
         </Field>
         <Field label="timeout (ms)" hint="0 → none">
           <NumberInput
-            value={node.timeout_ms ?? 0}
+            value={node.timeoutMs ?? 0}
             onChange={(value) =>
-              onPatch(node.id, { timeout_ms: value > 0 ? value : null })
+              onPatch(node.id, { timeoutMs: value > 0 ? value : null })
             }
           />
         </Field>
@@ -330,7 +330,7 @@ interface WorkflowPropsProps {
 }
 
 function WorkflowProps({ workflow, onPatch }: WorkflowPropsProps): JSX.Element {
-  const loopCount = workflow.edges.filter((e) => e.edge_type === "loop").length;
+  const loopCount = workflow.edges.filter((e) => e.edgeType === "loop").length;
   return (
     <div>
       <div style={{ padding: 10 }}>
@@ -408,7 +408,7 @@ function WorkflowProps({ workflow, onPatch }: WorkflowPropsProps): JSX.Element {
         <KV k="nodes" v={workflow.nodes.length} />
         <KV k="edges" v={workflow.edges.length} />
         <KV k="loops" v={loopCount} />
-        <KV k="schema" v={`v${workflow.schema_version}`} />
+        <KV k="schema" v={`v${workflow.schemaVersion}`} />
       </Section>
     </div>
   );
@@ -423,7 +423,7 @@ function summariseTrigger(trigger: Workflow["triggers"][number]): string {
     case "file-watch":
       return `paths: ${trigger.paths.join(", ")}`;
     case "webhook":
-      return trigger.secret_token ? "secret-gated" : "open endpoint";
+      return trigger.secretToken ? "secret-gated" : "open endpoint";
     default:
       return "";
   }
