@@ -16,11 +16,17 @@
 
 use crate::Engine;
 use crate::types::Trigger;
+use axum::Router;
+use axum::extract::{Path as AxumPath, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
 use chrono::{DateTime, Utc};
 use cron::Schedule as CronSchedule;
 use notify::RecursiveMode;
 use notify_debouncer_mini::new_debouncer;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -28,6 +34,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+const WEBHOOK_ADDR_ENV: &str = "ORDIUS_WEBHOOK_ADDR";
+const WEBHOOK_DEFAULT_ADDR: &str = "127.0.0.1:8421";
 
 /// Handle returned by [`Engine::start_triggers`]. Drop or call
 /// [`Self::stop`] to shut the runner down; the daemon CLI just awaits
@@ -88,10 +97,17 @@ async fn run_triggers_loop(engine: Arc<Engine>, cancel: CancellationToken) {
     let mut file_watches: Vec<FileWatchReg> = Vec::new();
     let mut watchers_started = false;
 
+    // Webhook HTTP server runs as a sibling task; cancel token
+    // cascades from the main runner.
+    let webhook_handle = spawn_webhook_server(Arc::clone(&engine), cancel.clone());
+
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
                 tracing::info!("trigger runner stopping");
+                if let Some(handle) = webhook_handle {
+                    drop(handle.await);
+                }
                 return;
             }
             _ = tick.tick() => {
@@ -412,10 +428,155 @@ fn fire_due_schedules(engine: &Arc<Engine>, schedules: &mut [ScheduleReg]) {
     }
 }
 
+// ─── Webhook trigger ────────────────────────────────────────────────
+
+/// Bind an axum server on `ORDIUS_WEBHOOK_ADDR` (or the default) and
+/// route `POST /webhooks/:workflow_id` to a handler that resolves the
+/// workflow, validates the optional `secret_token`, and starts a run
+/// with `trigger_kind="webhook"`. Returns the join handle for the
+/// server task, or `None` if the bind failed (logged warn — daemon
+/// keeps running without webhook support).
+fn spawn_webhook_server(engine: Arc<Engine>, cancel: CancellationToken) -> Option<JoinHandle<()>> {
+    let addr_str =
+        std::env::var(WEBHOOK_ADDR_ENV).unwrap_or_else(|_| WEBHOOK_DEFAULT_ADDR.to_string());
+    let addr: SocketAddr = match addr_str.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(addr = %addr_str, error = %e, "webhook server: invalid bind address");
+            return None;
+        },
+    };
+
+    let app = Router::new()
+        .route("/webhooks/:workflow_id", post(webhook_handler))
+        .with_state(engine);
+
+    let join = tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(addr = %addr, error = %e, "webhook server: bind failed");
+                return;
+            },
+        };
+        tracing::info!(addr = %addr, "webhook server listening");
+        let serve = axum::serve(listener, app)
+            .with_graceful_shutdown(async move { cancel.cancelled().await });
+        if let Err(e) = serve.await {
+            tracing::warn!(error = %e, "webhook server exited with error");
+        }
+    });
+
+    Some(join)
+}
+
+async fn webhook_handler(
+    State(engine): State<Arc<Engine>>,
+    AxumPath(workflow_id): AxumPath<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let Ok(wf) = crate::workflows::load(engine.home(), &workflow_id) else {
+        return (StatusCode::NOT_FOUND, "workflow not found").into_response();
+    };
+
+    let Some(secret_token_template) = wf.triggers.iter().find_map(|t| match t {
+        Trigger::Webhook { secret_token } => Some(secret_token.clone()),
+        _ => None,
+    }) else {
+        return (StatusCode::NOT_FOUND, "workflow has no webhook trigger").into_response();
+    };
+
+    // Validate token if the trigger configured one. Resolution happens
+    // against the engine's secrets store; failure to resolve is a 500.
+    if let Some(template) = secret_token_template.as_deref() {
+        let resolved = match resolve_webhook_token(&engine, template) {
+            Ok(t) => t,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("token template: {e}"),
+                )
+                    .into_response();
+            },
+        };
+        let provided = headers
+            .get("x-ordius-token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if provided != resolved {
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+    }
+
+    // Body → variables. Empty body is fine (no variables); a non-empty
+    // body must be a JSON object of {string: string-or-coercible}.
+    let variables = if body.is_empty() {
+        HashMap::new()
+    } else {
+        match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(serde_json::Value::Object(map)) => map
+                .into_iter()
+                .map(|(k, v)| {
+                    let s = match v {
+                        serde_json::Value::String(s) => s,
+                        other => other.to_string(),
+                    };
+                    (k, s)
+                })
+                .collect(),
+            Ok(_) => {
+                return (StatusCode::BAD_REQUEST, "body must be a JSON object").into_response();
+            },
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("body: {e}")).into_response();
+            },
+        }
+    };
+
+    let handle = match engine.start_run(Arc::new(wf), variables, "webhook", false, None) {
+        Ok(h) => h,
+        Err(crate::EngineError::AlreadyRunning { .. }) => {
+            return (StatusCode::CONFLICT, "workflow already running").into_response();
+        },
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("start_run: {e}")).into_response();
+        },
+    };
+
+    (
+        StatusCode::ACCEPTED,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        format!("{{\"run_id\":\"{}\"}}\n", handle.run_id),
+    )
+        .into_response()
+}
+
+/// Resolve a `{{secrets.NAME}}`-style template against the engine's
+/// secrets store at request time. Anything other than a single
+/// secret reference (raw strings, etc.) passes through as-is.
+fn resolve_webhook_token(engine: &Arc<Engine>, template: &str) -> Result<String, String> {
+    let trimmed = template.trim();
+    if let Some(inner) = trimmed
+        .strip_prefix("{{")
+        .and_then(|s| s.strip_suffix("}}"))
+    {
+        let inner = inner.trim();
+        if let Some(name) = inner.strip_prefix("secrets.") {
+            let store = engine.secrets_store();
+            return store
+                .get(name.trim())
+                .map_err(|e| format!("secret '{name}': {e}"));
+        }
+    }
+    Ok(template.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{Node, Pos, Trigger as WfTrigger, Workflow};
+    use serial_test::serial;
     use tempfile::TempDir;
 
     fn delay_node(id: &str, ms: u64) -> Node {
@@ -432,7 +593,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(webhook_env)]
     async fn schedule_runs_workflow_every_second() {
+        // Bind the implicit webhook server on a free port so this
+        // test doesn't fight with other start_triggers callers.
+        let addr = pick_free_addr();
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(WEBHOOK_ADDR_ENV, addr.to_string());
+        }
         // Cron `* * * * * *` (6 fields) → every second.
         let dir = TempDir::new().unwrap();
         let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
@@ -474,7 +643,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial(webhook_env)]
     async fn file_watch_fires_run_on_matching_write() {
+        let addr = pick_free_addr();
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(WEBHOOK_ADDR_ENV, addr.to_string());
+        }
         let dir = TempDir::new().unwrap();
         let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
         // Watch a separate temp dir so notify events don't get clouded
@@ -526,8 +701,108 @@ mod tests {
         assert!(saw_run, "file-watch should have fired a run");
     }
 
+    /// Bind 127.0.0.1:0 (kernel-assigned ephemeral port) so parallel
+    /// tests don't fight over the default. Returns the listener's
+    /// actual addr so the test can hit it.
+    fn pick_free_addr() -> SocketAddr {
+        let lst = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = lst.local_addr().unwrap();
+        drop(lst);
+        addr
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial(webhook_env)]
+    async fn webhook_post_fires_run() {
+        let addr = pick_free_addr();
+        // SAFETY: we own the env var for the lifetime of the test
+        // process; tokio doesn't fork.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(WEBHOOK_ADDR_ENV, addr.to_string());
+        }
+
+        let dir = TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+        let wf = Workflow {
+            id: "hook".into(),
+            name: "hook".into(),
+            schema_version: 1,
+            created_at: None,
+            updated_at: None,
+            variables: HashMap::new(),
+            triggers: vec![WfTrigger::Webhook { secret_token: None }],
+            nodes: vec![delay_node("step", 5)],
+            edges: vec![],
+        };
+        crate::workflows::save(engine.home(), &wf).unwrap();
+
+        let handle = engine.start_triggers();
+        // Give the webhook server time to bind.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/webhooks/hook");
+        let resp = client
+            .post(&url)
+            .json(&serde_json::json!({"foo": "bar"}))
+            .send()
+            .await
+            .expect("post webhook");
+        assert_eq!(resp.status(), 202, "expected accepted");
+
+        // The run should land in the runs table with trigger_kind=webhook.
+        let mut saw = false;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let conn = engine.pool().get().unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM runs WHERE workflow_id='hook' AND trigger_kind='webhook'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if count >= 1 {
+                saw = true;
+                break;
+            }
+        }
+        handle.stop();
+        drop(handle.join.await);
+        assert!(saw, "webhook should fire a run");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(webhook_env)]
+    async fn webhook_rejects_unknown_workflow() {
+        let addr = pick_free_addr();
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(WEBHOOK_ADDR_ENV, addr.to_string());
+        }
+        let dir = TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+        let handle = engine.start_triggers();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/webhooks/nope");
+        let resp = client.post(&url).body("").send().await.expect("post");
+        assert_eq!(resp.status(), 404);
+
+        handle.stop();
+        drop(handle.join.await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(webhook_env)]
     async fn invalid_cron_is_logged_not_fatal() {
+        let addr = pick_free_addr();
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(WEBHOOK_ADDR_ENV, addr.to_string());
+        }
         let dir = TempDir::new().unwrap();
         let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
         let wf = Workflow {

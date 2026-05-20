@@ -29,6 +29,7 @@ cron = { workspace = true }
 notify = { workspace = true }
 notify-debouncer-mini = { workspace = true }
 bollard = { workspace = true }
+axum = { workspace = true }
 reqwest = { workspace = true }
 keyring-core = { workspace = true }
 futures = { workspace = true }
