@@ -27,6 +27,7 @@ import {
   DEMO_WORKFLOW,
 } from "../components/canvas/demoWorkflow";
 import { EditorTopBar, type EditorMode } from "../components/chrome/EditorTopBar";
+import { Resizer } from "../components/chrome/Resizer";
 import {
   WorkflowTabStrip,
   type WorkflowTab,
@@ -69,6 +70,23 @@ export function Editor({
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [workspaceId, setWorkspaceId] = useState<string | null>(null);
   const [runDialogOpen, setRunDialogOpen] = useState(false);
+  const [paletteW, setPaletteW] = useState<number>(() => readStoredWidth("ordius.layout.paletteW", 220, PALETTE_MIN, PALETTE_MAX));
+  const [propsW, setPropsW] = useState<number>(() => readStoredWidth("ordius.layout.propsW", 320, PROPS_MIN, PROPS_MAX));
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("ordius.layout.paletteW", String(paletteW));
+    } catch {
+      // localStorage may be disabled (private mode, embedded surface) — silently skip.
+    }
+  }, [paletteW]);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("ordius.layout.propsW", String(propsW));
+    } catch {
+      // see above.
+    }
+  }, [propsW]);
 
   const insideTauri =
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -475,13 +493,17 @@ export function Editor({
       <main
         style={{
           display: "grid",
-          gridTemplateColumns: "220px 1fr 320px",
+          gridTemplateColumns: `${paletteW}px 5px 1fr 5px ${propsW}px`,
           minHeight: 0,
           overflow: "hidden",
         }}
       >
         {/* Palette — Phase 1.5c */}
         <Palette nodeTypes={nodeTypes} onAdd={handleAddNode} />
+        <Resizer
+          ariaLabel="Resize palette"
+          onResize={(dx) => setPaletteW((w) => clampWidth(w + dx, PALETTE_MIN, PALETTE_MAX))}
+        />
 
         {/* Canvas — Phase 1.5b */}
         <section style={{ position: "relative", minWidth: 0 }}>
@@ -533,6 +555,11 @@ export function Editor({
             />
           ) : null}
         </section>
+
+        <Resizer
+          ariaLabel="Resize properties panel"
+          onResize={(dx) => setPropsW((w) => clampWidth(w - dx, PROPS_MIN, PROPS_MAX))}
+        />
 
         {/* Right column — Properties in editor mode, RunPanel in run mode */}
         {mode === "run" ? (
@@ -586,6 +613,31 @@ export function Editor({
       />
     </div>
   );
+}
+
+const PALETTE_MIN = 180;
+const PALETTE_MAX = 480;
+const PROPS_MIN = 240;
+const PROPS_MAX = 560;
+
+function clampWidth(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+function readStoredWidth(
+  key: string,
+  fallback: number,
+  lo: number,
+  hi: number,
+): number {
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (raw == null) return fallback;
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) ? clampWidth(n, lo, hi) : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 /** Pick an id like `delay-3` that doesn't collide with existing nodes. */
