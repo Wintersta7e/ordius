@@ -13,8 +13,8 @@
 //! and template `{{inputs.X}}` references, with `http` reading
 //! its URL straight from static config.
 
-use ordius_engine::types::{Edge, EdgeType, Node, Pos, Workflow};
 use ordius_engine::Engine;
+use ordius_engine::types::{Edge, EdgeType, Node, Pos, Workflow};
 use std::collections::HashMap;
 use std::sync::Arc;
 use wiremock::matchers::{method, path};
@@ -122,11 +122,7 @@ async fn five_step_workflow_runs_through_file_transform_http_to_completion() {
         .await;
 
     let engine_home = tempfile::TempDir::new().unwrap();
-    let engine = Arc::new(
-        Engine::new(engine_home.path().to_path_buf())
-            .await
-            .unwrap(),
-    );
+    let engine = Arc::new(Engine::new(engine_home.path().to_path_buf()).await.unwrap());
 
     // The pre-write node + the workflow share an absolute path so
     // the test doesn't depend on knowing the run workspace dir in
@@ -171,7 +167,7 @@ async fn five_step_workflow_runs_through_file_transform_http_to_completion() {
     });
 
     let summary = engine
-        .run_workflow(wf, HashMap::new(), "test", false)
+        .run_workflow(wf, HashMap::new(), "test", false, None)
         .await
         .expect("multi-step run completes");
 

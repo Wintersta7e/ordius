@@ -69,7 +69,7 @@ execution:
     });
 
     let summary = engine
-        .run_workflow(wf, HashMap::new(), "test", true)
+        .run_workflow(wf, HashMap::new(), "test", true, None)
         .await
         .expect("run completes");
     assert_eq!(

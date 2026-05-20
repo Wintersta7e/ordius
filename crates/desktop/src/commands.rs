@@ -30,6 +30,40 @@ use ordius_engine::types::Workflow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Workflow ids become the filename stem under `<home>/workflows/`, so a
+/// hostile webview payload like `../../etc/passwd` would escape the dir.
+/// Restrict to a slug shape — ASCII alnum plus `_` and `-`, 1..=128 chars.
+fn validate_workflow_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("workflow id is empty".into());
+    }
+    if id.len() > 128 {
+        return Err(format!("workflow id is too long ({} > 128)", id.len()));
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!(
+            "workflow id {id:?} contains characters outside [A-Za-z0-9_-]"
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve a workspace id from the run-dialog payload to the absolute
+/// path stored in `<home>/workspaces.json`. Returns Err if the id is
+/// unknown — the GUI lists workspaces from the same source so a missing
+/// id is a programmer/path-traversal error rather than a transient one.
+fn resolve_workspace_path(home: &std::path::Path, id: &str) -> Result<PathBuf, String> {
+    let workspaces = ordius_engine::workspaces::list(home).map_err(|e| e.to_string())?;
+    workspaces
+        .into_iter()
+        .find(|w| w.id == id)
+        .map(|w| w.path)
+        .ok_or_else(|| format!("workspace id {id:?} is not registered"))
+}
+
 // ─── Workflows ───────────────────────────────────────────────────
 
 /// List every workflow in `<home>/workflows/`. Parse errors are
@@ -47,6 +81,7 @@ pub fn list_workflows(state: tauri::State<'_, AppState>) -> Result<Vec<SavedWork
 /// Load a single workflow by id.
 #[tauri::command]
 pub fn load_workflow(state: tauri::State<'_, AppState>, id: String) -> Result<WorkflowDto, String> {
+    validate_workflow_id(&id)?;
     ordius_engine::workflows::load(state.engine.home(), &id).map_err(|e| e.to_string())
 }
 
@@ -54,6 +89,7 @@ pub fn load_workflow(state: tauri::State<'_, AppState>, id: String) -> Result<Wo
 /// the editor's "Save" button gates on this.
 #[tauri::command]
 pub fn save_workflow(state: tauri::State<'_, AppState>, workflow: Workflow) -> Result<(), String> {
+    validate_workflow_id(&workflow.id)?;
     ordius_engine::validate(&workflow).map_err(|e| e.to_string())?;
     ordius_engine::workflows::save(state.engine.home(), &workflow).map_err(|e| e.to_string())
 }
@@ -61,6 +97,7 @@ pub fn save_workflow(state: tauri::State<'_, AppState>, workflow: Workflow) -> R
 /// Delete a workflow by id. The editor confirms before calling.
 #[tauri::command]
 pub fn delete_workflow(state: tauri::State<'_, AppState>, id: String) -> Result<bool, String> {
+    validate_workflow_id(&id)?;
     ordius_engine::workflows::delete(state.engine.home(), &id).map_err(|e| e.to_string())
 }
 
@@ -75,31 +112,73 @@ pub async fn run_workflow(
     args: RunWorkflowArgs,
     channel: tauri::ipc::Channel<RunEventDto>,
 ) -> Result<RunStartedDto, String> {
+    validate_workflow_id(&args.workflow_id)?;
     let engine = state.engine.clone();
     let wf = ordius_engine::workflows::load(engine.home(), &args.workflow_id)
         .map_err(|e| e.to_string())?;
 
-    // Workspace id is accepted but not yet wired into `RunContext.workspace`;
-    // the engine still uses its home dir as the per-run workspace root.
-    drop(args.workspace_id);
+    // Resolve workspace selection against the user's registered
+    // workspaces. `None` falls back to the engine's per-run scratch
+    // dir at `<home>/workspaces/<run_id>`.
+    let workspace_override = match args.workspace_id {
+        Some(id) => Some(resolve_workspace_path(engine.home(), &id)?),
+        None => None,
+    };
 
     let handle = engine
-        .start_run(Arc::new(wf), args.variables, "gui", args.auto_resume)
+        .start_run(
+            Arc::new(wf),
+            args.variables,
+            "gui",
+            args.auto_resume,
+            workspace_override,
+        )
         .map_err(|e| e.to_string())?;
     let run_id = handle.run_id.clone();
     let mut rx = handle.event_rx;
     let join = handle.join;
+    let lag_run_id = run_id.clone();
     tokio::spawn(async move {
+        let mut next_seq: u64 = 0;
         loop {
             match rx.recv().await {
                 Ok(ev) => {
+                    next_seq = ev.seq.saturating_add(1);
                     if channel.send(RunEventDto::from(ev)).is_err() {
                         // Frontend closed the channel — stop draining.
                         break;
                     }
                 },
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        run_id = %lag_run_id,
+                        dropped = n,
+                        "run event stream lagged; UI should refresh via get_run",
+                    );
+                    // Surface to the frontend so the timeline shows a marker
+                    // and the run viewer can choose to re-fetch persisted
+                    // state from `get_run` for accuracy.
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+                    let synthetic = RunEventDto {
+                        ty: "stream:lagged".into(),
+                        seq: next_seq,
+                        emitted_at: now_ms,
+                        run_id: lag_run_id.clone(),
+                        node_id: None,
+                        iteration: None,
+                        attempt: None,
+                        payload: std::collections::HashMap::from([(
+                            "dropped".to_string(),
+                            serde_json::json!(n),
+                        )]),
+                    };
+                    if channel.send(synthetic).is_err() {
+                        break;
+                    }
+                },
             }
         }
         // Drain the join handle so panics surface in tracing rather
@@ -344,4 +423,40 @@ pub fn system_status(state: tauri::State<'_, AppState>) -> Result<SystemStatusDt
         })
         .collect();
     Ok(dto)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_workflow_id;
+
+    #[test]
+    fn accepts_slug_shape() {
+        assert!(validate_workflow_id("hello").is_ok());
+        assert!(validate_workflow_id("hello-world_2").is_ok());
+        assert!(validate_workflow_id("New123").is_ok());
+        assert!(validate_workflow_id(&"x".repeat(128)).is_ok());
+    }
+
+    #[test]
+    fn rejects_path_separators() {
+        assert!(validate_workflow_id("../etc/passwd").is_err());
+        assert!(validate_workflow_id("..").is_err());
+        assert!(validate_workflow_id("a/b").is_err());
+        assert!(validate_workflow_id("a\\b").is_err());
+        assert!(validate_workflow_id("./hi").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_and_oversize() {
+        assert!(validate_workflow_id("").is_err());
+        assert!(validate_workflow_id(&"x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn rejects_whitespace_and_dot() {
+        assert!(validate_workflow_id("a b").is_err());
+        assert!(validate_workflow_id(" ").is_err());
+        assert!(validate_workflow_id("a.b").is_err());
+        assert!(validate_workflow_id("a\0b").is_err());
+    }
 }

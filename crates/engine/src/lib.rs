@@ -290,7 +290,7 @@ mod engine_tests {
         });
 
         let handle = engine
-            .start_run(wf, HashMap::new(), "test", false)
+            .start_run(wf, HashMap::new(), "test", false, None)
             .expect("start_run");
         // Let the run loop start dispatching before we ask to shut down.
         tokio::time::sleep(Duration::from_millis(100)).await;

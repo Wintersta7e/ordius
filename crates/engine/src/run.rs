@@ -74,6 +74,7 @@ impl Engine {
         variables: HashMap<String, String>,
         trigger_kind: &str,
         auto_resume_checkpoints: bool,
+        workspace_override: Option<std::path::PathBuf>,
     ) -> Result<RunHandle> {
         crate::validation::validate(&wf)?;
 
@@ -116,13 +117,16 @@ impl Engine {
             ]),
         );
 
-        let workspace = self.home().join("workspaces").join(&rec.run_id);
-        if let Err(e) = std::fs::create_dir_all(&workspace) {
-            tracing::warn!(
-                error = ?e, path = %workspace.display(),
-                "could not create run workspace; falling back to engine home",
-            );
-        }
+        let workspace = workspace_override.unwrap_or_else(|| {
+            let p = self.home().join("workspaces").join(&rec.run_id);
+            if let Err(e) = std::fs::create_dir_all(&p) {
+                tracing::warn!(
+                    error = ?e, path = %p.display(),
+                    "could not create run workspace; falling back to engine home",
+                );
+            }
+            p
+        });
 
         let run_id = rec.run_id.clone();
         let engine = Arc::clone(self);
@@ -170,8 +174,15 @@ impl Engine {
         variables: HashMap<String, String>,
         trigger_kind: &str,
         auto_resume_checkpoints: bool,
+        workspace_override: Option<std::path::PathBuf>,
     ) -> Result<RunSummary> {
-        let handle = self.start_run(wf, variables, trigger_kind, auto_resume_checkpoints)?;
+        let handle = self.start_run(
+            wf,
+            variables,
+            trigger_kind,
+            auto_resume_checkpoints,
+            workspace_override,
+        )?;
         handle
             .join
             .await
@@ -798,7 +809,7 @@ mod tests {
 
         let summary = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            engine.run_workflow(wf, HashMap::new(), "test", true),
+            engine.run_workflow(wf, HashMap::new(), "test", true, None),
         )
         .await
         .expect("must not park — auto_resume should short-circuit")
@@ -964,7 +975,7 @@ mod tests {
         let wf = Arc::new(minimal_workflow());
 
         let handle = engine
-            .start_run(wf, HashMap::new(), "test", false)
+            .start_run(wf, HashMap::new(), "test", false, None)
             .expect("start_run");
         let mut rx = handle.event_rx;
 
@@ -1019,7 +1030,7 @@ mod tests {
         let wf = Arc::new(minimal_workflow());
 
         let handle = engine
-            .start_run(wf, HashMap::new(), "test", false)
+            .start_run(wf, HashMap::new(), "test", false, None)
             .expect("start_run");
         let summary = handle.join.await.expect("join").expect("run ok");
         assert_eq!(summary.status, "done");
@@ -1064,7 +1075,7 @@ mod tests {
         });
 
         let summary = engine
-            .run_workflow(wf, HashMap::new(), "test", false)
+            .run_workflow(wf, HashMap::new(), "test", false, None)
             .await
             .expect("run ok");
         assert_eq!(summary.status, "done");
@@ -1078,9 +1089,9 @@ mod tests {
         let wf = Arc::new(minimal_workflow());
 
         let h1 = engine
-            .start_run(wf.clone(), HashMap::new(), "test", false)
+            .start_run(wf.clone(), HashMap::new(), "test", false, None)
             .expect("first run starts");
-        let second = engine.start_run(wf.clone(), HashMap::new(), "test", false);
+        let second = engine.start_run(wf.clone(), HashMap::new(), "test", false, None);
         match second {
             Err(EngineError::AlreadyRunning { .. }) => {},
             Ok(_) => panic!("expected AlreadyRunning, got Ok(RunHandle)"),
@@ -1117,7 +1128,7 @@ mod tests {
         });
 
         let summary = engine
-            .run_workflow(wf, HashMap::new(), "test", false)
+            .run_workflow(wf, HashMap::new(), "test", false, None)
             .await
             .expect("run completes (even on node failure)");
         assert_eq!(summary.status, "error");
@@ -1152,7 +1163,7 @@ mod tests {
         });
 
         let handle = engine
-            .start_run(wf, HashMap::new(), "test", false)
+            .start_run(wf, HashMap::new(), "test", false, None)
             .expect("start_run");
         let run_id = handle.run_id.clone();
         // Let dispatch start before cancelling.
@@ -1209,7 +1220,7 @@ mod tests {
         });
 
         let summary = engine
-            .run_workflow(wf, HashMap::new(), "test", false)
+            .run_workflow(wf, HashMap::new(), "test", false, None)
             .await
             .expect("run completes");
         assert_eq!(summary.status, "error", "expected timeout → run error");
@@ -1253,7 +1264,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         let summary = engine
-            .run_workflow(wf, HashMap::new(), "test", false)
+            .run_workflow(wf, HashMap::new(), "test", false, None)
             .await
             .expect("run completes (timeout is a node-level failure)");
         let elapsed = start.elapsed();
@@ -1300,7 +1311,7 @@ mod tests {
         });
 
         let summary = engine
-            .run_workflow(wf, HashMap::new(), "test", false)
+            .run_workflow(wf, HashMap::new(), "test", false, None)
             .await
             .expect("run completes once retry budget is exhausted");
         assert_eq!(summary.status, "error");

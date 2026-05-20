@@ -848,7 +848,7 @@ async fn cmd_run(home: &Path, args: RunArgs) -> anyhow::Result<u8> {
         }
     });
 
-    let handle = match engine.start_run(Arc::new(wf), variables, "cli", args.yes) {
+    let handle = match engine.start_run(Arc::new(wf), variables, "cli", args.yes, None) {
         Ok(h) => h,
         Err(EngineError::Validation(e)) => {
             eprintln!("ordius: validation failed: {e}");
