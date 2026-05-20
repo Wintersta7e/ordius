@@ -26,6 +26,8 @@ jsonpath-rust = { workspace = true }
 regex = { workspace = true }
 glob = { workspace = true }
 cron = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-mini = { workspace = true }
 reqwest = { workspace = true }
 keyring-core = { workspace = true }
 futures = { workspace = true }
