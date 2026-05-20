@@ -92,21 +92,18 @@ export function Editor({
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
   // Workspace catalog → RunDialog's workspace picker.
-  useEffect(() => {
+  const reloadWorkspaces = useCallback(async () => {
     if (!insideTauri) return;
-    let cancelled = false;
-    void (async () => {
-      try {
-        const ws = await listWorkspaces();
-        if (!cancelled) setWorkspaces(ws);
-      } catch {
-        /* non-fatal — RunDialog falls back to engine home */
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    try {
+      const ws = await listWorkspaces();
+      setWorkspaces(ws);
+    } catch {
+      /* non-fatal — RunDialog falls back to engine home */
+    }
   }, [insideTauri]);
+  useEffect(() => {
+    void reloadWorkspaces();
+  }, [reloadWorkspaces]);
 
   // Load node-type catalog once (under Tauri) — used by the Canvas
   // for port lookup and category tinting.
@@ -481,6 +478,7 @@ export function Editor({
         workspaces={workspaces}
         workspaceId={workspaceId}
         onWorkspaceChange={setWorkspaceId}
+        onWorkspacesChanged={() => void reloadWorkspaces()}
       />
       <WorkflowTabStrip
         tabs={tabs}

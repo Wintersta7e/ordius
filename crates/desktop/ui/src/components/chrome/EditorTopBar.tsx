@@ -10,6 +10,7 @@ import type { JSX } from "react";
 
 import { OrdiusWordmark } from "../Wordmark";
 import { Ic } from "../icons";
+import { WorkspaceSelector } from "./WorkspaceSelector";
 import type { Route } from "../../lib/router";
 import type { Workspace } from "../../engine/types";
 
@@ -32,6 +33,8 @@ interface Props {
   /** Currently selected workspace id (null = home). */
   workspaceId: string | null;
   onWorkspaceChange: (id: string | null) => void;
+  /** Called after the user creates a workspace inline so the parent reloads. */
+  onWorkspacesChanged?: () => void;
 }
 
 export function EditorTopBar({
@@ -48,6 +51,7 @@ export function EditorTopBar({
   workspaces,
   workspaceId,
   onWorkspaceChange,
+  onWorkspacesChanged,
 }: Props): JSX.Element {
   return (
     <header
@@ -75,10 +79,12 @@ export function EditorTopBar({
           <span style={{ color: "var(--txt-faint)" }}>⌂</span> home
         </button>
         <span style={{ color: "var(--line)" }}>│</span>
-        <WorkspaceChip
+        <WorkspaceSelector
           workspaces={workspaces}
           workspaceId={workspaceId}
           onChange={onWorkspaceChange}
+          {...(onWorkspacesChanged ? { onWorkspacesChanged } : {})}
+          onOpenManage={() => onNavigate({ kind: "settings" })}
         />
       </div>
 
@@ -262,67 +268,3 @@ function ModeTab({
   );
 }
 
-function WorkspaceChip({
-  workspaces,
-  workspaceId,
-  onChange,
-}: {
-  workspaces: Workspace[];
-  workspaceId: string | null;
-  onChange: (id: string | null) => void;
-}): JSX.Element {
-  const active = workspaceId
-    ? workspaces.find((w) => w.id === workspaceId) ?? null
-    : null;
-  const label = active ? active.name : "(home)";
-  return (
-    <label
-      style={{
-        position: "relative",
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 4,
-        height: 24,
-        padding: "0 8px",
-        fontFamily: "var(--mono)",
-        fontSize: 11,
-        color: "var(--txt)",
-        background: "var(--bg)",
-        border: "1px solid var(--line)",
-        borderRadius: 4,
-        cursor: "pointer",
-      }}
-      title={active?.path ?? "no workspace bound — runs use the engine home"}
-    >
-      <span style={{ color: "var(--accent)", fontSize: 11 }}>↗</span>
-      <span style={{ color: "var(--txt-dim)" }}>workspace</span>
-      <span style={{ color: "var(--txt-faint)" }}>·</span>
-      <span>{label}</span>
-      <select
-        value={workspaceId ?? ""}
-        onChange={(e) => onChange(e.target.value === "" ? null : e.target.value)}
-        style={{
-          appearance: "none",
-          border: 0,
-          background: "transparent",
-          color: "transparent",
-          font: "inherit",
-          position: "absolute",
-          inset: 0,
-          width: "100%",
-          height: "100%",
-          cursor: "pointer",
-          opacity: 0,
-        }}
-        aria-label="Switch workspace"
-      >
-        <option value="">(home)</option>
-        {workspaces.map((w) => (
-          <option key={w.id} value={w.id}>
-            {w.name} — {w.path}
-          </option>
-        ))}
-      </select>
-    </label>
-  );
-}
