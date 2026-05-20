@@ -11,6 +11,7 @@
 pub mod checkpoints;
 pub mod db;
 pub mod emitter;
+pub mod environment;
 pub mod error;
 pub mod events;
 pub mod events_registry;
@@ -80,6 +81,7 @@ pub struct Engine {
     events: Arc<events_registry::EventRegistry>,
     home: PathBuf,
     secrets_store: Arc<Store>,
+    environment: Arc<environment::EnvironmentReport>,
     /// Active-run broadcast senders so subscribers (CLI
     /// `--json-events`, GUI Tauri commands) can stream events for
     /// any run that this process started.
@@ -123,6 +125,12 @@ impl Engine {
         if seeded > 0 {
             tracing::info!(count = seeded, "installed starter workflows");
         }
+        let env_report = environment::detect().await;
+        tracing::info!(
+            platform = ?env_report.platform,
+            discovered = env_report.endpoints.len(),
+            "environment probe"
+        );
         Ok(Self {
             pool,
             registry: Arc::new(registry),
@@ -130,9 +138,18 @@ impl Engine {
             events: Arc::new(events_registry::EventRegistry::new()),
             home,
             secrets_store,
+            environment: Arc::new(env_report),
             run_senders: Arc::new(Mutex::new(HashMap::new())),
             run_tokens: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Snapshot of the host environment captured at boot — platform
+    /// and locally-reachable LLM endpoints. Cheap to clone (it's an
+    /// `Arc`); never re-probes.
+    #[must_use]
+    pub fn environment(&self) -> Arc<environment::EnvironmentReport> {
+        Arc::clone(&self.environment)
     }
 
     /// Shared secrets store. Backed by `<home>/secrets-index.json`

@@ -5,7 +5,12 @@
 
 import type { JSX, ReactNode } from "react";
 
-import type { SystemStatus, Workspace } from "../../engine/types";
+import type {
+  EnvironmentReport,
+  HostPlatform,
+  SystemStatus,
+  Workspace,
+} from "../../engine/types";
 import { fmtBytes, fmtDuration } from "../../lib/format";
 
 export interface RunningWorkflow {
@@ -21,6 +26,7 @@ interface Props {
   running: RunningWorkflow[];
   workspace: Workspace | null;
   status: SystemStatus | null;
+  environment: EnvironmentReport | null;
   now: number;
 }
 
@@ -28,6 +34,7 @@ export function LeftRail({
   running,
   workspace,
   status,
+  environment,
   now,
 }: Props): JSX.Element {
   return (
@@ -146,12 +153,31 @@ export function LeftRail({
                 detail={`v${status.engineVersion}`}
                 state="ok"
               />
-              {status.endpoints.length === 0 ? (
+              {environment ? (
                 <SysRow
-                  label="endpoints"
-                  detail="none registered yet"
-                  state="unknown"
+                  label="host"
+                  detail={formatPlatform(environment.platform, environment.wslDistro)}
+                  state="ok"
                 />
+              ) : null}
+              {environment && environment.endpoints.length > 0
+                ? environment.endpoints.map((ep) => (
+                    <SysRow
+                      key={ep.baseUrl}
+                      label={ep.kind}
+                      detail={ep.baseUrl.replace(/^https?:\/\//, "")}
+                      state="ok"
+                    />
+                  ))
+                : null}
+              {status.endpoints.length === 0 ? (
+                environment && environment.endpoints.length === 0 ? (
+                  <SysRow
+                    label="endpoints"
+                    detail="none detected — install Ollama or LM Studio"
+                    state="unknown"
+                  />
+                ) : null
               ) : (
                 status.endpoints.map((endpoint) => (
                   <SysRow
@@ -381,4 +407,22 @@ function SysRow({
       </span>
     </div>
   );
+}
+
+function formatPlatform(
+  platform: HostPlatform,
+  wslDistro: string | null,
+): string {
+  switch (platform) {
+    case "windows":
+      return "Windows";
+    case "wsl":
+      return wslDistro ? `WSL · ${wslDistro}` : "WSL";
+    case "linux":
+      return "Linux";
+    case "mac-os":
+      return "macOS";
+    default:
+      return "Other";
+  }
 }

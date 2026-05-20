@@ -19,6 +19,7 @@ import type { JSX } from "react";
 import {
   type RunRow,
   type SavedWorkflow,
+  type EnvironmentReport,
   type SystemStatus,
   type Workflow,
   type Workspace,
@@ -26,6 +27,7 @@ import {
   listWorkflows,
   listWorkspaces,
   saveWorkflow,
+  systemEnvironment,
   systemStatus,
   validateWorkflow,
 } from "../engine";
@@ -74,6 +76,9 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
   const [runs, setRuns] = useState<RunRow[]>([]);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [status, setStatus] = useState<SystemStatus | null>(null);
+  const [environment, setEnvironment] = useState<EnvironmentReport | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
   const [sort, setSort] = useState<SortKey>("recent");
 
@@ -93,19 +98,32 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
       setRuns(demo.runs);
       setWorkspaces(demo.workspaces);
       setStatus(demo.status);
+      setEnvironment({
+        platform: "wsl",
+        wslDistro: "Ubuntu-24.04",
+        endpoints: [
+          {
+            kind: "ollama",
+            name: "Ollama (127.0.0.1:11434)",
+            baseUrl: "http://127.0.0.1:11434",
+          },
+        ],
+      });
       return;
     }
     try {
-      const [wfs, allRuns, wsList, sys] = await Promise.all([
+      const [wfs, allRuns, wsList, sys, env] = await Promise.all([
         listWorkflows(),
         listRuns({ limit: 100 }),
         listWorkspaces(),
         systemStatus(),
+        systemEnvironment(),
       ]);
       setWorkflows(wfs);
       setRuns(allRuns);
       setWorkspaces(wsList);
       setStatus(sys);
+      setEnvironment(env);
       setError(null);
     } catch (e: unknown) {
       setError(String(e));
@@ -304,6 +322,7 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
             running={runningWorkflows}
             workspace={activeWorkspace}
             status={status}
+            environment={environment}
             now={now}
           />
 

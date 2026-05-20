@@ -423,6 +423,15 @@ pub fn set_settings(
 
 // ─── System status ───────────────────────────────────────────────
 
+/// Host platform + endpoints discovered at boot. Cached on the
+/// engine, so this is a pure data fetch — no extra probing.
+#[tauri::command]
+pub fn system_environment(
+    state: tauri::State<'_, AppState>,
+) -> crate::dto::JsonCamel<ordius_engine::environment::EnvironmentReport> {
+    crate::dto::JsonCamel((*state.engine.environment()).clone())
+}
+
 /// Snapshot of engine-side state the GUI surfaces on Home + About.
 #[tauri::command]
 pub fn system_status(state: tauri::State<'_, AppState>) -> Result<SystemStatusDto, String> {

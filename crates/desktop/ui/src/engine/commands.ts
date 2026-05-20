@@ -6,6 +6,7 @@
 
 import { invoke, Channel } from "@tauri-apps/api/core";
 import type {
+  EnvironmentReport,
   NodeType,
   RunDetail,
   RunEvent,
@@ -146,4 +147,8 @@ export function setSettings(settings: Settings): Promise<void> {
 
 export function systemStatus(): Promise<SystemStatus> {
   return invoke("system_status");
+}
+
+export function systemEnvironment(): Promise<EnvironmentReport> {
+  return invoke("system_environment");
 }

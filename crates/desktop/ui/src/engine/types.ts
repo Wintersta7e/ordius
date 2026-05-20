@@ -217,6 +217,20 @@ export interface SystemStatus {
   endpoints: EndpointStatus[];
 }
 
+export type HostPlatform = "windows" | "wsl" | "linux" | "mac-os" | "other";
+
+export interface DiscoveredEndpoint {
+  kind: string;
+  name: string;
+  baseUrl: string;
+}
+
+export interface EnvironmentReport {
+  platform: HostPlatform;
+  wslDistro: string | null;
+  endpoints: DiscoveredEndpoint[];
+}
+
 export interface RunWorkflowArgs {
   workflowId: string;
   variables?: Record<string, string>;
