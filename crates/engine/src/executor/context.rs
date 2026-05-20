@@ -71,6 +71,15 @@ pub struct RunContext {
     /// a waiter here and parks until an external caller delivers
     /// the matching event via `Engine::deliver_event`.
     pub events: Arc<crate::events_registry::EventRegistry>,
+    /// Weak handle back to the engine — built-ins that need to
+    /// invoke sub-workflows (`compose`, `parallel`) upgrade and call
+    /// `Engine::run_child_workflow`. Weak so the per-node context
+    /// doesn't extend the engine lifetime past shutdown.
+    pub engine: std::sync::Weak<crate::Engine>,
+    /// Compose recursion depth — 0 for top-level runs, +1 per
+    /// `compose` frame. The `compose` built-in compares this against
+    /// its `max_depth` config to reject `A -> B -> A` cycles.
+    pub compose_depth: u32,
     /// Run-level auto-resume flag. When `true`, every `checkpoint`
     /// node short-circuits without parking — set by the CLI's
     /// `run --yes`. Per-node `config.auto_resume` still overrides

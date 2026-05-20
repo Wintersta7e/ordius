@@ -3,9 +3,11 @@
 //! Built-ins are inserted at startup via [`Registry::with_v1_0_builtins`];
 //! manifest-loaded types land here once the manifest loader ships.
 
+use crate::executor::builtins::agent::NODE_TYPE_ID as AGENT_NODE_TYPE_ID;
 use crate::executor::builtins::checkpoint::{
     NODE_TYPE_ID as CHECKPOINT_NODE_TYPE_ID, PAUSE_NODE_TYPE_ID,
 };
+use crate::executor::builtins::compose::NODE_TYPE_ID as COMPOSE_NODE_TYPE_ID;
 use crate::executor::builtins::condition::NODE_TYPE_ID as CONDITION_NODE_TYPE_ID;
 use crate::executor::builtins::delay::NODE_TYPE_ID as DELAY_NODE_TYPE_ID;
 use crate::executor::builtins::file::NODE_TYPE_ID as FILE_NODE_TYPE_ID;
@@ -14,6 +16,7 @@ use crate::executor::builtins::kv::NODE_TYPE_ID as KV_NODE_TYPE_ID;
 use crate::executor::builtins::llm::NODE_TYPE_ID as LLM_NODE_TYPE_ID;
 use crate::executor::builtins::loop_for::NODE_TYPE_ID as LOOP_FOR_NODE_TYPE_ID;
 use crate::executor::builtins::notify::NODE_TYPE_ID as NOTIFY_NODE_TYPE_ID;
+use crate::executor::builtins::parallel::NODE_TYPE_ID as PARALLEL_NODE_TYPE_ID;
 use crate::executor::builtins::transform::NODE_TYPE_ID as TRANSFORM_NODE_TYPE_ID;
 use crate::executor::builtins::wait_event::NODE_TYPE_ID as WAIT_EVENT_NODE_TYPE_ID;
 use crate::executor::subprocess::{PORT_EXIT_CODE, PORT_TEXT, SHELL_NODE_TYPE_ID};
@@ -85,6 +88,10 @@ impl Registry {
         r.register(pause_spec());
         r.register(loop_for_spec());
         r.register(wait_event_spec());
+        r.register(compose_spec());
+        r.register(parallel_spec());
+        r.register(agent_spec());
+        r.register(container_spec());
         r
     }
 }
@@ -232,6 +239,333 @@ fn checkpoint_spec() -> NodeType {
                 label: "Auto-resume (testing)".into(),
                 ty: ConfigFieldType::Boolean,
                 default: Some(serde_json::json!(false)),
+                required: false,
+            },
+        ],
+        execution: in_process_execution_spec(),
+    }
+}
+
+fn container_spec() -> NodeType {
+    NodeType {
+        id: "container".into(),
+        name: "Container".into(),
+        category: Category::Execution,
+        tags: vec![],
+        icon: "box".into(),
+        description: "Run a command in a Docker container. Workspace dir is \
+                      bind-mounted at /workspace; default network is none. \
+                      Requires `docker` on PATH at run time."
+            .into(),
+        inputs: vec![],
+        outputs: vec![
+            PortDef {
+                name: "text".into(),
+                ty: PortType::String,
+                required: false,
+            },
+            PortDef {
+                name: "exit_code".into(),
+                ty: PortType::Number,
+                required: false,
+            },
+        ],
+        config: vec![
+            ConfigFieldDef {
+                name: "image".into(),
+                label: "Image".into(),
+                ty: ConfigFieldType::String,
+                default: None,
+                required: true,
+            },
+            ConfigFieldDef {
+                name: "command".into(),
+                label: "Command (JSON string array)".into(),
+                ty: ConfigFieldType::Textarea,
+                default: None,
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "workdir".into(),
+                label: "Working dir inside container".into(),
+                ty: ConfigFieldType::String,
+                default: Some(serde_json::json!("/workspace")),
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "network".into(),
+                label: "Network".into(),
+                ty: ConfigFieldType::Select,
+                default: Some(serde_json::json!(["none", "bridge", "host"])),
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "mount_workspace".into(),
+                label: "Bind-mount workspace".into(),
+                ty: ConfigFieldType::Boolean,
+                default: Some(serde_json::json!(true)),
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "workspace_mode".into(),
+                label: "Workspace mount mode (ro|rw)".into(),
+                ty: ConfigFieldType::String,
+                default: Some(serde_json::json!("rw")),
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "env".into(),
+                label: "Env vars (JSON object)".into(),
+                ty: ConfigFieldType::Textarea,
+                default: None,
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "stop_grace_secs".into(),
+                label: "Stop grace (seconds)".into(),
+                ty: ConfigFieldType::Number,
+                default: Some(serde_json::json!(5)),
+                required: false,
+            },
+        ],
+        execution: crate::types::ExecutionSpec {
+            backend: crate::types::ExecutionBackend::Container,
+            command: vec![],
+            stdin_template: None,
+            env: HashMap::new(),
+            timeout_ms: None,
+            output_parse: crate::types::OutputParse::Text,
+            output_map: HashMap::new(),
+        },
+    }
+}
+
+fn agent_spec() -> NodeType {
+    NodeType {
+        id: AGENT_NODE_TYPE_ID.into(),
+        name: "Agent".into(),
+        category: Category::Llm,
+        tags: vec![],
+        icon: "cpu".into(),
+        description: "OpenAI-compatible chat-completions loop with inline HTTP \
+                      tool calls. Stops when the assistant emits no tool calls \
+                      or max_turns is reached."
+            .into(),
+        inputs: vec![],
+        outputs: vec![
+            PortDef {
+                name: "text".into(),
+                ty: PortType::String,
+                required: false,
+            },
+            PortDef {
+                name: "transcript".into(),
+                ty: PortType::Json,
+                required: false,
+            },
+            PortDef {
+                name: "finish_reason".into(),
+                ty: PortType::String,
+                required: false,
+            },
+            PortDef {
+                name: "tokens_used".into(),
+                ty: PortType::Number,
+                required: false,
+            },
+            PortDef {
+                name: "tool_calls".into(),
+                ty: PortType::Json,
+                required: false,
+            },
+        ],
+        config: vec![
+            ConfigFieldDef {
+                name: "url".into(),
+                label: "Base URL".into(),
+                ty: ConfigFieldType::String,
+                default: Some(serde_json::json!("https://api.openai.com/v1")),
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "model".into(),
+                label: "Model".into(),
+                ty: ConfigFieldType::String,
+                default: None,
+                required: true,
+            },
+            ConfigFieldDef {
+                name: "messages".into(),
+                label: "Messages (JSON array)".into(),
+                ty: ConfigFieldType::Textarea,
+                default: None,
+                required: true,
+            },
+            ConfigFieldDef {
+                name: "tools".into(),
+                label: "Tools (JSON array)".into(),
+                ty: ConfigFieldType::Textarea,
+                default: None,
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "temperature".into(),
+                label: "Temperature".into(),
+                ty: ConfigFieldType::Number,
+                default: Some(serde_json::json!(0.7)),
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "max_tokens".into(),
+                label: "Max tokens per turn".into(),
+                ty: ConfigFieldType::Number,
+                default: None,
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "max_turns".into(),
+                label: "Max turns".into(),
+                ty: ConfigFieldType::Number,
+                default: Some(serde_json::json!(8)),
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "api_key".into(),
+                label: "API key (or template)".into(),
+                ty: ConfigFieldType::Secret,
+                default: None,
+                required: false,
+            },
+        ],
+        execution: in_process_execution_spec(),
+    }
+}
+
+fn parallel_spec() -> NodeType {
+    NodeType {
+        id: PARALLEL_NODE_TYPE_ID.into(),
+        name: "Parallel".into(),
+        category: Category::Control,
+        tags: vec![],
+        icon: "git-branch".into(),
+        description: "Fan out a child workflow once per item, run them \
+                      concurrently (capped by max_concurrent), join the \
+                      results. v1.1 mode is `all` only with fail-fast."
+            .into(),
+        inputs: vec![PortDef {
+            name: "items".into(),
+            ty: PortType::Json,
+            required: false,
+        }],
+        outputs: vec![PortDef {
+            name: "results".into(),
+            ty: PortType::Json,
+            required: false,
+        }],
+        config: vec![
+            ConfigFieldDef {
+                name: "workflow_id".into(),
+                label: "Child workflow id".into(),
+                ty: ConfigFieldType::String,
+                default: None,
+                required: true,
+            },
+            ConfigFieldDef {
+                name: "items".into(),
+                label: "Items (JSON array, overridden by `items` input)".into(),
+                ty: ConfigFieldType::Textarea,
+                default: None,
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "item_var".into(),
+                label: "Item variable name".into(),
+                ty: ConfigFieldType::String,
+                default: Some(serde_json::json!("item")),
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "index_var".into(),
+                label: "Index variable name".into(),
+                ty: ConfigFieldType::String,
+                default: Some(serde_json::json!("index")),
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "vars".into(),
+                label: "Shared vars (templated)".into(),
+                ty: ConfigFieldType::Textarea,
+                default: None,
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "max_concurrent".into(),
+                label: "Max concurrent children".into(),
+                ty: ConfigFieldType::Number,
+                default: Some(serde_json::json!(4)),
+                required: false,
+            },
+        ],
+        execution: in_process_execution_spec(),
+    }
+}
+
+fn compose_spec() -> NodeType {
+    NodeType {
+        id: COMPOSE_NODE_TYPE_ID.into(),
+        name: "Compose".into(),
+        category: Category::Control,
+        tags: vec![],
+        icon: "git-merge".into(),
+        description: "Invoke another saved workflow as a sub-frame. Child gets \
+                      its own run_id; outputs land on this node via output_map \
+                      or the default 'return' sink convention."
+            .into(),
+        inputs: vec![],
+        outputs: vec![
+            PortDef {
+                name: "child_run_id".into(),
+                ty: PortType::String,
+                required: false,
+            },
+            PortDef {
+                name: "status".into(),
+                ty: PortType::String,
+                required: false,
+            },
+            PortDef {
+                name: "outputs".into(),
+                ty: PortType::Json,
+                required: false,
+            },
+        ],
+        config: vec![
+            ConfigFieldDef {
+                name: "workflow_id".into(),
+                label: "Child workflow id".into(),
+                ty: ConfigFieldType::String,
+                default: None,
+                required: true,
+            },
+            ConfigFieldDef {
+                name: "vars".into(),
+                label: "Child variables (templated)".into(),
+                ty: ConfigFieldType::Textarea,
+                default: None,
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "output_map".into(),
+                label: "Output map".into(),
+                ty: ConfigFieldType::Textarea,
+                default: None,
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "max_depth".into(),
+                label: "Max recursion depth".into(),
+                ty: ConfigFieldType::Number,
+                default: Some(serde_json::json!(8)),
                 required: false,
             },
         ],

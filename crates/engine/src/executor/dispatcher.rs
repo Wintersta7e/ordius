@@ -8,7 +8,8 @@
 //! backend ships in a later release.
 
 use crate::executor::{
-    InProcessExecutor, NodeError, NodeExecutor, NodeOutputs, RunContext, SubprocessExecutor,
+    ContainerExecutor, InProcessExecutor, NodeError, NodeExecutor, NodeOutputs, RunContext,
+    SubprocessExecutor,
 };
 use crate::types::{ExecutionBackend, Node, NodeType};
 use async_trait::async_trait;
@@ -18,15 +19,17 @@ use tokio_util::sync::CancellationToken;
 pub struct Dispatcher {
     in_process: InProcessExecutor,
     subprocess: SubprocessExecutor,
+    container: ContainerExecutor,
 }
 
 impl Dispatcher {
-    /// Build a dispatcher with the v1.0 backends wired.
+    /// Build a dispatcher with all backends wired.
     #[must_use]
     pub fn new() -> Self {
         Self {
             in_process: InProcessExecutor::new(),
             subprocess: SubprocessExecutor,
+            container: ContainerExecutor,
         }
     }
 }
@@ -53,7 +56,7 @@ impl NodeExecutor for Dispatcher {
         match nt.execution.backend {
             ExecutionBackend::InProcess => self.in_process.run(node, nt, ctx, cancel).await,
             ExecutionBackend::Subprocess => self.subprocess.run(node, nt, ctx, cancel).await,
-            ExecutionBackend::Container => Err(NodeError::NotImplemented),
+            ExecutionBackend::Container => self.container.run(node, nt, ctx, cancel).await,
         }
     }
 }
@@ -146,7 +149,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn container_backend_returns_not_implemented() {
+    async fn container_backend_requires_image_config() {
         let (ctx, _rx, _dir) = make_ctx();
         let nt = container_nt();
         let node = Node {
@@ -159,10 +162,12 @@ mod tests {
             retry: None,
             continue_on_error: false,
         };
+        // No `image` config → Config error from the executor itself
+        // (we don't reach docker, so this works without a daemon).
         let err = Dispatcher::new()
             .run(&node, &nt, &ctx, CancellationToken::new())
             .await
-            .expect_err("container backend not yet wired");
-        assert!(matches!(err, NodeError::NotImplemented), "got {err:?}");
+            .expect_err("missing image is a config error");
+        assert!(matches!(err, NodeError::Config(_)), "got {err:?}");
     }
 }

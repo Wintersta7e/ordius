@@ -2,6 +2,7 @@
 //! Spec: `docs/02-engine-model.md` "The executor".
 
 pub mod builtins;
+pub mod container;
 pub mod context;
 pub mod dispatcher;
 mod http_client;
@@ -11,6 +12,7 @@ pub mod subprocess;
 #[cfg(test)]
 mod test_support;
 
+pub use container::ContainerExecutor;
 pub use context::{EnvResolver, RunContext, wrap_process_env};
 pub use dispatcher::Dispatcher;
 pub use in_process::InProcessExecutor;

@@ -140,8 +140,10 @@ impl Engine {
                     variables,
                     cancel,
                     auto_resume_checkpoints,
+                    0,
                 )
-                .await;
+                .await
+                .map(|(summary, _outputs)| summary);
             engine
                 .run_senders
                 .lock()
@@ -189,6 +191,75 @@ impl Engine {
             .map_err(|e| EngineError::Db(format!("run task join: {e}")))?
     }
 
+    /// Run another workflow as a sub-frame of the current run.
+    ///
+    /// Caller (the `compose` built-in) supplies the child workflow,
+    /// explicit variable map, a parent cancellation token, and the
+    /// depth this child sits at. Returns the child's run summary plus
+    /// the final `upstream_outputs` map so the caller can extract
+    /// specific outputs from sink nodes.
+    ///
+    /// The child gets its own `run_id` + recorder row (separate
+    /// `runs` entry) but reuses the engine's pool, registry,
+    /// secrets store, checkpoint registry, and event registry. The
+    /// workflow lock is intentionally not acquired so the same
+    /// child workflow can be composed in parallel from a parent.
+    pub async fn run_child_workflow(
+        self: &Arc<Self>,
+        child_wf: Arc<Workflow>,
+        variables: HashMap<String, String>,
+        parent_cancel: &CancellationToken,
+        compose_depth: u32,
+    ) -> Result<(RunSummary, HashMap<(String, String), PortValue>)> {
+        crate::validation::validate(&child_wf)?;
+        let rec = Arc::new(RunRecorder::start(
+            self.pool(),
+            &child_wf,
+            "{}",
+            &variables,
+            "compose",
+        )?);
+        let (em, _rx) = Emitter::new(rec.clone());
+        let em = Arc::new(em);
+        em.emit(
+            EventType::WorkflowStarted,
+            None,
+            None,
+            None,
+            HashMap::from([
+                ("workflow_id".into(), serde_json::json!(child_wf.id)),
+                ("workflow_name".into(), serde_json::json!(child_wf.name)),
+                ("trigger_kind".into(), serde_json::json!("compose")),
+                ("compose_depth".into(), serde_json::json!(compose_depth)),
+            ]),
+        );
+        // Child scratch dir parallels the top-level scheme but under
+        // a `compose-` prefix so it's distinguishable from primary runs.
+        let workspace = self
+            .home()
+            .join("workspaces")
+            .join(format!("compose-{}", rec.run_id));
+        if let Err(e) = std::fs::create_dir_all(&workspace) {
+            tracing::warn!(
+                error = ?e, path = %workspace.display(),
+                "could not create compose workspace; falling back to engine home",
+            );
+        }
+        // Child cancel cascades from the parent.
+        let child_cancel = parent_cancel.child_token();
+        self.run_loop_inner(
+            child_wf,
+            rec,
+            em,
+            workspace,
+            variables,
+            child_cancel,
+            false,
+            compose_depth,
+        )
+        .await
+    }
+
     /// Drives the scheduler to completion: dispatches each ready
     /// batch through [`Dispatcher`], persists outputs, emits node
     /// lifecycle events, routes condition branches + loop fires,
@@ -204,8 +275,9 @@ impl Engine {
     // — the dispatch loop's per-node context construction + scheduler
     // dance still dominate.
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     async fn run_loop_inner(
-        &self,
+        self: &Arc<Self>,
         wf: Arc<Workflow>,
         recorder: Arc<RunRecorder>,
         emitter: Arc<Emitter>,
@@ -213,7 +285,8 @@ impl Engine {
         variables: HashMap<String, String>,
         cancel: CancellationToken,
         auto_resume: bool,
-    ) -> Result<RunSummary> {
+        compose_depth: u32,
+    ) -> Result<(RunSummary, HashMap<(String, String), PortValue>)> {
         let mut upstream_outputs: HashMap<(String, String), PortValue> = HashMap::new();
         let mut iterations: HashMap<String, u32> = HashMap::new();
         let mut node_runs_count: usize = 0;
@@ -277,6 +350,8 @@ impl Engine {
                     upstream_outputs: upstream_outputs.clone(),
                     checkpoints: self.checkpoints(),
                     events: self.events(),
+                    engine: Arc::downgrade(self),
+                    compose_depth,
                     iteration,
                     attempt: std::sync::atomic::AtomicU32::new(1),
                     auto_resume,
@@ -396,11 +471,14 @@ impl Engine {
         emitter.emit(terminal_event, None, None, None, payload);
         recorder.finalize(status, error_tail)?;
 
-        Ok(RunSummary {
-            run_id: recorder.run_id.clone(),
-            status: status.into(),
-            node_runs: node_runs_count,
-        })
+        Ok((
+            RunSummary {
+                run_id: recorder.run_id.clone(),
+                status: status.into(),
+                node_runs: node_runs_count,
+            },
+            upstream_outputs,
+        ))
     }
 }
 

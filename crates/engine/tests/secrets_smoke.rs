@@ -73,6 +73,8 @@ async fn template_resolves_secret_and_redacts_in_event_log() {
         upstream_outputs: HashMap::new(),
         checkpoints: Arc::new(CheckpointRegistry::new()),
         events: Arc::new(ordius_engine::events_registry::EventRegistry::new()),
+        engine: std::sync::Weak::new(),
+        compose_depth: 0,
         iteration: 1,
         attempt: std::sync::atomic::AtomicU32::new(1),
         auto_resume: false,

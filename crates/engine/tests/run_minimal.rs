@@ -50,6 +50,7 @@ fn forward_edge(id: &str, from: &str, to: &str) -> Edge {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn two_delay_nodes_run_end_to_end() {
     let dir = tempfile::TempDir::new().unwrap();
     let pool = open(dir.path().join("t.db")).unwrap();
@@ -88,6 +89,8 @@ async fn two_delay_nodes_run_end_to_end() {
         upstream_outputs: HashMap::new(),
         checkpoints: Arc::new(CheckpointRegistry::new()),
         events: Arc::new(ordius_engine::events_registry::EventRegistry::new()),
+        engine: std::sync::Weak::new(),
+        compose_depth: 0,
         iteration: 1,
         attempt: std::sync::atomic::AtomicU32::new(1),
         auto_resume: false,
