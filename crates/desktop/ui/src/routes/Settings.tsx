@@ -297,6 +297,7 @@ export function Settings({
             <SecretsSection
               secrets={secrets}
               onReload={reload}
+              onError={setError}
               insideTauri={insideTauri}
             />
           ) : null}
@@ -304,6 +305,7 @@ export function Settings({
             <WorkspacesSection
               workspaces={workspaces}
               onReload={reload}
+              onError={setError}
               insideTauri={insideTauri}
             />
           ) : null}
@@ -407,10 +409,12 @@ function AppearanceSection({
 function SecretsSection({
   secrets,
   onReload,
+  onError,
   insideTauri,
 }: {
   secrets: SecretMeta[];
   onReload: () => Promise<void>;
+  onError: (msg: string) => void;
   insideTauri: boolean;
 }): JSX.Element {
   const [name, setName] = useState("");
@@ -425,6 +429,8 @@ function SecretsSection({
       setName("");
       setValue("");
       await onReload();
+    } catch (e) {
+      onError(`add secret: ${String(e)}`);
     } finally {
       setBusy(false);
     }
@@ -436,6 +442,8 @@ function SecretsSection({
     try {
       await removeSecret(n);
       await onReload();
+    } catch (e) {
+      onError(`remove secret: ${String(e)}`);
     } finally {
       setBusy(false);
     }
@@ -457,6 +465,8 @@ function SecretsSection({
             value={value}
             onChange={setValue}
             placeholder="hidden after submit"
+            type="password"
+            autoComplete="new-password"
           />
         </Field>
         <div style={{ padding: "8px 16px 14px" }}>
@@ -534,10 +544,12 @@ function SecretsSection({
 function WorkspacesSection({
   workspaces,
   onReload,
+  onError,
   insideTauri,
 }: {
   workspaces: Workspace[];
   onReload: () => Promise<void>;
+  onError: (msg: string) => void;
   insideTauri: boolean;
 }): JSX.Element {
   const [name, setName] = useState("");
@@ -552,6 +564,8 @@ function WorkspacesSection({
       setName("");
       setPath("");
       await onReload();
+    } catch (e) {
+      onError(`add workspace: ${String(e)}`);
     } finally {
       setBusy(false);
     }
@@ -563,6 +577,8 @@ function WorkspacesSection({
     try {
       await removeWorkspace(id);
       await onReload();
+    } catch (e) {
+      onError(`remove workspace: ${String(e)}`);
     } finally {
       setBusy(false);
     }
