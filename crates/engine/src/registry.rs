@@ -514,6 +514,13 @@ fn parallel_spec() -> NodeType {
                 default: Some(serde_json::json!(4)),
                 required: false,
             },
+            ConfigFieldDef {
+                name: "mode".into(),
+                label: "Join mode".into(),
+                ty: ConfigFieldType::Select,
+                default: Some(serde_json::json!(["all", "any", "race"])),
+                required: false,
+            },
         ],
         execution: in_process_execution_spec(),
         skip_config_templates: false,

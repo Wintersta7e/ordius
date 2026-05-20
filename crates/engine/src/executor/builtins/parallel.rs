@@ -24,6 +24,18 @@ const DEFAULT_INDEX_VAR: &str = "index";
 #[allow(unreachable_pub)]
 pub const NODE_TYPE_ID: &str = "parallel";
 
+/// Join semantics for the fan-out:
+/// - `All`: wait for every child, fail-fast on first error (v1.1 default).
+/// - `Any`: succeed on first success, cancel siblings; if every child
+///   fails, return Err.
+/// - `Race`: take the first finisher regardless of status, cancel siblings.
+#[derive(Debug, Clone, Copy)]
+enum ParallelMode {
+    All,
+    Any,
+    Race,
+}
+
 /// Parallel fan-out executor — see module docs.
 pub struct ParallelExecutor;
 
@@ -33,6 +45,7 @@ impl NodeExecutor for ParallelExecutor {
         nt.id == NODE_TYPE_ID
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run(
         &self,
         node: &Node,
@@ -50,6 +63,16 @@ impl NodeExecutor for ParallelExecutor {
         ))
         .unwrap_or(4)
         .max(1);
+        let mode = match config_str_or(&node.config, "mode", "all") {
+            "all" => ParallelMode::All,
+            "any" => ParallelMode::Any,
+            "race" => ParallelMode::Race,
+            other => {
+                return Err(NodeError::Config(format!(
+                    "parallel: unknown mode '{other}' — expected all|any|race"
+                )));
+            },
+        };
 
         let items = resolve_items(node, ctx)?;
         if items.is_empty() {
@@ -92,21 +115,50 @@ impl NodeExecutor for ParallelExecutor {
             next_index += 1;
         }
 
+        let mut errors: HashMap<usize, String> = HashMap::new();
+        let mut winner: Option<serde_json::Value> = None;
         // Drain results, spawning replacement children as slots free.
         while let Some(joined) = joinset.join_next().await {
             let (idx, outcome) = joined
                 .map_err(|e| NodeError::Other(format!("parallel: child task join error: {e}")))?;
-            match outcome {
-                Ok(value) => {
+            match (&mode, outcome) {
+                (ParallelMode::All, Ok(value)) => {
                     results.insert(idx, value);
                 },
-                Err(err) => {
+                (ParallelMode::All, Err(err)) => {
                     // Fail-fast: cancel siblings before bubbling up.
                     group_cancel.cancel();
                     while joinset.join_next().await.is_some() {}
                     return Err(NodeError::Other(format!(
                         "parallel: child[{idx}] failed: {err}"
                     )));
+                },
+                (ParallelMode::Any, Ok(value)) => {
+                    // First success wins; cancel siblings + drain.
+                    winner = Some(value);
+                    group_cancel.cancel();
+                    while joinset.join_next().await.is_some() {}
+                    break;
+                },
+                (ParallelMode::Any, Err(err)) => {
+                    // Track error; keep going — maybe another child succeeds.
+                    errors.insert(idx, err);
+                },
+                (ParallelMode::Race, outcome) => {
+                    // First to finish wins, regardless of success/fail.
+                    // Use a synthetic value that mirrors success rows when
+                    // possible, or wrap the failure for the Err arm.
+                    winner = Some(match outcome {
+                        Ok(v) => v,
+                        Err(e) => serde_json::json!({
+                            "index": idx,
+                            "status": "error",
+                            "error": e,
+                        }),
+                    });
+                    group_cancel.cancel();
+                    while joinset.join_next().await.is_some() {}
+                    break;
                 },
             }
             if next_index < items.len() {
@@ -126,9 +178,30 @@ impl NodeExecutor for ParallelExecutor {
             }
         }
 
-        let ordered: Vec<serde_json::Value> = (0..items.len())
-            .map(|i| results.remove(&i).unwrap_or(serde_json::Value::Null))
-            .collect();
+        let ordered: Vec<serde_json::Value> = match mode {
+            ParallelMode::All => (0..items.len())
+                .map(|i| results.remove(&i).unwrap_or(serde_json::Value::Null))
+                .collect(),
+            ParallelMode::Any => {
+                if let Some(v) = winner {
+                    vec![v]
+                } else {
+                    // No success — surface the per-child errors.
+                    let mut sorted: Vec<_> = errors.into_iter().collect();
+                    sorted.sort_by_key(|(i, _)| *i);
+                    return Err(NodeError::Other(format!(
+                        "parallel.any: all {} children failed: {}",
+                        sorted.len(),
+                        sorted
+                            .iter()
+                            .map(|(i, e)| format!("[{i}]: {e}"))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    )));
+                }
+            },
+            ParallelMode::Race => winner.into_iter().collect(),
+        };
         let mut out = NodeOutputs::new();
         out.insert(
             "results".into(),
