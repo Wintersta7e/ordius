@@ -455,6 +455,76 @@ pub fn system_environment(
     crate::dto::JsonCamel((*state.engine.environment()).clone())
 }
 
+/// Re-run namespace + endpoint discovery and return the refreshed
+/// report. Used by the GUI's environment picker after the user
+/// edits namespace overrides or asks for a manual rescan.
+#[tauri::command]
+pub async fn refresh_environment(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::dto::JsonCamel<ordius_engine::environment::EnvironmentReport>, String> {
+    let report = state
+        .engine
+        .refresh_environment()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(crate::dto::JsonCamel((*report).clone()))
+}
+
+/// Insert a `custom:*` namespace override (validated host) and
+/// return the refreshed environment so the GUI sees the new row
+/// + its probe result in a single round-trip.
+#[tauri::command]
+pub async fn add_custom_namespace(
+    state: tauri::State<'_, AppState>,
+    label: String,
+    host: String,
+) -> Result<crate::dto::JsonCamel<ordius_engine::environment::EnvironmentReport>, String> {
+    ordius_engine::namespaces::add_custom(&state.engine.pool(), &label, &host)
+        .map_err(|e| e.to_string())?;
+    let report = state
+        .engine
+        .refresh_environment()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(crate::dto::JsonCamel((*report).clone()))
+}
+
+/// Delete a `custom:*` namespace override and return the refreshed
+/// environment. WSL/local ids are rejected by the engine layer.
+#[tauri::command]
+pub async fn remove_custom_namespace(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<crate::dto::JsonCamel<ordius_engine::environment::EnvironmentReport>, String> {
+    ordius_engine::namespaces::remove_custom(&state.engine.pool(), &id)
+        .map_err(|e| e.to_string())?;
+    let report = state
+        .engine
+        .refresh_environment()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(crate::dto::JsonCamel((*report).clone()))
+}
+
+/// Toggle the enabled flag for any namespace (custom, WSL, or local)
+/// and return the refreshed environment. Disabled namespaces are
+/// skipped by the probe orchestrator and surface as `Disabled`.
+#[tauri::command]
+pub async fn set_namespace_enabled(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    enabled: bool,
+) -> Result<crate::dto::JsonCamel<ordius_engine::environment::EnvironmentReport>, String> {
+    ordius_engine::namespaces::set_enabled(&state.engine.pool(), &id, enabled)
+        .map_err(|e| e.to_string())?;
+    let report = state
+        .engine
+        .refresh_environment()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(crate::dto::JsonCamel((*report).clone()))
+}
+
 /// Snapshot of engine-side state the GUI surfaces on Home + About.
 #[tauri::command]
 pub fn system_status(state: tauri::State<'_, AppState>) -> Result<SystemStatusDto, String> {

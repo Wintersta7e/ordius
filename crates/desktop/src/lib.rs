@@ -52,6 +52,10 @@ pub fn run() {
             commands::set_settings,
             commands::system_status,
             commands::system_environment,
+            commands::refresh_environment,
+            commands::add_custom_namespace,
+            commands::remove_custom_namespace,
+            commands::set_namespace_enabled,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
