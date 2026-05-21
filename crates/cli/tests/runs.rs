@@ -258,7 +258,7 @@ fn run_without_workspace_flag_uses_scratch_dir_as_shell_cwd() {
     let workspaces_dir = home.path().join("workspaces");
     let entries: Vec<_> = fs::read_dir(&workspaces_dir)
         .unwrap()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .collect();
     let with_marker = entries
         .iter()
@@ -270,7 +270,10 @@ fn run_without_workspace_flag_uses_scratch_dir_as_shell_cwd() {
         "expected exactly one scratch dir under {} to contain the marker; \
          found {with_marker} (entries: {:?})",
         workspaces_dir.display(),
-        entries.iter().map(|e| e.file_name()).collect::<Vec<_>>(),
+        entries
+            .iter()
+            .map(std::fs::DirEntry::file_name)
+            .collect::<Vec<_>>(),
     );
 }
 

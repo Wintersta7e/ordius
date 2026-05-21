@@ -110,7 +110,7 @@ fn duplicate_creates_clone_with_copy_suffix() {
     assert_eq!(clone.id, "demo-copy");
     assert!(clone.name.ends_with("(copy)"));
     assert!(path(home.path(), "demo-copy").exists());
-    assert!(path(home.path(), "demo").exists(), "original is preserved",);
+    assert!(path(home.path(), "demo").exists(), "original is preserved");
 }
 
 #[test]
