@@ -66,6 +66,7 @@ impl NodeExecutor for ComposeExecutor {
                 vars,
                 &cancel,
                 u32::try_from(next_depth).unwrap_or(u32::MAX),
+                Some(ctx.workspace.clone()),
             )
             .await
             .map_err(|e| NodeError::Other(format!("compose: child run: {e}")))?;

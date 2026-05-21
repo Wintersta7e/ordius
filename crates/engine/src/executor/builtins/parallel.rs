@@ -111,6 +111,7 @@ impl NodeExecutor for ParallelExecutor {
                 &index_var,
                 &group_cancel,
                 next_depth,
+                &ctx.workspace,
             );
             next_index += 1;
         }
@@ -173,6 +174,7 @@ impl NodeExecutor for ParallelExecutor {
                     &index_var,
                     &group_cancel,
                     next_depth,
+                    &ctx.workspace,
                 );
                 next_index += 1;
             }
@@ -223,9 +225,11 @@ fn spawn_one(
     index_var: &str,
     group_cancel: &CancellationToken,
     next_depth: u32,
+    workspace: &std::path::Path,
 ) {
     let item = items[index].clone();
     let engine = Arc::clone(engine);
+    let workspace = workspace.to_path_buf();
     let mut vars = base_vars.clone();
     let item_str = match &item {
         serde_json::Value::String(s) => s.clone(),
@@ -236,7 +240,7 @@ fn spawn_one(
     let child_cancel = group_cancel.clone();
     joinset.spawn(async move {
         let res = engine
-            .run_child_workflow(child_wf, vars, &child_cancel, next_depth)
+            .run_child_workflow(child_wf, vars, &child_cancel, next_depth, Some(workspace))
             .await;
         match res {
             Ok((summary, outputs)) => {

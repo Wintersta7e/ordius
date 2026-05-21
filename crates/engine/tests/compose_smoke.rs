@@ -41,6 +41,19 @@ fn compose_node(id: &str, child_workflow_id: &str) -> Node {
     }
 }
 
+fn shell_node(id: &str, command: &str) -> Node {
+    Node {
+        id: id.into(),
+        ty: "shell".into(),
+        name: String::new(),
+        config: HashMap::from([("command".into(), serde_json::json!(command))]),
+        pos: Pos::default(),
+        timeout_ms: None,
+        retry: None,
+        continue_on_error: false,
+    }
+}
+
 fn workflow(id: &str, nodes: Vec<Node>) -> Workflow {
     Workflow {
         id: id.into(),
@@ -83,6 +96,42 @@ async fn compose_runs_child_workflow_and_records_separate_run() {
         )
         .unwrap();
     assert_eq!(trigger_count, 1, "exactly one compose-trigger child run");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compose_child_shell_inherits_parent_workspace() {
+    let home = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(home.path().to_path_buf()).await.unwrap());
+
+    // Child workflow: a single shell node that drops a marker file
+    // in the workspace dir via the platform shell's working dir.
+    let child = workflow(
+        "child",
+        vec![shell_node("touch", "touch ordius-compose-marker")],
+    );
+    ordius_engine::workflows::save(engine.home(), &child).unwrap();
+
+    let parent = workflow("parent", vec![compose_node("invoke", "child")]);
+    let summary = engine
+        .run_workflow(
+            Arc::new(parent),
+            HashMap::new(),
+            "test",
+            false,
+            Some(workspace.path().to_path_buf()),
+        )
+        .await
+        .expect("parent run completes");
+    assert_eq!(summary.status, "done", "parent should finish ok");
+
+    let marker = workspace.path().join("ordius-compose-marker");
+    assert!(
+        marker.exists(),
+        "composed child shell node should inherit parent workspace; \
+         marker missing at {}",
+        marker.display(),
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
