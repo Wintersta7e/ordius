@@ -56,6 +56,7 @@ pub use validation::{ValidationError, validate};
 
 use crate::db::DbPool;
 use crate::registry::Registry;
+use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -81,7 +82,8 @@ pub struct Engine {
     events: Arc<events_registry::EventRegistry>,
     home: PathBuf,
     secrets_store: Arc<Store>,
-    environment: Arc<environment::EnvironmentReport>,
+    environment: ArcSwap<environment::EnvironmentReport>,
+    env_refresh_lock: tokio::sync::Mutex<()>,
     /// Active-run broadcast senders so subscribers (CLI
     /// `--json-events`, GUI Tauri commands) can stream events for
     /// any run that this process started.
@@ -125,11 +127,12 @@ impl Engine {
         if seeded > 0 {
             tracing::info!(count = seeded, "installed starter workflows");
         }
-        let env_report = environment::detect().await;
+        let env_report = environment::detect(&home, &pool).await;
         tracing::info!(
             platform = ?env_report.platform,
-            discovered = env_report.endpoints.len(),
-            "environment probe"
+            namespaces = env_report.namespaces.len(),
+            endpoints = env_report.endpoints.len(),
+            "environment probe",
         );
         Ok(Self {
             pool,
@@ -138,18 +141,31 @@ impl Engine {
             events: Arc::new(events_registry::EventRegistry::new()),
             home,
             secrets_store,
-            environment: Arc::new(env_report),
+            environment: ArcSwap::new(Arc::new(env_report)),
+            env_refresh_lock: tokio::sync::Mutex::new(()),
             run_senders: Arc::new(Mutex::new(HashMap::new())),
             run_tokens: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    /// Snapshot of the host environment captured at boot — platform
-    /// and locally-reachable LLM endpoints. Cheap to clone (it's an
-    /// `Arc`); never re-probes.
+    /// Snapshot of the host environment captured at boot — platform,
+    /// namespaces, and the LLM endpoints discovered inside them.
+    /// Cheap (loads an `Arc` from the `ArcSwap` cache); never re-probes.
     #[must_use]
     pub fn environment(&self) -> Arc<environment::EnvironmentReport> {
-        Arc::clone(&self.environment)
+        self.environment.load_full()
+    }
+
+    /// Re-run host environment discovery and atomically swap the
+    /// cached report. Serialized via an internal mutex so concurrent
+    /// callers don't race; later callers observe the latest result.
+    pub async fn refresh_environment(
+        &self,
+    ) -> std::result::Result<Arc<environment::EnvironmentReport>, EngineError> {
+        let _guard = self.env_refresh_lock.lock().await;
+        let report = environment::detect(&self.home, &self.pool).await;
+        self.environment.store(Arc::new(report));
+        Ok(self.environment.load_full())
     }
 
     /// Shared secrets store. Backed by `<home>/secrets-index.json`

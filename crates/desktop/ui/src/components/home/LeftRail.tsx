@@ -161,14 +161,22 @@ export function LeftRail({
                 />
               ) : null}
               {environment && environment.endpoints.length > 0
-                ? environment.endpoints.map((ep) => (
-                    <SysRow
-                      key={ep.baseUrl}
-                      label={ep.kind}
-                      detail={ep.baseUrl.replace(/^https?:\/\//, "")}
-                      state="ok"
-                    />
-                  ))
+                ? environment.endpoints.map((ep) => {
+                    const url =
+                      ep.type === "direct" ? ep.callableUrl : ep.observedUrl;
+                    const namespaceLabel =
+                      environment.namespaces.find((n) => n.id === ep.namespaceId)
+                        ?.label ?? ep.namespaceId;
+                    const rowState = ep.type === "direct" ? "ok" : "unknown";
+                    return (
+                      <SysRow
+                        key={`${ep.namespaceId}::${ep.kind}::${ep.observedUrl}`}
+                        label={`${ep.kind} (${namespaceLabel})`}
+                        detail={url.replace(/^https?:\/\//, "")}
+                        state={rowState}
+                      />
+                    );
+                  })
                 : null}
               {status.endpoints.length === 0 ? (
                 environment && environment.endpoints.length === 0 ? (

@@ -103,13 +103,27 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
       setEnvironment({
         platform: "wsl",
         wslDistro: "Ubuntu-24.04",
-        endpoints: [
+        namespaces: [
           {
-            kind: "ollama",
-            name: "Ollama (127.0.0.1:11434)",
-            baseUrl: "http://127.0.0.1:11434",
+            id: "local",
+            label: "Local (this machine)",
+            kind: { kind: "local" },
+            enabled: true,
+            reachable: { state: "reachable" },
           },
         ],
+        endpoints: [
+          {
+            type: "direct",
+            kind: "ollama",
+            name: "Ollama (127.0.0.1:11434)",
+            namespaceId: "local",
+            callableUrl: "http://127.0.0.1:11434",
+            observedUrl: "http://127.0.0.1:11434",
+            coVisibleIn: [],
+          },
+        ],
+        timedOut: false,
       });
       return;
     }

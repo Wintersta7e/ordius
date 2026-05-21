@@ -111,13 +111,27 @@ export function Settings({
       setEnvironment({
         platform: "wsl",
         wslDistro: "Ubuntu-24.04",
-        endpoints: [
+        namespaces: [
           {
-            kind: "ollama",
-            name: "Ollama (127.0.0.1:11434)",
-            baseUrl: "http://127.0.0.1:11434",
+            id: "local",
+            label: "Local (this machine)",
+            kind: { kind: "local" },
+            enabled: true,
+            reachable: { state: "reachable" },
           },
         ],
+        endpoints: [
+          {
+            type: "direct",
+            kind: "ollama",
+            name: "Ollama (127.0.0.1:11434)",
+            namespaceId: "local",
+            callableUrl: "http://127.0.0.1:11434",
+            observedUrl: "http://127.0.0.1:11434",
+            coVisibleIn: [],
+          },
+        ],
+        timedOut: false,
       });
       setWorkspaces([
         {
@@ -965,10 +979,13 @@ function ModelsSection({
           />
           <Card>
             {environment.endpoints.map((ep) => {
-              const saved = registeredUrls.has(ep.baseUrl);
+              const url =
+                ep.type === "direct" ? ep.callableUrl : ep.observedUrl;
+              const saved =
+                ep.type === "direct" && registeredUrls.has(ep.callableUrl);
               return (
                 <div
-                  key={ep.baseUrl}
+                  key={`${ep.namespaceId}::${ep.kind}::${ep.observedUrl}`}
                   style={{
                     display: "grid",
                     gridTemplateColumns: "1fr 1fr 110px",
@@ -982,21 +999,32 @@ function ModelsSection({
                   }}
                 >
                   <span>{ep.name}</span>
-                  <span style={{ color: "var(--txt-dim)" }}>{ep.baseUrl}</span>
-                  {saved ? (
-                    <span style={{ color: "var(--accent)", fontSize: 11 }}>
-                      ✓ saved
-                    </span>
+                  <span style={{ color: "var(--txt-dim)" }}>{url}</span>
+                  {ep.type === "direct" ? (
+                    saved ? (
+                      <span style={{ color: "var(--accent)", fontSize: 11 }}>
+                        ✓ saved
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn"
+                        onClick={() =>
+                          void handleSaveDiscovered(ep.kind, ep.callableUrl)
+                        }
+                        disabled={busy}
+                        style={{ height: 22, padding: "0 10px" }}
+                      >
+                        save endpoint
+                      </button>
+                    )
                   ) : (
-                    <button
-                      type="button"
-                      className="btn"
-                      onClick={() => void handleSaveDiscovered(ep.kind, ep.baseUrl)}
-                      disabled={busy}
-                      style={{ height: 22, padding: "0 10px" }}
+                    <span
+                      title={`Not directly reachable — via ${ep.namespaceId}. Phase 6 will add the full tooltip.`}
+                      style={{ color: "var(--warn)", fontSize: 11 }}
                     >
-                      save endpoint
-                    </button>
+                      ⚠ via {ep.namespaceId}
+                    </span>
                   )}
                 </div>
               );

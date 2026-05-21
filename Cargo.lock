@@ -4056,6 +4056,7 @@ dependencies = [
 name = "ordius-engine"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "axum",
  "bollard",
@@ -4083,6 +4084,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "url",
  "uuid",
  "windows 0.58.0",
  "wiremock",

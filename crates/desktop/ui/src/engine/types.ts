@@ -219,16 +219,60 @@ export interface SystemStatus {
 
 export type HostPlatform = "windows" | "wsl" | "linux" | "mac-os" | "other";
 
-export interface DiscoveredEndpoint {
-  kind: string;
-  name: string;
-  baseUrl: string;
+export type WslState = "running" | "stopped";
+
+export type NamespaceKind =
+  | { kind: "local" }
+  | { kind: "wsl-distro"; name: string; state: WslState }
+  | { kind: "windows-host"; gatewayIp: string }
+  | { kind: "custom"; host: string };
+
+export type NamespaceState =
+  | { state: "reachable" }
+  | { state: "unreachable"; reason: string }
+  | { state: "disabled" }
+  | { state: "stopped" }
+  | { state: "not-probeable"; reason: string };
+
+export interface NamespaceInfo {
+  id: string;
+  label: string;
+  kind: NamespaceKind;
+  enabled: boolean;
+  reachable: NamespaceState;
 }
+
+export type ReachHint =
+  | "wsl-loopback-bound"
+  | "windows-host-bound"
+  | "custom-unreachable";
+
+export type DiscoveredEndpoint =
+  | {
+      type: "direct";
+      kind: string;
+      name: string;
+      namespaceId: string;
+      callableUrl: string;
+      observedUrl: string;
+      coVisibleIn: string[];
+    }
+  | {
+      type: "only-via-namespace";
+      kind: string;
+      name: string;
+      namespaceId: string;
+      observedUrl: string;
+      hint: ReachHint;
+      coVisibleIn: string[];
+    };
 
 export interface EnvironmentReport {
   platform: HostPlatform;
   wslDistro: string | null;
+  namespaces: NamespaceInfo[];
   endpoints: DiscoveredEndpoint[];
+  timedOut: boolean;
 }
 
 export interface RunWorkflowArgs {
