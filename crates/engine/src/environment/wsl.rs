@@ -1,13 +1,4 @@
 //! WSL distro enumeration + in-distro probe.
-//!
-//! The detect-orchestration path that wires `enumerate_wsl_distros` /
-//! `enumerate_running_distros` into the namespace fan-out lands in a
-//! later phase; until then the public surface is dead from the
-//! compiler's perspective. `dead_code` is silenced module-wide so the
-//! incremental commits in this series keep the workspace clippy gate
-//! green.
-
-#![allow(dead_code)]
 
 use super::types::{
     DiscoveredEndpoint, NamespaceInfo, NamespaceProbeResult, NamespaceState, ReachHint, WslState,
