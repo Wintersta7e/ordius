@@ -88,6 +88,26 @@ export function Editor({
     }
   }, [propsW]);
 
+  // Cmd/Ctrl+P → focus the palette filter input. Matches the keystroke
+  // advertised on the empty-canvas hint; preventDefault stops the
+  // webview's native print dialog.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const cmd = event.metaKey || event.ctrlKey;
+      if (!cmd || event.altKey || event.shiftKey) return;
+      if (event.key !== "p" && event.key !== "P") return;
+      const filter = document.querySelector<HTMLInputElement>(
+        'input[aria-label="Filter node types"]',
+      );
+      if (!filter) return;
+      event.preventDefault();
+      filter.focus();
+      filter.select();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   // Palette drag-to-canvas state. `drag` tracks the in-flight gesture
   // and powers the floating ghost near the cursor; `dropPreview`
   // mirrors that as world-space coords for the canvas crosshair (only
@@ -157,6 +177,14 @@ export function Editor({
       setError(
         "running in browser preview · engine commands disabled — launch via `tauri dev` to open real workflows",
       );
+      // Unsaved tabs (id starts with `new-`) have no on-disk source,
+      // so re-activating one in browser preview should keep its
+      // blank canvas — not silently swap in the demo fixture.
+      if (workflowId.startsWith("new-")) {
+        setWorkflow({ ...makeBlankWorkflow(), id: workflowId });
+        setActiveId(workflowId);
+        return;
+      }
       // Fall back to a baked-in demo workflow so the canvas has
       // something to render for visual review.
       setWorkflow(DEMO_WORKFLOW);

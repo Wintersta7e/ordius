@@ -380,23 +380,7 @@ export const Canvas = forwardRef(function CanvasInner(
         onFit={fitToWorkflow}
       />
 
-      {workflow.nodes.length === 0 ? (
-        <div
-          style={{
-            position: "absolute",
-            inset: 0,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            color: "var(--txt-faint)",
-            fontSize: 12,
-            pointerEvents: "none",
-            fontFamily: "var(--mono)",
-          }}
-        >
-          drag a node from the palette ▶
-        </div>
-      ) : null}
+      {workflow.nodes.length === 0 ? <EmptyCanvasHint /> : null}
 
       <style>{`
         @keyframes pulse {
@@ -662,6 +646,103 @@ function ZoomControls({
       >
         {Ic["check"]?.({ size: 12 })}
       </button>
+    </div>
+  );
+}
+
+function EmptyCanvasHint(): JSX.Element {
+  const isMac =
+    typeof navigator !== "undefined" &&
+    /Mac|iPhone|iPad/.test(navigator.platform);
+  const chord = isMac ? "⌘P" : "Ctrl+P";
+  return (
+    <div
+      style={{
+        position: "absolute",
+        inset: 0,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        pointerEvents: "none",
+        fontFamily: "var(--mono)",
+      }}
+      aria-hidden="true"
+    >
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          gap: 14,
+          textAlign: "center",
+        }}
+      >
+        <div
+          style={{
+            width: 88,
+            height: 60,
+            border: "1.5px dashed var(--line-strong)",
+            borderRadius: 3,
+            background: "var(--bg-panel)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            color: "var(--txt-faint)",
+            fontSize: 22,
+          }}
+        >
+          +
+        </div>
+        <div
+          style={{
+            fontSize: 11.5,
+            color: "var(--txt-dim)",
+            maxWidth: 340,
+            lineHeight: 1.55,
+          }}
+        >
+          <div
+            style={{
+              color: "var(--txt)",
+              fontWeight: 600,
+              marginBottom: 4,
+            }}
+          >
+            This canvas is empty.
+          </div>
+          drag a node from the palette on the left, or press{" "}
+          <span
+            style={{
+              border: "1px solid var(--line)",
+              padding: "0 5px",
+              borderRadius: 2,
+              background: "var(--bg-input)",
+              color: "var(--txt)",
+            }}
+          >
+            {chord}
+          </span>{" "}
+          to search node types.
+        </div>
+      </div>
+      <div
+        style={{
+          position: "absolute",
+          left: 12,
+          top: "50%",
+          transform: "translateY(-50%)",
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          fontSize: 10,
+          color: "var(--accent)",
+          letterSpacing: "0.10em",
+          textTransform: "uppercase",
+        }}
+      >
+        <span style={{ fontSize: 16 }}>◀</span>
+        <span>palette</span>
+      </div>
     </div>
   );
 }
