@@ -16,6 +16,7 @@ import {
   getSettings,
   listSecrets,
   listWorkspaces,
+  renameWorkspace,
   removeSecret,
   removeWorkspace,
   setSettings,
@@ -118,6 +119,18 @@ export function Settings({
           },
         ],
       });
+      setWorkspaces([
+        {
+          id: "demo-ws-1",
+          name: "code-critique-loop",
+          path: "/home/josh/code/critique-bot",
+        },
+        {
+          id: "demo-ws-2",
+          name: "personal-notes",
+          path: "/home/josh/notes",
+        },
+      ]);
       return;
     }
     try {
@@ -579,6 +592,8 @@ function WorkspacesSection({
   const [name, setName] = useState("");
   const [path, setPath] = useState("");
   const [busy, setBusy] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [draftName, setDraftName] = useState("");
 
   const handleAdd = async () => {
     if (!insideTauri || !name.trim() || !path.trim()) return;
@@ -603,6 +618,36 @@ function WorkspacesSection({
       await onReload();
     } catch (e) {
       onError(`remove workspace: ${String(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const startRename = (workspace: Workspace) => {
+    setEditingId(workspace.id);
+    setDraftName(workspace.name);
+  };
+
+  const cancelRename = () => {
+    setEditingId(null);
+    setDraftName("");
+  };
+
+  const commitRename = async () => {
+    if (!insideTauri || !editingId) return;
+    const next = draftName.trim();
+    if (!next) {
+      onError("rename workspace: name must be non-empty");
+      return;
+    }
+    setBusy(true);
+    try {
+      await renameWorkspace(editingId, next);
+      await onReload();
+      setEditingId(null);
+      setDraftName("");
+    } catch (e) {
+      onError(`rename workspace: ${String(e)}`);
     } finally {
       setBusy(false);
     }
@@ -656,51 +701,116 @@ function WorkspacesSection({
             no workspaces yet.
           </div>
         ) : (
-          workspaces.map((workspace) => (
-            <div
-              key={workspace.id}
-              style={{
-                padding: "10px 14px",
-                borderBottom: "1px solid var(--line-soft)",
-                fontFamily: "var(--mono)",
-                fontSize: 12,
-                color: "var(--txt)",
-                display: "grid",
-                gridTemplateColumns: "1fr auto",
-                gap: 10,
-                alignItems: "center",
-              }}
-            >
-              <div style={{ minWidth: 0 }}>
-                <div>{workspace.name}</div>
-                <div
-                  style={{
-                    fontSize: 10,
-                    color: "var(--txt-faint)",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                  }}
-                  title={workspace.path}
-                >
-                  {workspace.path}
-                </div>
-              </div>
-              <button
-                type="button"
-                className="btn"
-                onClick={() => void handleRemove(workspace.id)}
-                disabled={busy}
+          workspaces.map((workspace) => {
+            const editing = editingId === workspace.id;
+            return (
+              <div
+                key={workspace.id}
                 style={{
-                  height: 22,
-                  padding: "0 10px",
-                  color: "var(--err)",
-                  borderColor: "var(--err)",
+                  padding: "10px 14px",
+                  borderBottom: "1px solid var(--line-soft)",
+                  fontFamily: "var(--mono)",
+                  fontSize: 12,
+                  color: "var(--txt)",
+                  display: "grid",
+                  gridTemplateColumns: "1fr auto",
+                  gap: 10,
+                  alignItems: "center",
                 }}
               >
-                remove
-              </button>
-            </div>
-          ))
+                <div style={{ minWidth: 0 }}>
+                  {editing ? (
+                    <input
+                      value={draftName}
+                      onChange={(event) => setDraftName(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") void commitRename();
+                        if (event.key === "Escape") cancelRename();
+                      }}
+                      autoFocus
+                      disabled={busy}
+                      aria-label={`rename workspace ${workspace.name}`}
+                      style={{
+                        width: "100%",
+                        background: "var(--bg-input)",
+                        border: "1px solid var(--accent)",
+                        color: "var(--txt)",
+                        fontFamily: "var(--mono)",
+                        fontSize: 12,
+                        padding: "3px 6px",
+                        outline: "none",
+                        borderRadius: 2,
+                      }}
+                    />
+                  ) : (
+                    <div>{workspace.name}</div>
+                  )}
+                  <div
+                    style={{
+                      fontSize: 10,
+                      color: "var(--txt-faint)",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      marginTop: editing ? 4 : 0,
+                    }}
+                    title={workspace.path}
+                  >
+                    {workspace.path}
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  {editing ? (
+                    <>
+                      <button
+                        type="button"
+                        className="btn primary"
+                        onClick={() => void commitRename()}
+                        disabled={busy || !draftName.trim()}
+                        style={{ height: 22, padding: "0 10px" }}
+                      >
+                        save
+                      </button>
+                      <button
+                        type="button"
+                        className="btn"
+                        onClick={cancelRename}
+                        disabled={busy}
+                        style={{ height: 22, padding: "0 10px" }}
+                      >
+                        cancel
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        className="btn"
+                        onClick={() => startRename(workspace)}
+                        disabled={busy}
+                        style={{ height: 22, padding: "0 10px" }}
+                      >
+                        rename
+                      </button>
+                      <button
+                        type="button"
+                        className="btn"
+                        onClick={() => void handleRemove(workspace.id)}
+                        disabled={busy}
+                        style={{
+                          height: 22,
+                          padding: "0 10px",
+                          color: "var(--err)",
+                          borderColor: "var(--err)",
+                        }}
+                      >
+                        remove
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+            );
+          })
         )}
       </div>
     </div>

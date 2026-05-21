@@ -119,6 +119,10 @@ export function removeWorkspace(id: string): Promise<void> {
   return invoke("remove_workspace", { id });
 }
 
+export function renameWorkspace(id: string, name: string): Promise<Workspace> {
+  return invoke("rename_workspace", { id, name });
+}
+
 // ─── Secrets ─────────────────────────────────────────────────────
 
 export function listSecrets(): Promise<SecretMeta[]> {

@@ -365,6 +365,18 @@ pub fn remove_workspace(state: tauri::State<'_, AppState>, id: String) -> Result
     ordius_engine::workspaces::remove(state.engine.home(), &id).map_err(|e| e.to_string())
 }
 
+/// Change a workspace's display name. Returns the updated record.
+#[tauri::command]
+pub fn rename_workspace(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    name: String,
+) -> Result<WorkspaceDto, String> {
+    let ws = ordius_engine::workspaces::rename(state.engine.home(), &id, &name)
+        .map_err(|e| e.to_string())?;
+    Ok(ws.into())
+}
+
 // ─── Secrets ─────────────────────────────────────────────────────
 
 /// Names of every secret stored in the OS keyring (values never

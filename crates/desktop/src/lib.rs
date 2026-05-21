@@ -43,6 +43,7 @@ pub fn run() {
             commands::list_workspaces,
             commands::add_workspace,
             commands::remove_workspace,
+            commands::rename_workspace,
             commands::list_secrets,
             commands::add_secret,
             commands::remove_secret,

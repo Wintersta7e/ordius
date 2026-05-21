@@ -51,6 +51,11 @@ pub enum WorkspacesError {
     /// Tried to remove an id that isn't in the catalog.
     #[error("unknown workspace id: {0}")]
     Unknown(String),
+    /// Tried to set a workspace name to an empty or whitespace-only
+    /// string. Names are user-facing labels; we reject the obvious
+    /// nonsense at the boundary rather than letting it propagate.
+    #[error("workspace name must be non-empty")]
+    EmptyName,
 }
 
 fn catalog_path(home: &Path) -> PathBuf {
@@ -96,6 +101,25 @@ pub fn add(home: &Path, name: &str, path: &Path) -> Result<Workspace, Workspaces
     catalog.push(ws.clone());
     write_catalog(home, &catalog)?;
     Ok(ws)
+}
+
+/// Change a workspace's display name. The path + id are untouched
+/// so saved workflows that pin to the id keep working. Returns the
+/// updated `Workspace` on success.
+pub fn rename(home: &Path, id: &str, new_name: &str) -> Result<Workspace, WorkspacesError> {
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() {
+        return Err(WorkspacesError::EmptyName);
+    }
+    let mut catalog = list(home)?;
+    let entry = catalog
+        .iter_mut()
+        .find(|w| w.id == id)
+        .ok_or_else(|| WorkspacesError::Unknown(id.to_string()))?;
+    entry.name = trimmed.to_string();
+    let updated = entry.clone();
+    write_catalog(home, &catalog)?;
+    Ok(updated)
 }
 
 /// Remove a workspace by id. Returns `Ok(())` only when an entry
