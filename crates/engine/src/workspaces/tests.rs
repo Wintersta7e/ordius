@@ -76,6 +76,24 @@ fn rename_unknown_id_errors() {
 }
 
 #[test]
+fn find_returns_workspace_by_id() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let ws = add(home.path(), "demo", project.path()).unwrap();
+    let found = find(home.path(), &ws.id).unwrap();
+    assert_eq!(found.id, ws.id);
+    assert_eq!(found.name, "demo");
+    assert_eq!(found.path, ws.path);
+}
+
+#[test]
+fn find_unknown_id_errors() {
+    let home = TempDir::new().unwrap();
+    let result = find(home.path(), "no-such-id");
+    assert!(matches!(result, Err(WorkspacesError::Unknown(_))));
+}
+
+#[test]
 fn rename_rejects_empty_name() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();

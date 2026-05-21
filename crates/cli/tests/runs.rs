@@ -186,6 +186,63 @@ fn runs_rm_missing_errors() {
 }
 
 #[test]
+fn run_with_workspace_flag_sets_shell_cwd_to_workspace_dir() {
+    let home = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+
+    // Register the workspace by writing the catalog directly.
+    let catalog = serde_json::json!([
+        { "id": "demo-ws", "name": "demo", "path": workspace.path() }
+    ]);
+    fs::create_dir_all(home.path()).unwrap();
+    fs::write(
+        home.path().join("workspaces.json"),
+        serde_json::to_string_pretty(&catalog).unwrap(),
+    )
+    .unwrap();
+
+    // A shell workflow that drops a marker file in its CWD.
+    let marker_workflow = r#"{
+      "id": "marker",
+      "name": "Marker",
+      "schema_version": 1,
+      "nodes": [
+        {
+          "id": "touch",
+          "type": "shell",
+          "name": "touch",
+          "config": { "command": "touch ordius-workspace-marker" }
+        }
+      ],
+      "edges": []
+    }"#;
+    seed(&home, "marker", marker_workflow);
+
+    cli(&home)
+        .args(["run", "marker", "--workspace", "demo-ws"])
+        .assert()
+        .success();
+
+    let marker = workspace.path().join("ordius-workspace-marker");
+    assert!(
+        marker.exists(),
+        "expected shell node to run in workspace dir; marker missing at {}",
+        marker.display(),
+    );
+}
+
+#[test]
+fn run_with_unknown_workspace_id_errors() {
+    let home = TempDir::new().unwrap();
+    seed(&home, "demo", DEMO_WORKFLOW);
+    cli(&home)
+        .args(["run", "demo", "--workspace", "no-such-id"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no-such-id"));
+}
+
+#[test]
 fn runs_rm_removes_output_cache_spill_dir() {
     let home = TempDir::new().unwrap();
     seed(&home, "demo", DEMO_WORKFLOW);

@@ -110,6 +110,11 @@ struct RunArgs {
     /// Keep the run's workspace dir on disk after the run ends.
     #[arg(long)]
     keep_workspace: bool,
+    /// Run inside a registered workspace (`ordius workspaces ls` for
+    /// the ids). Without this, runs spawn in a private scratch dir
+    /// at `<home>/workspaces/<run_id>`.
+    #[arg(long, value_name = "ID")]
+    workspace: Option<String>,
 }
 
 fn parse_var(s: &str) -> Result<(String, String), String> {
@@ -891,23 +896,33 @@ async fn cmd_run(home: &Path, args: RunArgs) -> anyhow::Result<u8> {
         }
     });
 
-    let handle = match engine.start_run(Arc::new(wf), variables, "cli", args.yes, None) {
-        Ok(h) => h,
-        Err(EngineError::Validation(e)) => {
-            eprintln!("ordius: validation failed: {e}");
-            signal_task.abort();
-            return Ok(2);
-        },
-        Err(EngineError::AlreadyRunning { id, run_id }) => {
-            eprintln!("ordius: workflow {id} already running (run_id={run_id})");
-            signal_task.abort();
-            return Ok(3);
-        },
-        Err(e) => {
-            signal_task.abort();
-            return Err(e).context("start workflow run");
-        },
+    let workspace_override = match &args.workspace {
+        Some(id) => Some(
+            ordius_engine::workspaces::find(home, id)
+                .with_context(|| format!("resolve workspace {id}"))?
+                .path,
+        ),
+        None => None,
     };
+
+    let handle =
+        match engine.start_run(Arc::new(wf), variables, "cli", args.yes, workspace_override) {
+            Ok(h) => h,
+            Err(EngineError::Validation(e)) => {
+                eprintln!("ordius: validation failed: {e}");
+                signal_task.abort();
+                return Ok(2);
+            },
+            Err(EngineError::AlreadyRunning { id, run_id }) => {
+                eprintln!("ordius: workflow {id} already running (run_id={run_id})");
+                signal_task.abort();
+                return Ok(3);
+            },
+            Err(e) => {
+                signal_task.abort();
+                return Err(e).context("start workflow run");
+            },
+        };
 
     let run_id = handle.run_id.clone();
     if args.json_events {

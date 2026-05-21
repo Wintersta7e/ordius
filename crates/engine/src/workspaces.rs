@@ -3,10 +3,12 @@
 //! A workspace is a directory the user has added through the GUI's
 //! `Settings → Workspaces` table. It carries a stable id, a display
 //! name, and an absolute path that becomes the CWD of runs spawned
-//! against that workspace. The engine itself doesn't dispatch
-//! workspace-aware work yet — `RunContext::workspace` is filled by
-//! the engine home today — but the catalog lives here so the Tauri
-//! layer can persist + surface it to the GUI ahead of the wiring.
+//! against that workspace. Both the GUI (`run_workflow` Tauri
+//! command) and the CLI (`ordius run --workspace <id>`) resolve the
+//! id through [`find`] and pass the resulting path as
+//! `workspace_override` on [`crate::Engine::start_run`]; everything
+//! downstream (shell CWD, file builtins, container bind-mounts)
+//! reads from `RunContext::workspace`.
 //!
 //! Persistence: a single JSON file at `<home>/workspaces.json`.
 //! Missing file is treated as an empty list (fresh install).
@@ -101,6 +103,16 @@ pub fn add(home: &Path, name: &str, path: &Path) -> Result<Workspace, Workspaces
     catalog.push(ws.clone());
     write_catalog(home, &catalog)?;
     Ok(ws)
+}
+
+/// Look up a registered workspace by id. Used by the CLI and Tauri
+/// run-dispatch paths to resolve the user's selection into an
+/// absolute CWD for the run.
+pub fn find(home: &Path, id: &str) -> Result<Workspace, WorkspacesError> {
+    list(home)?
+        .into_iter()
+        .find(|w| w.id == id)
+        .ok_or_else(|| WorkspacesError::Unknown(id.to_string()))
 }
 
 /// Change a workspace's display name. The path + id are untouched

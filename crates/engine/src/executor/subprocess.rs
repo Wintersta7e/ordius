@@ -108,6 +108,7 @@ impl NodeExecutor for SubprocessExecutor {
 
         let mut cmd = Command::new(program);
         cmd.args(argv_rest);
+        cmd.current_dir(&ctx.workspace);
         for (k, v) in &env_pairs {
             cmd.env(k, v);
         }

@@ -55,12 +55,9 @@ fn validate_workflow_id(id: &str) -> Result<(), String> {
 /// unknown — the GUI lists workspaces from the same source so a missing
 /// id is a programmer/path-traversal error rather than a transient one.
 fn resolve_workspace_path(home: &std::path::Path, id: &str) -> Result<PathBuf, String> {
-    let workspaces = ordius_engine::workspaces::list(home).map_err(|e| e.to_string())?;
-    workspaces
-        .into_iter()
-        .find(|w| w.id == id)
+    ordius_engine::workspaces::find(home, id)
         .map(|w| w.path)
-        .ok_or_else(|| format!("workspace id {id:?} is not registered"))
+        .map_err(|e| e.to_string())
 }
 
 // ─── Workflows ───────────────────────────────────────────────────
