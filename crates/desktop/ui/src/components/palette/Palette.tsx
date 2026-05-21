@@ -1,10 +1,10 @@
 // Node-type palette — categorised, collapsible, filterable list of
-// every NodeType the engine has registered. Click an item to drop
-// a new node at the viewport centre (drag-to-canvas with ghost
-// preview is deferred per the design handoff's v1.x list).
+// every NodeType the engine has registered. Pointer-down begins a
+// drag that the Editor turns into either a drop-at-cursor (drag past
+// threshold) or a regular click-to-add (no movement).
 
 import { useMemo, useState } from "react";
-import type { JSX } from "react";
+import type { JSX, PointerEvent as ReactPointerEvent } from "react";
 
 import type { Category, NodeType } from "../../engine/types";
 import { CATEGORIES, CATEGORY_LIST, catColor } from "../../data/categories";
@@ -13,10 +13,14 @@ import { BracketHeader } from "./BracketHeader";
 
 interface Props {
   nodeTypes: NodeType[];
+  /** Click fallback: spawn at the default cascading position. */
   onAdd: (typeId: string) => void;
+  /** Optional drag-to-canvas hook. Editor takes ownership of the
+   * pointer once this fires and decides click-vs-drag by threshold. */
+  onBeginDrag?: (typeId: string, screenX: number, screenY: number) => void;
 }
 
-export function Palette({ nodeTypes, onAdd }: Props): JSX.Element {
+export function Palette({ nodeTypes, onAdd, onBeginDrag }: Props): JSX.Element {
   const [query, setQuery] = useState("");
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
@@ -188,6 +192,7 @@ export function Palette({ nodeTypes, onAdd }: Props): JSX.Element {
                       type={t}
                       idx={idx}
                       onAdd={onAdd}
+                      {...(onBeginDrag ? { onBeginDrag } : {})}
                     />
                   ))}
                   {items.length === 0 ? (
@@ -215,17 +220,27 @@ interface ItemProps {
   type: NodeType;
   idx: number;
   onAdd: (typeId: string) => void;
+  onBeginDrag?: (typeId: string, screenX: number, screenY: number) => void;
 }
 
-function PaletteItem({ type, idx, onAdd }: ItemProps): JSX.Element {
+function PaletteItem({ type, idx, onAdd, onBeginDrag }: ItemProps): JSX.Element {
   const [hover, setHover] = useState(false);
   const base = catColor(type.category, "base");
   const tint = catColor(type.category, "tint");
+  const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    if (onBeginDrag) {
+      onBeginDrag(type.id, event.clientX, event.clientY);
+    } else {
+      // Touch-only fallback (no Editor drag wiring): spawn immediately.
+      onAdd(type.id);
+    }
+  };
   return (
     <div
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
-      onClick={() => onAdd(type.id)}
+      onPointerDown={handlePointerDown}
       title={`${type.id} — ${type.description}`}
       style={{
         display: "flex",
@@ -236,6 +251,7 @@ function PaletteItem({ type, idx, onAdd }: ItemProps): JSX.Element {
         background: hover ? "var(--bg-hover)" : "transparent",
         borderLeft: `2px solid ${hover ? base : "transparent"}`,
         position: "relative",
+        userSelect: "none",
       }}
     >
       <span

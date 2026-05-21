@@ -4,8 +4,21 @@
 // props. Wheel zoom is cursor-anchored; empty-space drag pans;
 // node drag updates positions via onMoveNode.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { JSX, MouseEvent as ReactMouseEvent, WheelEvent } from "react";
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import type {
+  ForwardedRef,
+  JSX,
+  MouseEvent as ReactMouseEvent,
+  WheelEvent,
+} from "react";
 
 import type {
   Edge,
@@ -30,6 +43,14 @@ interface RunState {
   traveledEdges: Set<string>;
 }
 
+/** Imperative handle exposed to parents that need to translate cursor
+ * positions into the canvas's world space (e.g. palette drag-to-drop). */
+export interface CanvasHandle {
+  screenToWorld(screenX: number, screenY: number): { x: number; y: number };
+  /** Returns true if a screen-space point is over the canvas surface. */
+  containsScreenPoint(screenX: number, screenY: number): boolean;
+}
+
 interface Props {
   workflow: Workflow;
   nodeTypes: NodeType[];
@@ -39,6 +60,9 @@ interface Props {
   density?: Density;
   edgeStyle?: "bezier" | "orthogonal" | "straight";
   runState?: RunState | undefined;
+  /** When set, renders a drop-indicator crosshair at the given world
+   * coordinates — used while a palette item is being dragged over. */
+  dropPreview?: { x: number; y: number; label?: string } | null;
 }
 
 interface PanState {
@@ -56,16 +80,20 @@ interface DragState {
   origY: number;
 }
 
-export function Canvas({
-  workflow,
-  nodeTypes,
-  selectedId,
-  onSelect,
-  onMoveNode,
-  density = "standard",
-  edgeStyle = "orthogonal",
-  runState,
-}: Props): JSX.Element {
+export const Canvas = forwardRef(function CanvasInner(
+  {
+    workflow,
+    nodeTypes,
+    selectedId,
+    onSelect,
+    onMoveNode,
+    density = "standard",
+    edgeStyle = "orthogonal",
+    runState,
+    dropPreview,
+  }: Props,
+  ref: ForwardedRef<CanvasHandle>,
+): JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [pan, setPan] = useState({ x: 80, y: 80 });
   const [zoom, setZoom] = useState(0.85);
@@ -73,6 +101,32 @@ export function Canvas({
   const dragState = useRef<DragState | null>(null);
 
   const typesById = useMemo(() => nodeTypeIndex(nodeTypes), [nodeTypes]);
+
+  useImperativeHandle(
+    ref,
+    (): CanvasHandle => ({
+      screenToWorld(screenX, screenY) {
+        const el = containerRef.current;
+        if (!el) return { x: 0, y: 0 };
+        const rect = el.getBoundingClientRect();
+        const px = screenX - rect.left;
+        const py = screenY - rect.top;
+        return { x: (px - pan.x) / zoom, y: (py - pan.y) / zoom };
+      },
+      containsScreenPoint(screenX, screenY) {
+        const el = containerRef.current;
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        return (
+          screenX >= rect.left &&
+          screenX <= rect.right &&
+          screenY >= rect.top &&
+          screenY <= rect.bottom
+        );
+      },
+    }),
+    [pan, zoom],
+  );
 
   const fitToWorkflow = useCallback(() => {
     const el = containerRef.current;
@@ -269,6 +323,46 @@ export function Canvas({
               />
             );
           })}
+          {dropPreview ? (
+            <div
+              style={{
+                position: "absolute",
+                left: dropPreview.x,
+                top: dropPreview.y,
+                width: 232,
+                height: 162,
+                border: "2px dashed var(--accent)",
+                borderRadius: 6,
+                background:
+                  "color-mix(in srgb, var(--accent) 10%, transparent)",
+                pointerEvents: "none",
+                boxSizing: "border-box",
+              }}
+              aria-hidden="true"
+            >
+              {dropPreview.label ? (
+                <div
+                  className="num"
+                  style={{
+                    position: "absolute",
+                    left: 0,
+                    top: -22,
+                    fontFamily: "var(--mono)",
+                    fontSize: 11,
+                    color: "var(--accent)",
+                    background: "var(--bg-panel)",
+                    padding: "2px 8px",
+                    border: "1px solid var(--accent)",
+                    borderRadius: 3,
+                    whiteSpace: "nowrap",
+                    letterSpacing: "0.04em",
+                  }}
+                >
+                  + {dropPreview.label}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
         </div>
 
         <Corner pos="tl" />
@@ -312,7 +406,7 @@ export function Canvas({
       `}</style>
     </div>
   );
-}
+});
 
 interface EdgeLayerProps {
   workflow: Workflow;

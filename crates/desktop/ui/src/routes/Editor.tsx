@@ -5,7 +5,7 @@
 // workflow, single-click select, drag-to-move. Palette + properties
 // land in 1.5c / 1.5d.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { JSX } from "react";
 
 import {
@@ -21,7 +21,7 @@ import {
   stopRun,
   validateWorkflow,
 } from "../engine";
-import { Canvas } from "../components/canvas";
+import { Canvas, type CanvasHandle } from "../components/canvas";
 import {
   DEMO_NODE_TYPES,
   DEMO_WORKFLOW,
@@ -87,6 +87,16 @@ export function Editor({
       // see above.
     }
   }, [propsW]);
+
+  // Palette drag-to-canvas state. `drag` tracks the in-flight gesture
+  // and powers the floating ghost near the cursor; `dropPreview`
+  // mirrors that as world-space coords for the canvas crosshair (only
+  // set when the cursor is over the canvas surface).
+  const canvasHandleRef = useRef<CanvasHandle | null>(null);
+  const [drag, setDrag] = useState<PaletteDrag | null>(null);
+  const [dropPreview, setDropPreview] = useState<
+    { x: number; y: number; label: string } | null
+  >(null);
 
   const insideTauri =
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -454,6 +464,118 @@ export function Editor({
     [nodeTypes, activeId],
   );
 
+  /** Spawn at an explicit world-space position, used by drag-to-drop. */
+  const handleAddNodeAt = useCallback(
+    (typeId: string, pos: { x: number; y: number }) => {
+      const nodeType = nodeTypes.find((t) => t.id === typeId);
+      setWorkflow((wf) => {
+        if (!wf) return wf;
+        const nextId = synthesiseNodeId(typeId, wf.nodes);
+        return {
+          ...wf,
+          nodes: [
+            ...wf.nodes,
+            {
+              id: nextId,
+              type: typeId,
+              name: nodeType?.name ?? typeId,
+              config: {},
+              pos: { x: Math.round(pos.x), y: Math.round(pos.y) },
+              continueOnError: false,
+            },
+          ],
+        };
+      });
+      setTabs((existing) =>
+        existing.map((t) =>
+          t.id === activeId ? { ...t, dirty: true } : t,
+        ),
+      );
+    },
+    [nodeTypes, activeId],
+  );
+
+  /** Start a palette drag. Window-level pointer + key listeners are
+   * attached synchronously here (rather than in a useEffect) so a
+   * rapid press-and-release still hits our pointerup handler. */
+  const handleBeginDrag = useCallback(
+    (typeId: string, startX: number, startY: number) => {
+      const nodeType = nodeTypes.find((t) => t.id === typeId);
+      const label = nodeType?.name ?? typeId;
+      const initial: PaletteDrag = {
+        typeId,
+        label,
+        startX,
+        startY,
+        x: startX,
+        y: startY,
+        active: false,
+      };
+      let current: PaletteDrag = initial;
+      setDrag(initial);
+
+      const finish = (commit: boolean, upX: number, upY: number) => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        window.removeEventListener("keydown", onKey);
+        setDrag(null);
+        setDropPreview(null);
+        if (!commit) return;
+        const handle = canvasHandleRef.current;
+        if (!current.active) {
+          handleAddNode(current.typeId);
+          return;
+        }
+        if (handle && handle.containsScreenPoint(upX, upY)) {
+          const world = handle.screenToWorld(upX, upY);
+          handleAddNodeAt(current.typeId, {
+            x: world.x - NODE_HALF_W,
+            y: world.y - NODE_HALF_H,
+          });
+        }
+      };
+
+      const onMove = (event: PointerEvent) => {
+        const dx = event.clientX - current.startX;
+        const dy = event.clientY - current.startY;
+        const nextActive =
+          current.active || Math.hypot(dx, dy) >= DRAG_THRESHOLD_PX;
+        current = {
+          ...current,
+          x: event.clientX,
+          y: event.clientY,
+          active: nextActive,
+        };
+        setDrag(current);
+        const handle = canvasHandleRef.current;
+        if (
+          nextActive &&
+          handle &&
+          handle.containsScreenPoint(event.clientX, event.clientY)
+        ) {
+          const world = handle.screenToWorld(event.clientX, event.clientY);
+          setDropPreview({
+            x: world.x - NODE_HALF_W,
+            y: world.y - NODE_HALF_H,
+            label: current.label,
+          });
+        } else {
+          setDropPreview(null);
+        }
+      };
+      const onUp = (event: PointerEvent) => {
+        finish(true, event.clientX, event.clientY);
+      };
+      const onKey = (event: KeyboardEvent) => {
+        if (event.key === "Escape") finish(false, 0, 0);
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+      window.addEventListener("keydown", onKey);
+    },
+    [nodeTypes, handleAddNode, handleAddNodeAt],
+  );
+
   return (
     <div
       style={{
@@ -497,7 +619,11 @@ export function Editor({
         }}
       >
         {/* Palette — Phase 1.5c */}
-        <Palette nodeTypes={nodeTypes} onAdd={handleAddNode} />
+        <Palette
+          nodeTypes={nodeTypes}
+          onAdd={handleAddNode}
+          onBeginDrag={handleBeginDrag}
+        />
         <Resizer
           ariaLabel="Resize palette"
           onResize={(dx) => setPaletteW((w) => clampWidth(w + dx, PALETTE_MIN, PALETTE_MAX))}
@@ -507,6 +633,7 @@ export function Editor({
         <section style={{ position: "relative", minWidth: 0 }}>
           {workflow ? (
             <Canvas
+              ref={canvasHandleRef}
               workflow={workflow}
               nodeTypes={nodeTypes}
               selectedId={selectedNodeId}
@@ -523,6 +650,7 @@ export function Editor({
                     }
                   : undefined
               }
+              dropPreview={dropPreview}
             />
           ) : (
             <div
@@ -609,6 +737,31 @@ export function Editor({
         onConfirm={(input) => void handleRunConfirm(input)}
         onCancel={() => setRunDialogOpen(false)}
       />
+
+      {drag?.active ? (
+        <div
+          aria-hidden="true"
+          style={{
+            position: "fixed",
+            left: drag.x + 14,
+            top: drag.y + 14,
+            zIndex: 1000,
+            pointerEvents: "none",
+            fontFamily: "var(--mono)",
+            fontSize: 11,
+            color: "var(--accent)",
+            background: "var(--bg-elevated)",
+            border: "1px solid var(--accent)",
+            padding: "3px 8px",
+            borderRadius: 3,
+            boxShadow: "0 4px 12px -4px rgba(0,0,0,.4)",
+            letterSpacing: "0.04em",
+            whiteSpace: "nowrap",
+          }}
+        >
+          + {drag.label}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -617,6 +770,24 @@ const PALETTE_MIN = 180;
 const PALETTE_MAX = 480;
 const PROPS_MIN = 240;
 const PROPS_MAX = 560;
+
+/** Pixels of cursor travel before a palette press becomes a drag.
+ * Below this, the gesture is treated as a click (cascade-spawn). */
+const DRAG_THRESHOLD_PX = 4;
+/** Half-width / half-height of a standard NodeCard footprint —
+ * lets us centre the drop on the cursor instead of top-lefting it. */
+const NODE_HALF_W = 116;
+const NODE_HALF_H = 80;
+
+interface PaletteDrag {
+  typeId: string;
+  label: string;
+  startX: number;
+  startY: number;
+  x: number;
+  y: number;
+  active: boolean;
+}
 
 function clampWidth(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
