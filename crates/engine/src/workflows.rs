@@ -41,6 +41,10 @@ pub enum WorkflowsError {
         #[source]
         source: serde_json::Error,
     },
+    /// Catch-all for engine-level invariants that don't fit the other
+    /// variants — e.g. clone-id collision space exhausted.
+    #[error("{0}")]
+    Other(String),
 }
 
 /// `<home>/workflows/`.
@@ -135,7 +139,7 @@ pub fn save(home: &Path, wf: &Workflow) -> Result<(), WorkflowsError> {
 /// the saved clone.
 pub fn duplicate(home: &Path, source_id: &str) -> Result<Workflow, WorkflowsError> {
     let original = load(home, source_id)?;
-    let new_id = unique_clone_id(home, source_id);
+    let new_id = unique_clone_id(home, source_id)?;
     let mut clone = original;
     clone.id = new_id;
     clone.name = format!("{} (copy)", clone.name);
@@ -143,14 +147,32 @@ pub fn duplicate(home: &Path, source_id: &str) -> Result<Workflow, WorkflowsErro
     Ok(clone)
 }
 
-fn unique_clone_id(home: &Path, base: &str) -> String {
-    let mut candidate = format!("{base}-copy");
-    let mut counter = 2;
+const MAX_CLONE_ATTEMPTS: u32 = 999;
+
+fn unique_clone_id(home: &Path, base: &str) -> Result<String, WorkflowsError> {
+    // Strip a single trailing `-copy` or `-copy-<n>` so duplicating
+    // a clone yields `foo-copy-2`, not `foo-copy-copy`.
+    let root = if let Some((head, tail)) = base.rsplit_once("-copy-")
+        && !tail.is_empty()
+        && tail.chars().all(|c| c.is_ascii_digit())
+    {
+        head
+    } else {
+        base.strip_suffix("-copy").unwrap_or(base)
+    };
+
+    let mut candidate = format!("{root}-copy");
+    let mut counter: u32 = 2;
     while path(home, &candidate).exists() {
-        candidate = format!("{base}-copy-{counter}");
+        if counter > MAX_CLONE_ATTEMPTS {
+            return Err(WorkflowsError::Other(format!(
+                "could not find a free clone id under {root}-copy-* after {MAX_CLONE_ATTEMPTS} attempts",
+            )));
+        }
+        candidate = format!("{root}-copy-{counter}");
         counter += 1;
     }
-    candidate
+    Ok(candidate)
 }
 
 /// Delete a workflow by id. Returns `Ok(true)` if the file existed

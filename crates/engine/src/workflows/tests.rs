@@ -127,3 +127,42 @@ fn duplicate_collisions_get_numeric_suffix() {
     let third = duplicate(home.path(), "demo").unwrap();
     assert_eq!(third.id, "demo-copy-3");
 }
+
+#[test]
+fn duplicate_missing_source_returns_load_error() {
+    let home = TempDir::new().unwrap();
+    let result = duplicate(home.path(), "no-such-source");
+    assert!(
+        matches!(result, Err(WorkflowsError::Load { .. })),
+        "expected Load error, got {result:?}",
+    );
+}
+
+#[test]
+fn duplicate_of_duplicate_strips_existing_copy_suffix() {
+    let home = TempDir::new().unwrap();
+    write_workflow(&home, "demo", DEMO_JSON);
+
+    // First clone: demo → demo-copy
+    let first = duplicate(home.path(), "demo").unwrap();
+    assert_eq!(first.id, "demo-copy");
+
+    // Duplicating the clone should not produce demo-copy-copy;
+    // strip_copy_suffix turns `demo-copy` back into `demo`, and the
+    // first available slot is `demo-copy-2`.
+    let from_clone = duplicate(home.path(), "demo-copy").unwrap();
+    assert_eq!(from_clone.id, "demo-copy-2");
+}
+
+#[test]
+fn duplicate_of_numbered_clone_strips_numeric_suffix() {
+    let home = TempDir::new().unwrap();
+    write_workflow(&home, "demo", DEMO_JSON);
+    duplicate(home.path(), "demo").unwrap(); // demo-copy
+    let numbered = duplicate(home.path(), "demo").unwrap();
+    assert_eq!(numbered.id, "demo-copy-2");
+
+    // Duplicating demo-copy-2 should treat the base as `demo` again.
+    let clone_of_numbered = duplicate(home.path(), &numbered.id).unwrap();
+    assert_eq!(clone_of_numbered.id, "demo-copy-3");
+}
