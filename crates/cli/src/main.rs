@@ -861,7 +861,7 @@ fn runs_rm(
         Ok(()) => " + spill dir",
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => "",
         Err(e) => {
-            eprintln!("warning: failed to remove {}: {e}", spill_dir.display(),);
+            eprintln!("warning: failed to remove {}: {e}", spill_dir.display());
             " (spill dir cleanup failed)"
         },
     };
