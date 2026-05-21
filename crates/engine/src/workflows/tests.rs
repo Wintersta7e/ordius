@@ -155,6 +155,19 @@ fn duplicate_of_duplicate_strips_existing_copy_suffix() {
 }
 
 #[test]
+fn duplicate_of_alphanumeric_copy_suffix_is_not_stripped() {
+    // The strip predicate only fires when the tail after `-copy-` is
+    // purely numeric. A user-chosen suffix like `-copy-v2` is not a
+    // counter and stays in the base, producing `foo-copy-v2-copy`.
+    let home = TempDir::new().unwrap();
+    let body = DEMO_JSON.replace("\"id\": \"demo\"", "\"id\": \"foo-copy-v2\"");
+    write_workflow(&home, "foo-copy-v2", &body);
+
+    let clone = duplicate(home.path(), "foo-copy-v2").unwrap();
+    assert_eq!(clone.id, "foo-copy-v2-copy");
+}
+
+#[test]
 fn duplicate_of_numbered_clone_strips_numeric_suffix() {
     let home = TempDir::new().unwrap();
     write_workflow(&home, "demo", DEMO_JSON);
