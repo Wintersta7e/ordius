@@ -1,7 +1,7 @@
 //! Subprocess-backed executor.
 //!
 //! Spawns child processes and supervises them with platform-native
-//! process trees:
+//! process trees via [`super::supervisor`]:
 //!
 //! - **Unix:** `pre_exec` calls `setsid()` so each child becomes
 //!   its own process-group leader. Cancellation sends signals to
@@ -18,16 +18,9 @@
 //! forwarded to the run's [`Emitter`] as `node:output` events.
 //! [`parse_outputs`] then maps the accumulated stdout + exit status
 //! onto the node's declared output ports.
-//!
-//! The crate-level `unsafe_code = "deny"` lint is overridden here —
-//! `pre_exec` on Unix and the Win32 Job-Object / Toolhelp32 calls
-//! on Windows both need raw FFI.
-#![allow(unsafe_code)]
 
 use crate::emitter::Emitter;
 use crate::events::EventType;
-#[cfg(unix)]
-use crate::executor::supervisor::CANCEL_GRACE;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::template::{SubstitutionContext, default_env_allowlist, substitute};
 use crate::types::{ExecutionBackend, Node, NodeType, OutputParse, PortValue};
@@ -40,6 +33,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+use super::supervisor::{self, Supervised};
 
 // ---- Contract strings shared with the registry + downstream consumers ----
 
@@ -107,16 +102,11 @@ impl NodeExecutor for SubprocessExecutor {
         if stdin_body.is_some() {
             cmd.stdin(Stdio::piped());
         }
-        cmd.kill_on_drop(true);
 
-        #[cfg(unix)]
-        configure_unix_command(&mut cmd);
-        #[cfg(windows)]
-        configure_windows_command(&mut cmd);
+        let mut sup: Supervised =
+            supervisor::spawn(cmd).map_err(|e| NodeError::Subprocess(format!("spawn: {e}")))?;
 
-        let mut sup = platform_spawn(cmd)?;
-
-        if let (Some(body), Some(mut stdin)) = (stdin_body, sup.child.stdin.take()) {
+        if let (Some(body), Some(mut stdin)) = (stdin_body, sup.child_mut().stdin.take()) {
             // Writer runs on its own task so a child that reads stdin
             // fully before producing stdout can't deadlock us (we
             // hold the stdout read loop below).
@@ -136,7 +126,7 @@ impl NodeExecutor for SubprocessExecutor {
         let iteration = ctx.iteration;
         let attempt = ctx.attempt.load(std::sync::atomic::Ordering::Relaxed);
         let stdout_handle = spawn_line_reader(
-            sup.child.stdout.take(),
+            sup.child_mut().stdout.take(),
             emitter.clone(),
             node.id.clone(),
             iteration,
@@ -144,7 +134,7 @@ impl NodeExecutor for SubprocessExecutor {
             CHANNEL_STDOUT,
         );
         let stderr_handle = spawn_line_reader(
-            sup.child.stderr.take(),
+            sup.child_mut().stderr.take(),
             emitter,
             node.id.clone(),
             iteration,
@@ -153,9 +143,9 @@ impl NodeExecutor for SubprocessExecutor {
         );
 
         let outcome = tokio::select! {
-            wait_res = sup.child.wait() => Outcome::Exit(wait_res),
+            wait_res = sup.child_mut().wait() => Outcome::Exit(wait_res),
             () = cancel.cancelled() => {
-                platform_cancel(&mut sup).await;
+                let _ = supervisor::cancel(&mut sup).await;
                 Outcome::Cancelled
             }
         };
@@ -385,282 +375,6 @@ fn parse_outputs(
     }
 
     Ok(outputs)
-}
-
-// =====================================================================
-// Unix
-// =====================================================================
-
-/// Per-platform supervised child. On Unix this is just the child
-/// and its PID; on Windows we additionally hold the Job Object
-/// handle that owns the whole tree.
-#[cfg(unix)]
-struct Supervised {
-    child: tokio::process::Child,
-    pid: u32,
-}
-
-#[cfg(unix)]
-fn platform_spawn(mut cmd: Command) -> Result<Supervised, NodeError> {
-    let child = cmd
-        .spawn()
-        .map_err(|e| NodeError::Subprocess(format!("spawn: {e}")))?;
-    let pid = child
-        .id()
-        .ok_or_else(|| NodeError::Subprocess("child has no pid (already reaped)".into()))?;
-    Ok(Supervised { child, pid })
-}
-
-#[cfg(unix)]
-async fn platform_cancel(sup: &mut Supervised) {
-    use nix::sys::signal::Signal;
-
-    let _soft = kill_unix_pgroup(sup.pid, Signal::SIGTERM);
-    let grace = tokio::time::sleep(CANCEL_GRACE);
-    tokio::select! {
-        wait_res = sup.child.wait() => { drop(wait_res); }
-        () = grace => {
-            let _hard = kill_unix_pgroup(sup.pid, Signal::SIGKILL);
-            let reap = sup.child.wait().await;
-            drop(reap);
-        }
-    }
-}
-
-/// Configure a Unix `Command` so the child becomes the leader of
-/// its own process group via `setsid()` in the post-fork /
-/// pre-spawn window.
-///
-/// Negative PIDs passed to `kill(2)` then signal the whole group,
-/// which is how subprocess cancellation reaches grandchildren the
-/// child spawned itself.
-#[cfg(unix)]
-pub(crate) fn configure_unix_command(cmd: &mut Command) {
-    // SAFETY: `setsid()` is async-signal-safe and the only call we
-    // make between `fork` and the child's `execve`. No allocation,
-    // no locks, no non-reentrant libc functions.
-    unsafe {
-        cmd.pre_exec(|| {
-            nix::unistd::setsid()
-                .map(|_| ())
-                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
-        });
-    }
-}
-
-/// Send `signal` to the process group led by `pid`. A negative PID
-/// passed to `kill(2)` targets every member of the group, so a
-/// SIGTERM here also reaches any grandchildren the original child
-/// spawned (provided they did not call `setsid` themselves to
-/// detach into a new group).
-#[cfg(unix)]
-fn kill_unix_pgroup(pid: u32, signal: nix::sys::signal::Signal) -> std::io::Result<()> {
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
-
-    let pid_i32 = i32::try_from(pid)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "pid overflows i32"))?;
-    kill(Pid::from_raw(-pid_i32), signal).map_err(|e| std::io::Error::from_raw_os_error(e as i32))
-}
-
-// =====================================================================
-// Windows
-// =====================================================================
-
-#[cfg(windows)]
-struct Supervised {
-    child: tokio::process::Child,
-    job: windows::Win32::Foundation::HANDLE,
-}
-
-// SAFETY: Windows kernel HANDLEs are safe to use from any thread —
-// concurrency is enforced by the kernel — and we hold this one
-// uniquely (no aliasing). HANDLE only fails Send/Sync automatically
-// because its inner field is a raw pointer.
-#[cfg(windows)]
-unsafe impl Send for Supervised {}
-#[cfg(windows)]
-unsafe impl Sync for Supervised {}
-
-#[cfg(windows)]
-impl Drop for Supervised {
-    fn drop(&mut self) {
-        // SAFETY: `job` is a live kernel handle we own.
-        let close = unsafe { windows::Win32::Foundation::CloseHandle(self.job) };
-        drop(close);
-    }
-}
-
-#[cfg(windows)]
-fn platform_spawn(mut cmd: Command) -> Result<Supervised, NodeError> {
-    let sup = win_job::spawn_supervised(&mut cmd)?;
-    let pid = sup
-        .child
-        .id()
-        .ok_or_else(|| NodeError::Subprocess("child has no pid (already reaped)".into()))?;
-    win_job::resume_initial_thread(pid)?;
-    Ok(sup)
-}
-
-#[cfg(windows)]
-async fn platform_cancel(sup: &mut Supervised) {
-    // TerminateJobObject hard-kills every process in the job
-    // atomically — analog of kill(-pgid, SIGKILL).
-    win_job::terminate_job(sup.job);
-    let reap = sup.child.wait().await;
-    drop(reap);
-}
-
-/// Windows command-configuration hook. Job-Object setup happens
-/// post-spawn (see [`win_job::spawn_supervised`]); the pre-spawn
-/// hook itself is a no-op placeholder retained for symmetry with
-/// the Unix path.
-#[cfg(windows)]
-pub(crate) fn configure_windows_command(_cmd: &mut Command) {}
-
-#[cfg(windows)]
-mod win_job {
-    //! Windows process supervision via Job Objects.
-    //!
-    //! Spawning a child with `CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP`
-    //! and assigning it to a fresh Job Object with the
-    //! `KILL_ON_JOB_CLOSE` limit before its main thread runs means
-    //! every descendant the program later spawns inherits the job
-    //! membership automatically. Closing or terminating the job then
-    //! terminates the whole tree atomically.
-
-    use super::{Command, NodeError, Supervised};
-    use windows::Win32::Foundation::{CloseHandle, FALSE, HANDLE};
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-    };
-    use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject,
-    };
-    use windows::Win32::System::Threading::{
-        CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
-    };
-
-    pub(super) fn spawn_supervised(cmd: &mut Command) -> Result<Supervised, NodeError> {
-        cmd.creation_flags(CREATE_SUSPENDED.0 | CREATE_NEW_PROCESS_GROUP.0);
-        let child = cmd
-            .spawn()
-            .map_err(|e| NodeError::Subprocess(format!("spawn: {e}")))?;
-
-        // SAFETY: both args are `None` (no SECURITY_ATTRIBUTES, no
-        // name), so there are no pointer preconditions to satisfy.
-        // The returned HANDLE is owned by us and closed on every
-        // error path below + on `Supervised::drop` on success.
-        let job = unsafe { CreateJobObjectW(None, None) }
-            .map_err(|e| NodeError::Subprocess(format!("CreateJobObjectW: {e}")))?;
-
-        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let info_size = u32::try_from(std::mem::size_of_val(&info))
-            .expect("JOBOBJECT_EXTENDED_LIMIT_INFORMATION fits in u32");
-        // SAFETY: `info` is a fully-initialized stack struct; the
-        // pointer is valid for `info_size` bytes; the job handle was
-        // just created.
-        let set_res = unsafe {
-            SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                std::ptr::addr_of!(info).cast(),
-                info_size,
-            )
-        };
-        if let Err(e) = set_res {
-            // SAFETY: closing the job we just created.
-            let close = unsafe { CloseHandle(job) };
-            drop(close);
-            return Err(NodeError::Subprocess(format!(
-                "SetInformationJobObject: {e}"
-            )));
-        }
-
-        let raw = match child.raw_handle() {
-            Some(h) => h,
-            None => {
-                // SAFETY: closing the job we just created.
-                let close = unsafe { CloseHandle(job) };
-                drop(close);
-                return Err(NodeError::Subprocess("child has no raw handle".into()));
-            },
-        };
-        let child_handle = HANDLE(raw.cast());
-
-        // SAFETY: `child_handle` borrows from the `Child` we just
-        // spawned and are about to return — the OS handle stays
-        // valid for the call.
-        let assign_res = unsafe { AssignProcessToJobObject(job, child_handle) };
-        if let Err(e) = assign_res {
-            // SAFETY: closing the job we just created.
-            let close = unsafe { CloseHandle(job) };
-            drop(close);
-            return Err(NodeError::Subprocess(format!(
-                "AssignProcessToJobObject: {e}"
-            )));
-        }
-
-        Ok(Supervised { child, job })
-    }
-
-    pub(super) fn resume_initial_thread(pid: u32) -> Result<(), NodeError> {
-        // SAFETY: snapshot is an owned kernel handle; closed below.
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
-            .map_err(|e| NodeError::Subprocess(format!("CreateToolhelp32Snapshot: {e}")))?;
-
-        let mut entry = THREADENTRY32 {
-            dwSize: u32::try_from(std::mem::size_of::<THREADENTRY32>())
-                .expect("THREADENTRY32 fits in u32"),
-            ..Default::default()
-        };
-
-        // SAFETY: `entry` has `dwSize` set; `snapshot` is live.
-        let mut step = unsafe { Thread32First(snapshot, &mut entry) };
-        let mut found_tid: Option<u32> = None;
-        while step.is_ok() {
-            if entry.th32OwnerProcessID == pid {
-                found_tid = Some(entry.th32ThreadID);
-                break;
-            }
-            // SAFETY: same invariants as the First call.
-            step = unsafe { Thread32Next(snapshot, &mut entry) };
-        }
-
-        // SAFETY: closing the snapshot we created.
-        let close_snap = unsafe { CloseHandle(snapshot) };
-        drop(close_snap);
-
-        let tid = found_tid
-            .ok_or_else(|| NodeError::Subprocess(format!("no thread found for pid {pid}")))?;
-
-        // SAFETY: OpenThread returns an owned handle; closed below.
-        let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid) }
-            .map_err(|e| NodeError::Subprocess(format!("OpenThread tid={tid}: {e}")))?;
-
-        // ResumeThread returns the previous suspend count, or
-        // `u32::MAX` (cast of -1) on failure.
-        // SAFETY: `thread` is a live kernel handle we just opened.
-        let prev = unsafe { ResumeThread(thread) };
-
-        // SAFETY: closing the thread handle we opened.
-        let close_thread = unsafe { CloseHandle(thread) };
-        drop(close_thread);
-
-        if prev == u32::MAX {
-            return Err(NodeError::Subprocess("ResumeThread failed".into()));
-        }
-        Ok(())
-    }
-
-    pub(super) fn terminate_job(job: HANDLE) {
-        // SAFETY: `job` is a live kernel handle the caller owns.
-        let res = unsafe { TerminateJobObject(job, 1) };
-        drop(res);
-    }
 }
 
 // =====================================================================
