@@ -90,6 +90,27 @@ export function Editor({
     }
   }, [propsW]);
 
+  // Home's ▶ button writes the workflow id to sessionStorage so this
+  // route auto-opens the run dialog once the workflow has loaded.
+  // We clear the flag on consumption so re-navigating to the editor
+  // (e.g. from another card) doesn't re-trigger.
+  useEffect(() => {
+    if (!workflow) return;
+    let flagged: string | null = null;
+    try {
+      flagged = window.sessionStorage.getItem("ordius.run-on-open");
+    } catch {
+      return;
+    }
+    if (!flagged || flagged !== workflow.id) return;
+    try {
+      window.sessionStorage.removeItem("ordius.run-on-open");
+    } catch {
+      /* see above */
+    }
+    setRunDialogOpen(true);
+  }, [workflow]);
+
   // Cmd/Ctrl+P → focus the palette filter input. Matches the keystroke
   // advertised on the empty-canvas hint; preventDefault stops the
   // webview's native print dialog.

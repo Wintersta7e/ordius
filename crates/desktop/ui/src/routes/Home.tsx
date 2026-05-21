@@ -218,7 +218,16 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
     navigateRoute({ kind: "editor", workflowId: id });
   }, []);
   const handleRun = useCallback((id: string) => {
-    console.warn("run dialog lands in Phase 1.9", { id });
+    // Editor reads this flag on mount + auto-opens its existing
+    // RunDialog. sessionStorage (not localStorage) so the hint
+    // doesn't leak across tabs or process restarts.
+    try {
+      window.sessionStorage.setItem("ordius.run-on-open", id);
+    } catch {
+      /* sessionStorage may be disabled — fall through; user can
+         still click ▶ in the editor manually. */
+    }
+    navigateRoute({ kind: "editor", workflowId: id });
   }, []);
   const handleDuplicate = useCallback(async (id: string) => {
     const insideTauri =
