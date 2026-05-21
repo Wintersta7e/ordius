@@ -65,6 +65,7 @@ export function Editor({
   const [workflow, setWorkflow] = useState<Workflow | null>(null);
   const [nodeTypes, setNodeTypes] = useState<NodeType[]>([]);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [validateNotice, setValidateNotice] = useState<string | null>(null);
   const [runState, setRunState] = useState<LiveRunState>(emptyRunState);
@@ -355,6 +356,57 @@ export function Editor({
     },
     [activeId],
   );
+
+  const handleDeleteEdge = useCallback(
+    (id: string) => {
+      setWorkflow((wf) => {
+        if (!wf) return wf;
+        return { ...wf, edges: wf.edges.filter((e) => e.id !== id) };
+      });
+      setSelectedEdgeId((current) => (current === id ? null : current));
+      setTabs((existing) =>
+        existing.map((t) => (t.id === activeId ? { ...t, dirty: true } : t)),
+      );
+    },
+    [activeId],
+  );
+
+  const handleSelectEdge = useCallback((id: string | null) => {
+    setSelectedEdgeId(id);
+    setSelectedNodeId(null);
+  }, []);
+
+  const handleSelectNode = useCallback((id: string | null) => {
+    setSelectedNodeId(id);
+    setSelectedEdgeId(null);
+  }, []);
+
+  // Delete/Backspace removes the selected node or edge — but only
+  // when the user isn't typing into an input/textarea/select.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Delete" && event.key !== "Backspace") return;
+      const t = event.target as HTMLElement | null;
+      if (
+        t &&
+        (t.tagName === "INPUT" ||
+          t.tagName === "TEXTAREA" ||
+          t.tagName === "SELECT" ||
+          t.isContentEditable)
+      ) {
+        return;
+      }
+      if (selectedEdgeId) {
+        event.preventDefault();
+        handleDeleteEdge(selectedEdgeId);
+      } else if (selectedNodeId) {
+        event.preventDefault();
+        handleDeleteNode(selectedNodeId);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selectedEdgeId, selectedNodeId, handleDeleteEdge, handleDeleteNode]);
 
   // Drop a fresh node from the palette into the open workflow.
   // For Phase 1.5c the new node lands below the lowest existing
@@ -792,7 +844,9 @@ export function Editor({
               workflow={workflow}
               nodeTypes={nodeTypes}
               selectedId={selectedNodeId}
-              onSelect={setSelectedNodeId}
+              onSelect={handleSelectNode}
+              selectedEdgeId={selectedEdgeId}
+              onEdgeSelect={handleSelectEdge}
               onMoveNode={handleMoveNode}
               density="standard"
               edgeStyle="orthogonal"

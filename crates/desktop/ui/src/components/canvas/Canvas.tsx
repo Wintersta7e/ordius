@@ -56,6 +56,11 @@ interface Props {
   nodeTypes: NodeType[];
   selectedId: string | null;
   onSelect: (id: string | null) => void;
+  /** Edge currently picked via click; passed to the renderer for
+   * highlight styling. Null when nothing is selected. */
+  selectedEdgeId?: string | null;
+  /** Click handler for individual edges. */
+  onEdgeSelect?: (id: string | null) => void;
   onMoveNode: (id: string, pos: { x: number; y: number }) => void;
   density?: Density;
   edgeStyle?: "bezier" | "orthogonal" | "straight";
@@ -100,6 +105,8 @@ export const Canvas = forwardRef(function CanvasInner(
     nodeTypes,
     selectedId,
     onSelect,
+    selectedEdgeId,
+    onEdgeSelect,
     onMoveNode,
     density = "standard",
     edgeStyle = "orthogonal",
@@ -320,6 +327,8 @@ export const Canvas = forwardRef(function CanvasInner(
             edgeStyle={edgeStyle}
             density={density}
             runState={runState}
+            selectedEdgeId={selectedEdgeId ?? null}
+            {...(onEdgeSelect ? { onEdgeSelect } : {})}
           />
           {workflow.nodes.map((node) => {
             const nodeType = typesById.get(node.type);
@@ -469,6 +478,8 @@ interface EdgeLayerProps {
   edgeStyle: "bezier" | "orthogonal" | "straight";
   density: Density;
   runState?: RunState | undefined;
+  selectedEdgeId: string | null;
+  onEdgeSelect?: (id: string | null) => void;
 }
 
 function EdgeLayer({
@@ -477,6 +488,8 @@ function EdgeLayer({
   edgeStyle,
   density,
   runState,
+  selectedEdgeId,
+  onEdgeSelect,
 }: EdgeLayerProps): JSX.Element {
   return (
     <svg
@@ -486,6 +499,8 @@ function EdgeLayer({
         position: "absolute",
         left: 0,
         top: 0,
+        // `none` so empty SVG areas don't block canvas pan; each
+        // edge group explicitly opts back in via pointer-events=stroke.
         pointerEvents: "none",
         overflow: "visible",
       }}
@@ -527,7 +542,16 @@ function EdgeLayer({
         </marker>
       </defs>
       {workflow.edges.map((edge) =>
-        renderEdge(edge, workflow.nodes, typesById, edgeStyle, density, runState),
+        renderEdge(
+          edge,
+          workflow.nodes,
+          typesById,
+          edgeStyle,
+          density,
+          runState,
+          selectedEdgeId,
+          onEdgeSelect,
+        ),
       )}
     </svg>
   );
@@ -540,6 +564,8 @@ function renderEdge(
   style: "bezier" | "orthogonal" | "straight",
   density: Density,
   runState?: RunState | undefined,
+  selectedEdgeId?: string | null,
+  onEdgeSelect?: (id: string | null) => void,
 ): JSX.Element | null {
   const from = nodes.find((n) => n.id === edge.fromNodeId);
   const to = nodes.find((n) => n.id === edge.toNodeId);
@@ -553,30 +579,59 @@ function renderEdge(
   const isLoop = edge.edgeType === "loop";
   const active = runState?.activeEdges.has(edge.id) ?? false;
   const traveled = runState?.traveledEdges.has(edge.id) ?? false;
+  const selected = selectedEdgeId === edge.id;
 
   const baseColor = isLoop
     ? "var(--warn)"
     : traveled
       ? "oklch(0.78 0.18 305)"
       : "var(--txt-soft)";
-  const color = active ? "var(--accent)" : baseColor;
-  const sw = active ? 2.2 : traveled ? 1.6 : 1.2;
+  const color = selected
+    ? "var(--accent)"
+    : active
+      ? "var(--accent)"
+      : baseColor;
+  const sw = selected ? 2.4 : active ? 2.2 : traveled ? 1.6 : 1.2;
   const d = isLoop ? loopPath(a, b) : edgePath(style, a, b);
 
+  const handleClick = onEdgeSelect
+    ? (event: React.MouseEvent) => {
+        event.stopPropagation();
+        onEdgeSelect(edge.id);
+      }
+    : undefined;
+
   return (
-    <path
+    <g
       key={edge.id}
-      d={d}
-      fill="none"
-      stroke={color}
-      strokeWidth={sw}
-      strokeDasharray={isLoop ? "6 4" : active ? "4 3" : "none"}
-      markerEnd={`url(#${active ? "ord-arrow-active" : isLoop ? "ord-arrow-loop" : "ord-arrow"})`}
-      style={{
-        filter: active ? "drop-shadow(0 0 6px var(--accent))" : "none",
-        transition: "stroke .2s, stroke-width .2s",
-      }}
-    />
+      style={{ cursor: onEdgeSelect ? "pointer" : "default" }}
+      onClick={handleClick}
+    >
+      {/* Invisible wide hit-target so clicks register without
+       * needing pixel-perfect aim on the visible stroke. */}
+      <path
+        d={d}
+        fill="none"
+        stroke="transparent"
+        strokeWidth={14}
+        pointerEvents={onEdgeSelect ? "stroke" : "none"}
+      />
+      <path
+        d={d}
+        fill="none"
+        stroke={color}
+        strokeWidth={sw}
+        strokeDasharray={isLoop ? "6 4" : active ? "4 3" : "none"}
+        markerEnd={`url(#${selected || active ? "ord-arrow-active" : isLoop ? "ord-arrow-loop" : "ord-arrow"})`}
+        style={{
+          filter:
+            selected || active
+              ? "drop-shadow(0 0 6px var(--accent))"
+              : "none",
+          transition: "stroke .2s, stroke-width .2s",
+        }}
+      />
+    </g>
   );
 }
 
