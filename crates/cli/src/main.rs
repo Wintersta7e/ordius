@@ -564,7 +564,7 @@ async fn cmd_runs(home: &Path, sub: RunsSub, json_out: bool) -> anyhow::Result<u
             node,
             follow,
         } => runs_logs(&pool, &run_id, node.as_deref(), follow).await,
-        RunsSub::Rm { run_id, force } => runs_rm(&pool, &run_id, force),
+        RunsSub::Rm { run_id, force } => runs_rm(&pool, home, &run_id, force),
     }
 }
 
@@ -837,7 +837,12 @@ async fn runs_logs(
     }
 }
 
-fn runs_rm(pool: &ordius_engine::db::DbPool, run_id: &str, force: bool) -> anyhow::Result<u8> {
+fn runs_rm(
+    pool: &ordius_engine::db::DbPool,
+    home: &Path,
+    run_id: &str,
+    force: bool,
+) -> anyhow::Result<u8> {
     let conn = pool.get().context("acquire DB connection")?;
     let exists: bool = conn
         .prepare("SELECT 1 FROM runs WHERE id = ?")?
@@ -851,7 +856,16 @@ fn runs_rm(pool: &ordius_engine::db::DbPool, run_id: &str, force: bool) -> anyho
         return Ok(1);
     }
     let deleted = conn.execute("DELETE FROM runs WHERE id = ?", rusqlite::params![run_id])?;
-    println!("removed {run_id} ({deleted} row)");
+    let spill_dir = home.join("output-cache").join(run_id);
+    let spill_note = match std::fs::remove_dir_all(&spill_dir) {
+        Ok(()) => " + spill dir",
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "",
+        Err(e) => {
+            eprintln!("warning: failed to remove {}: {e}", spill_dir.display(),);
+            " (spill dir cleanup failed)"
+        },
+    };
+    println!("removed {run_id} ({deleted} row{spill_note})");
     Ok(0)
 }
 

@@ -184,3 +184,33 @@ fn runs_rm_missing_errors() {
         .failure()
         .stderr(predicate::str::contains("not found"));
 }
+
+#[test]
+fn runs_rm_removes_output_cache_spill_dir() {
+    let home = TempDir::new().unwrap();
+    seed(&home, "demo", DEMO_WORKFLOW);
+    run_once(&home, "demo");
+
+    let out = cli(&home).args(["--json", "runs", "ls"]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let run_id = v[0]["run_id"].as_str().unwrap().to_string();
+
+    // Simulate a large-output spill the engine would write itself for
+    // any node whose serialised output exceeds the in-DB threshold.
+    let spill_dir = home.path().join("output-cache").join(&run_id);
+    fs::create_dir_all(&spill_dir).unwrap();
+    fs::write(spill_dir.join("n-out-0-0.json"), b"\"hello\"").unwrap();
+    assert!(spill_dir.exists());
+
+    cli(&home)
+        .args(["runs", "rm", &run_id, "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+ spill dir"));
+
+    assert!(
+        !spill_dir.exists(),
+        "spill dir {} should have been removed",
+        spill_dir.display(),
+    );
+}
