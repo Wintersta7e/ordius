@@ -21,6 +21,41 @@ const ENUM_TIMEOUT: Duration = Duration::from_millis(1500);
 const RUNNING_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_LIST_STDOUT: usize = 64 * 1024;
 
+/// POSIX shell script (dash-tested) dispatched into a WSL distro via
+/// `wsl.exe -d <name> --exec /bin/sh -c`. Probes the four well-known
+/// LLM ports on the distro's loopback and emits a single JSON object.
+/// `BusyBox` `curl` is rejected by the version-banner check; `wget`
+/// fallback covers `Alpine`-style minimal distros.
+pub(super) const STATIC_SCRIPT: &str = r#"set -u
+M=
+if command -v curl >/dev/null 2>&1 \
+   && curl --version 2>/dev/null | head -1 | grep -qi '^curl '; then
+  M=curl
+elif command -v wget >/dev/null 2>&1; then
+  M=wget
+fi
+if [ -z "$M" ]; then printf '{"error":"no-probe-tool"}\n'; exit 0; fi
+probe() {
+  code=0
+  if [ "$M" = curl ]; then
+    if out=$(curl -s -o /dev/null -w "%{http_code}" --max-time 0.5 "$1" 2>/dev/null); then
+      case "$out" in
+        000) ;;
+        [1-5][0-9][0-9]) code=$out ;;
+      esac
+    fi
+  elif wget --spider -q -T 1 -t 1 "$1" 2>/dev/null; then
+    code=200
+  fi
+  printf '%s' "$code"
+}
+o=$(probe http://127.0.0.1:11434/api/version)
+l=$(probe http://127.0.0.1:1234/v1/models)
+c=$(probe http://127.0.0.1:8080/v1/models)
+x=$(probe http://127.0.0.1:8000/v1/models)
+printf '{"ollama":%s,"lm-studio":%s,"llamacpp":%s,"openai-compat":%s}\n' "$o" "$l" "$c" "$x"
+"#;
+
 /// One row of `wsl.exe -l --verbose` after filtering and parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WslDistroEntry {
