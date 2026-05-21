@@ -60,24 +60,25 @@ pub struct RunHandle {
 }
 
 impl Engine {
-    /// Materialise the scratch dir a run uses when the caller didn't
-    /// supply a workspace_override. `prefix` distinguishes child runs
-    /// (`compose-<run_id>`) from primary ones (`<run_id>`); a create
-    /// failure logs + returns the path anyway since the engine treats
-    /// a missing workspace as "fall back to engine home" downstream.
-    fn ensure_run_workspace(&self, run_id: &str, prefix: Option<&str>) -> PathBuf {
-        let dir_name = match prefix {
-            Some(p) => format!("{p}{run_id}"),
-            None => run_id.to_string(),
-        };
-        let path = self.home().join("workspaces").join(&dir_name);
-        if let Err(e) = std::fs::create_dir_all(&path) {
-            tracing::warn!(
-                error = ?e, path = %path.display(),
-                "could not create run workspace; falling back to engine home",
-            );
+    /// Allocate a per-run scratch dir under `<home>/workspaces/`.
+    /// `prefix` (empty for primary runs) distinguishes children. On
+    /// create failure, fall back to engine home so subprocess CWDs
+    /// stay valid instead of failing with `No such file or directory`.
+    fn ensure_run_workspace(&self, run_id: &str, prefix: &str) -> PathBuf {
+        let path = self
+            .home()
+            .join("workspaces")
+            .join(format!("{prefix}{run_id}"));
+        match std::fs::create_dir_all(&path) {
+            Ok(()) => path,
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e, path = %path.display(),
+                    "could not create run workspace; falling back to engine home",
+                );
+                self.home().to_path_buf()
+            },
         }
-        path
     }
 
     /// Start a workflow run. Returns immediately with a
@@ -138,7 +139,7 @@ impl Engine {
         );
 
         let workspace =
-            workspace_override.unwrap_or_else(|| self.ensure_run_workspace(&rec.run_id, None));
+            workspace_override.unwrap_or_else(|| self.ensure_run_workspace(&rec.run_id, ""));
 
         let run_id = rec.run_id.clone();
         let engine = Arc::clone(self);
@@ -223,6 +224,7 @@ impl Engine {
         parent_cancel: &CancellationToken,
         compose_depth: u32,
         workspace_override: Option<PathBuf>,
+        scratch_prefix: &str,
     ) -> Result<(RunSummary, HashMap<(String, String), PortValue>)> {
         crate::validation::validate(&child_wf)?;
         let rec = Arc::new(RunRecorder::start(
@@ -247,10 +249,10 @@ impl Engine {
             ]),
         );
         // Inherit parent workspace when provided; else allocate a
-        // per-child scratch dir prefixed `compose-` so it stays
-        // distinguishable from primary runs.
+        // per-child scratch dir distinguishable from primary runs
+        // by the caller-supplied prefix (`compose-`, `parallel-`).
         let workspace = workspace_override
-            .unwrap_or_else(|| self.ensure_run_workspace(&rec.run_id, Some("compose-")));
+            .unwrap_or_else(|| self.ensure_run_workspace(&rec.run_id, scratch_prefix));
         let child_cancel = parent_cancel.child_token();
         self.run_loop_inner(
             child_wf,

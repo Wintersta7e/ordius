@@ -240,7 +240,14 @@ fn spawn_one(
     let child_cancel = group_cancel.clone();
     joinset.spawn(async move {
         let res = engine
-            .run_child_workflow(child_wf, vars, &child_cancel, next_depth, Some(workspace))
+            .run_child_workflow(
+                child_wf,
+                vars,
+                &child_cancel,
+                next_depth,
+                Some(workspace),
+                "parallel-",
+            )
             .await;
         match res {
             Ok((summary, outputs)) => {
