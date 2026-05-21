@@ -8,6 +8,7 @@ pub mod dispatcher;
 mod http_client;
 pub mod in_process;
 pub mod subprocess;
+pub mod supervisor;
 
 #[cfg(test)]
 mod test_support;

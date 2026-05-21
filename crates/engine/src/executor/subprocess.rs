@@ -26,6 +26,8 @@
 
 use crate::emitter::Emitter;
 use crate::events::EventType;
+#[cfg(unix)]
+use crate::executor::supervisor::CANCEL_GRACE;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::template::{SubstitutionContext, default_env_allowlist, substitute};
 use crate::types::{ExecutionBackend, Node, NodeType, OutputParse, PortValue};
@@ -34,21 +36,10 @@ use jsonpath_rust::JsonPath;
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
-#[cfg(unix)]
-use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-
-/// Grace period between SIGTERM and SIGKILL on Unix. Long enough
-/// for shells and Python interpreters to flush stdout, short
-/// enough that a hung child doesn't block run finalization.
-///
-/// Windows cancellation uses `TerminateJobObject`, which is hard-
-/// kill only — no grace window — so this constant is Unix-only.
-#[cfg(unix)]
-const CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 // ---- Contract strings shared with the registry + downstream consumers ----
 
@@ -683,6 +674,8 @@ mod tests {
     use crate::executor::test_support::{
         make_ctx as test_ctx, subprocess_node_type, trivial_subprocess_node as trivial_node,
     };
+    #[cfg(unix)]
+    use std::time::Duration;
     use tempfile::TempDir;
     use tokio::sync::broadcast;
 
