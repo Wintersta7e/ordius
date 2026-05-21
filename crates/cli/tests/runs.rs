@@ -232,6 +232,49 @@ fn run_with_workspace_flag_sets_shell_cwd_to_workspace_dir() {
 }
 
 #[test]
+fn run_without_workspace_flag_uses_scratch_dir_as_shell_cwd() {
+    // Without --workspace, shell nodes CWD into the engine scratch
+    // dir, not the CLI invocation dir.
+    let home = TempDir::new().unwrap();
+    let marker_workflow = r#"{
+      "id": "scratch",
+      "name": "Scratch",
+      "schema_version": 1,
+      "nodes": [
+        {
+          "id": "touch",
+          "type": "shell",
+          "name": "touch",
+          "config": { "command": "touch ordius-scratch-marker" }
+        }
+      ],
+      "edges": []
+    }"#;
+    seed(&home, "scratch", marker_workflow);
+    cli(&home).args(["run", "scratch"]).assert().success();
+
+    // Walk `<home>/workspaces/*/` and assert the marker landed in
+    // exactly one of them — we don't know the run id up front.
+    let workspaces_dir = home.path().join("workspaces");
+    let entries: Vec<_> = fs::read_dir(&workspaces_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    let with_marker = entries
+        .iter()
+        .filter(|e| e.path().join("ordius-scratch-marker").exists())
+        .count();
+    assert_eq!(
+        with_marker,
+        1,
+        "expected exactly one scratch dir under {} to contain the marker; \
+         found {with_marker} (entries: {:?})",
+        workspaces_dir.display(),
+        entries.iter().map(|e| e.file_name()).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
 fn run_with_unknown_workspace_id_errors() {
     let home = TempDir::new().unwrap();
     seed(&home, "demo", DEMO_WORKFLOW);

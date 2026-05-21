@@ -108,3 +108,25 @@ fn rename_rejects_empty_name() {
         Err(WorkspacesError::EmptyName),
     ));
 }
+
+#[test]
+fn rename_allows_duplicate_display_names() {
+    // Names are user-facing labels; the GUI selector distinguishes
+    // by id, so the engine deliberately doesn't enforce uniqueness.
+    let home = TempDir::new().unwrap();
+    let a = TempDir::new().unwrap();
+    let b = TempDir::new().unwrap();
+    let first = add(home.path(), "shared", a.path()).unwrap();
+    let second = add(home.path(), "other", b.path()).unwrap();
+
+    let renamed = rename(home.path(), &second.id, "shared").unwrap();
+    assert_eq!(renamed.name, "shared");
+
+    let listed = list(home.path()).unwrap();
+    let shared_count = listed.iter().filter(|w| w.name == "shared").count();
+    assert_eq!(
+        shared_count, 2,
+        "rename should allow two workspaces with the same display name",
+    );
+    assert_ne!(first.id, renamed.id, "ids stay distinct");
+}
