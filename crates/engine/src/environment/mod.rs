@@ -8,6 +8,7 @@ mod local;
 mod detect;
 pub use detect::{detect, detect_platform};
 
+mod wsl;
+
 // Submodules added in subsequent tasks:
-// mod wsl;
 // mod custom;
