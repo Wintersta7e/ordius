@@ -1,16 +1,29 @@
 //! WSL distro enumeration + in-distro probe.
 //!
-//! Parser-only in this module checkpoint; the subprocess-spawning
-//! callers land in the next commit and discharge the `dead_code`
-//! allow.
+//! The detect-orchestration path that wires `enumerate_wsl_distros` /
+//! `enumerate_running_distros` into the namespace fan-out lands in a
+//! later phase; until then the public surface is dead from the
+//! compiler's perspective. `dead_code` is silenced module-wide so the
+//! incremental commits in this series keep the workspace clippy gate
+//! green.
 
 #![allow(dead_code)]
 
 use super::types::WslState;
+use crate::executor::supervisor;
+use std::collections::HashSet;
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
+
+const ENUM_TIMEOUT: Duration = Duration::from_millis(1500);
+const RUNNING_TIMEOUT: Duration = Duration::from_millis(500);
+const MAX_LIST_STDOUT: usize = 64 * 1024;
 
 /// One row of `wsl.exe -l --verbose` after filtering and parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct WslDistroEntry {
+pub struct WslDistroEntry {
     /// Distro name as reported by `wsl.exe` (e.g. `Ubuntu-24.04`).
     pub name: String,
     /// Running / Stopped at the moment the command ran.
@@ -96,6 +109,67 @@ pub(super) fn parse_running_quiet(bytes: &[u8]) -> Vec<String> {
 
 fn is_filtered(name: &str) -> bool {
     matches!(name, "docker-desktop" | "docker-desktop-data")
+}
+
+/// Spawn `wsl.exe -l --verbose`, parse the result into entries.
+///
+/// Returns an empty vec on any failure path: missing `wsl.exe`
+/// (e.g. non-Windows hosts), spawn errors, stdout read errors, or
+/// the bounded timeout firing. The caller treats all failure modes
+/// the same — no WSL distros to probe.
+pub async fn enumerate_wsl_distros() -> Vec<WslDistroEntry> {
+    let Some(bytes) = run_wsl_list(&["-l", "--verbose"], ENUM_TIMEOUT).await else {
+        return Vec::new();
+    };
+    parse_verbose(&bytes)
+}
+
+/// Return the set of currently-running distro names.
+///
+/// Runs `wsl.exe -l --running --quiet`. Used as the pre-probe race
+/// re-check so we don't poke a distro that exited between the
+/// verbose enumeration and the probe dispatch. Same failure
+/// semantics as [`enumerate_wsl_distros`]: empty set on any error.
+pub async fn enumerate_running_distros() -> HashSet<String> {
+    let Some(bytes) = run_wsl_list(&["-l", "--running", "--quiet"], RUNNING_TIMEOUT).await else {
+        return HashSet::new();
+    };
+    parse_running_quiet(&bytes).into_iter().collect()
+}
+
+async fn run_wsl_list(args: &[&str], budget: Duration) -> Option<Vec<u8>> {
+    let mut cmd = Command::new("wsl.exe");
+    for a in args {
+        cmd.arg(a);
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut sup = match supervisor::spawn(cmd) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(error = %e, "wsl.exe spawn failed");
+            return None;
+        },
+    };
+
+    let mut stdout = sup.child_mut().stdout.take().expect("piped");
+    let mut buf = Vec::with_capacity(MAX_LIST_STDOUT);
+
+    let mut limited = (&mut stdout).take(MAX_LIST_STDOUT as u64);
+    let read_outcome = tokio::time::timeout(budget, limited.read_to_end(&mut buf)).await;
+    let _ = supervisor::cancel(&mut sup).await;
+
+    match read_outcome {
+        Ok(Ok(_)) => Some(buf),
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "wsl.exe stdout read failed");
+            None
+        },
+        Err(_) => {
+            tracing::warn!("wsl.exe {:?} timed out after {:?}", args, budget);
+            None
+        },
+    }
 }
 
 #[cfg(test)]
