@@ -160,3 +160,25 @@ export function systemStatus(): Promise<SystemStatus> {
 export function systemEnvironment(): Promise<EnvironmentReport> {
   return invoke("system_environment");
 }
+
+export function refreshEnvironment(): Promise<EnvironmentReport> {
+  return invoke("refresh_environment");
+}
+
+export function addCustomNamespace(
+  label: string,
+  host: string,
+): Promise<EnvironmentReport> {
+  return invoke("add_custom_namespace", { label, host });
+}
+
+export function removeCustomNamespace(id: string): Promise<EnvironmentReport> {
+  return invoke("remove_custom_namespace", { id });
+}
+
+export function setNamespaceEnabled(
+  id: string,
+  enabled: boolean,
+): Promise<EnvironmentReport> {
+  return invoke("set_namespace_enabled", { id, enabled });
+}
