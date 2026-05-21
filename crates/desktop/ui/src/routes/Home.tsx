@@ -24,6 +24,7 @@ import {
   type Workflow,
   type Workspace,
   deleteWorkflow,
+  duplicateWorkflow,
   listRuns,
   listWorkflows,
   listWorkspaces,
@@ -219,6 +220,25 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
   const handleRun = useCallback((id: string) => {
     console.warn("run dialog lands in Phase 1.9", { id });
   }, []);
+  const handleDuplicate = useCallback(async (id: string) => {
+    const insideTauri =
+      typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+    if (!insideTauri) {
+      setError("duplicate requires the desktop host");
+      return;
+    }
+    try {
+      const clone = await duplicateWorkflow(id);
+      setError(null);
+      const next = await listWorkflows();
+      setWorkflows(next);
+      // Open the freshly-cloned workflow so the user can rename
+      // immediately if they want.
+      navigateRoute({ kind: "editor", workflowId: clone.id });
+    } catch (e: unknown) {
+      setError(`duplicate failed: ${String(e)}`);
+    }
+  }, []);
   const handleDelete = useCallback(async (id: string) => {
     const insideTauri =
       typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -392,6 +412,7 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
                     onOpen={handleOpen}
                     onRun={handleRun}
                     onDelete={(id) => void handleDelete(id)}
+                    onDuplicate={(id) => void handleDuplicate(id)}
                   />
                 ))}
                 <NewWorkflowCard onClick={handleNewWorkflow} />

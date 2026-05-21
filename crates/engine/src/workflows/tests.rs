@@ -100,3 +100,30 @@ fn delete_removes_file_and_returns_true() {
         "second delete reports false"
     );
 }
+
+#[test]
+fn duplicate_creates_clone_with_copy_suffix() {
+    let home = TempDir::new().unwrap();
+    write_workflow(&home, "demo", DEMO_JSON);
+
+    let clone = duplicate(home.path(), "demo").unwrap();
+    assert_eq!(clone.id, "demo-copy");
+    assert!(clone.name.ends_with("(copy)"));
+    assert!(path(home.path(), "demo-copy").exists());
+    assert!(path(home.path(), "demo").exists(), "original is preserved",);
+}
+
+#[test]
+fn duplicate_collisions_get_numeric_suffix() {
+    let home = TempDir::new().unwrap();
+    write_workflow(&home, "demo", DEMO_JSON);
+
+    let first = duplicate(home.path(), "demo").unwrap();
+    assert_eq!(first.id, "demo-copy");
+
+    let second = duplicate(home.path(), "demo").unwrap();
+    assert_eq!(second.id, "demo-copy-2");
+
+    let third = duplicate(home.path(), "demo").unwrap();
+    assert_eq!(third.id, "demo-copy-3");
+}

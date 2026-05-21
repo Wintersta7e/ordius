@@ -39,6 +39,10 @@ export function validateWorkflow(workflow: Workflow): Promise<void> {
   return invoke("validate_workflow", { workflow });
 }
 
+export function duplicateWorkflow(id: string): Promise<Workflow> {
+  return invoke("duplicate_workflow", { id });
+}
+
 export function deleteWorkflow(id: string): Promise<boolean> {
   return invoke("delete_workflow", { id });
 }

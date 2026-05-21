@@ -112,6 +112,20 @@ pub fn delete_workflow(state: tauri::State<'_, AppState>, id: String) -> Result<
     ordius_engine::workflows::delete(state.engine.home(), &id).map_err(|e| e.to_string())
 }
 
+/// Clone an existing workflow to a fresh `<id>-copy` (collisions are
+/// resolved by appending `-2`, `-3`, ...) with a `(copy)` suffix on
+/// the display name. Returns the saved clone.
+#[tauri::command]
+pub fn duplicate_workflow(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<WorkflowDto, String> {
+    validate_workflow_id(&id)?;
+    let wf =
+        ordius_engine::workflows::duplicate(state.engine.home(), &id).map_err(|e| e.to_string())?;
+    Ok(JsonCamel(wf))
+}
+
 // ─── Runs ────────────────────────────────────────────────────────
 
 /// Start a workflow run. Streams events back via the `Channel`

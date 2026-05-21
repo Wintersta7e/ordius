@@ -34,6 +34,7 @@ pub fn run() {
             commands::save_workflow,
             commands::validate_workflow,
             commands::delete_workflow,
+            commands::duplicate_workflow,
             commands::run_workflow,
             commands::stop_run,
             commands::deliver_event,

@@ -41,6 +41,8 @@ interface Props {
   /** Optional. Caller provides the confirmation + IPC call; the
    * card surfaces only the affordance. */
   onDelete?: (id: string) => void;
+  /** Optional. Caller handles the IPC + opens the clone. */
+  onDuplicate?: (id: string) => void;
 }
 
 const STATUS_COLOR: Record<string, string> = {
@@ -64,6 +66,7 @@ export function WorkflowCard({
   onOpen,
   onRun,
   onDelete,
+  onDuplicate,
 }: Props): JSX.Element {
   const [hover, setHover] = useState(false);
   const w = workflow;
@@ -178,6 +181,36 @@ export function WorkflowCard({
         >
           {Ic["play"]?.({ size: 10 })}
         </button>
+        {onDuplicate ? (
+          <button
+            type="button"
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onDuplicate(w.id);
+            }}
+            title="Duplicate workflow"
+            aria-label={`Duplicate workflow ${w.name}`}
+            style={{
+              appearance: "none",
+              border: 0,
+              width: 22,
+              height: 22,
+              borderRadius: 2,
+              background: "transparent",
+              color: hover ? "var(--accent)" : "var(--txt-faint)",
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              cursor: "pointer",
+              transition: "color .15s",
+              fontFamily: "var(--mono)",
+              fontSize: 13,
+            }}
+          >
+            ⎘
+          </button>
+        ) : null}
         {onDelete ? (
           <button
             type="button"

@@ -129,6 +129,30 @@ pub fn save(home: &Path, wf: &Workflow) -> Result<(), WorkflowsError> {
     })
 }
 
+/// Duplicate an existing workflow. The clone gets a fresh id
+/// (`<source>-copy`, then `-copy-2`, `-copy-3`, ... to avoid
+/// collisions) and a `(copy)` suffix on the display name. Returns
+/// the saved clone.
+pub fn duplicate(home: &Path, source_id: &str) -> Result<Workflow, WorkflowsError> {
+    let original = load(home, source_id)?;
+    let new_id = unique_clone_id(home, source_id);
+    let mut clone = original;
+    clone.id = new_id;
+    clone.name = format!("{} (copy)", clone.name);
+    save(home, &clone)?;
+    Ok(clone)
+}
+
+fn unique_clone_id(home: &Path, base: &str) -> String {
+    let mut candidate = format!("{base}-copy");
+    let mut counter = 2;
+    while path(home, &candidate).exists() {
+        candidate = format!("{base}-copy-{counter}");
+        counter += 1;
+    }
+    candidate
+}
+
 /// Delete a workflow by id. Returns `Ok(true)` if the file existed
 /// and was removed, `Ok(false)` if the file was missing.
 pub fn delete(home: &Path, id: &str) -> Result<bool, WorkflowsError> {
