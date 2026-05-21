@@ -291,3 +291,41 @@ pub fn spawn(cmd: Command) -> std::io::Result<Supervised> {
 pub async fn cancel(sup: &mut Supervised) -> Option<i32> {
     platform_cancel(sup).await
 }
+
+#[cfg(test)]
+#[cfg(unix)]
+mod unix_tests {
+    use super::*;
+    use std::process::Stdio;
+
+    #[tokio::test]
+    async fn cancel_kills_grandchild_via_pgroup() {
+        // Backgrounded `sleep 30 &` survives the immediate `sh` exit
+        // unless we signal the pgroup. Without pgroup signaling it
+        // would be orphaned to init; with pgroup signaling SIGKILL
+        // gets delivered to the surviving grandchild.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 30 & sleep 30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let mut sup = spawn(cmd).expect("spawn");
+        let pgid = i32::try_from(sup.pid).expect("pid fits in i32");
+
+        // Give the shell 50ms to fork the backgrounded grandchild.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let _ = cancel(&mut sup).await;
+
+        // Verify no process in the pgroup is alive. kill(-pgid, None)
+        // returns ESRCH if the group is empty.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let result = nix::sys::signal::kill(nix::unistd::Pid::from_raw(-pgid), None);
+        match result {
+            Err(nix::errno::Errno::ESRCH) => {}, // expected
+            Ok(()) => panic!("pgroup {pgid} still has live members after cancel"),
+            Err(e) => panic!("kill -0 failed unexpectedly: {e}"),
+        }
+    }
+}
