@@ -167,7 +167,12 @@ export function LeftRail({
                     const namespaceLabel =
                       environment.namespaces.find((n) => n.id === ep.namespaceId)
                         ?.label ?? ep.namespaceId;
-                    const rowState = ep.type === "direct" ? "ok" : "unknown";
+                    const rowState: SysRowState =
+                      ep.type === "direct"
+                        ? "ok"
+                        : ep.type === "only-via-namespace"
+                          ? "warn"
+                          : "unknown";
                     return (
                       <SysRow
                         key={`${ep.namespaceId}::${ep.kind}::${ep.observedUrl}`}
@@ -359,6 +364,8 @@ function RunningRow({
   );
 }
 
+type SysRowState = "ok" | "warn" | "down" | "unknown";
+
 function SysRow({
   label,
   detail,
@@ -367,11 +374,12 @@ function SysRow({
 }: {
   label: string;
   detail: string;
-  state: "ok" | "down" | "unknown";
+  state: SysRowState;
   last?: boolean;
 }): JSX.Element {
-  const colorMap: Record<string, string> = {
+  const colorMap: Record<SysRowState, string> = {
     ok: "var(--ok)",
+    warn: "var(--warn)",
     down: "var(--err)",
     unknown: "var(--txt-faint)",
   };

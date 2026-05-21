@@ -1018,14 +1018,21 @@ function ModelsSection({
                         save endpoint
                       </button>
                     )
-                  ) : (
+                  ) : ep.type === "only-via-namespace" ? (
                     <span
-                      title={`Not directly reachable — via ${ep.namespaceId}. Phase 6 will add the full tooltip.`}
+                      title={
+                        `This service is bound inside ${ep.namespaceId} and is not ` +
+                        `directly reachable from the host. Bind it to 0.0.0.0 to ` +
+                        `expose it to the agent.\n\n` +
+                        `Note: 0.0.0.0 also exposes the service to your LAN. Set a ` +
+                        `Windows Firewall rule, or use WSL networkingMode = mirrored ` +
+                        `in your .wslconfig, if untrusted devices share your network.`
+                      }
                       style={{ color: "var(--warn)", fontSize: 11 }}
                     >
                       ⚠ via {ep.namespaceId}
                     </span>
-                  )}
+                  ) : null}
                 </div>
               );
             })}
