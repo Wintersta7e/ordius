@@ -23,6 +23,7 @@ import {
 } from "../engine";
 import { Canvas, type CanvasHandle } from "../components/canvas";
 import { portTip } from "../components/canvas/types";
+import { attachWindowDrag } from "../lib/windowDrag";
 import {
   DEMO_NODE_TYPES,
   DEMO_WORKFLOW,
@@ -48,6 +49,7 @@ import type { Route } from "../lib/router";
 
 interface Props {
   workflowId: string | undefined;
+  runOnOpen?: boolean;
   theme: "dark" | "light";
   onThemeToggle: () => void;
   onNavigate: (route: Route) => void;
@@ -55,6 +57,7 @@ interface Props {
 
 export function Editor({
   workflowId,
+  runOnOpen = false,
   theme,
   onThemeToggle,
   onNavigate,
@@ -90,26 +93,15 @@ export function Editor({
     }
   }, [propsW]);
 
-  // Home's ▶ button writes the workflow id to sessionStorage so this
-  // route auto-opens the run dialog once the workflow has loaded.
-  // We clear the flag on consumption so re-navigating to the editor
-  // (e.g. from another card) doesn't re-trigger.
+  // Re-navigating to the same workflow without runOnOpen must not
+  // re-trigger the dialog, so guard against repeats per workflow id.
+  const runOnOpenConsumed = useRef<string | null>(null);
   useEffect(() => {
-    if (!workflow) return;
-    let flagged: string | null = null;
-    try {
-      flagged = window.sessionStorage.getItem("ordius.run-on-open");
-    } catch {
-      return;
-    }
-    if (!flagged || flagged !== workflow.id) return;
-    try {
-      window.sessionStorage.removeItem("ordius.run-on-open");
-    } catch {
-      /* see above */
-    }
+    if (!workflow || !runOnOpen) return;
+    if (runOnOpenConsumed.current === workflow.id) return;
+    runOnOpenConsumed.current = workflow.id;
     setRunDialogOpen(true);
-  }, [workflow]);
+  }, [workflow, runOnOpen]);
 
   // Cmd/Ctrl+P → focus the palette filter input. Matches the keystroke
   // advertised on the empty-canvas hint; preventDefault stops the
@@ -149,6 +141,16 @@ export function Editor({
     fromPort: string;
     cursorWorld: { x: number; y: number };
   } | null>(null);
+
+  // Tears down window listeners if the editor unmounts mid-drag.
+  const activeDragDetach = useRef<(() => void) | null>(null);
+  useEffect(
+    () => () => {
+      activeDragDetach.current?.();
+      activeDragDetach.current = null;
+    },
+    [],
+  );
 
   const insideTauri =
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -626,9 +628,8 @@ export function Editor({
       setDrag(initial);
 
       const finish = (commit: boolean, upX: number, upY: number) => {
-        window.removeEventListener("pointermove", onMove);
-        window.removeEventListener("pointerup", onUp);
-        window.removeEventListener("keydown", onKey);
+        activeDragDetach.current?.();
+        activeDragDetach.current = null;
         setDrag(null);
         setDropPreview(null);
         if (!commit) return;
@@ -646,43 +647,42 @@ export function Editor({
         }
       };
 
-      const onMove = (event: PointerEvent) => {
-        const dx = event.clientX - current.startX;
-        const dy = event.clientY - current.startY;
-        const nextActive =
-          current.active || Math.hypot(dx, dy) >= DRAG_THRESHOLD_PX;
-        current = {
-          ...current,
-          x: event.clientX,
-          y: event.clientY,
-          active: nextActive,
-        };
-        setDrag(current);
-        const handle = canvasHandleRef.current;
-        if (
-          nextActive &&
-          handle &&
-          handle.containsScreenPoint(event.clientX, event.clientY)
-        ) {
-          const world = handle.screenToWorld(event.clientX, event.clientY);
-          setDropPreview({
-            x: world.x - NODE_HALF_W,
-            y: world.y - NODE_HALF_H,
-            label: current.label,
-          });
-        } else {
-          setDropPreview(null);
-        }
-      };
-      const onUp = (event: PointerEvent) => {
-        finish(true, event.clientX, event.clientY);
-      };
-      const onKey = (event: KeyboardEvent) => {
-        if (event.key === "Escape") finish(false, 0, 0);
-      };
-      window.addEventListener("pointermove", onMove);
-      window.addEventListener("pointerup", onUp);
-      window.addEventListener("keydown", onKey);
+      activeDragDetach.current = attachWindowDrag({
+        onMove(event) {
+          const dx = event.clientX - current.startX;
+          const dy = event.clientY - current.startY;
+          const nextActive =
+            current.active || Math.hypot(dx, dy) >= DRAG_THRESHOLD_PX;
+          current = {
+            ...current,
+            x: event.clientX,
+            y: event.clientY,
+            active: nextActive,
+          };
+          setDrag(current);
+          const handle = canvasHandleRef.current;
+          if (
+            nextActive &&
+            handle &&
+            handle.containsScreenPoint(event.clientX, event.clientY)
+          ) {
+            const world = handle.screenToWorld(event.clientX, event.clientY);
+            setDropPreview({
+              x: world.x - NODE_HALF_W,
+              y: world.y - NODE_HALF_H,
+              label: current.label,
+            });
+          } else {
+            setDropPreview(null);
+          }
+        },
+        onUp(event) {
+          finish(true, event.clientX, event.clientY);
+        },
+        onKey(event) {
+          if (event.key === "Escape") finish(false, 0, 0);
+        },
+      });
     },
     [nodeTypes, handleAddNode, handleAddNodeAt],
   );
@@ -748,9 +748,8 @@ export function Editor({
       });
 
       const finish = (commit: boolean, upX: number, upY: number) => {
-        window.removeEventListener("pointermove", onMove);
-        window.removeEventListener("pointerup", onUp);
-        window.removeEventListener("keydown", onKey);
+        activeDragDetach.current?.();
+        activeDragDetach.current = null;
         setConnect(null);
         if (!commit) return;
         const target = document.elementFromPoint(upX, upY) as
@@ -769,22 +768,22 @@ export function Editor({
         );
       };
 
-      const onMove = (event: PointerEvent) => {
-        const live = canvasHandleRef.current;
-        if (!live) return;
-        const world = live.screenToWorld(event.clientX, event.clientY);
-        setConnect((current) =>
-          current ? { ...current, cursorWorld: world } : current,
-        );
-      };
-      const onUp = (event: PointerEvent) =>
-        finish(true, event.clientX, event.clientY);
-      const onKey = (event: KeyboardEvent) => {
-        if (event.key === "Escape") finish(false, 0, 0);
-      };
-      window.addEventListener("pointermove", onMove);
-      window.addEventListener("pointerup", onUp);
-      window.addEventListener("keydown", onKey);
+      activeDragDetach.current = attachWindowDrag({
+        onMove(event) {
+          const live = canvasHandleRef.current;
+          if (!live) return;
+          const world = live.screenToWorld(event.clientX, event.clientY);
+          setConnect((current) =>
+            current ? { ...current, cursorWorld: world } : current,
+          );
+        },
+        onUp(event) {
+          finish(true, event.clientX, event.clientY);
+        },
+        onKey(event) {
+          if (event.key === "Escape") finish(false, 0, 0);
+        },
+      });
     },
     [handleCreateEdge],
   );

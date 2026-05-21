@@ -9,7 +9,12 @@
 /** Routes wired in the GUI. */
 export type Route =
   | { kind: "home" }
-  | { kind: "editor"; workflowId?: string | undefined }
+  | {
+      kind: "editor";
+      workflowId?: string | undefined;
+      /** Auto-open the run dialog after the workflow loads. */
+      runOnOpen?: boolean | undefined;
+    }
   | { kind: "history" }
   | { kind: "settings" };
 

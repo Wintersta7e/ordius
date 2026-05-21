@@ -30,6 +30,7 @@ function App() {
       return (
         <Editor
           workflowId={route.workflowId}
+          runOnOpen={route.runOnOpen ?? false}
           theme={theme}
           onThemeToggle={toggleTheme}
           onNavigate={setRoute}
