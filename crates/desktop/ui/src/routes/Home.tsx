@@ -23,6 +23,7 @@ import {
   type SystemStatus,
   type Workflow,
   type Workspace,
+  deleteWorkflow,
   listRuns,
   listWorkflows,
   listWorkspaces,
@@ -218,6 +219,30 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
   const handleRun = useCallback((id: string) => {
     console.warn("run dialog lands in Phase 1.9", { id });
   }, []);
+  const handleDelete = useCallback(async (id: string) => {
+    const insideTauri =
+      typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+    if (!insideTauri) {
+      setError("delete requires the desktop host");
+      return;
+    }
+    const ok = window.confirm(
+      `Delete workflow "${id}"?\n\nThis removes the on-disk JSON. Saved run history is kept.`,
+    );
+    if (!ok) return;
+    try {
+      const deleted = await deleteWorkflow(id);
+      if (!deleted) {
+        setError(`delete: workflow ${id} not found`);
+        return;
+      }
+      setError(null);
+      const next = await listWorkflows();
+      setWorkflows(next);
+    } catch (e: unknown) {
+      setError(`delete failed: ${String(e)}`);
+    }
+  }, []);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const handleImport = useCallback(() => {
     fileInputRef.current?.click();
@@ -366,6 +391,7 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
                     workflow={card}
                     onOpen={handleOpen}
                     onRun={handleRun}
+                    onDelete={(id) => void handleDelete(id)}
                   />
                 ))}
                 <NewWorkflowCard onClick={handleNewWorkflow} />

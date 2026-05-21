@@ -38,6 +38,9 @@ interface Props {
   workflow: WorkflowCardData;
   onOpen: (id: string) => void;
   onRun: (id: string) => void;
+  /** Optional. Caller provides the confirmation + IPC call; the
+   * card surfaces only the affordance. */
+  onDelete?: (id: string) => void;
 }
 
 const STATUS_COLOR: Record<string, string> = {
@@ -56,7 +59,12 @@ const TRIGGER_GLYPH: Record<string, string> = {
   "file-watch": "◫",
 };
 
-export function WorkflowCard({ workflow, onOpen, onRun }: Props): JSX.Element {
+export function WorkflowCard({
+  workflow,
+  onOpen,
+  onRun,
+  onDelete,
+}: Props): JSX.Element {
   const [hover, setHover] = useState(false);
   const w = workflow;
   const base = catColor(w.category, "base");
@@ -170,6 +178,34 @@ export function WorkflowCard({ workflow, onOpen, onRun }: Props): JSX.Element {
         >
           {Ic["play"]?.({ size: 10 })}
         </button>
+        {onDelete ? (
+          <button
+            type="button"
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onDelete(w.id);
+            }}
+            title="Delete workflow"
+            aria-label={`Delete workflow ${w.name}`}
+            style={{
+              appearance: "none",
+              border: 0,
+              width: 22,
+              height: 22,
+              borderRadius: 2,
+              background: "transparent",
+              color: hover ? "var(--err)" : "var(--txt-faint)",
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              cursor: "pointer",
+              transition: "color .15s",
+            }}
+          >
+            {Ic["x"]?.({ size: 12 })}
+          </button>
+        ) : null}
       </div>
 
       <p
