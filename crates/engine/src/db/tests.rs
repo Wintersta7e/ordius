@@ -2,6 +2,7 @@ use super::open;
 
 const EXPECTED_TABLES: &[&str] = &[
     "kv_store",
+    "namespace_overrides",
     "node_outputs",
     "node_runs",
     "run_events",
@@ -32,25 +33,42 @@ fn open_creates_schema() {
 }
 
 #[test]
-fn open_seeds_schema_version_to_one() {
+fn open_seeds_schema_version_to_two() {
     let f = tempfile::NamedTempFile::new().unwrap();
     let pool = open(f.path()).unwrap();
     let conn = pool.get().unwrap();
     let version: i64 = conn
-        .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+        .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
 }
 
 #[test]
 fn open_is_idempotent() {
     let f = tempfile::NamedTempFile::new().unwrap();
     drop(open(f.path()).unwrap());
-    // Re-open: schema is already at v1, migration should no-op.
+    // Re-open: schema is already at v2, migration should no-op.
     let pool = open(f.path()).unwrap();
     let conn = pool.get().unwrap();
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+#[test]
+fn migration_v2_idempotent() {
+    let f = tempfile::NamedTempFile::new().unwrap();
+    drop(open(f.path()).unwrap());
+    drop(open(f.path()).unwrap());
+    let pool = open(f.path()).unwrap();
+    let conn = pool.get().unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='namespace_overrides'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(count, 1);
 }

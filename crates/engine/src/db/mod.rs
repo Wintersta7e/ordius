@@ -16,8 +16,13 @@ pub type DbPool = Pool<SqliteConnectionManager>;
 /// current schema version. WAL journalling and foreign-key
 /// enforcement are enabled on every connection.
 pub fn open<P: AsRef<Path>>(path: P) -> Result<DbPool> {
-    let mgr = SqliteConnectionManager::file(path)
-        .with_init(|c| c.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;"));
+    let mgr = SqliteConnectionManager::file(path).with_init(|c| {
+        c.execute_batch(
+            "PRAGMA foreign_keys = ON; \
+             PRAGMA journal_mode = WAL; \
+             PRAGMA busy_timeout = 5000;",
+        )
+    });
     let pool = Pool::builder().max_size(8).build(mgr)?;
     let conn = pool.get()?;
     migrations::apply(&conn)?;

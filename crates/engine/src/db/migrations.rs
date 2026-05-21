@@ -98,7 +98,42 @@ CREATE INDEX IF NOT EXISTS run_events_node_idx       ON run_events (run_id, node
 INSERT OR IGNORE INTO schema_version (version) VALUES (1);
 ";
 
+/// Schema v2: per-namespace overrides table. Additive only.
+/// CHECK constraint enforces that custom rows carry both `custom_label`
+/// and `custom_host`, while non-custom rows (e.g. `wsl:Ubuntu`, `local`)
+/// must have neither.
+const MIGRATION_V2: &str = r"
+CREATE TABLE IF NOT EXISTS namespace_overrides (
+    namespace_id    TEXT PRIMARY KEY,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    custom_label    TEXT,
+    custom_host     TEXT,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    CHECK (
+        (namespace_id LIKE 'custom:%' AND custom_label IS NOT NULL AND custom_host IS NOT NULL)
+        OR
+        (namespace_id NOT LIKE 'custom:%' AND custom_label IS NULL AND custom_host IS NULL)
+    )
+);
+INSERT OR IGNORE INTO schema_version (version) VALUES (2);
+";
+
 /// Apply the bundled migration set to `conn`. Idempotent.
+///
+/// V1 is unconditionally re-run because all of its statements are
+/// `IF NOT EXISTS` / `INSERT OR IGNORE`; this also guarantees the
+/// `schema_version` row exists before we read it. Then `MAX(version)`
+/// gates V2 so we don't run it twice on databases already at v2.
 pub(super) fn apply(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(MIGRATION_V1)
+    conn.execute_batch(MIGRATION_V1)?;
+    let v: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+        [],
+        |r| r.get(0),
+    )?;
+    if v < 2 {
+        conn.execute_batch(MIGRATION_V2)?;
+    }
+    Ok(())
 }
