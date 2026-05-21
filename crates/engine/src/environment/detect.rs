@@ -1,5 +1,6 @@
 //! Top-level detection orchestration.
 
+use super::custom::probe_custom_namespace;
 use super::local::{build_local_record, probe_local_namespace};
 use super::types::{
     DiscoveredEndpoint, EnvironmentReport, HostPlatform, NamespaceInfo, NamespaceKind,
@@ -51,12 +52,18 @@ pub fn detect_platform() -> (HostPlatform, Option<String>) {
 /// Detect the host environment: Local + every reachable namespace.
 ///
 /// Sets a hard deadline before any IO, then probes Local, enumerates
-/// WSL distros (and, in a later phase, Custom namespaces), spawns one
-/// probe task per namespace into a [`JoinSet`], drains cooperatively
-/// at the probe-budget deadline, and detaches any tasks still alive
-/// at the hard deadline so their teardown completes on the runtime
-/// independently of this function returning.
-pub async fn detect(_home: &Path, _pool: &DbPool) -> EnvironmentReport {
+/// WSL distros + user-added Custom namespaces (read from the
+/// `namespace_overrides` table), spawns one probe task per namespace
+/// into a [`JoinSet`], drains cooperatively at the probe-budget
+/// deadline, and detaches any tasks still alive at the hard deadline
+/// so their teardown completes on the runtime independently of this
+/// function returning.
+///
+/// `home` is currently unused at the orchestrator level but reserved
+/// for future side-channel writes (probe-history caches, etc.);
+/// `pool` is consulted for `namespace_overrides`.
+pub async fn detect(home: &Path, pool: &DbPool) -> EnvironmentReport {
+    let _ = home; // reserved for future probe-history writes
     // 1. Hard deadline FIRST, before any I/O.
     let hard_deadline = Instant::now() + TOTAL_DETECTION_BUDGET + TEARDOWN_GRACE;
     // 2. Probe-budget deadline — the inner loop joins until this elapses.
@@ -75,7 +82,7 @@ pub async fn detect(_home: &Path, _pool: &DbPool) -> EnvironmentReport {
     // 5. Enumerate WSL/Custom. On timeout return partial(Local).
     let Ok(target_namespaces) = tokio::time::timeout_at(
         hard_deadline.into(),
-        enumerate_target_namespaces(host_platform),
+        enumerate_target_namespaces(host_platform, pool),
     )
     .await
     else {
@@ -103,11 +110,9 @@ pub async fn detect(_home: &Path, _pool: &DbPool) -> EnvironmentReport {
                 NamespaceKind::WslDistro { name, .. } => {
                     probe_wsl_namespace(&ns_clone, name, tok).await
                 },
-                NamespaceKind::Custom { .. } => {
-                    // Phase 4 fills this in.
-                    NamespaceProbeResult::Unreachable {
-                        reason: "custom probe not yet implemented".into(),
-                    }
+                NamespaceKind::Custom { host } => {
+                    let host_str = host.0.to_string();
+                    probe_custom_namespace(&ns_clone, &host_str, tok).await
                 },
                 _ => NamespaceProbeResult::Unreachable {
                     reason: "unexpected kind in target list".into(),
@@ -164,19 +169,25 @@ pub async fn detect(_home: &Path, _pool: &DbPool) -> EnvironmentReport {
 
 /// Enumerate every non-Local target the current host can probe.
 ///
-/// Phase 3: WSL distros only. Phase 4 extends this to include user-
-/// supplied custom namespaces loaded from the run DB. Returns an
-/// empty Vec on hosts that cannot reach WSL (macOS, non-WSL Linux).
-async fn enumerate_target_namespaces(platform: HostPlatform) -> Vec<NamespaceInfo> {
-    // WSL only for now; phase 4 adds Custom from the DB.
-    if !matches!(platform, HostPlatform::Windows | HostPlatform::Wsl) {
-        return Vec::new();
-    }
-    let distros = enumerate_wsl_distros().await;
-    let running = enumerate_running_distros().await;
-    distros
-        .into_iter()
-        .map(|d| {
+/// WSL distros (Windows + WSL hosts) are enumerated via `wsl.exe` and
+/// have their `enabled` flag applied from `namespace_overrides`.
+/// Custom namespaces materialize from the same table: every row whose
+/// id starts with `custom:` becomes a [`NamespaceInfo`] with a
+/// [`NamespaceKind::Custom`] host. Invalid host strings are silently
+/// skipped (a defensive guard; `add_custom` validates on insert, but
+/// out-of-band edits to the DB shouldn't crash the probe).
+///
+/// Returns an empty Vec on hosts that cannot reach WSL **and** have
+/// no Custom overrides (macOS, non-WSL Linux without user-added
+/// remotes).
+async fn enumerate_target_namespaces(platform: HostPlatform, pool: &DbPool) -> Vec<NamespaceInfo> {
+    let mut out = Vec::new();
+    let overrides = crate::namespaces::list(pool).unwrap_or_default();
+
+    if matches!(platform, HostPlatform::Windows | HostPlatform::Wsl) {
+        let distros = enumerate_wsl_distros().await;
+        let running = enumerate_running_distros().await;
+        for d in distros {
             let actually_running =
                 matches!(d.state, WslState::Running) && running.contains(&d.name);
             let state = if actually_running {
@@ -185,22 +196,53 @@ async fn enumerate_target_namespaces(platform: HostPlatform) -> Vec<NamespaceInf
                 WslState::Stopped
             };
             let id = format!("wsl:{}", d.name);
-            let initial_reachable = match state {
-                WslState::Running => NamespaceState::Reachable,
-                WslState::Stopped => NamespaceState::Stopped,
+            let enabled = overrides
+                .iter()
+                .find(|o| o.namespace_id == id)
+                .is_none_or(|o| o.enabled);
+            let initial_reachable = if !enabled {
+                NamespaceState::Disabled
+            } else if matches!(state, WslState::Stopped) {
+                NamespaceState::Stopped
+            } else {
+                NamespaceState::Reachable
             };
-            NamespaceInfo {
+            out.push(NamespaceInfo {
                 id,
                 label: format!("WSL: {}", d.name),
                 kind: NamespaceKind::WslDistro {
                     name: d.name,
                     state,
                 },
-                enabled: true,
+                enabled,
                 reachable: initial_reachable,
-            }
-        })
-        .collect()
+            });
+        }
+    }
+
+    for o in &overrides {
+        if !o.namespace_id.starts_with("custom:") {
+            continue;
+        }
+        let (Some(label), Some(host_str)) = (&o.custom_label, &o.custom_host) else {
+            continue;
+        };
+        let Ok(host) = crate::namespaces::validate_host(host_str) else {
+            continue;
+        };
+        out.push(NamespaceInfo {
+            id: o.namespace_id.clone(),
+            label: label.clone(),
+            kind: NamespaceKind::Custom { host },
+            enabled: o.enabled,
+            reachable: if o.enabled {
+                NamespaceState::Reachable
+            } else {
+                NamespaceState::Disabled
+            },
+        });
+    }
+    out
 }
 
 /// Fold the per-namespace probe results into a single
