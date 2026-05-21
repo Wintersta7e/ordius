@@ -22,6 +22,7 @@ import {
   validateWorkflow,
 } from "../engine";
 import { Canvas, type CanvasHandle } from "../components/canvas";
+import { portTip } from "../components/canvas/types";
 import {
   DEMO_NODE_TYPES,
   DEMO_WORKFLOW,
@@ -117,6 +118,15 @@ export function Editor({
   const [dropPreview, setDropPreview] = useState<
     { x: number; y: number; label: string } | null
   >(null);
+
+  // Port→port edge drag state. `connect` carries the source endpoint
+  // plus the live cursor world position so Canvas can render a
+  // preview line straight to the cursor.
+  const [connect, setConnect] = useState<{
+    fromNodeId: string;
+    fromPort: string;
+    cursorWorld: { x: number; y: number };
+  } | null>(null);
 
   const insideTauri =
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -604,6 +614,123 @@ export function Editor({
     [nodeTypes, handleAddNode, handleAddNodeAt],
   );
 
+  /** Create an edge from output port → input port. Validates against
+   * self-loops and duplicates; silently no-ops on rejection so a bad
+   * drop just dismisses the preview. */
+  const handleCreateEdge = useCallback(
+    (
+      from: { nodeId: string; port: string },
+      to: { nodeId: string; port: string },
+    ) => {
+      if (from.nodeId === to.nodeId) return;
+      setWorkflow((wf) => {
+        if (!wf) return wf;
+        const dup = wf.edges.some(
+          (e) =>
+            e.fromNodeId === from.nodeId &&
+            e.fromPort === from.port &&
+            e.toNodeId === to.nodeId &&
+            e.toPort === to.port,
+        );
+        if (dup) return wf;
+        const id = synthesiseEdgeId(wf.edges);
+        return {
+          ...wf,
+          edges: [
+            ...wf.edges,
+            {
+              id,
+              fromNodeId: from.nodeId,
+              fromPort: from.port,
+              toNodeId: to.nodeId,
+              toPort: to.port,
+              edgeType: "forward",
+            },
+          ],
+        };
+      });
+      setTabs((existing) =>
+        existing.map((t) =>
+          t.id === activeId ? { ...t, dirty: true } : t,
+        ),
+      );
+    },
+    [activeId],
+  );
+
+  /** Start an edge drag from an output port. Pointer listeners are
+   * attached synchronously here (same pattern as palette drag) so a
+   * rapid press-release without movement still hits pointerup. */
+  const handleBeginConnect = useCallback(
+    (fromNodeId: string, fromPort: string, startX: number, startY: number) => {
+      const handle = canvasHandleRef.current;
+      const initialWorld = handle?.screenToWorld(startX, startY) ?? {
+        x: 0,
+        y: 0,
+      };
+      setConnect({
+        fromNodeId,
+        fromPort,
+        cursorWorld: initialWorld,
+      });
+
+      const finish = (commit: boolean, upX: number, upY: number) => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        window.removeEventListener("keydown", onKey);
+        setConnect(null);
+        if (!commit) return;
+        const target = document.elementFromPoint(upX, upY) as
+          | HTMLElement
+          | null;
+        if (!target) return;
+        const portEl = target.closest<HTMLElement>("[data-port-node-id]");
+        if (!portEl) return;
+        const side = portEl.dataset["portSide"];
+        const toNodeId = portEl.dataset["portNodeId"];
+        const toPort = portEl.dataset["portName"];
+        if (side !== "in" || !toNodeId || !toPort) return;
+        handleCreateEdge(
+          { nodeId: fromNodeId, port: fromPort },
+          { nodeId: toNodeId, port: toPort },
+        );
+      };
+
+      const onMove = (event: PointerEvent) => {
+        const live = canvasHandleRef.current;
+        if (!live) return;
+        const world = live.screenToWorld(event.clientX, event.clientY);
+        setConnect((current) =>
+          current ? { ...current, cursorWorld: world } : current,
+        );
+      };
+      const onUp = (event: PointerEvent) =>
+        finish(true, event.clientX, event.clientY);
+      const onKey = (event: KeyboardEvent) => {
+        if (event.key === "Escape") finish(false, 0, 0);
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+      window.addEventListener("keydown", onKey);
+    },
+    [handleCreateEdge],
+  );
+
+  // Derive the world-space preview line endpoints (source port tip
+  // + live cursor) from the connect state. Returns null when no
+  // edge drag is in flight.
+  const connectPreview = (() => {
+    if (!connect) return null;
+    const fromNode = workflow?.nodes.find((n) => n.id === connect.fromNodeId);
+    if (!fromNode) return null;
+    const fromType = nodeTypes.find((t) => t.id === fromNode.type);
+    const fromPorts = fromType?.outputs.map((p) => p.name) ?? [
+      connect.fromPort,
+    ];
+    const from = portTip(fromNode, fromPorts, connect.fromPort, "out", "standard");
+    return { from, to: connect.cursorWorld };
+  })();
+
   return (
     <div
       style={{
@@ -679,6 +806,8 @@ export function Editor({
                   : undefined
               }
               dropPreview={dropPreview}
+              onPortConnectStart={handleBeginConnect}
+              connectPreview={connectPreview}
             />
           ) : (
             <div
@@ -848,6 +977,18 @@ function synthesiseNodeId(
   while (ids.has(candidate)) {
     counter += 1;
     candidate = `${typeId}-${counter}`;
+  }
+  return candidate;
+}
+
+/** Pick an id like `e-7` that doesn't collide with existing edges. */
+function synthesiseEdgeId(existing: ReadonlyArray<{ id: string }>): string {
+  const ids = new Set(existing.map((e) => e.id));
+  let counter = 1;
+  let candidate = `e-${counter}`;
+  while (ids.has(candidate)) {
+    counter += 1;
+    candidate = `e-${counter}`;
   }
   return candidate;
 }

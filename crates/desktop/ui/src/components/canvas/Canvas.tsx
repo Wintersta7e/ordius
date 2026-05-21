@@ -63,6 +63,20 @@ interface Props {
   /** When set, renders a drop-indicator crosshair at the given world
    * coordinates — used while a palette item is being dragged over. */
   dropPreview?: { x: number; y: number; label?: string } | null;
+  /** Fires when the user grabs an output pin to wire a new edge. */
+  onPortConnectStart?: (
+    nodeId: string,
+    portName: string,
+    screenX: number,
+    screenY: number,
+  ) => void;
+  /** While an edge is being drawn, two world-space endpoints + a
+   * highlight colour for the preview stroke. */
+  connectPreview?: {
+    from: { x: number; y: number };
+    to: { x: number; y: number };
+    color?: string;
+  } | null;
 }
 
 interface PanState {
@@ -91,6 +105,8 @@ export const Canvas = forwardRef(function CanvasInner(
     edgeStyle = "orthogonal",
     runState,
     dropPreview,
+    onPortConnectStart,
+    connectPreview,
   }: Props,
   ref: ForwardedRef<CanvasHandle>,
 ): JSX.Element {
@@ -320,9 +336,64 @@ export const Canvas = forwardRef(function CanvasInner(
                 runStatus={status}
                 onSelect={onSelect}
                 onDragStart={onNodeDragStart}
+                {...(onPortConnectStart
+                  ? { onPortConnectStart }
+                  : {})}
               />
             );
           })}
+          {connectPreview ? (
+            <svg
+              aria-hidden="true"
+              style={{
+                position: "absolute",
+                left: Math.min(connectPreview.from.x, connectPreview.to.x) - 12,
+                top: Math.min(connectPreview.from.y, connectPreview.to.y) - 12,
+                width:
+                  Math.abs(connectPreview.to.x - connectPreview.from.x) + 24,
+                height:
+                  Math.abs(connectPreview.to.y - connectPreview.from.y) + 24,
+                pointerEvents: "none",
+                overflow: "visible",
+              }}
+            >
+              <line
+                x1={
+                  connectPreview.from.x -
+                  (Math.min(connectPreview.from.x, connectPreview.to.x) - 12)
+                }
+                y1={
+                  connectPreview.from.y -
+                  (Math.min(connectPreview.from.y, connectPreview.to.y) - 12)
+                }
+                x2={
+                  connectPreview.to.x -
+                  (Math.min(connectPreview.from.x, connectPreview.to.x) - 12)
+                }
+                y2={
+                  connectPreview.to.y -
+                  (Math.min(connectPreview.from.y, connectPreview.to.y) - 12)
+                }
+                stroke={connectPreview.color ?? "var(--accent)"}
+                strokeWidth={2}
+                strokeDasharray="6 4"
+                style={{ filter: "drop-shadow(0 0 4px var(--accent))" }}
+              />
+              <circle
+                cx={
+                  connectPreview.to.x -
+                  (Math.min(connectPreview.from.x, connectPreview.to.x) - 12)
+                }
+                cy={
+                  connectPreview.to.y -
+                  (Math.min(connectPreview.from.y, connectPreview.to.y) - 12)
+                }
+                r={4}
+                fill={connectPreview.color ?? "var(--accent)"}
+                opacity={0.85}
+              />
+            </svg>
+          ) : null}
           {dropPreview ? (
             <div
               style={{

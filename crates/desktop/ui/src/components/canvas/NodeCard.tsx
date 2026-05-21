@@ -34,6 +34,13 @@ interface Props {
   runStatus?: NodeRunStatus | undefined;
   onSelect: (id: string) => void;
   onDragStart: (event: MouseEvent, id: string) => void;
+  /** Fires when an output pin is grabbed for edge-creation. */
+  onPortConnectStart?: (
+    nodeId: string,
+    portName: string,
+    screenX: number,
+    screenY: number,
+  ) => void;
 }
 
 export function NodeCard({
@@ -45,6 +52,7 @@ export function NodeCard({
   runStatus,
   onSelect,
   onDragStart,
+  onPortConnectStart,
 }: Props): JSX.Element {
   const cat = CATEGORIES[category];
   const w = NODE_W[density];
@@ -277,6 +285,7 @@ export function NodeCard({
           label={port.name}
           side="in"
           color={base}
+          nodeId={node.id}
         />
       ))}
       {/* Output pins (right side) */}
@@ -288,6 +297,8 @@ export function NodeCard({
           side="out"
           color={base}
           cardWidth={w}
+          nodeId={node.id}
+          {...(onPortConnectStart ? { onConnectStart: onPortConnectStart } : {})}
         />
       ))}
     </div>
@@ -300,9 +311,26 @@ interface PinProps {
   side: "in" | "out";
   color: string;
   cardWidth?: number;
+  nodeId: string;
+  /** Output-pin only — fires when the user starts dragging from
+   * this pin to wire it to another node. */
+  onConnectStart?: (
+    nodeId: string,
+    portName: string,
+    screenX: number,
+    screenY: number,
+  ) => void;
 }
 
-function Pin({ y, label, side, color, cardWidth = 0 }: PinProps): JSX.Element {
+function Pin({
+  y,
+  label,
+  side,
+  color,
+  cardWidth = 0,
+  nodeId,
+  onConnectStart,
+}: PinProps): JSX.Element {
   const isOut = side === "out";
   return (
     <div
@@ -319,6 +347,18 @@ function Pin({ y, label, side, color, cardWidth = 0 }: PinProps): JSX.Element {
       }}
     >
       <div
+        data-port-node-id={nodeId}
+        data-port-name={label}
+        data-port-side={side}
+        onPointerDown={
+          side === "out" && onConnectStart
+            ? (event) => {
+                if (event.button !== 0) return;
+                event.stopPropagation();
+                onConnectStart(nodeId, label, event.clientX, event.clientY);
+              }
+            : undefined
+        }
         style={{
           width: PIN_W,
           height: 4,
