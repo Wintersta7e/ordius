@@ -11,14 +11,18 @@ import {
   type Settings as SettingsShape,
   type SystemStatus,
   type Workspace,
+  addCustomNamespace,
   addSecret,
   addWorkspace,
   getSettings,
   listSecrets,
   listWorkspaces,
+  refreshEnvironment,
+  removeCustomNamespace,
   renameWorkspace,
   removeSecret,
   removeWorkspace,
+  setNamespaceEnabled,
   setSettings,
   systemEnvironment,
   systemStatus,
@@ -39,6 +43,7 @@ import type { Route } from "../lib/router";
 
 type SectionId =
   | "secrets"
+  | "environments"
   | "workspaces"
   | "retention"
   | "concurrency"
@@ -52,6 +57,7 @@ const SECTIONS: Array<{
   description: string;
 }> = [
   { id: "secrets", label: "Secrets", description: "API keys, tokens, passwords" },
+  { id: "environments", label: "Environments", description: "Namespaces probed for LLM services" },
   { id: "workspaces", label: "Workspaces", description: "Project folders workflows run against" },
   { id: "retention", label: "Retention", description: "Run history & workspace cleanup" },
   { id: "concurrency", label: "Concurrency", description: "Parallel workflow & node limits" },
@@ -345,6 +351,12 @@ export function Settings({
               insideTauri={insideTauri}
             />
           ) : null}
+          {active === "environments" ? (
+            <EnvironmentsSection
+              environment={environment}
+              onEnvironmentChange={setEnvironment}
+            />
+          ) : null}
           {active === "workspaces" ? (
             <WorkspacesSection
               workspaces={workspaces}
@@ -586,6 +598,205 @@ function SecretsSection({
           ))
         )}
       </div>
+    </div>
+  );
+}
+
+// ─── Environments ────────────────────────────────────────────────
+
+function EnvironmentsSection({
+  environment,
+  onEnvironmentChange,
+}: {
+  environment: EnvironmentReport | null;
+  onEnvironmentChange: (env: EnvironmentReport) => void;
+}): JSX.Element | null {
+  const [busy, setBusy] = useState(false);
+  const [newLabel, setNewLabel] = useState("");
+  const [newHost, setNewHost] = useState("");
+  const [hostError, setHostError] = useState<string | null>(null);
+
+  if (!environment) return null;
+
+  const handleToggle = async (id: string, enabled: boolean) => {
+    setBusy(true);
+    try {
+      const env = await setNamespaceEnabled(id, enabled);
+      onEnvironmentChange(env);
+    } catch (e) {
+      console.error("toggle failed:", e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const validateClientSide = (host: string): string | null => {
+    if (!host) return "host required";
+    if (host.includes("://") || host.includes("/") || host.includes("@"))
+      return "no scheme, path, or credentials";
+    if (host.toLowerCase() === "localhost") return "use Local namespace";
+    return null;
+  };
+
+  const handleAdd = async () => {
+    const err = validateClientSide(newHost);
+    if (err) {
+      setHostError(err);
+      return;
+    }
+    setHostError(null);
+    setBusy(true);
+    try {
+      const env = await addCustomNamespace(newLabel, newHost);
+      onEnvironmentChange(env);
+      setNewLabel("");
+      setNewHost("");
+    } catch (e) {
+      setHostError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRemove = async (id: string) => {
+    if (!window.confirm(`Remove ${id}?`)) return;
+    setBusy(true);
+    try {
+      const env = await removeCustomNamespace(id);
+      onEnvironmentChange(env);
+    } catch (e) {
+      console.error("remove failed:", e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRefresh = async () => {
+    setBusy(true);
+    try {
+      const env = await refreshEnvironment();
+      onEnvironmentChange(env);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div>
+      <Heading
+        text="Environments"
+        sub="namespaces probed for LLM services"
+      />
+      <Card>
+        {environment.namespaces.map((ns) => (
+          <div
+            key={ns.id}
+            style={{
+              display: "grid",
+              gridTemplateColumns: "auto 1fr auto auto",
+              gap: 10,
+              alignItems: "center",
+              padding: "10px 14px",
+              borderBottom: "1px solid var(--line-soft)",
+              fontFamily: "var(--mono)",
+              fontSize: 12,
+              color: "var(--txt)",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={ns.enabled}
+              onChange={(e) => void handleToggle(ns.id, e.target.checked)}
+              disabled={busy || ns.id === "local"}
+            />
+            <span>{ns.label}</span>
+            <span style={{ color: "var(--txt-dim)" }}>
+              {ns.reachable.state}
+            </span>
+            {ns.id.startsWith("custom:") ? (
+              <button
+                type="button"
+                className="btn"
+                onClick={() => void handleRemove(ns.id)}
+                disabled={busy}
+                style={{ height: 22, padding: "0 10px" }}
+              >
+                ✕
+              </button>
+            ) : (
+              <span />
+            )}
+          </div>
+        ))}
+        <div style={{ padding: "10px 14px", display: "flex", gap: 8 }}>
+          <input
+            placeholder="Label"
+            value={newLabel}
+            onChange={(e) => setNewLabel(e.target.value)}
+            disabled={busy}
+            style={{
+              flex: 1,
+              background: "var(--bg-input)",
+              border: "1px solid var(--line)",
+              color: "var(--txt)",
+              fontFamily: "var(--mono)",
+              fontSize: 12,
+              padding: "5px 8px",
+              borderRadius: 2,
+              outline: "none",
+            }}
+          />
+          <input
+            placeholder="Host (e.g. 192.0.2.10)"
+            value={newHost}
+            onChange={(e) => setNewHost(e.target.value)}
+            disabled={busy}
+            style={{
+              flex: 1,
+              background: "var(--bg-input)",
+              border: "1px solid var(--line)",
+              color: "var(--txt)",
+              fontFamily: "var(--mono)",
+              fontSize: 12,
+              padding: "5px 8px",
+              borderRadius: 2,
+              outline: "none",
+            }}
+          />
+          <button
+            type="button"
+            className="btn"
+            onClick={() => void handleAdd()}
+            disabled={busy || !newLabel || !newHost}
+            style={{ height: 28, padding: "0 12px" }}
+          >
+            + Add
+          </button>
+        </div>
+        {hostError ? (
+          <div
+            style={{
+              padding: "4px 14px",
+              color: "var(--warn)",
+              fontSize: 11,
+              fontFamily: "var(--mono)",
+            }}
+          >
+            {hostError}
+          </div>
+        ) : null}
+        <div style={{ padding: "10px 14px" }}>
+          <button
+            type="button"
+            className="btn"
+            onClick={() => void handleRefresh()}
+            disabled={busy}
+            style={{ height: 22, padding: "0 10px" }}
+          >
+            ↻ Refresh
+          </button>
+        </div>
+      </Card>
     </div>
   );
 }
