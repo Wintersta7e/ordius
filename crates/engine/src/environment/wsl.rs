@@ -9,13 +9,16 @@
 
 #![allow(dead_code)]
 
-use super::types::WslState;
+use super::types::{
+    DiscoveredEndpoint, NamespaceInfo, NamespaceProbeResult, NamespaceState, ReachHint, WslState,
+};
 use crate::executor::supervisor;
 use std::collections::HashSet;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 const ENUM_TIMEOUT: Duration = Duration::from_millis(1500);
 const RUNNING_TIMEOUT: Duration = Duration::from_millis(500);
@@ -207,9 +210,164 @@ async fn run_wsl_list(args: &[&str], budget: Duration) -> Option<Vec<u8>> {
     }
 }
 
+const PROBE_BUDGET: Duration = Duration::from_secs(2);
+const MAX_PROBE_STDOUT: usize = 8 * 1024;
+const MAX_PROBE_STDERR: usize = 8 * 1024;
+
+/// Probe a single WSL distro by dispatching [`STATIC_SCRIPT`] via
+/// `wsl.exe -d <name> --exec /bin/sh -c`. Reads both stdout and
+/// stderr with bounded capacity, races a per-probe timeout against
+/// the external `cancel` token, then captures the child's exit code
+/// via supervised cancel. Maps the outcome to a single
+/// [`NamespaceProbeResult`] for the orchestrator to slot into its
+/// results map.
+///
+/// All failure modes (spawn error, read error, non-zero exit, timeout,
+/// outer-cancel) collapse to [`NamespaceProbeResult::Unreachable`]
+/// with a human-readable reason. A successful exit with parseable
+/// JSON returns [`NamespaceProbeResult::Done`].
+pub(super) async fn probe_wsl_namespace(
+    ns: &NamespaceInfo,
+    distro_name: &str,
+    cancel: CancellationToken,
+) -> NamespaceProbeResult {
+    let mut cmd = Command::new("wsl.exe");
+    cmd.arg("-d")
+        .arg(distro_name)
+        .arg("--exec")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(STATIC_SCRIPT)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut sup = match supervisor::spawn(cmd) {
+        Ok(s) => s,
+        Err(e) => {
+            return NamespaceProbeResult::Unreachable {
+                reason: format!("spawn wsl.exe: {e}"),
+            };
+        },
+    };
+
+    let mut stdout = sup.child_mut().stdout.take().expect("piped");
+    let mut stderr = sup.child_mut().stderr.take().expect("piped");
+    let mut stdout_buf = Vec::with_capacity(MAX_PROBE_STDOUT);
+    let mut stderr_buf = Vec::with_capacity(MAX_PROBE_STDERR);
+
+    let mut stdout_limited = (&mut stdout).take(MAX_PROBE_STDOUT as u64);
+    let mut stderr_limited = (&mut stderr).take(MAX_PROBE_STDERR as u64);
+    let read_stdout = stdout_limited.read_to_end(&mut stdout_buf);
+    let read_stderr = stderr_limited.read_to_end(&mut stderr_buf);
+    let read_both = futures::future::try_join(read_stdout, read_stderr);
+
+    let read_outcome: Result<Result<(usize, usize), std::io::Error>, ()> = tokio::select! {
+        r = tokio::time::timeout(PROBE_BUDGET, read_both) => match r {
+            Ok(Ok(pair)) => Ok(Ok(pair)),
+            Ok(Err(e)) => Ok(Err(e)),
+            Err(_) => Err(()),
+        },
+        () = cancel.cancelled() => Err(()),
+    };
+
+    let exit_code = supervisor::cancel(&mut sup).await;
+
+    if !stderr_buf.is_empty() {
+        tracing::debug!(
+            distro = distro_name,
+            stderr = %String::from_utf8_lossy(&stderr_buf),
+            "wsl probe stderr",
+        );
+    }
+
+    match (read_outcome, exit_code) {
+        (Ok(Ok(_)), Some(0)) => parse_probe_output(ns, distro_name, &stdout_buf),
+        (Ok(Ok(_)), Some(code)) => NamespaceProbeResult::Unreachable {
+            reason: format!("wsl probe failed (exit {code}); see tracing::debug for stderr"),
+        },
+        (Ok(Ok(_)), None) => NamespaceProbeResult::Unreachable {
+            reason: "wsl probe failed (no exit code)".into(),
+        },
+        (Ok(Err(e)), _) => NamespaceProbeResult::Unreachable {
+            reason: format!("wsl probe stdout read: {e}"),
+        },
+        (Err(()), _) => NamespaceProbeResult::Unreachable {
+            reason: "wsl probe timed out or outer-cancelled".into(),
+        },
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ProbeJson {
+    error: Option<String>,
+    ollama: Option<u16>,
+    #[serde(rename = "lm-studio")]
+    lm_studio: Option<u16>,
+    llamacpp: Option<u16>,
+    #[serde(rename = "openai-compat")]
+    openai_compat: Option<u16>,
+}
+
+fn parse_probe_output(
+    ns: &NamespaceInfo,
+    distro_name: &str,
+    stdout: &[u8],
+) -> NamespaceProbeResult {
+    let parsed: ProbeJson = match serde_json::from_slice(stdout) {
+        Ok(p) => p,
+        Err(e) => {
+            return NamespaceProbeResult::Unreachable {
+                reason: format!("malformed probe output: {e}"),
+            };
+        },
+    };
+    if let Some(err) = parsed.error {
+        return NamespaceProbeResult::Done {
+            namespace: NamespaceInfo {
+                reachable: NamespaceState::NotProbeable { reason: err },
+                ..ns.clone()
+            },
+            endpoints: Vec::new(),
+        };
+    }
+    let mut endpoints = Vec::new();
+    for (kind, code, port) in [
+        ("ollama", parsed.ollama, 11434_u16),
+        ("lm-studio", parsed.lm_studio, 1234),
+        ("llamacpp", parsed.llamacpp, 8080),
+        ("openai-compat", parsed.openai_compat, 8000),
+    ] {
+        if matches!(code, Some(c) if (100..600).contains(&c)) {
+            let observed = format!("http://127.0.0.1:{port}");
+            endpoints.push(DiscoveredEndpoint::OnlyViaNamespace {
+                kind: kind.to_string(),
+                name: format!(
+                    "{kind} ({} via {distro_name})",
+                    observed.trim_start_matches("http://"),
+                ),
+                namespace_id: ns.id.clone(),
+                observed_url: observed,
+                hint: ReachHint::WslLoopbackBound,
+                co_visible_in: Vec::new(),
+            });
+        }
+    }
+    NamespaceProbeResult::Done {
+        namespace: NamespaceInfo {
+            reachable: NamespaceState::Reachable,
+            ..ns.clone()
+        },
+        endpoints,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{WslDistroEntry, WslState, parse_running_quiet, parse_verbose};
+    use super::super::types::NamespaceKind;
+    use super::{
+        DiscoveredEndpoint, NamespaceInfo, NamespaceProbeResult, NamespaceState, WslDistroEntry,
+        WslState, parse_probe_output, parse_running_quiet, parse_verbose,
+    };
 
     fn utf16_le_no_bom(s: &str) -> Vec<u8> {
         s.encode_utf16().flat_map(u16::to_le_bytes).collect()
@@ -277,5 +435,75 @@ mod tests {
     #[test]
     fn parse_verbose_empty_input() {
         assert_eq!(parse_verbose(b""), Vec::<WslDistroEntry>::new());
+    }
+
+    #[test]
+    fn parse_probe_output_emits_only_via_namespace() {
+        let ns = NamespaceInfo {
+            id: "wsl:Ubuntu".into(),
+            label: "WSL: Ubuntu".into(),
+            kind: NamespaceKind::WslDistro {
+                name: "Ubuntu".into(),
+                state: WslState::Running,
+            },
+            enabled: true,
+            reachable: NamespaceState::Reachable,
+        };
+        let json = br#"{"ollama":200,"lm-studio":0,"llamacpp":200,"openai-compat":0}"#;
+        let result = parse_probe_output(&ns, "Ubuntu", json);
+        match result {
+            NamespaceProbeResult::Done { endpoints, .. } => {
+                assert_eq!(endpoints.len(), 2);
+                for ep in &endpoints {
+                    assert!(matches!(ep, DiscoveredEndpoint::OnlyViaNamespace { .. }));
+                }
+            },
+            _ => panic!("expected Done"),
+        }
+    }
+
+    #[test]
+    fn parse_probe_output_no_probe_tool_is_not_probeable() {
+        let ns = NamespaceInfo {
+            id: "wsl:Alpine".into(),
+            label: "WSL: Alpine".into(),
+            kind: NamespaceKind::WslDistro {
+                name: "Alpine".into(),
+                state: WslState::Running,
+            },
+            enabled: true,
+            reachable: NamespaceState::Reachable,
+        };
+        let json = br#"{"error":"no-probe-tool"}"#;
+        let result = parse_probe_output(&ns, "Alpine", json);
+        match result {
+            NamespaceProbeResult::Done {
+                namespace,
+                endpoints,
+            } => {
+                assert!(matches!(
+                    namespace.reachable,
+                    NamespaceState::NotProbeable { .. }
+                ));
+                assert!(endpoints.is_empty());
+            },
+            _ => panic!("expected Done with NotProbeable"),
+        }
+    }
+
+    #[test]
+    fn parse_probe_output_malformed_is_unreachable() {
+        let ns = NamespaceInfo {
+            id: "wsl:Garbage".into(),
+            label: "WSL: Garbage".into(),
+            kind: NamespaceKind::WslDistro {
+                name: "Garbage".into(),
+                state: WslState::Running,
+            },
+            enabled: true,
+            reachable: NamespaceState::Reachable,
+        };
+        let result = parse_probe_output(&ns, "Garbage", b"this is not json");
+        assert!(matches!(result, NamespaceProbeResult::Unreachable { .. }));
     }
 }
