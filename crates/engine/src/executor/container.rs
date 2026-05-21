@@ -97,6 +97,15 @@ impl NodeExecutor for ContainerExecutor {
 
         let env_strings: Vec<String> = env_pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
         let binds = if mount_workspace {
+            // Docker would silently create an empty host dir, masking
+            // a misconfigured workspace as a successful empty-data run.
+            if !ctx.workspace.exists() {
+                return Err(NodeError::Config(format!(
+                    "container: workspace path {} does not exist; \
+                     disable mount_workspace or fix the workspace binding",
+                    ctx.workspace.display(),
+                )));
+            }
             Some(vec![format!(
                 "{}:{}:{}",
                 ctx.workspace.to_string_lossy(),
