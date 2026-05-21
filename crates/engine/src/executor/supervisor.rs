@@ -151,10 +151,18 @@ fn platform_spawn(mut cmd: Command) -> std::io::Result<Supervised> {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
         SetInformationJobObject,
     };
-    use windows::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED};
+    use windows::Win32::System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+    };
 
     configure_windows_command(&mut cmd);
-    cmd.creation_flags(CREATE_SUSPENDED.0 | CREATE_NEW_PROCESS_GROUP.0);
+    // CREATE_NO_WINDOW suppresses the console popup that would otherwise
+    // appear when a GUI-subsystem parent (ordius.exe in Tauri 2 release
+    // mode has no console) spawns a console-subsystem child like wsl.exe.
+    // Without it, Windows allocates a fresh console for the child and
+    // pops it as a window — and on some builds the resulting handle
+    // setup produces `ERROR_NO_DATA` (0x800700e8) on CreateProcess.
+    cmd.creation_flags(CREATE_SUSPENDED.0 | CREATE_NEW_PROCESS_GROUP.0 | CREATE_NO_WINDOW.0);
     let child = cmd.spawn()?;
 
     // SAFETY: both args None; HANDLE owned and closed in Supervised::drop.
