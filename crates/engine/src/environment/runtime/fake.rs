@@ -120,11 +120,11 @@ impl Dispatcher for FakeRemoteDispatcher {
     async fn probe(
         &self,
         plan: ProbePlan,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<ProbeSummary, DispatchError> {
         let mut resources = HashMap::new();
         for def in &plan.defs {
-            let outcome = self.probe_resource(def, CancellationToken::new()).await;
+            let outcome = self.probe_resource(def, cancel.clone()).await;
             resources.insert(def.id.clone(), outcome);
         }
         let total = resources.len();
@@ -148,12 +148,17 @@ impl Dispatcher for FakeRemoteDispatcher {
     async fn probe_resource(
         &self,
         def: &ResourceDefinition,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> ResourceProbeOutcome {
         // Clone the seed while the lock is held for the minimum possible time.
         // Using map+cloned avoids naming the guard, so clippy does not see a
         // significant-drop temporary living into the match body.
-        let Some(seed) = self.seeded.lock().get(&def.id).cloned() else {
+        let seed = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return cancelled_probe_outcome(),
+            seed = async { self.seeded.lock().get(&def.id).cloned() } => seed,
+        };
+        let Some(seed) = seed else {
             return ResourceProbeOutcome::NotFound;
         };
 
@@ -247,6 +252,12 @@ impl Dispatcher for FakeRemoteDispatcher {
     }
 }
 
+fn cancelled_probe_outcome() -> ResourceProbeOutcome {
+    ResourceProbeOutcome::Skipped {
+        reason: "cancelled".into(),
+    }
+}
+
 // ── FakeHttpTransport ─────────────────────────────────────────────────────────
 
 /// Non-streaming `HttpTransport` stub. Always returns `200 {}`.
@@ -337,5 +348,39 @@ mod tests {
             panic!("expected Found, got {outcome:?}")
         };
         assert_eq!(base_url, "http://fake/11434");
+    }
+
+    #[tokio::test]
+    async fn fake_probe_cancelled_returns_skipped() {
+        let fake = FakeRemoteDispatcher::new(info("a")).with_seeded(
+            "ollama",
+            FakeResource::http("http://fake/11434", &[Capability::OllamaNative]),
+        );
+        let def = ResourceDefinition {
+            id: ResourceId("ollama".into()),
+            kind: ResourceKind::HttpEndpoint,
+            advertised_capabilities: vec![Capability::OllamaNative],
+            probe: ProbeSpec::Http {
+                ports: vec![11434],
+                routes: vec![HttpProbeRoute {
+                    path: "/api/version".into(),
+                    method: HttpProbeMethod::Get,
+                    flavor: ApiFlavor::OllamaNative,
+                    proves: vec![Capability::OllamaNative],
+                    models_jsonpath: None,
+                    fingerprint_jsonpaths: vec![],
+                }],
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let outcome = fake.probe_resource(&def, cancel).await;
+        assert!(matches!(
+            outcome,
+            ResourceProbeOutcome::Skipped { reason } if reason == "cancelled"
+        ));
     }
 }

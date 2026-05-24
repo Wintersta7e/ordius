@@ -330,6 +330,7 @@ impl LocalDispatcher {
                     extra_search_paths,
                     *timeout_ms,
                     default_timeout,
+                    cancel,
                     false,
                 )
                 .await
@@ -348,6 +349,7 @@ impl LocalDispatcher {
                     &[],
                     *timeout_ms,
                     default_timeout,
+                    cancel,
                     true,
                 )
                 .await
@@ -361,7 +363,7 @@ impl LocalDispatcher {
         routes: &[HttpProbeRoute],
         timeout_ms: Option<u64>,
         default_timeout: Duration,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> ResourceProbeOutcome {
         let timeout = timeout_ms
             .map(Duration::from_millis)
@@ -384,7 +386,12 @@ impl LocalDispatcher {
                     timeout,
                 };
 
-                match self.transport.execute(req).await {
+                let response = tokio::select! {
+                    () = cancel.cancelled() => return cancelled_probe_outcome(),
+                    response = self.transport.execute(req) => response,
+                };
+
+                match response {
                     Ok(resp) if (200..300).contains(&resp.status) => {
                         any_2xx = true;
                         for cap in &route.proves {
@@ -449,8 +456,13 @@ impl LocalDispatcher {
         extra_search_paths: &[String],
         timeout_ms: Option<u64>,
         default_timeout: Duration,
+        cancel: CancellationToken,
         is_toolchain: bool,
     ) -> ResourceProbeOutcome {
+        if cancel.is_cancelled() {
+            return cancelled_probe_outcome();
+        }
+
         // 1. Locate the binary.
         let Some(path) = which_with_fallback(bin, extra_search_paths) else {
             return ResourceProbeOutcome::NotFound;
@@ -461,11 +473,15 @@ impl LocalDispatcher {
             .map(Duration::from_millis)
             .unwrap_or(default_timeout);
         let mut command = tokio::process::Command::new(&path);
+        command.kill_on_drop(true);
         command.args(version_args);
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
 
-        let output = match tokio::time::timeout(timeout, command.output()).await {
+        let output = match tokio::select! {
+            () = cancel.cancelled() => return cancelled_probe_outcome(),
+            output = tokio::time::timeout(timeout, command.output()) => output,
+        } {
             Ok(Ok(out)) => out,
             Ok(Err(e)) => {
                 return ResourceProbeOutcome::ProbeFailed {
@@ -510,6 +526,12 @@ impl LocalDispatcher {
                 capabilities: def.advertised_capabilities.clone(),
             })
         }
+    }
+}
+
+fn cancelled_probe_outcome() -> ResourceProbeOutcome {
+    ResourceProbeOutcome::Skipped {
+        reason: "cancelled".into(),
     }
 }
 
@@ -806,6 +828,65 @@ mod tests {
                 .get(&ResourceId("slow-http".into())),
             Some(ResourceProbeOutcome::TimedOut)
         ));
+    }
+
+    #[tokio::test]
+    async fn probe_cancelled_returns_skipped() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r"{}")
+                    .set_delay(Duration::from_secs(1)),
+            )
+            .mount(&server)
+            .await;
+
+        let port = server.address().port();
+        let def = ResourceDefinition {
+            id: ResourceId("slow-http".into()),
+            kind: ResourceKind::HttpEndpoint,
+            advertised_capabilities: vec![Capability::OllamaNative],
+            probe: ProbeSpec::Http {
+                ports: vec![port],
+                routes: vec![HttpProbeRoute {
+                    path: "/api/version".into(),
+                    method: HttpProbeMethod::Get,
+                    flavor: ApiFlavor::OllamaNative,
+                    proves: vec![Capability::OllamaNative],
+                    models_jsonpath: None,
+                    fingerprint_jsonpaths: vec![],
+                }],
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        };
+        let plan = ProbePlan {
+            env_id: EnvId::local(),
+            registry_revision: 1,
+            defs: vec![def],
+            per_resource_timeout: Duration::from_secs(5),
+            max_concurrency: 1,
+            overall_budget: Duration::from_secs(10),
+        };
+        let cancel = CancellationToken::new();
+        let cancel_task = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                cancel.cancel();
+            })
+        };
+
+        let d = LocalDispatcher::new(local_info());
+        let summary = d.probe(plan, cancel).await.expect("probe ok");
+        cancel_task.await.expect("cancel task");
+
+        assert!(summary.catalog.resources.values().any(|outcome| matches!(
+            outcome,
+            ResourceProbeOutcome::Skipped { reason } if reason == "cancelled"
+        )));
     }
 
     #[tokio::test]
