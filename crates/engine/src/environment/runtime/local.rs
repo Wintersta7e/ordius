@@ -9,7 +9,9 @@ use futures::TryStreamExt;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use super::catalog::{ProvenRoute, ResourceDetail, ResourceProbeOutcome, RouteOrigin};
+use super::catalog::{
+    ProvenRoute, ResourceCatalog, ResourceDetail, ResourceProbeOutcome, RouteOrigin,
+};
 use super::dispatcher::{Dispatcher, HttpTransport, ResponseStream};
 use super::env::{EnvInfo, RunId, WorkspaceBinding};
 use super::error::DispatchError;
@@ -147,6 +149,13 @@ impl LocalDispatcher {
             transport: Arc::new(LocalHttpTransport::new()),
         }
     }
+
+    fn clone_shallow(&self) -> Self {
+        Self {
+            info: self.info.clone(),
+            transport: self.transport.clone(),
+        }
+    }
 }
 
 #[async_trait]
@@ -156,13 +165,68 @@ impl Dispatcher for LocalDispatcher {
         &self.info
     }
 
-    /// Full probe pass — implemented in Task 18.
+    /// Execute a full probe plan with a concurrency cap and overall budget.
     async fn probe(
         &self,
-        _plan: ProbePlan,
-        _cancel: CancellationToken,
+        plan: ProbePlan,
+        cancel: CancellationToken,
     ) -> Result<ProbeSummary, DispatchError> {
-        unimplemented!("Task 18 wires the probe orchestrator")
+        let started = std::time::Instant::now();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(plan.max_concurrency.max(1)));
+        let mut set =
+            tokio::task::JoinSet::<(super::resource::ResourceId, ResourceProbeOutcome)>::new();
+
+        for def in plan.defs.iter().cloned() {
+            let permit_source = semaphore.clone();
+            let dispatcher = self.clone_shallow();
+            let cancel = cancel.clone();
+
+            set.spawn(async move {
+                let _permit = permit_source.acquire_owned().await.expect("semaphore open");
+                let outcome = dispatcher.probe_resource(&def, cancel).await;
+                (def.id, outcome)
+            });
+        }
+
+        let overall_deadline = tokio::time::Instant::now() + plan.overall_budget;
+        let mut resources = std::collections::HashMap::new();
+        let mut total_probed = 0_usize;
+
+        while let Some(joined) = tokio::time::timeout_at(overall_deadline, set.join_next())
+            .await
+            .unwrap_or(None)
+        {
+            match joined {
+                Ok((id, outcome)) => {
+                    resources.insert(id, outcome);
+                    total_probed += 1;
+                },
+                Err(e) => {
+                    tracing::warn!("probe task join error: {e}");
+                },
+            }
+        }
+
+        set.abort_all();
+
+        for def in &plan.defs {
+            resources
+                .entry(def.id.clone())
+                .or_insert_with(|| ResourceProbeOutcome::Skipped {
+                    reason: "overall budget elapsed".into(),
+                });
+        }
+
+        Ok(ProbeSummary {
+            catalog: ResourceCatalog {
+                env_id: plan.env_id,
+                registry_revision: plan.registry_revision,
+                probed_at: chrono::Utc::now(),
+                resources,
+            },
+            total_probed,
+            elapsed: started.elapsed(),
+        })
     }
 
     /// Single-resource re-probe — implemented in Tasks 16 + 17.
@@ -649,5 +713,73 @@ mod tests {
         let d = LocalDispatcher::new(local_info());
         let outcome = d.probe_resource(&def, CancellationToken::new()).await;
         assert!(matches!(outcome, ResourceProbeOutcome::NotFound));
+    }
+
+    #[tokio::test]
+    async fn probe_runs_full_plan_concurrent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r"{}"))
+            .mount(&server)
+            .await;
+        let url = Url::parse(&server.uri()).unwrap();
+        let port = url.port().unwrap();
+
+        let plan = ProbePlan {
+            env_id: EnvId::local(),
+            registry_revision: 1,
+            defs: vec![
+                ResourceDefinition {
+                    id: ResourceId("ollama".into()),
+                    kind: ResourceKind::HttpEndpoint,
+                    advertised_capabilities: vec![Capability::OllamaNative],
+                    probe: ProbeSpec::Http {
+                        ports: vec![port],
+                        routes: vec![HttpProbeRoute {
+                            path: "/api/version".into(),
+                            method: HttpProbeMethod::Get,
+                            flavor: ApiFlavor::OllamaNative,
+                            proves: vec![Capability::OllamaNative],
+                            models_jsonpath: None,
+                            fingerprint_jsonpaths: vec![],
+                        }],
+                        timeout_ms: None,
+                    },
+                    override_lower_scope: false,
+                },
+                ResourceDefinition {
+                    id: ResourceId("git".into()),
+                    kind: ResourceKind::Toolchain,
+                    advertised_capabilities: vec![],
+                    probe: ProbeSpec::Toolchain {
+                        bin: "git".into(),
+                        version_args: vec!["--version".into()],
+                        version_regex: r"^git version (\S+)".into(),
+                        timeout_ms: None,
+                    },
+                    override_lower_scope: false,
+                },
+            ],
+            per_resource_timeout: Duration::from_secs(2),
+            max_concurrency: 4,
+            overall_budget: Duration::from_secs(5),
+        };
+
+        let d = LocalDispatcher::new(local_info());
+        let summary = d
+            .probe(plan, CancellationToken::new())
+            .await
+            .expect("probe ok");
+        assert_eq!(summary.total_probed, 2);
+        assert_eq!(summary.catalog.resources.len(), 2);
+        assert!(matches!(
+            summary.catalog.resources.get(&ResourceId("ollama".into())),
+            Some(ResourceProbeOutcome::Found(_))
+        ));
+        assert!(matches!(
+            summary.catalog.resources.get(&ResourceId("git".into())),
+            Some(ResourceProbeOutcome::Found(_))
+        ));
     }
 }
