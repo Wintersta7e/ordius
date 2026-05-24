@@ -27,8 +27,8 @@ pub enum ResourceKind {
 
 /// A specific feature a resource can offer.
 ///
-/// Per spec §2 round-3 MAJOR #7 — split so the `llm` node can require what it
-/// actually needs rather than a coarse `llm` capability.
+/// Capabilities are fine-grained so the `llm` node can require exactly what
+/// it needs rather than matching against a coarse category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
