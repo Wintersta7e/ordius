@@ -41,3 +41,5 @@ pub use transport::{
 pub use error::{DispatchError, RegistryError};
 
 pub use builtin::{BUILTIN_RESOURCES, builtin_by_id};
+
+pub use registry::{RegistryInner, ScopeKey};
