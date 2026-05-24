@@ -21,6 +21,8 @@ use super::transport::{
     EnvPath, HttpError, HttpMethod, HttpRequest, HttpResponse, ProcessCmd, WorkspaceHandle,
 };
 
+const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_millis(1_000);
+
 /// Reqwest-backed HTTP transport that operates in the host process's network
 /// namespace (direct loopback access, no tunnelling).
 ///
@@ -62,10 +64,13 @@ impl HttpTransport for LocalHttpTransport {
         if let Some(b) = req.body {
             builder = builder.body(b);
         }
-        let resp = builder
-            .send()
-            .await
-            .map_err(|e| HttpError::Transport(e.to_string()))?;
+        let resp = builder.send().await.map_err(|e| {
+            if e.is_timeout() {
+                HttpError::Timeout(req.timeout)
+            } else {
+                HttpError::Transport(e.to_string())
+            }
+        })?;
         let status = resp.status().as_u16();
         let headers = resp
             .headers()
@@ -180,10 +185,13 @@ impl Dispatcher for LocalDispatcher {
             let permit_source = semaphore.clone();
             let dispatcher = self.clone_shallow();
             let cancel = cancel.clone();
+            let default_timeout = plan.per_resource_timeout;
 
             set.spawn(async move {
                 let _permit = permit_source.acquire_owned().await.expect("semaphore open");
-                let outcome = dispatcher.probe_resource(&def, cancel).await;
+                let outcome = dispatcher
+                    .probe_resource_with_default_timeout(&def, default_timeout, cancel)
+                    .await;
                 (def.id, outcome)
             });
         }
@@ -235,48 +243,8 @@ impl Dispatcher for LocalDispatcher {
         def: &ResourceDefinition,
         cancel: CancellationToken,
     ) -> ResourceProbeOutcome {
-        match &def.probe {
-            ProbeSpec::Http {
-                ports,
-                routes,
-                timeout_ms,
-            } => self.probe_http(ports, routes, *timeout_ms, cancel).await,
-            ProbeSpec::Binary {
-                bin,
-                version_args,
-                version_regex,
-                extra_search_paths,
-                timeout_ms,
-            } => {
-                self.probe_binary_or_toolchain(
-                    def,
-                    bin,
-                    version_args,
-                    version_regex,
-                    extra_search_paths,
-                    *timeout_ms,
-                    false,
-                )
-                .await
-            },
-            ProbeSpec::Toolchain {
-                bin,
-                version_args,
-                version_regex,
-                timeout_ms,
-            } => {
-                self.probe_binary_or_toolchain(
-                    def,
-                    bin,
-                    version_args,
-                    version_regex,
-                    &[],
-                    *timeout_ms,
-                    true,
-                )
-                .await
-            },
-        }
+        self.probe_resource_with_default_timeout(def, DEFAULT_PROBE_TIMEOUT, cancel)
+            .await
     }
 
     /// Spawn a subprocess in the host namespace.
@@ -332,14 +300,73 @@ impl Dispatcher for LocalDispatcher {
 }
 
 impl LocalDispatcher {
+    async fn probe_resource_with_default_timeout(
+        &self,
+        def: &ResourceDefinition,
+        default_timeout: Duration,
+        cancel: CancellationToken,
+    ) -> ResourceProbeOutcome {
+        match &def.probe {
+            ProbeSpec::Http {
+                ports,
+                routes,
+                timeout_ms,
+            } => {
+                self.probe_http(ports, routes, *timeout_ms, default_timeout, cancel)
+                    .await
+            },
+            ProbeSpec::Binary {
+                bin,
+                version_args,
+                version_regex,
+                extra_search_paths,
+                timeout_ms,
+            } => {
+                self.probe_binary_or_toolchain(
+                    def,
+                    bin,
+                    version_args,
+                    version_regex,
+                    extra_search_paths,
+                    *timeout_ms,
+                    default_timeout,
+                    false,
+                )
+                .await
+            },
+            ProbeSpec::Toolchain {
+                bin,
+                version_args,
+                version_regex,
+                timeout_ms,
+            } => {
+                self.probe_binary_or_toolchain(
+                    def,
+                    bin,
+                    version_args,
+                    version_regex,
+                    &[],
+                    *timeout_ms,
+                    default_timeout,
+                    true,
+                )
+                .await
+            },
+        }
+    }
+
     async fn probe_http(
         &self,
         ports: &[u16],
         routes: &[HttpProbeRoute],
         timeout_ms: Option<u64>,
+        default_timeout: Duration,
         _cancel: CancellationToken,
     ) -> ResourceProbeOutcome {
-        let timeout = Duration::from_millis(timeout_ms.unwrap_or(1000));
+        let timeout = timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(default_timeout);
+        let mut any_timeout = false;
 
         for &port in ports {
             let mut routes_by_capability = std::collections::HashMap::new();
@@ -357,19 +384,23 @@ impl LocalDispatcher {
                     timeout,
                 };
 
-                if let Ok(resp) = self.transport.execute(req).await
-                    && (200..300).contains(&resp.status)
-                {
-                    any_2xx = true;
-                    for cap in &route.proves {
-                        routes_by_capability
-                            .entry(*cap)
-                            .or_insert_with(|| ProvenRoute {
-                                path: route.path.clone(),
-                                method: route.method,
-                                flavor: route.flavor,
-                            });
-                    }
+                match self.transport.execute(req).await {
+                    Ok(resp) if (200..300).contains(&resp.status) => {
+                        any_2xx = true;
+                        for cap in &route.proves {
+                            routes_by_capability
+                                .entry(*cap)
+                                .or_insert_with(|| ProvenRoute {
+                                    path: route.path.clone(),
+                                    method: route.method,
+                                    flavor: route.flavor,
+                                });
+                        }
+                    },
+                    Err(HttpError::Timeout(_)) => {
+                        any_timeout = true;
+                    },
+                    Ok(_) | Err(_) => {},
                 }
             }
 
@@ -386,6 +417,10 @@ impl LocalDispatcher {
             }
         }
 
+        if any_timeout {
+            return ResourceProbeOutcome::TimedOut;
+        }
+
         ResourceProbeOutcome::NotFound
     }
 
@@ -400,8 +435,8 @@ impl LocalDispatcher {
     /// The binary is spawned with `version_args`; stdout and stderr are
     /// concatenated before the regex is applied. Group 1 of `version_regex`
     /// becomes the version string. If the regex has no capture groups the
-    /// version is `None` (not an error). A hard `timeout_ms` (default 2 s)
-    /// guards the spawn so a stalled binary never blocks the probe loop.
+    /// version is `None` (not an error). A hard timeout guards the spawn so
+    /// a stalled binary never blocks the probe loop.
     ///
     /// `is_toolchain` selects the `ResourceDetail` variant: `Toolchain` when
     /// `true`, `Binary` when `false`.
@@ -413,6 +448,7 @@ impl LocalDispatcher {
         version_regex: &str,
         extra_search_paths: &[String],
         timeout_ms: Option<u64>,
+        default_timeout: Duration,
         is_toolchain: bool,
     ) -> ResourceProbeOutcome {
         // 1. Locate the binary.
@@ -421,7 +457,9 @@ impl LocalDispatcher {
         };
 
         // 2. Spawn with a hard timeout.
-        let timeout = Duration::from_millis(timeout_ms.unwrap_or(2_000));
+        let timeout = timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(default_timeout);
         let mut command = tokio::process::Command::new(&path);
         command.args(version_args);
         command.stdout(std::process::Stdio::piped());
@@ -713,6 +751,61 @@ mod tests {
         let d = LocalDispatcher::new(local_info());
         let outcome = d.probe_resource(&def, CancellationToken::new()).await;
         assert!(matches!(outcome, ResourceProbeOutcome::NotFound));
+    }
+
+    #[tokio::test]
+    async fn probe_plan_uses_per_resource_timeout_when_resource_timeout_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r"{}")
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .mount(&server)
+            .await;
+
+        let port = server.address().port();
+        let def = ResourceDefinition {
+            id: ResourceId("slow-http".into()),
+            kind: ResourceKind::HttpEndpoint,
+            advertised_capabilities: vec![Capability::OllamaNative],
+            probe: ProbeSpec::Http {
+                ports: vec![port],
+                routes: vec![HttpProbeRoute {
+                    path: "/api/version".into(),
+                    method: HttpProbeMethod::Get,
+                    flavor: ApiFlavor::OllamaNative,
+                    proves: vec![Capability::OllamaNative],
+                    models_jsonpath: None,
+                    fingerprint_jsonpaths: vec![],
+                }],
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        };
+        let plan = ProbePlan {
+            env_id: EnvId::local(),
+            registry_revision: 1,
+            defs: vec![def],
+            per_resource_timeout: Duration::from_millis(50),
+            max_concurrency: 1,
+            overall_budget: Duration::from_secs(1),
+        };
+
+        let d = LocalDispatcher::new(local_info());
+        let summary = d
+            .probe(plan, CancellationToken::new())
+            .await
+            .expect("probe ok");
+        assert!(matches!(
+            summary
+                .catalog
+                .resources
+                .get(&ResourceId("slow-http".into())),
+            Some(ResourceProbeOutcome::TimedOut)
+        ));
     }
 
     #[tokio::test]
