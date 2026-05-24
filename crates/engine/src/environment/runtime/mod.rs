@@ -31,3 +31,5 @@ pub use resource::{
 pub use catalog::{
     ProvenRoute, ResourceCatalog, ResourceDetail, ResourceProbeOutcome, RouteOrigin,
 };
+
+pub use plan::{ProbePlan, ProbeSummary};
