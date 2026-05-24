@@ -60,6 +60,11 @@ pub enum EngineError {
     /// Engine has been asked to shut down and is no longer accepting new runs.
     #[error("engine shutting down")]
     ShuttingDown,
+    /// Dispatcher / runtime-layer error (environment unreachable, missing
+    /// resource or capability, workspace setup failure, path translation,
+    /// or spawn failure).
+    #[error("dispatch: {0}")]
+    Dispatch(#[from] crate::environment::runtime::error::DispatchError),
     /// A code path that intentionally returns `NotImplemented` in this
     /// release. The static string identifies the missing capability
     /// (e.g. `"container backend"` for the v1.0 stub).

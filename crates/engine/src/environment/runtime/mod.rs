@@ -37,3 +37,5 @@ pub use plan::{ProbePlan, ProbeSummary};
 pub use transport::{
     EnvPath, HttpError, HttpMethod, HttpRequest, HttpResponse, ProcessCmd, WorkspaceHandle,
 };
+
+pub use error::{DispatchError, RegistryError};
