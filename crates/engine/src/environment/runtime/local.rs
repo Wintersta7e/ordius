@@ -21,7 +21,19 @@ use super::transport::{
     EnvPath, HttpError, HttpMethod, HttpRequest, HttpResponse, ProcessCmd, WorkspaceHandle,
 };
 
-const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_millis(1_000);
+const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+struct BinaryProbe<'a> {
+    def: &'a ResourceDefinition,
+    bin: &'a str,
+    version_args: &'a [String],
+    version_regex: &'a str,
+    extra_search_paths: &'a [String],
+    timeout_ms: Option<u64>,
+    default_timeout: Duration,
+    cancel: CancellationToken,
+    is_toolchain: bool,
+}
 
 /// Reqwest-backed HTTP transport that operates in the host process's network
 /// namespace (direct loopback access, no tunnelling).
@@ -58,6 +70,7 @@ impl HttpTransport for LocalHttpTransport {
     async fn execute(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
         let method = http_method_to_reqwest(req.method);
         let mut builder = self.client.request(method, &req.url).timeout(req.timeout);
+        let timeout = req.timeout;
         for (k, v) in &req.headers {
             builder = builder.header(k, v);
         }
@@ -66,7 +79,7 @@ impl HttpTransport for LocalHttpTransport {
         }
         let resp = builder.send().await.map_err(|e| {
             if e.is_timeout() {
-                HttpError::Timeout(req.timeout)
+                HttpError::Timeout(timeout)
             } else {
                 HttpError::Transport(e.to_string())
             }
@@ -77,10 +90,13 @@ impl HttpTransport for LocalHttpTransport {
             .iter()
             .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
             .collect();
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| HttpError::Transport(e.to_string()))?;
+        let body = resp.bytes().await.map_err(|e| {
+            if e.is_timeout() {
+                HttpError::Timeout(timeout)
+            } else {
+                HttpError::Transport(e.to_string())
+            }
+        })?;
         Ok(HttpResponse {
             status,
             headers,
@@ -322,17 +338,17 @@ impl LocalDispatcher {
                 extra_search_paths,
                 timeout_ms,
             } => {
-                self.probe_binary_or_toolchain(
+                self.probe_binary_or_toolchain(BinaryProbe {
                     def,
                     bin,
                     version_args,
                     version_regex,
                     extra_search_paths,
-                    *timeout_ms,
+                    timeout_ms: *timeout_ms,
                     default_timeout,
                     cancel,
-                    false,
-                )
+                    is_toolchain: false,
+                })
                 .await
             },
             ProbeSpec::Toolchain {
@@ -341,17 +357,17 @@ impl LocalDispatcher {
                 version_regex,
                 timeout_ms,
             } => {
-                self.probe_binary_or_toolchain(
+                self.probe_binary_or_toolchain(BinaryProbe {
                     def,
                     bin,
                     version_args,
                     version_regex,
-                    &[],
-                    *timeout_ms,
+                    extra_search_paths: &[],
+                    timeout_ms: *timeout_ms,
                     default_timeout,
                     cancel,
-                    true,
-                )
+                    is_toolchain: true,
+                })
                 .await
             },
         }
@@ -365,10 +381,9 @@ impl LocalDispatcher {
         default_timeout: Duration,
         cancel: CancellationToken,
     ) -> ResourceProbeOutcome {
-        let timeout = timeout_ms
-            .map(Duration::from_millis)
-            .unwrap_or(default_timeout);
+        let timeout = timeout_ms.map_or(default_timeout, Duration::from_millis);
         let mut any_timeout = false;
+        let mut first_transport_error = None;
 
         for &port in ports {
             let mut routes_by_capability = std::collections::HashMap::new();
@@ -407,7 +422,13 @@ impl LocalDispatcher {
                     Err(HttpError::Timeout(_)) => {
                         any_timeout = true;
                     },
-                    Ok(_) | Err(_) => {},
+                    Err(HttpError::Transport(reason)) => {
+                        first_transport_error.get_or_insert(reason);
+                    },
+                    Err(err) => {
+                        first_transport_error.get_or_insert_with(|| err.to_string());
+                    },
+                    Ok(_) => {},
                 }
             }
 
@@ -426,6 +447,10 @@ impl LocalDispatcher {
 
         if any_timeout {
             return ResourceProbeOutcome::TimedOut;
+        }
+
+        if let Some(reason) = first_transport_error {
+            return ResourceProbeOutcome::ProbeFailed { reason };
         }
 
         ResourceProbeOutcome::NotFound
@@ -447,45 +472,34 @@ impl LocalDispatcher {
     ///
     /// `is_toolchain` selects the `ResourceDetail` variant: `Toolchain` when
     /// `true`, `Binary` when `false`.
-    async fn probe_binary_or_toolchain(
-        &self,
-        def: &ResourceDefinition,
-        bin: &str,
-        version_args: &[String],
-        version_regex: &str,
-        extra_search_paths: &[String],
-        timeout_ms: Option<u64>,
-        default_timeout: Duration,
-        cancel: CancellationToken,
-        is_toolchain: bool,
-    ) -> ResourceProbeOutcome {
-        if cancel.is_cancelled() {
+    async fn probe_binary_or_toolchain(&self, probe: BinaryProbe<'_>) -> ResourceProbeOutcome {
+        if probe.cancel.is_cancelled() {
             return cancelled_probe_outcome();
         }
 
         // 1. Locate the binary.
-        let Some(path) = which_with_fallback(bin, extra_search_paths) else {
+        let Some(path) = which_with_fallback(probe.bin, probe.extra_search_paths) else {
             return ResourceProbeOutcome::NotFound;
         };
 
         // 2. Spawn with a hard timeout.
-        let timeout = timeout_ms
-            .map(Duration::from_millis)
-            .unwrap_or(default_timeout);
+        let timeout = probe
+            .timeout_ms
+            .map_or(probe.default_timeout, Duration::from_millis);
         let mut command = tokio::process::Command::new(&path);
         command.kill_on_drop(true);
-        command.args(version_args);
+        command.args(probe.version_args);
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
 
         let output = match tokio::select! {
-            () = cancel.cancelled() => return cancelled_probe_outcome(),
+            () = probe.cancel.cancelled() => return cancelled_probe_outcome(),
             output = tokio::time::timeout(timeout, command.output()) => output,
         } {
             Ok(Ok(out)) => out,
             Ok(Err(e)) => {
                 return ResourceProbeOutcome::ProbeFailed {
-                    reason: format!("spawn {bin}: {e}"),
+                    reason: format!("spawn {}: {e}", probe.bin),
                 };
             },
             Err(_elapsed) => return ResourceProbeOutcome::TimedOut,
@@ -499,7 +513,7 @@ impl LocalDispatcher {
         );
 
         // 4. Extract version via capture group 1, if present.
-        let re = match regex::Regex::new(version_regex) {
+        let re = match regex::Regex::new(probe.version_regex) {
             Ok(r) => r,
             Err(e) => {
                 return ResourceProbeOutcome::ProbeFailed {
@@ -513,9 +527,9 @@ impl LocalDispatcher {
             .map(|m| m.as_str().to_owned());
 
         // 5. Return the appropriate Found variant.
-        if is_toolchain {
+        if probe.is_toolchain {
             ResourceProbeOutcome::Found(ResourceDetail::Toolchain {
-                name: def.id.0.clone(),
+                name: probe.def.id.0.clone(),
                 version,
                 exe_path: path.to_string_lossy().into_owned(),
             })
@@ -523,7 +537,7 @@ impl LocalDispatcher {
             ResourceProbeOutcome::Found(ResourceDetail::Binary {
                 path: path.to_string_lossy().into_owned(),
                 version,
-                capabilities: def.advertised_capabilities.clone(),
+                capabilities: probe.def.advertised_capabilities.clone(),
             })
         }
     }
@@ -773,6 +787,77 @@ mod tests {
         let d = LocalDispatcher::new(local_info());
         let outcome = d.probe_resource(&def, CancellationToken::new()).await;
         assert!(matches!(outcome, ResourceProbeOutcome::NotFound));
+    }
+
+    #[tokio::test]
+    async fn probe_http_transport_error_returns_probefailed() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let def = ResourceDefinition {
+            id: ResourceId("missing-http".into()),
+            kind: ResourceKind::HttpEndpoint,
+            advertised_capabilities: vec![Capability::OllamaNative],
+            probe: ProbeSpec::Http {
+                ports: vec![port],
+                routes: vec![HttpProbeRoute {
+                    path: "/api/version".into(),
+                    method: HttpProbeMethod::Get,
+                    flavor: ApiFlavor::OllamaNative,
+                    proves: vec![Capability::OllamaNative],
+                    models_jsonpath: None,
+                    fingerprint_jsonpaths: vec![],
+                }],
+                timeout_ms: Some(500),
+            },
+            override_lower_scope: false,
+        };
+
+        let d = LocalDispatcher::new(local_info());
+        let outcome = d.probe_resource(&def, CancellationToken::new()).await;
+        assert!(matches!(
+            outcome,
+            ResourceProbeOutcome::ProbeFailed { reason } if !reason.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn probe_http_timeout_returns_timedout() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r"{}")
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .mount(&server)
+            .await;
+
+        let port = server.address().port();
+        let def = ResourceDefinition {
+            id: ResourceId("slow-http".into()),
+            kind: ResourceKind::HttpEndpoint,
+            advertised_capabilities: vec![Capability::OllamaNative],
+            probe: ProbeSpec::Http {
+                ports: vec![port],
+                routes: vec![HttpProbeRoute {
+                    path: "/api/version".into(),
+                    method: HttpProbeMethod::Get,
+                    flavor: ApiFlavor::OllamaNative,
+                    proves: vec![Capability::OllamaNative],
+                    models_jsonpath: None,
+                    fingerprint_jsonpaths: vec![],
+                }],
+                timeout_ms: Some(50),
+            },
+            override_lower_scope: false,
+        };
+
+        let d = LocalDispatcher::new(local_info());
+        let outcome = d.probe_resource(&def, CancellationToken::new()).await;
+        assert!(matches!(outcome, ResourceProbeOutcome::TimedOut));
     }
 
     #[tokio::test]
