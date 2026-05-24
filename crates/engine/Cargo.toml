@@ -29,6 +29,7 @@ r2d2 = { workspace = true }
 r2d2_sqlite = { workspace = true }
 jsonpath-rust = { workspace = true }
 regex = { workspace = true }
+which = { workspace = true }
 glob = { workspace = true }
 cron = { workspace = true }
 notify = { workspace = true }

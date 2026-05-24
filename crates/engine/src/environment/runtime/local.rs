@@ -1,6 +1,6 @@
 //! Local dispatcher and HTTP transport implementations for the host environment.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -177,10 +177,40 @@ impl Dispatcher for LocalDispatcher {
                 routes,
                 timeout_ms,
             } => self.probe_http(ports, routes, *timeout_ms, cancel).await,
-            ProbeSpec::Binary { .. } | ProbeSpec::Toolchain { .. } => {
-                ResourceProbeOutcome::ProbeFailed {
-                    reason: "binary/toolchain probe not yet implemented".into(),
-                }
+            ProbeSpec::Binary {
+                bin,
+                version_args,
+                version_regex,
+                extra_search_paths,
+                timeout_ms,
+            } => {
+                self.probe_binary_or_toolchain(
+                    def,
+                    bin,
+                    version_args,
+                    version_regex,
+                    extra_search_paths,
+                    *timeout_ms,
+                    false,
+                )
+                .await
+            },
+            ProbeSpec::Toolchain {
+                bin,
+                version_args,
+                version_regex,
+                timeout_ms,
+            } => {
+                self.probe_binary_or_toolchain(
+                    def,
+                    bin,
+                    version_args,
+                    version_regex,
+                    &[],
+                    *timeout_ms,
+                    true,
+                )
+                .await
             },
         }
     }
@@ -294,6 +324,108 @@ impl LocalDispatcher {
 
         ResourceProbeOutcome::NotFound
     }
+
+    /// Locate a binary + run its version command, returning `Found(Binary)`
+    /// or `Found(Toolchain)` on success.
+    ///
+    /// Resolution order:
+    /// 1. `which::which(bin)` — searches `PATH` exactly as a shell would.
+    /// 2. Each path in `extra_search_paths` joined with `bin` — useful for
+    ///    tools installed outside `PATH` (e.g. `~/.local/bin` on some distros).
+    ///
+    /// The binary is spawned with `version_args`; stdout and stderr are
+    /// concatenated before the regex is applied. Group 1 of `version_regex`
+    /// becomes the version string. If the regex has no capture groups the
+    /// version is `None` (not an error). A hard `timeout_ms` (default 2 s)
+    /// guards the spawn so a stalled binary never blocks the probe loop.
+    ///
+    /// `is_toolchain` selects the `ResourceDetail` variant: `Toolchain` when
+    /// `true`, `Binary` when `false`.
+    async fn probe_binary_or_toolchain(
+        &self,
+        def: &ResourceDefinition,
+        bin: &str,
+        version_args: &[String],
+        version_regex: &str,
+        extra_search_paths: &[String],
+        timeout_ms: Option<u64>,
+        is_toolchain: bool,
+    ) -> ResourceProbeOutcome {
+        // 1. Locate the binary.
+        let Some(path) = which_with_fallback(bin, extra_search_paths) else {
+            return ResourceProbeOutcome::NotFound;
+        };
+
+        // 2. Spawn with a hard timeout.
+        let timeout = Duration::from_millis(timeout_ms.unwrap_or(2_000));
+        let mut command = tokio::process::Command::new(&path);
+        command.args(version_args);
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+
+        let output = match tokio::time::timeout(timeout, command.output()).await {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => {
+                return ResourceProbeOutcome::ProbeFailed {
+                    reason: format!("spawn {bin}: {e}"),
+                };
+            },
+            Err(_elapsed) => return ResourceProbeOutcome::TimedOut,
+        };
+
+        // 3. Combine stdout + stderr (some tools, e.g. older Java, print to stderr).
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        // 4. Extract version via capture group 1, if present.
+        let re = match regex::Regex::new(version_regex) {
+            Ok(r) => r,
+            Err(e) => {
+                return ResourceProbeOutcome::ProbeFailed {
+                    reason: format!("invalid version_regex: {e}"),
+                };
+            },
+        };
+        let version = re
+            .captures(&combined)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_owned());
+
+        // 5. Return the appropriate Found variant.
+        if is_toolchain {
+            ResourceProbeOutcome::Found(ResourceDetail::Toolchain {
+                name: def.id.0.clone(),
+                version,
+                exe_path: path.to_string_lossy().into_owned(),
+            })
+        } else {
+            ResourceProbeOutcome::Found(ResourceDetail::Binary {
+                path: path.to_string_lossy().into_owned(),
+                version,
+                capabilities: def.advertised_capabilities.clone(),
+            })
+        }
+    }
+}
+
+/// Resolve `bin` to an absolute path.
+///
+/// Tries `which::which` first (honours `PATH`), then walks `extra_search_paths`
+/// appending `bin` directly. Returns the first candidate that is a regular file.
+fn which_with_fallback(bin: &str, extras: &[String]) -> Option<PathBuf> {
+    if let Ok(p) = which::which(bin) {
+        return Some(p);
+    }
+    for dir in extras {
+        let cand = PathBuf::from(dir).join(bin);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -442,6 +574,53 @@ mod tests {
         };
         assert_eq!(route_origin, RouteOrigin::HostDirect);
         assert!(routes_by_capability.contains_key(&Capability::OllamaNative));
+    }
+
+    #[tokio::test]
+    async fn probe_resource_binary_git_found() {
+        // git is required to run the Ordius test suite anyway, so it's always present.
+        let def = ResourceDefinition {
+            id: ResourceId("git".into()),
+            kind: ResourceKind::Toolchain,
+            advertised_capabilities: vec![],
+            probe: ProbeSpec::Toolchain {
+                bin: "git".into(),
+                version_args: vec!["--version".into()],
+                version_regex: r"^git version (\S+)".into(),
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        };
+
+        let d = LocalDispatcher::new(local_info());
+        let outcome = d.probe_resource(&def, CancellationToken::new()).await;
+        let ResourceProbeOutcome::Found(ResourceDetail::Toolchain { name, version, .. }) = outcome
+        else {
+            panic!("expected Found Toolchain, got {outcome:?}")
+        };
+        assert_eq!(name, "git");
+        assert!(version.is_some(), "version captured by regex");
+    }
+
+    #[tokio::test]
+    async fn probe_resource_binary_missing_returns_not_found() {
+        let def = ResourceDefinition {
+            id: ResourceId("definitely-not-installed-xyz".into()),
+            kind: ResourceKind::Binary,
+            advertised_capabilities: vec![],
+            probe: ProbeSpec::Binary {
+                bin: "definitely-not-installed-xyz".into(),
+                version_args: vec!["--version".into()],
+                version_regex: r"(\S+)".into(),
+                extra_search_paths: vec![],
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        };
+
+        let d = LocalDispatcher::new(local_info());
+        let outcome = d.probe_resource(&def, CancellationToken::new()).await;
+        assert!(matches!(outcome, ResourceProbeOutcome::NotFound));
     }
 
     #[tokio::test]
