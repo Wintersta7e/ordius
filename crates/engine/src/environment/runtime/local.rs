@@ -174,9 +174,25 @@ impl Dispatcher for LocalDispatcher {
         unimplemented!("Tasks 16+17 wire single-resource probing")
     }
 
-    /// Spawn a subprocess in the host namespace — implemented in Task 15.
-    fn spawn(&self, _cmd: ProcessCmd) -> std::io::Result<crate::executor::supervisor::Supervised> {
-        unimplemented!("Task 15 wires spawn through supervisor")
+    /// Spawn a subprocess in the host namespace.
+    ///
+    /// Builds a `tokio::process::Command` from the argv-only `ProcessCmd` and
+    /// delegates to `executor::supervisor::spawn`, which sets up a process group
+    /// (Unix) or Job Object (Windows) for correct tree teardown.
+    fn spawn(&self, cmd: ProcessCmd) -> std::io::Result<crate::executor::supervisor::Supervised> {
+        let mut command = tokio::process::Command::new(&cmd.program);
+        command.args(&cmd.args);
+        for (k, v) in &cmd.env {
+            command.env(k, v);
+        }
+        if let Some(cwd) = &cmd.cwd {
+            command.current_dir(cwd.as_str());
+        }
+        // Note: ProcessCmd.stdin is currently ignored; the supervisor takes
+        // ownership of the Child after spawn. Callers that need stdin should
+        // pipe it after spawn via Supervised::child_mut(), matching the pattern
+        // in executor/builtins/subprocess.rs.
+        crate::executor::supervisor::spawn(command)
     }
 
     /// Return the host-network HTTP transport.
@@ -286,5 +302,27 @@ mod tests {
     async fn local_http_can_stream_arbitrary_url() {
         let t = LocalHttpTransport::new();
         assert!(t.can_stream(&Url::parse("http://anything").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn local_spawn_echo_succeeds() {
+        let d = LocalDispatcher::new(local_info());
+        let cmd = ProcessCmd {
+            program: if cfg!(windows) {
+                "cmd".into()
+            } else {
+                "echo".into()
+            },
+            args: if cfg!(windows) {
+                vec!["/C".into(), "echo hello".into()]
+            } else {
+                vec!["hello".into()]
+            },
+            env: std::collections::HashMap::new(),
+            cwd: None,
+            stdin: None,
+        };
+        let mut sup = d.spawn(cmd).expect("spawn");
+        let _exit = crate::executor::supervisor::cancel(&mut sup).await;
     }
 }
