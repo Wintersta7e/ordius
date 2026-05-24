@@ -144,7 +144,7 @@ pub enum HttpProbeMethod {
 #[serde(rename_all = "snake_case")]
 pub enum ApiFlavor {
     /// OpenAI-compatible chat/completions API.
-    OpenAiChat,
+    OpenaiChat,
     /// Ollama-native API.
     OllamaNative,
     /// LM Studio native API.
@@ -204,6 +204,16 @@ mod tests {
         let cap = Capability::OpenaiChatCompletions;
         let s = serde_json::to_string(&cap).unwrap();
         assert_eq!(s, "\"openai_chat_completions\"");
+    }
+
+    #[test]
+    fn api_flavor_openai_wire_form() {
+        // `OpenaiChat` must serialize to `"openai_chat"` — consistent with the
+        // `openai_*` prefix used by `Capability` variants for the same domain.
+        assert_eq!(
+            serde_json::to_string(&ApiFlavor::OpenaiChat).unwrap(),
+            "\"openai_chat\""
+        );
     }
 
     #[test]
