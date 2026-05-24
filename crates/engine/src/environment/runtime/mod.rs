@@ -16,3 +16,9 @@ pub mod transport;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod fake;
+
+pub use env::{
+    BindMount, ConflictDetect, EnvId, EnvInfo, EnvKind, EnvSpec, EnvState, HostDirectMethod,
+    HostDirectVerification, RunId, SecretRef, SyncStrategy, WorkflowId, WorkspaceBinding,
+    WriteBackPolicy, default_max_files,
+};
