@@ -168,17 +168,19 @@ impl Dispatcher for FakeRemoteDispatcher {
                 capabilities,
             } => {
                 let mut routes_by_capability = HashMap::new();
-                if let ProbeSpec::Http { routes, .. } = &def.probe
-                    && let Some(first_route) = routes.first()
-                {
-                    for cap in &capabilities {
-                        routes_by_capability
-                            .entry(*cap)
-                            .or_insert_with(|| ProvenRoute {
-                                path: first_route.path.clone(),
-                                method: first_route.method,
-                                flavor: first_route.flavor,
-                            });
+                if let ProbeSpec::Http { routes, .. } = &def.probe {
+                    for route in routes {
+                        for cap in &route.proves {
+                            if capabilities.contains(cap) {
+                                routes_by_capability
+                                    .entry(*cap)
+                                    .or_insert_with(|| ProvenRoute {
+                                        path: route.path.clone(),
+                                        method: route.method,
+                                        flavor: route.flavor,
+                                    });
+                            }
+                        }
                     }
                 }
                 ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
@@ -382,5 +384,64 @@ mod tests {
             outcome,
             ResourceProbeOutcome::Skipped { reason } if reason == "cancelled"
         ));
+    }
+
+    #[tokio::test]
+    async fn fake_capability_proof_uses_actual_route_proves() {
+        let fake = FakeRemoteDispatcher::new(info("a")).with_seeded(
+            "ollama",
+            FakeResource::http(
+                "http://fake/11434",
+                &[Capability::OllamaNative, Capability::OpenaiChatCompletions],
+            ),
+        );
+        let def = ResourceDefinition {
+            id: ResourceId("ollama".into()),
+            kind: ResourceKind::HttpEndpoint,
+            advertised_capabilities: vec![
+                Capability::OllamaNative,
+                Capability::OpenaiChatCompletions,
+                Capability::CodeFormatter,
+            ],
+            probe: ProbeSpec::Http {
+                ports: vec![11434],
+                routes: vec![
+                    HttpProbeRoute {
+                        path: "/api/version".into(),
+                        method: HttpProbeMethod::Get,
+                        flavor: ApiFlavor::OllamaNative,
+                        proves: vec![Capability::OllamaNative],
+                        models_jsonpath: None,
+                        fingerprint_jsonpaths: vec![],
+                    },
+                    HttpProbeRoute {
+                        path: "/format".into(),
+                        method: HttpProbeMethod::Get,
+                        flavor: ApiFlavor::Custom,
+                        proves: vec![Capability::CodeFormatter],
+                        models_jsonpath: None,
+                        fingerprint_jsonpaths: vec![],
+                    },
+                ],
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        };
+
+        let outcome = fake.probe_resource(&def, CancellationToken::new()).await;
+        let ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
+            routes_by_capability,
+            ..
+        }) = outcome
+        else {
+            panic!("expected Found, got {outcome:?}")
+        };
+
+        let proven = routes_by_capability
+            .get(&Capability::OllamaNative)
+            .expect("ollama route is proven");
+        assert_eq!(proven.path, "/api/version");
+        assert!(!routes_by_capability.contains_key(&Capability::OpenaiChatCompletions));
+        assert!(!routes_by_capability.contains_key(&Capability::CodeFormatter));
     }
 }
