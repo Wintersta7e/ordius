@@ -175,6 +175,7 @@ pub static BUILTIN_RESOURCES: LazyLock<Vec<ResourceDefinition>> = LazyLock::new(
                     ApiFlavor::OpenaiChat,
                     &[Capability::OpenaiChatCompletions],
                 ),
+                // liveness check only — no capability proof
                 route("/health", ApiFlavor::LlamaCppServer, &[]),
             ],
             &[Capability::OpenaiChatCompletions],
@@ -201,7 +202,8 @@ pub static BUILTIN_RESOURCES: LazyLock<Vec<ResourceDefinition>> = LazyLock::new(
             )],
             &[Capability::OpenaiChatCompletions],
         ),
-        // Tabby: code-completion server, separate health endpoint; no chat caps yet.
+        // Tabby: code-completion server; /v1/health is a liveness check only,
+        // not a capability probe (no chat caps surfaced yet).
         http(
             "tabby",
             &[8080],
@@ -342,8 +344,8 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_id_uses_underscored_canonical() {
-        // AgentDeck-aligned: id "claude-code", binary "claude"
+    fn claude_code_id_is_hyphenated() {
+        // AgentDeck-aligned: id "claude-code" (hyphen), binary "claude"
         let r = builtin_by_id("claude-code").unwrap();
         let ProbeSpec::Binary { bin, .. } = &r.probe else {
             panic!("binary")
