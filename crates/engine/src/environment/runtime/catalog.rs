@@ -9,7 +9,7 @@ use super::env::{EnvId, SecretRef};
 use super::resource::{ApiFlavor, Capability, HttpProbeMethod, ResourceId};
 
 /// Snapshot of all probe results for a single environment at a point in time.
-/// Keyed by `ResourceId`; keyed by the same ids as `ResourceDefinition`.
+/// Shares resource ids with `ResourceDefinition`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceCatalog {
     /// The environment this catalog describes.
