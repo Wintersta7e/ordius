@@ -5,10 +5,13 @@
 //! by resolvers in Task 10+.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
 use super::env::{EnvId, WorkflowId};
+use super::error::RegistryError;
 use super::resource::{ResourceDefinition, ResourceId};
 
 /// Identifies which layer of the registry a definition belongs to.
@@ -111,6 +114,114 @@ impl RegistryInner {
             }
         }
         out
+    }
+}
+
+/// Live, mutable resource registry.
+///
+/// The active [`RegistryInner`] is held behind [`ArcSwap`] so reads can take
+/// immutable snapshots while writes publish a copied replacement atomically.
+#[derive(Debug)]
+pub struct ResourceRegistry {
+    inner: ArcSwap<RegistryInner>,
+}
+
+impl ResourceRegistry {
+    /// Create an empty registry at revision `0`.
+    pub fn new() -> Self {
+        Self {
+            inner: ArcSwap::from_pointee(RegistryInner {
+                revision: 0,
+                layers: HashMap::new(),
+            }),
+        }
+    }
+
+    /// Insert or replace a resource definition in `scope`.
+    ///
+    /// When `def.override_lower_scope` is `false`, this rejects writes that
+    /// would shadow an existing definition with the same id at a lower
+    /// precedence scope. On success, returns the newly published revision.
+    pub fn upsert(&self, scope: ScopeKey, def: ResourceDefinition) -> Result<u64, RegistryError> {
+        struct PendingUpsert {
+            scope: ScopeKey,
+            def: ResourceDefinition,
+        }
+
+        let pending = PendingUpsert { scope, def };
+
+        loop {
+            let current = self.inner.load_full();
+
+            if !pending.def.override_lower_scope
+                && let Some(existing_scope) =
+                    find_lower_scope_with_id(&current, &pending.scope, &pending.def.id)
+            {
+                return Err(RegistryError::OverrideRequired {
+                    id: pending.def.id.0.clone(),
+                    existing_scope: format!("{existing_scope:?}"),
+                });
+            }
+
+            let mut new_layers = current.layers.clone();
+            new_layers
+                .entry(pending.scope.clone())
+                .or_default()
+                .insert(pending.def.id.clone(), pending.def.clone());
+            let new = Arc::new(RegistryInner {
+                revision: current.revision + 1,
+                layers: new_layers,
+            });
+            let revision = new.revision;
+            let previous = self.inner.compare_and_swap(&current, new);
+            if Arc::ptr_eq(&current, &previous) {
+                return Ok(revision);
+            }
+        }
+    }
+
+    /// Return an immutable snapshot of the current registry state.
+    ///
+    /// The returned [`Arc`] remains valid even after later writes publish newer
+    /// registry revisions.
+    pub fn snapshot(&self) -> Arc<RegistryInner> {
+        self.inner.load_full()
+    }
+}
+
+impl Default for ResourceRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Find an existing declaration for `id` at a lower-precedence scope.
+fn find_lower_scope_with_id(
+    inner: &RegistryInner,
+    incoming_scope: &ScopeKey,
+    id: &ResourceId,
+) -> Option<ScopeKey> {
+    let highest_lower_rank = match incoming_scope {
+        ScopeKey::Workflow { .. } => 2,
+        ScopeKey::EnvLocal { .. } => 1,
+        ScopeKey::UserGlobal => 0,
+        ScopeKey::Builtin => return None,
+    };
+    for (existing_scope, layer) in &inner.layers {
+        if layer.contains_key(id) && scope_rank(existing_scope) <= highest_lower_rank {
+            return Some(existing_scope.clone());
+        }
+    }
+    None
+}
+
+/// Return the precedence rank for a scope; higher ranks are more specific.
+const fn scope_rank(scope: &ScopeKey) -> u8 {
+    match scope {
+        ScopeKey::Workflow { .. } => 3,
+        ScopeKey::EnvLocal { .. } => 2,
+        ScopeKey::UserGlobal => 1,
+        ScopeKey::Builtin => 0,
     }
 }
 
@@ -243,5 +354,61 @@ mod tests {
         assert!(ids.contains(&"ollama"));
         assert!(ids.contains(&"custom"));
         assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn registry_starts_empty_revision_zero() {
+        let reg = ResourceRegistry::new();
+        assert_eq!(reg.snapshot().revision, 0);
+    }
+
+    #[test]
+    fn upsert_bumps_revision() {
+        let reg = ResourceRegistry::new();
+        let d = def("ollama", false);
+        let new_rev = reg.upsert(ScopeKey::Builtin, d).unwrap();
+        assert_eq!(new_rev, 1);
+        assert_eq!(reg.snapshot().revision, 1);
+    }
+
+    #[test]
+    fn upsert_collision_without_override_errors() {
+        let reg = ResourceRegistry::new();
+        let _ = reg.upsert(ScopeKey::Builtin, def("ollama", false)).unwrap();
+        let err = reg
+            .upsert(ScopeKey::UserGlobal, def("ollama", false))
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::OverrideRequired { .. }));
+    }
+
+    #[test]
+    fn upsert_with_override_succeeds() {
+        let reg = ResourceRegistry::new();
+        let _ = reg.upsert(ScopeKey::Builtin, def("ollama", false)).unwrap();
+        let new_rev = reg
+            .upsert(ScopeKey::UserGlobal, def("ollama", true))
+            .unwrap();
+        assert_eq!(new_rev, 2);
+    }
+
+    #[test]
+    fn snapshot_does_not_observe_later_upserts() {
+        let reg = ResourceRegistry::new();
+        let _ = reg.upsert(ScopeKey::Builtin, def("ollama", false)).unwrap();
+        let snap = reg.snapshot();
+        let _ = reg.upsert(ScopeKey::Builtin, def("vllm", false)).unwrap();
+        assert!(
+            snap.layers
+                .get(&ScopeKey::Builtin)
+                .unwrap()
+                .contains_key(&ResourceId("ollama".into()))
+        );
+        assert!(
+            !snap
+                .layers
+                .get(&ScopeKey::Builtin)
+                .unwrap()
+                .contains_key(&ResourceId("vllm".into()))
+        );
     }
 }
