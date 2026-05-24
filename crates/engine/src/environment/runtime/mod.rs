@@ -27,3 +27,7 @@ pub use resource::{
     ApiFlavor, Capability, HttpProbeMethod, HttpProbeRoute, ProbeSpec, ResourceDefinition,
     ResourceId, ResourceKind, ResourceRef,
 };
+
+pub use catalog::{
+    ProvenRoute, ResourceCatalog, ResourceDetail, ResourceProbeOutcome, RouteOrigin,
+};
