@@ -1,15 +1,23 @@
 //! Local dispatcher and HTTP transport implementations for the host environment.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::TryStreamExt;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use super::dispatcher::{HttpTransport, ResponseStream};
-use super::env::EnvInfo;
-use super::transport::{HttpError, HttpMethod, HttpRequest, HttpResponse};
+use super::catalog::ResourceProbeOutcome;
+use super::dispatcher::{Dispatcher, HttpTransport, ResponseStream};
+use super::env::{EnvInfo, RunId, WorkspaceBinding};
+use super::error::DispatchError;
+use super::plan::{ProbePlan, ProbeSummary};
+use super::resource::ResourceDefinition;
+use super::transport::{
+    EnvPath, HttpError, HttpMethod, HttpRequest, HttpResponse, ProcessCmd, WorkspaceHandle,
+};
 
 /// Reqwest-backed HTTP transport that operates in the host process's network
 /// namespace (direct loopback access, no tunnelling).
@@ -117,28 +125,140 @@ const fn http_method_to_reqwest(m: HttpMethod) -> reqwest::Method {
     }
 }
 
-/// Placeholder for the local-environment dispatcher.
+/// Runs everything in the host process's own namespace: direct filesystem
+/// access, direct network loopback, host `PATH`.
 ///
-/// `LocalDispatcher` runs everything in the host process's own namespace:
-/// direct filesystem access, direct network loopback, host `PATH`.
-/// Tasks 14–18 fill in the `Dispatcher` trait implementation.
+/// `translate_path` is the identity — host paths are already env paths.
+/// `prepare_workspace` accepts only `WorkspaceBinding::Shared`; other
+/// bindings (`Translated`, `BindMount`, `Sync`) have no meaning on the local env.
 #[derive(Debug)]
 pub struct LocalDispatcher {
     /// Metadata about this environment (id, label, spec, state).
-    pub info: EnvInfo,
+    info: EnvInfo,
     /// Shared HTTP transport bound to the host network namespace.
-    pub transport: Arc<LocalHttpTransport>,
+    transport: Arc<LocalHttpTransport>,
+}
+
+impl LocalDispatcher {
+    /// Construct a `LocalDispatcher` for the given environment info.
+    pub fn new(info: EnvInfo) -> Self {
+        Self {
+            info,
+            transport: Arc::new(LocalHttpTransport::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl Dispatcher for LocalDispatcher {
+    /// Return metadata for this environment.
+    fn info(&self) -> &EnvInfo {
+        &self.info
+    }
+
+    /// Full probe pass — implemented in Task 18.
+    async fn probe(
+        &self,
+        _plan: ProbePlan,
+        _cancel: CancellationToken,
+    ) -> Result<ProbeSummary, DispatchError> {
+        unimplemented!("Task 18 wires the probe orchestrator")
+    }
+
+    /// Single-resource re-probe — implemented in Tasks 16 + 17.
+    async fn probe_resource(
+        &self,
+        _def: &ResourceDefinition,
+        _cancel: CancellationToken,
+    ) -> ResourceProbeOutcome {
+        unimplemented!("Tasks 16+17 wire single-resource probing")
+    }
+
+    /// Spawn a subprocess in the host namespace — implemented in Task 15.
+    fn spawn(&self, _cmd: ProcessCmd) -> std::io::Result<crate::executor::supervisor::Supervised> {
+        unimplemented!("Task 15 wires spawn through supervisor")
+    }
+
+    /// Return the host-network HTTP transport.
+    fn http_transport(&self) -> Arc<dyn HttpTransport> {
+        self.transport.clone()
+    }
+
+    /// Identity translation: the local env shares the host filesystem.
+    fn translate_path(&self, host_path: &Path) -> Result<EnvPath, DispatchError> {
+        Ok(EnvPath::new(host_path.to_string_lossy().into_owned()))
+    }
+
+    /// For `WorkspaceBinding::Shared` the env path equals the host path and
+    /// no teardown is needed. Any other binding is unsupported on the local env.
+    async fn prepare_workspace(
+        &self,
+        workspace_host: &Path,
+        binding: &WorkspaceBinding,
+        _run_id: &RunId,
+    ) -> Result<WorkspaceHandle, DispatchError> {
+        match binding {
+            WorkspaceBinding::Shared => Ok(WorkspaceHandle {
+                env_path: EnvPath::new(workspace_host.to_string_lossy().into_owned()),
+                teardown: None,
+            }),
+            other => Err(DispatchError::WorkspaceUnavailable {
+                env_id: self.info.id.to_string(),
+                reason: format!("LocalDispatcher only supports Shared binding, got {other:?}"),
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::environment::runtime::env::{EnvId, EnvSpec, EnvState};
     use crate::environment::runtime::transport::{HttpMethod, HttpRequest};
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::time::Duration;
     use url::Url;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn local_info() -> EnvInfo {
+        EnvInfo {
+            id: EnvId::local(),
+            label: "Local (host)".into(),
+            spec: EnvSpec::Local {
+                resources: vec![],
+                host_direct_verifications: HashMap::default(),
+            },
+            state: EnvState::Reachable,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn local_dispatcher_info() {
+        let d = LocalDispatcher::new(local_info());
+        assert_eq!(d.info().id, EnvId::local());
+    }
+
+    #[test]
+    fn local_translate_path_is_identity() {
+        let d = LocalDispatcher::new(local_info());
+        let host = PathBuf::from("/some/path");
+        let env_path = d.translate_path(&host).expect("ok");
+        assert_eq!(env_path.as_str(), "/some/path");
+    }
+
+    #[tokio::test]
+    async fn local_prepare_workspace_shared_is_noop() {
+        let d = LocalDispatcher::new(local_info());
+        let host = PathBuf::from("/workspaces/wf");
+        let handle = d
+            .prepare_workspace(&host, &WorkspaceBinding::Shared, &RunId("r1".into()))
+            .await
+            .expect("ok");
+        assert_eq!(handle.env_path.as_str(), "/workspaces/wf");
+    }
 
     #[tokio::test]
     async fn local_http_get_returns_body() {
