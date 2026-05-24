@@ -46,5 +46,9 @@ pub use registry::{RegistryInner, ResourceRegistry, ScopeKey};
 
 pub use dispatcher::{Dispatcher, HttpTransport, ResponseStream};
 
+// Local dispatcher + transport.
+pub use local::{LocalDispatcher, LocalHttpTransport};
+
+// Test-support fixtures.
 #[cfg(any(test, feature = "testing"))]
 pub use fake::{FakeHttpTransport, FakeRemoteDispatcher, FakeResource};
