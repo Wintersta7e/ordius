@@ -142,32 +142,24 @@ impl ResourceRegistry {
     /// When `def.override_lower_scope` is `false`, this rejects writes that
     /// would shadow an existing definition with the same id at a lower
     /// precedence scope. On success, returns the newly published revision.
-    pub fn upsert(&self, scope: ScopeKey, def: ResourceDefinition) -> Result<u64, RegistryError> {
-        struct PendingUpsert {
-            scope: ScopeKey,
-            def: ResourceDefinition,
-        }
-
-        let pending = PendingUpsert { scope, def };
-
+    pub fn upsert(&self, scope: &ScopeKey, def: &ResourceDefinition) -> Result<u64, RegistryError> {
         loop {
             let current = self.inner.load_full();
 
-            if !pending.def.override_lower_scope
-                && let Some(existing_scope) =
-                    find_lower_scope_with_id(&current, &pending.scope, &pending.def.id)
+            if !def.override_lower_scope
+                && let Some(existing_scope) = find_lower_scope_with_id(&current, scope, &def.id)
             {
                 return Err(RegistryError::OverrideRequired {
-                    id: pending.def.id.0.clone(),
+                    id: def.id.0.clone(),
                     existing_scope: format!("{existing_scope:?}"),
                 });
             }
 
             let mut new_layers = current.layers.clone();
             new_layers
-                .entry(pending.scope.clone())
+                .entry(scope.clone())
                 .or_default()
-                .insert(pending.def.id.clone(), pending.def.clone());
+                .insert(def.id.clone(), def.clone());
             let new = Arc::new(RegistryInner {
                 revision: current.revision + 1,
                 layers: new_layers,
@@ -365,8 +357,9 @@ mod tests {
     #[test]
     fn upsert_bumps_revision() {
         let reg = ResourceRegistry::new();
-        let d = def("ollama", false);
-        let new_rev = reg.upsert(ScopeKey::Builtin, d).unwrap();
+        let new_rev = reg
+            .upsert(&ScopeKey::Builtin, &def("ollama", false))
+            .unwrap();
         assert_eq!(new_rev, 1);
         assert_eq!(reg.snapshot().revision, 1);
     }
@@ -374,9 +367,11 @@ mod tests {
     #[test]
     fn upsert_collision_without_override_errors() {
         let reg = ResourceRegistry::new();
-        let _ = reg.upsert(ScopeKey::Builtin, def("ollama", false)).unwrap();
+        let _ = reg
+            .upsert(&ScopeKey::Builtin, &def("ollama", false))
+            .unwrap();
         let err = reg
-            .upsert(ScopeKey::UserGlobal, def("ollama", false))
+            .upsert(&ScopeKey::UserGlobal, &def("ollama", false))
             .unwrap_err();
         assert!(matches!(err, RegistryError::OverrideRequired { .. }));
     }
@@ -384,9 +379,11 @@ mod tests {
     #[test]
     fn upsert_with_override_succeeds() {
         let reg = ResourceRegistry::new();
-        let _ = reg.upsert(ScopeKey::Builtin, def("ollama", false)).unwrap();
+        let _ = reg
+            .upsert(&ScopeKey::Builtin, &def("ollama", false))
+            .unwrap();
         let new_rev = reg
-            .upsert(ScopeKey::UserGlobal, def("ollama", true))
+            .upsert(&ScopeKey::UserGlobal, &def("ollama", true))
             .unwrap();
         assert_eq!(new_rev, 2);
     }
@@ -394,9 +391,11 @@ mod tests {
     #[test]
     fn snapshot_does_not_observe_later_upserts() {
         let reg = ResourceRegistry::new();
-        let _ = reg.upsert(ScopeKey::Builtin, def("ollama", false)).unwrap();
+        let _ = reg
+            .upsert(&ScopeKey::Builtin, &def("ollama", false))
+            .unwrap();
         let snap = reg.snapshot();
-        let _ = reg.upsert(ScopeKey::Builtin, def("vllm", false)).unwrap();
+        let _ = reg.upsert(&ScopeKey::Builtin, &def("vllm", false)).unwrap();
         assert!(
             snap.layers
                 .get(&ScopeKey::Builtin)
