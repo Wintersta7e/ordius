@@ -1,17 +1,11 @@
-//! Resource identity, kind, capability, probe spec, and reference types.
+//! Resource definitions: identity, kind, capabilities, probe specs.
+
+use serde::{Deserialize, Serialize};
 
 /// Stable identifier for a resource, such as `"ollama"` or `"lm-studio"`.
-/// Persisted as text in the `resources` table.
-///
-/// Note: Task 2 pre-seeds this type and a minimal `ResourceDefinition` stub
-/// so `env.rs` fields can compile. Task 3 will expand this file with
-/// `ResourceKind`, `Capability`, `ProbeSpec`, full `ResourceDefinition`, and
-/// all tests, replacing the stub body here.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct ResourceId(
-    /// Stable resource identifier.
-    pub String,
-);
+/// Persisted as text in `EnvSpec::*::resources` inline lists.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ResourceId(pub String);
 
 impl std::fmt::Display for ResourceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -19,10 +13,215 @@ impl std::fmt::Display for ResourceId {
     }
 }
 
-/// Stub for Task 2 compilation. Task 3 replaces this with the full definition:
-/// (`kind`, `advertised_capabilities`, `probe`, `override_lower_scope`).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Broad category of a resource; drives which probe path is taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceKind {
+    /// A service reachable over HTTP (LLM inference server, etc.).
+    HttpEndpoint,
+    /// A standalone executable (CLI agent, formatter, etc.).
+    Binary,
+    /// A language runtime / toolchain (node, python, rustc, etc.).
+    Toolchain,
+}
+
+/// A specific feature a resource can offer.
+///
+/// Per spec §2 round-3 MAJOR #7 — split so the `llm` node can require what it
+/// actually needs rather than a coarse `llm` capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    /// OpenAI-compatible `/v1/chat/completions` endpoint.
+    OpenaiChatCompletions,
+    /// OpenAI-compatible tool-calling in chat completions.
+    OpenaiToolCalling,
+    /// OpenAI-compatible streaming chat completions.
+    OpenaiStreamingChat,
+    /// OpenAI-compatible `/v1/embeddings` endpoint.
+    OpenaiEmbeddings,
+    /// Ollama-native API (`/api/generate`, `/api/chat`, `/api/version`).
+    OllamaNative,
+    /// LM Studio native API (`/api/v1/models` etc.).
+    LmStudioNative,
+    /// Coding CLI agent that accepts `--print` / non-interactive invocation.
+    CliAgentPrint,
+    /// Code formatter binary (`rustfmt`, `black`, `prettier`, etc.).
+    CodeFormatter,
+    /// Package manager binary (`npm`, `pip`, `cargo`, etc.).
+    PackageManager,
+}
+
+/// Full resource declaration. Stored inline in `EnvSpec::*::resources`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceDefinition {
-    /// Resource identifier.
+    /// Stable resource identifier (must match a builtin id or be unique within scope).
     pub id: ResourceId,
+    /// Broad category; determines which probe path is used.
+    pub kind: ResourceKind,
+    /// Capabilities the resource *advertises*. The dispatcher must *prove*
+    /// each via a successful probe of that capability's route before
+    /// surfacing it on the catalog.
+    pub advertised_capabilities: Vec<Capability>,
+    /// How to probe for this resource.
+    pub probe: ProbeSpec,
+    /// Must be `true` when shadowing a built-in or user-global with the same id.
+    #[serde(default)]
+    pub override_lower_scope: bool,
+}
+
+/// How to probe a resource for presence and capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProbeSpec {
+    /// Probe by sending HTTP requests to one or more ports and routes.
+    Http {
+        /// Ports to attempt in order; first successful bind wins.
+        ports: Vec<u16>,
+        /// Routes to probe; each route proves zero or more capabilities.
+        routes: Vec<HttpProbeRoute>,
+        /// Override `ProbePlan.per_resource_timeout` for this resource.
+        timeout_ms: Option<u64>,
+    },
+    /// Probe by running a binary with version arguments.
+    Binary {
+        /// Executable name (looked up on PATH + `extra_search_paths`).
+        bin: String,
+        /// Arguments passed to get a version string (e.g. `["--version"]`).
+        version_args: Vec<String>,
+        /// Regex with one capture group extracting the version number.
+        version_regex: String,
+        /// Additional directories to search before PATH.
+        #[serde(default)]
+        extra_search_paths: Vec<String>,
+        /// Override `ProbePlan.per_resource_timeout` for this resource.
+        timeout_ms: Option<u64>,
+    },
+    /// Probe a language toolchain binary.
+    Toolchain {
+        /// Executable name (looked up on PATH).
+        bin: String,
+        /// Arguments passed to get a version string.
+        version_args: Vec<String>,
+        /// Regex with one capture group extracting the version number.
+        version_regex: String,
+        /// Override `ProbePlan.per_resource_timeout` for this resource.
+        timeout_ms: Option<u64>,
+    },
+}
+
+/// A single HTTP route within an `HttpProbeSpec`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpProbeRoute {
+    /// Path component of the probe URL (e.g. `"/api/version"`).
+    pub path: String,
+    /// HTTP method to use for the probe request.
+    pub method: HttpProbeMethod,
+    /// API flavor to interpret the response as.
+    pub flavor: ApiFlavor,
+    /// Capabilities a 2xx response on this route proves. The catalog stores
+    /// only proven capabilities.
+    pub proves: Vec<Capability>,
+    /// `JSONPath` expression to extract the model list from the response body.
+    pub models_jsonpath: Option<String>,
+    /// Stable `JSONPath` subset for `HostDirect` fingerprinting (per spec §2).
+    #[serde(default)]
+    pub fingerprint_jsonpaths: Vec<String>,
+}
+
+/// HTTP method used for probing a route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpProbeMethod {
+    /// HTTP GET request.
+    Get,
+    /// HTTP HEAD request.
+    Head,
+}
+
+/// Which API dialect a probe route belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiFlavor {
+    /// OpenAI-compatible chat/completions API.
+    OpenAiChat,
+    /// Ollama-native API.
+    OllamaNative,
+    /// LM Studio native API.
+    LmStudioNative,
+    /// llama.cpp server API.
+    LlamaCppServer,
+    /// Custom / unclassified API.
+    Custom,
+}
+
+/// Carried in node config — references a resource by id, optionally asserting
+/// a required capability that must be proven before the node may dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceRef {
+    /// The resource to use.
+    pub id: ResourceId,
+    /// If set, the dispatcher enforces this capability before dispatch.
+    #[serde(default)]
+    pub required_capability: Option<Capability>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_id_roundtrips() {
+        let id = ResourceId("ollama".into());
+        let s = serde_json::to_string(&id).unwrap();
+        assert_eq!(s, "\"ollama\"");
+        let back: ResourceId = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, id);
+    }
+
+    #[test]
+    fn probe_spec_http_serializes_with_routes() {
+        let spec = ProbeSpec::Http {
+            ports: vec![11434],
+            routes: vec![HttpProbeRoute {
+                path: "/api/version".into(),
+                method: HttpProbeMethod::Get,
+                flavor: ApiFlavor::OllamaNative,
+                proves: vec![Capability::OllamaNative],
+                models_jsonpath: None,
+                fingerprint_jsonpaths: vec!["$.version".into()],
+            }],
+            timeout_ms: None,
+        };
+        let s = serde_json::to_string(&spec).unwrap();
+        assert!(s.contains("\"kind\":\"http\""));
+        let back: ProbeSpec = serde_json::from_str(&s).unwrap();
+        assert_eq!(spec, back);
+    }
+
+    #[test]
+    fn capability_serializes_snake_case() {
+        let cap = Capability::OpenaiChatCompletions;
+        let s = serde_json::to_string(&cap).unwrap();
+        assert_eq!(s, "\"openai_chat_completions\"");
+    }
+
+    #[test]
+    fn resource_definition_with_override_flag() {
+        let def = ResourceDefinition {
+            id: ResourceId("ollama".into()),
+            kind: ResourceKind::HttpEndpoint,
+            advertised_capabilities: vec![Capability::OpenaiChatCompletions],
+            probe: ProbeSpec::Http {
+                ports: vec![11434],
+                routes: vec![],
+                timeout_ms: None,
+            },
+            override_lower_scope: true,
+        };
+        let s = serde_json::to_string(&def).unwrap();
+        assert!(s.contains("\"override_lower_scope\":true"));
+        let back: ResourceDefinition = serde_json::from_str(&s).unwrap();
+        assert_eq!(def, back);
+    }
 }

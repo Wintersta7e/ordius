@@ -22,3 +22,8 @@ pub use env::{
     HostDirectVerification, RunId, SecretRef, SyncStrategy, WorkflowId, WorkspaceBinding,
     WriteBackPolicy, default_max_files,
 };
+
+pub use resource::{
+    ApiFlavor, Capability, HttpProbeMethod, HttpProbeRoute, ProbeSpec, ResourceDefinition,
+    ResourceId, ResourceKind, ResourceRef,
+};
