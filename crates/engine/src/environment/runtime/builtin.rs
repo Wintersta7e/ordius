@@ -97,7 +97,7 @@ fn toolchain(
 
 /// All built-in resources Ordius knows how to probe.
 ///
-/// 23 entries total:
+/// 21 entries total:
 /// - 6 LLM HTTP endpoints: `ollama`, `lm-studio`, `llama-cpp`, `openai-compat`, `vllm`, `tabby`
 /// - 8 coding CLI agents:  `claude-code`, `codex`, `aider`, `gemini-cli`, `goose`,
 ///   `amazon-q`, `opencode`, `cursor-cli`
