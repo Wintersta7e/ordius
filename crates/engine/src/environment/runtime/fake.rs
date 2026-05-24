@@ -95,6 +95,12 @@ impl FakeRemoteDispatcher {
     }
 
     /// Seed a resource outcome. Returns `self` for chaining.
+    ///
+    /// When seeding a `FakeResource::Http` resource, the matching
+    /// `ResourceDefinition` must use `ProbeSpec::Http`; if it does not,
+    /// `probe_resource` will return an `HttpEndpoint` detail with an empty
+    /// `routes_by_capability` map. That is a test-authoring error, not a
+    /// runtime contract violation.
     #[must_use]
     pub fn with_seeded(self, id: &str, res: FakeResource) -> Self {
         self.seeded.lock().insert(ResourceId(id.into()), res);
@@ -144,7 +150,6 @@ impl Dispatcher for FakeRemoteDispatcher {
         def: &ResourceDefinition,
         _cancel: CancellationToken,
     ) -> ResourceProbeOutcome {
-        // Clone the seed out of the lock immediately so the guard is dropped
         // Clone the seed while the lock is held for the minimum possible time.
         // Using map+cloned avoids naming the guard, so clippy does not see a
         // significant-drop temporary living into the match body.
