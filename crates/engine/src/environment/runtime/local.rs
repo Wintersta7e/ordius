@@ -9,12 +9,12 @@ use futures::TryStreamExt;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use super::catalog::ResourceProbeOutcome;
+use super::catalog::{ProvenRoute, ResourceDetail, ResourceProbeOutcome, RouteOrigin};
 use super::dispatcher::{Dispatcher, HttpTransport, ResponseStream};
 use super::env::{EnvInfo, RunId, WorkspaceBinding};
 use super::error::DispatchError;
 use super::plan::{ProbePlan, ProbeSummary};
-use super::resource::ResourceDefinition;
+use super::resource::{HttpProbeMethod, HttpProbeRoute, ProbeSpec, ResourceDefinition};
 use super::transport::{
     EnvPath, HttpError, HttpMethod, HttpRequest, HttpResponse, ProcessCmd, WorkspaceHandle,
 };
@@ -168,10 +168,21 @@ impl Dispatcher for LocalDispatcher {
     /// Single-resource re-probe — implemented in Tasks 16 + 17.
     async fn probe_resource(
         &self,
-        _def: &ResourceDefinition,
-        _cancel: CancellationToken,
+        def: &ResourceDefinition,
+        cancel: CancellationToken,
     ) -> ResourceProbeOutcome {
-        unimplemented!("Tasks 16+17 wire single-resource probing")
+        match &def.probe {
+            ProbeSpec::Http {
+                ports,
+                routes,
+                timeout_ms,
+            } => self.probe_http(ports, routes, *timeout_ms, cancel).await,
+            ProbeSpec::Binary { .. } | ProbeSpec::Toolchain { .. } => {
+                ResourceProbeOutcome::ProbeFailed {
+                    reason: "binary/toolchain probe not yet implemented".into(),
+                }
+            },
+        }
     }
 
     /// Spawn a subprocess in the host namespace.
@@ -226,10 +237,73 @@ impl Dispatcher for LocalDispatcher {
     }
 }
 
+impl LocalDispatcher {
+    async fn probe_http(
+        &self,
+        ports: &[u16],
+        routes: &[HttpProbeRoute],
+        timeout_ms: Option<u64>,
+        _cancel: CancellationToken,
+    ) -> ResourceProbeOutcome {
+        let timeout = Duration::from_millis(timeout_ms.unwrap_or(1000));
+
+        for &port in ports {
+            let mut routes_by_capability = std::collections::HashMap::new();
+            let mut any_2xx = false;
+
+            for route in routes {
+                let req = HttpRequest {
+                    method: match route.method {
+                        HttpProbeMethod::Get => HttpMethod::Get,
+                        HttpProbeMethod::Head => HttpMethod::Head,
+                    },
+                    url: format!("http://127.0.0.1:{port}{}", route.path),
+                    headers: std::collections::HashMap::default(),
+                    body: None,
+                    timeout,
+                };
+
+                if let Ok(resp) = self.transport.execute(req).await
+                    && (200..300).contains(&resp.status)
+                {
+                    any_2xx = true;
+                    for cap in &route.proves {
+                        routes_by_capability
+                            .entry(*cap)
+                            .or_insert_with(|| ProvenRoute {
+                                path: route.path.clone(),
+                                method: route.method,
+                                flavor: route.flavor,
+                            });
+                    }
+                }
+            }
+
+            if any_2xx {
+                return ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
+                    base_url: format!("http://127.0.0.1:{port}"),
+                    routes_by_capability,
+                    version: None,
+                    models_list: None,
+                    auth_secret_ref: None,
+                    streaming_supported_natively: true,
+                    route_origin: RouteOrigin::HostDirect,
+                });
+            }
+        }
+
+        ResourceProbeOutcome::NotFound
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::environment::runtime::catalog::{ResourceDetail, RouteOrigin};
     use crate::environment::runtime::env::{EnvId, EnvSpec, EnvState};
+    use crate::environment::runtime::resource::{
+        ApiFlavor, Capability, HttpProbeMethod, HttpProbeRoute, ProbeSpec, ResourceId, ResourceKind,
+    };
     use crate::environment::runtime::transport::{HttpMethod, HttpRequest};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -324,5 +398,77 @@ mod tests {
         };
         let mut sup = d.spawn(cmd).expect("spawn");
         let _exit = crate::executor::supervisor::cancel(&mut sup).await;
+    }
+
+    #[tokio::test]
+    async fn probe_resource_http_found_with_proven_capability() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"version":"0.3.14"}"#))
+            .mount(&server)
+            .await;
+
+        let port = server.address().port();
+        let def = ResourceDefinition {
+            id: ResourceId("ollama".into()),
+            kind: ResourceKind::HttpEndpoint,
+            advertised_capabilities: vec![Capability::OllamaNative],
+            probe: ProbeSpec::Http {
+                ports: vec![port],
+                routes: vec![HttpProbeRoute {
+                    path: "/api/version".into(),
+                    method: HttpProbeMethod::Get,
+                    flavor: ApiFlavor::OllamaNative,
+                    proves: vec![Capability::OllamaNative],
+                    models_jsonpath: None,
+                    fingerprint_jsonpaths: vec!["$.version".into()],
+                }],
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        };
+
+        let d = LocalDispatcher::new(local_info());
+        let outcome = d.probe_resource(&def, CancellationToken::new()).await;
+
+        let ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
+            routes_by_capability,
+            route_origin,
+            ..
+        }) = outcome
+        else {
+            panic!("expected Found, got {outcome:?}");
+        };
+        assert_eq!(route_origin, RouteOrigin::HostDirect);
+        assert!(routes_by_capability.contains_key(&Capability::OllamaNative));
+    }
+
+    #[tokio::test]
+    async fn probe_resource_http_not_found_on_404() {
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        let def = ResourceDefinition {
+            id: ResourceId("ollama".into()),
+            kind: ResourceKind::HttpEndpoint,
+            advertised_capabilities: vec![Capability::OllamaNative],
+            probe: ProbeSpec::Http {
+                ports: vec![port],
+                routes: vec![HttpProbeRoute {
+                    path: "/api/version".into(),
+                    method: HttpProbeMethod::Get,
+                    flavor: ApiFlavor::OllamaNative,
+                    proves: vec![Capability::OllamaNative],
+                    models_jsonpath: None,
+                    fingerprint_jsonpaths: vec![],
+                }],
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        };
+
+        let d = LocalDispatcher::new(local_info());
+        let outcome = d.probe_resource(&def, CancellationToken::new()).await;
+        assert!(matches!(outcome, ResourceProbeOutcome::NotFound));
     }
 }
