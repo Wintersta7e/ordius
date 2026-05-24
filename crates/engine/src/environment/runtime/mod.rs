@@ -33,3 +33,7 @@ pub use catalog::{
 };
 
 pub use plan::{ProbePlan, ProbeSummary};
+
+pub use transport::{
+    EnvPath, HttpError, HttpMethod, HttpRequest, HttpResponse, ProcessCmd, WorkspaceHandle,
+};
