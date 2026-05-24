@@ -9,20 +9,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// HTTP method for dispatch-level requests.
+///
+/// Serialised as lowercase `snake_case` (e.g. `"get"`, `"delete"`).
+#[allow(missing_docs)] // variant names are self-describing RFC 7231 tokens
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HttpMethod {
-    /// GET
     Get,
-    /// HEAD
     Head,
-    /// POST
     Post,
-    /// PUT
     Put,
-    /// PATCH
     Patch,
-    /// DELETE
     Delete,
 }
 
@@ -144,8 +141,6 @@ impl Drop for WorkspaceHandle {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
 
     #[test]
