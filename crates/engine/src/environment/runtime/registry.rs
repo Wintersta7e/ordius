@@ -69,12 +69,78 @@ impl RegistryInner {
         chain.push(ScopeKey::Builtin);
         chain
     }
+
+    /// Walk the scope chain in precedence order and return the first
+    /// `ResourceDefinition` whose id matches, together with the scope it
+    /// lives in. Returns `None` if the id is not declared at any scope
+    /// visible to `(env, workflow?)`.
+    pub fn resolve(
+        &self,
+        id: &ResourceId,
+        env: &EnvId,
+        workflow: Option<&WorkflowId>,
+    ) -> Option<(&ResourceDefinition, ScopeKey)> {
+        for sk in Self::scope_chain(env, workflow) {
+            if let Some(def) = self.layers.get(&sk).and_then(|m| m.get(id)) {
+                return Some((def, sk));
+            }
+        }
+        None
+    }
+
+    /// All resource definitions visible to `(env, workflow?)`, deduplicated
+    /// by precedence: the first scope in the chain that declares an id wins;
+    /// lower-precedence declarations of the same id are silently dropped.
+    ///
+    /// Order within the returned `Vec` is precedence-descending (highest
+    /// scope first within each scope, then next scope, etc.).
+    pub fn visible_to(
+        &self,
+        env: &EnvId,
+        workflow: Option<&WorkflowId>,
+    ) -> Vec<(&ResourceDefinition, ScopeKey)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for sk in Self::scope_chain(env, workflow) {
+            if let Some(layer) = self.layers.get(&sk) {
+                for (id, def) in layer {
+                    if seen.insert(id.clone()) {
+                        out.push((def, sk.clone()));
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::environment::runtime::env::{EnvId, WorkflowId};
+    use crate::environment::runtime::resource::{ProbeSpec, ResourceKind};
+
+    /// Build a minimal `ResourceDefinition` for test scaffolding.
+    fn def(id: &str, override_flag: bool) -> ResourceDefinition {
+        ResourceDefinition {
+            id: ResourceId(id.into()),
+            kind: ResourceKind::HttpEndpoint,
+            advertised_capabilities: vec![],
+            probe: ProbeSpec::Http {
+                ports: vec![],
+                routes: vec![],
+                timeout_ms: None,
+            },
+            override_lower_scope: override_flag,
+        }
+    }
+
+    fn empty_inner() -> RegistryInner {
+        RegistryInner {
+            revision: 1,
+            layers: HashMap::new(),
+        }
+    }
 
     #[test]
     fn scope_chain_full_walk() {
@@ -106,5 +172,76 @@ mod tests {
         let chain_b = RegistryInner::scope_chain(&env_b, None);
         // EnvLocal slot differs by env
         assert_ne!(chain_a[0], chain_b[0]);
+    }
+
+    // ── Task 10 tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_returns_highest_scope() {
+        let mut inner = empty_inner();
+        inner
+            .layers
+            .entry(ScopeKey::Builtin)
+            .or_default()
+            .insert(ResourceId("ollama".into()), def("ollama", false));
+        inner
+            .layers
+            .entry(ScopeKey::EnvLocal {
+                id: EnvId::wsl("Ubuntu"),
+            })
+            .or_default()
+            .insert(ResourceId("ollama".into()), def("ollama", true));
+
+        let (found, scope) = inner
+            .resolve(&ResourceId("ollama".into()), &EnvId::wsl("Ubuntu"), None)
+            .expect("found");
+        assert!(found.override_lower_scope);
+        assert!(matches!(scope, ScopeKey::EnvLocal { .. }));
+    }
+
+    #[test]
+    fn resolve_falls_back_to_builtin() {
+        let mut inner = empty_inner();
+        inner
+            .layers
+            .entry(ScopeKey::Builtin)
+            .or_default()
+            .insert(ResourceId("ollama".into()), def("ollama", false));
+
+        let (_, scope) = inner
+            .resolve(&ResourceId("ollama".into()), &EnvId::wsl("Ubuntu"), None)
+            .expect("found");
+        assert_eq!(scope, ScopeKey::Builtin);
+    }
+
+    #[test]
+    fn resolve_misses_returns_none() {
+        let inner = empty_inner();
+        assert!(
+            inner
+                .resolve(&ResourceId("nope".into()), &EnvId::local(), None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn visible_to_dedupes_by_scope_precedence() {
+        let mut inner = empty_inner();
+        inner
+            .layers
+            .entry(ScopeKey::Builtin)
+            .or_default()
+            .insert(ResourceId("ollama".into()), def("ollama", false));
+        inner
+            .layers
+            .entry(ScopeKey::UserGlobal)
+            .or_default()
+            .insert(ResourceId("custom".into()), def("custom", false));
+
+        let visible = inner.visible_to(&EnvId::local(), None);
+        let ids: Vec<&str> = visible.iter().map(|(d, _)| d.id.0.as_str()).collect();
+        assert!(ids.contains(&"ollama"));
+        assert!(ids.contains(&"custom"));
+        assert_eq!(ids.len(), 2);
     }
 }
