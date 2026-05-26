@@ -19,6 +19,10 @@ use crate::environment::runtime::env::{EnvId, WorkflowId};
 use crate::environment::runtime::resource::{Capability, ProbeSpec, ResourceRef};
 use crate::events::EventType;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
+use crate::template::{
+    BoxedResourceResolver, SubstitutionContext, build_resources_resolver, default_env_allowlist,
+    substitute_in_config,
+};
 use crate::types::{Node, NodeType, PortValue, StreamMode};
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -55,7 +59,22 @@ impl NodeExecutor for LlmExecutor {
         ctx: &RunContext,
         cancel: CancellationToken,
     ) -> Result<NodeOutputs, NodeError> {
-        let tools_cfg = node
+        // The merged executor opts out of the run-loop's universal config
+        // substitution (NodeType.skip_config_templates=true) because the
+        // tool-loop fills `tools[].body_template` with `{{args | json}}`
+        // per turn — pre-substituting it would fail with Undefined. We
+        // own the substitution timing here: every config field EXCEPT
+        // `tools` is templated up-front via the standard substitution
+        // context (vars / secrets / inputs / nodes.*.outputs / resource),
+        // and the raw `tools` value is reattached untouched so the loop
+        // body can still do its per-call `{{args | json}}` swap.
+        let substituted_config = substitute_llm_config(node, ctx)?;
+        let resolved_node = Node {
+            config: substituted_config,
+            ..node.clone()
+        };
+
+        let tools_cfg = resolved_node
             .config
             .get("tools")
             .cloned()
@@ -63,11 +82,68 @@ impl NodeExecutor for LlmExecutor {
         let tools = parse_tools(&tools_cfg)?;
 
         if tools.is_empty() {
-            run_single_turn(node, nt, ctx, cancel).await
+            run_single_turn(&resolved_node, nt, ctx, cancel).await
         } else {
-            run_tool_loop(node, nt, ctx, cancel, &tools).await
+            run_tool_loop(&resolved_node, nt, ctx, cancel, &tools).await
         }
     }
+}
+
+/// Apply the standard substitution context to every config field except
+/// `tools`. The tools array stays raw — its `body_template` strings are
+/// evaluated per tool call by [`invoke_tool`] (the `{{args | json}}`
+/// expansion needs the runtime tool-call arguments, not the workflow
+/// substitution context).
+///
+/// Mirrors the closure-construction pattern in
+/// [`crate::executor::subprocess::resolve_templated_inputs`] so secrets
+/// register with the emitter for redaction, env reads use the run-loop
+/// allowlist, and resource refs resolve through the shared registry.
+fn substitute_llm_config(
+    node: &Node,
+    ctx: &RunContext,
+) -> Result<HashMap<String, serde_json::Value>, NodeError> {
+    let secrets_resolver = crate::executor::context::make_secrets_resolver(ctx);
+    let kv_resolver = |_: &str| -> Option<String> { None };
+    let env_allowlist = default_env_allowlist();
+    let resources_resolver: BoxedResourceResolver = if let Some(engine) = ctx.engine.upgrade() {
+        Box::new(build_resources_resolver(
+            engine.resource_registry(),
+            ctx.workflow_id.clone(),
+        ))
+    } else {
+        Box::new(|_, _| None)
+    };
+
+    // Detach `tools` so the substitution pass never touches it; reattach
+    // afterwards so downstream code sees the same map shape it would
+    // have gotten without the carve-out.
+    let mut working = node.config.clone();
+    let raw_tools = working.remove("tools");
+
+    let sub_ctx = SubstitutionContext {
+        vars: &ctx.variables,
+        secrets: &secrets_resolver,
+        upstream_outputs: &ctx.upstream_outputs,
+        current_inputs: &ctx.current_inputs,
+        current_config: &working,
+        kv: &kv_resolver,
+        env: &*ctx.env,
+        env_allowlist: &env_allowlist,
+        resources: &resources_resolver,
+        run_id: &ctx.run_id,
+        workspace: &ctx.workspace,
+        started_at_iso: &ctx.started_at_iso,
+        workflow_id: &ctx.workflow_id,
+        workflow_name: &ctx.workflow_name,
+    };
+
+    let mut substituted =
+        substitute_in_config(&working, &sub_ctx).map_err(|e| NodeError::Template(e.to_string()))?;
+    if let Some(tools) = raw_tools {
+        substituted.insert("tools".into(), tools);
+    }
+    Ok(substituted)
 }
 
 /// Resolve the optional `resource` config field on an `llm` node into
@@ -1206,6 +1282,240 @@ mod tests {
         assert_eq!(
             out.get("finish_reason"),
             Some(&PortValue::String("http_503".into()))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn single_turn_substitutes_vars_in_messages_and_url() {
+        // {{vars.X}} on `messages[].content`, `model`, and `url` should
+        // resolve before the request hits the wire — the executor owns
+        // the substitution because skip_config_templates=true bypasses
+        // the run-loop's universal pass.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "ack"},
+                    "finish_reason": "stop"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let (mut ctx, _rx, _dir) = make_ctx();
+        ctx.variables.insert("base".into(), server.uri());
+        ctx.variables
+            .insert("greeting".into(), "hello there".into());
+        ctx.variables.insert("model_id".into(), "test-model".into());
+
+        let node = Node {
+            id: "n".into(),
+            ty: NODE_TYPE_ID.into(),
+            name: String::new(),
+            config: HashMap::from([
+                ("url".into(), serde_json::json!("{{vars.base}}")),
+                ("model".into(), serde_json::json!("{{vars.model_id}}")),
+                (
+                    "messages".into(),
+                    serde_json::json!([
+                        {"role": "user", "content": "{{vars.greeting}}"}
+                    ]),
+                ),
+                ("stream".into(), serde_json::json!("off")),
+            ]),
+            pos: Pos::default(),
+            timeout_ms: None,
+            retry: None,
+            continue_on_error: false,
+            target_env: None,
+        };
+
+        let out = LlmExecutor
+            .run(&node, &llm_nt(), &ctx, CancellationToken::new())
+            .await
+            .expect("substituted call succeeds");
+        assert_eq!(out.get("text"), Some(&PortValue::String("ack".into())));
+
+        let reqs = server.received_requests().await.expect("requests captured");
+        assert_eq!(reqs.len(), 1, "exactly one /chat/completions hit");
+        let body: serde_json::Value = reqs[0].body_json().expect("json body");
+        assert_eq!(body["model"], serde_json::json!("test-model"));
+        assert_eq!(
+            body["messages"][0]["content"],
+            serde_json::json!("hello there"),
+            "vars substituted in messages.content; got {body}",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tool_loop_does_not_pre_substitute_body_template() {
+        // The tool loop's `body_template` carries `{{args | json}}` which
+        // only resolves per tool call inside `invoke_tool`; the executor's
+        // up-front substitution must leave the `tools` array untouched.
+        let server = MockServer::start().await;
+        // Turn 1: assistant emits a tool call.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "echo",
+                                "arguments": "{\"k\":\"v\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Tool endpoint: capture body so we can assert on it.
+        Mock::given(method("POST"))
+            .and(path("/tool"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("tool-ok"))
+            .mount(&server)
+            .await;
+        // Turn 2: assistant terminates the loop.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "done"},
+                    "finish_reason": "stop"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let (ctx, _rx, _dir) = make_ctx();
+        let tool_url = format!("{}/tool", server.uri());
+        let node = Node {
+            id: "n".into(),
+            ty: NODE_TYPE_ID.into(),
+            name: String::new(),
+            config: HashMap::from([
+                ("url".into(), serde_json::json!(server.uri())),
+                ("model".into(), serde_json::json!("test-model")),
+                (
+                    "messages".into(),
+                    serde_json::json!([{"role": "user", "content": "go"}]),
+                ),
+                ("stream".into(), serde_json::json!("off")),
+                ("max_turns".into(), serde_json::json!(2)),
+                (
+                    "tools".into(),
+                    serde_json::json!([{
+                        "name": "echo",
+                        "description": "echoes args",
+                        "kind": "http",
+                        "method": "POST",
+                        "url": tool_url,
+                        "body_template": "{{args | json}}",
+                    }]),
+                ),
+            ]),
+            pos: Pos::default(),
+            timeout_ms: None,
+            retry: None,
+            continue_on_error: false,
+            target_env: None,
+        };
+
+        let out = LlmExecutor
+            .run(&node, &llm_nt(), &ctx, CancellationToken::new())
+            .await
+            .expect("tool loop completes");
+        assert_eq!(out.get("text"), Some(&PortValue::String("done".into())));
+
+        let reqs = server.received_requests().await.expect("requests captured");
+        let tool_calls: Vec<&wiremock::Request> =
+            reqs.iter().filter(|r| r.url.path() == "/tool").collect();
+        assert_eq!(tool_calls.len(), 1, "tool endpoint hit exactly once");
+        let body = String::from_utf8_lossy(&tool_calls[0].body);
+        assert_eq!(
+            body.as_ref(),
+            "{\"k\":\"v\"}",
+            "body_template kept its `{{{{args | json}}}}` placeholder until the \
+             loop swapped it for the JSON-encoded tool args; got {body}",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn secret_substitutes_in_api_key_and_is_redacted() {
+        // `{{secrets.X}}` on `api_key` resolves through the standard
+        // resolver (which registers the value for redaction on the
+        // emitter) and reaches the wire as a `Bearer <value>` header.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        // Seed an in-process secrets store with a single entry. The
+        // `keyring::use_sample_store` shim keeps the real OS keyring out
+        // of the test path; the `secrets-index.json` lives in a tempdir
+        // that gets cleaned up at end-of-test.
+        keyring::use_sample_store(&HashMap::from([("persist", "false")])).unwrap();
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::secrets::Store::with_index_path(
+            store_dir.path().join("secrets-index.json"),
+        ));
+        store.set("api_token", "sk-secret-abc").expect("set");
+
+        let (mut ctx, _rx, _dir) = make_ctx();
+        ctx.secrets_store = Some(store);
+
+        let node = Node {
+            id: "n".into(),
+            ty: NODE_TYPE_ID.into(),
+            name: String::new(),
+            config: HashMap::from([
+                ("url".into(), serde_json::json!(server.uri())),
+                ("model".into(), serde_json::json!("test-model")),
+                (
+                    "messages".into(),
+                    serde_json::json!([{"role": "user", "content": "hi"}]),
+                ),
+                ("stream".into(), serde_json::json!("off")),
+                ("api_key".into(), serde_json::json!("{{secrets.api_token}}")),
+            ]),
+            pos: Pos::default(),
+            timeout_ms: None,
+            retry: None,
+            continue_on_error: false,
+            target_env: None,
+        };
+
+        LlmExecutor
+            .run(&node, &llm_nt(), &ctx, CancellationToken::new())
+            .await
+            .expect("substituted call succeeds");
+
+        let reqs = server.received_requests().await.expect("requests captured");
+        assert_eq!(reqs.len(), 1);
+        let auth = reqs[0]
+            .headers
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(
+            auth, "Bearer sk-secret-abc",
+            "api_key resolved from secrets; got {auth}",
         );
     }
 

@@ -882,11 +882,12 @@ fn llm_spec() -> NodeType {
         ],
         config: llm_config_fields(),
         execution: in_process_execution_spec(),
-        // The merged executor's tool-loop path evaluates inline tool
-        // body_template / result_path per invocation; pre-substituting
-        // {{args | json}} at dispatch would resolve as a missing
-        // reference. (Was false when the spec covered single-turn only;
-        // necessary now that the same id handles the tool loop too.)
+        // Stays true because `tools[].body_template` carries the per-turn
+        // `{{args | json}}` placeholder that only resolves inside the loop
+        // body; pre-substituting it at dispatch would fail with Undefined.
+        // The executor (`LlmExecutor::run` → `substitute_llm_config`) owns
+        // substitution for every other config field, so {{vars}}/{{secrets}}
+        // /{{inputs}}/{{nodes.*.outputs}}/{{resource.*}} still resolve.
         skip_config_templates: true,
     }
 }
