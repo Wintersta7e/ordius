@@ -96,9 +96,9 @@ pub enum DispatchError {
         source: std::io::Error,
     },
 
-    /// A host ↔ env path translation rule didn't match.
-    #[error("path translation: {0}")]
-    Translation(String),
+    /// Building a serialisable plan or wire payload failed.
+    #[error("plan build failed: {0}")]
+    PlanBuild(String),
 
     /// The dispatcher does not handle this binding/operation for the given env type.
     #[error("operation unsupported: {0}")]
