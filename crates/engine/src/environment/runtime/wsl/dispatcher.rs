@@ -172,6 +172,17 @@ impl WslDispatcher {
             .spawn()
             .map_err(|e| DispatchError::HelperBootstrap(format!("helper spawn: {e}")))?;
 
+        // Drain the helper's stderr in the background so a chatty helper can't
+        // fill the ~64 KB pipe buffer and deadlock the stdout reader below.
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::debug!(target: "ordius::wsl::helper", "helper stderr: {line}");
+                }
+            });
+        }
+
         let Some(mut stdin) = child.stdin.take() else {
             return Err(DispatchError::HelperBootstrap(
                 "helper stdin missing".into(),
@@ -356,12 +367,17 @@ fn probe_failed(reason: impl Into<String>) -> ResourceProbeOutcome {
 
 fn build_wsl_command(distro: &str, cmd: &ProcessCmd) -> tokio::process::Command {
     let mut c = tokio::process::Command::new("wsl.exe");
-    c.arg("-d").arg(distro).arg("--exec").arg(&cmd.program);
+    c.arg("-d").arg(distro);
+    // `cmd.cwd` is an env-side path (e.g. `/home/me/work`).  Pass it via
+    // `wsl.exe --cd` so the in-distro working directory is set before `--exec`
+    // — setting `current_dir` on the host-side Command would point the
+    // launcher at a path that doesn't exist on Windows.
+    if let Some(cwd) = cmd.cwd.as_ref() {
+        c.arg("--cd").arg(cwd.as_str());
+    }
+    c.arg("--exec").arg(&cmd.program);
     for a in &cmd.args {
         c.arg(a);
-    }
-    if let Some(cwd) = cmd.cwd.as_ref() {
-        c.current_dir(cwd.as_str());
     }
     for (k, v) in &cmd.env {
         c.env(k, v);
@@ -541,8 +557,9 @@ fn resource_spec_v1_from_def(def: &ResourceDefinition) -> Result<ResourceSpecV1,
                         },
                         proves: route
                             .proves
-                            .first()
-                            .map_or_else(String::new, |cap| capability_to_wire(*cap)),
+                            .iter()
+                            .map(|cap| capability_to_wire(*cap))
+                            .collect(),
                         expect_status: Vec::new(),
                         fingerprint_jsonpaths: route.fingerprint_jsonpaths.clone(),
                     })
@@ -663,28 +680,30 @@ fn routes_by_capability_from_wire(
 
     let mut by_capability = HashMap::new();
     for wire_route in proven_routes {
-        let Some(capability) = capability_from_wire(&wire_route.capability) else {
-            continue;
-        };
-        let Some(route) = routes
-            .iter()
-            .find(|route| route.path == wire_route.path && route.proves.contains(&capability))
-        else {
-            tracing::debug!(
-                capability = %wire_route.capability,
-                path = %wire_route.path,
-                "dropping helper proven route absent from original probe definition"
-            );
-            continue;
-        };
+        for wire_cap in &wire_route.capabilities {
+            let Some(capability) = capability_from_wire(wire_cap) else {
+                continue;
+            };
+            let Some(route) = routes
+                .iter()
+                .find(|route| route.path == wire_route.path && route.proves.contains(&capability))
+            else {
+                tracing::debug!(
+                    capability = %wire_cap,
+                    path = %wire_route.path,
+                    "dropping helper proven route absent from original probe definition"
+                );
+                continue;
+            };
 
-        by_capability
-            .entry(capability)
-            .or_insert_with(|| ProvenRoute {
-                path: wire_route.path.clone(),
-                method: route.method,
-                flavor: route.flavor,
-            });
+            by_capability
+                .entry(capability)
+                .or_insert_with(|| ProvenRoute {
+                    path: wire_route.path.clone(),
+                    method: route.method,
+                    flavor: route.flavor,
+                });
+        }
     }
     by_capability
 }
@@ -717,6 +736,7 @@ mod tests {
     use crate::environment::runtime::resource::{
         ApiFlavor, Capability, HttpProbeRoute, ResourceId,
     };
+    use crate::environment::runtime::transport::EnvPath;
 
     fn info(distro: &str) -> EnvInfo {
         EnvInfo {
@@ -824,6 +844,24 @@ mod tests {
         assert!(sh_pos < c_pos && c_pos < script_pos);
     }
 
+    #[test]
+    fn build_command_passes_cwd_via_dash_cd() {
+        let cmd = ProcessCmd {
+            program: "/bin/ls".into(),
+            args: vec![],
+            env: HashMap::new(),
+            cwd: Some(EnvPath::new("/home/me/work")),
+            stdin: None,
+        };
+        let built = build_wsl_command("Ubuntu", &cmd);
+        let dbg = format!("{built:?}");
+        assert!(dbg.contains("\"--cd\""));
+        assert!(dbg.contains("\"/home/me/work\""));
+        let dash_cd_pos = dbg.find("\"--cd\"").unwrap();
+        let dash_exec_pos = dbg.find("\"--exec\"").unwrap();
+        assert!(dash_cd_pos < dash_exec_pos, "--cd must precede --exec");
+    }
+
     #[tokio::test]
     async fn probe_resource_cancelled_skips_before_bootstrap() {
         let d = WslDispatcher::new(info("Ubuntu"), "Ubuntu");
@@ -842,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_spec_maps_http_ports_head_and_first_capability() {
+    fn resource_spec_maps_http_ports_head_and_all_capabilities() {
         let def = ResourceDefinition {
             id: ResourceId("api".into()),
             kind: ResourceKind::HttpEndpoint,
@@ -882,7 +920,13 @@ mod tests {
         );
         assert_eq!(routes.len(), 1);
         assert!(matches!(routes[0].method, HttpProbeMethodV1::Get));
-        assert_eq!(routes[0].proves, "openai_chat_completions");
+        assert_eq!(
+            routes[0].proves,
+            vec![
+                "openai_chat_completions".to_string(),
+                "openai_tool_calling".to_string(),
+            ]
+        );
         assert!(routes[0].expect_status.is_empty());
     }
 
@@ -893,7 +937,7 @@ mod tests {
             ProbeOutcomeBodyV1::Found(ProbeDetailV1::HttpEndpoint {
                 base_url: "http://127.0.0.1:11434".into(),
                 proven_routes: vec![ProvenRouteV1 {
-                    capability: "ollama_native".into(),
+                    capabilities: vec!["ollama_native".into()],
                     path: "/api/version".into(),
                     status: 200,
                     fingerprint: "abc".into(),
@@ -922,6 +966,65 @@ mod tests {
                 flavor: ApiFlavor::OllamaNative,
             })
         );
+    }
+
+    #[test]
+    fn wire_http_outcome_expands_multi_capability_routes() {
+        // OpenAI-shaped /v1/models simultaneously proves chat-completions
+        // and tool-calling.  Both capabilities must show up in the engine
+        // catalog, not just the first.
+        let def = ResourceDefinition {
+            id: ResourceId("openai-shaped".into()),
+            kind: ResourceKind::HttpEndpoint,
+            advertised_capabilities: vec![
+                Capability::OpenaiChatCompletions,
+                Capability::OpenaiToolCalling,
+            ],
+            probe: ProbeSpec::Http {
+                ports: vec![1234],
+                routes: vec![HttpProbeRoute {
+                    path: "/v1/models".into(),
+                    method: HttpProbeMethod::Get,
+                    flavor: ApiFlavor::OpenaiChat,
+                    proves: vec![
+                        Capability::OpenaiChatCompletions,
+                        Capability::OpenaiToolCalling,
+                    ],
+                    models_jsonpath: None,
+                    fingerprint_jsonpaths: vec![],
+                }],
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        };
+
+        let outcome = wire_outcome_to_engine(
+            ProbeOutcomeBodyV1::Found(ProbeDetailV1::HttpEndpoint {
+                base_url: "http://127.0.0.1:1234".into(),
+                proven_routes: vec![ProvenRouteV1 {
+                    capabilities: vec![
+                        "openai_chat_completions".into(),
+                        "openai_tool_calling".into(),
+                    ],
+                    path: "/v1/models".into(),
+                    status: 200,
+                    fingerprint: String::new(),
+                }],
+            }),
+            &def,
+            &HashMap::new(),
+        );
+
+        let ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
+            routes_by_capability,
+            ..
+        }) = outcome
+        else {
+            panic!("expected Found HTTP outcome");
+        };
+        assert!(routes_by_capability.contains_key(&Capability::OpenaiChatCompletions));
+        assert!(routes_by_capability.contains_key(&Capability::OpenaiToolCalling));
+        assert_eq!(routes_by_capability.len(), 2);
     }
 
     #[test]
@@ -990,7 +1093,7 @@ mod tests {
             ProbeOutcomeBodyV1::Found(ProbeDetailV1::HttpEndpoint {
                 base_url: "http://127.0.0.1:11434".into(),
                 proven_routes: vec![ProvenRouteV1 {
-                    capability: "not_a_capability".into(),
+                    capabilities: vec!["not_a_capability".into()],
                     path: "/api/version".into(),
                     status: 200,
                     fingerprint: "abc".into(),

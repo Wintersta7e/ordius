@@ -70,15 +70,17 @@ pub enum ResourceKindV1 {
     },
 }
 
-/// One HTTP probe route, carrying the capability it proves.
+/// One HTTP probe route, carrying the capabilities it proves.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpProbeRouteV1 {
     /// Path under the base URL (e.g. `"/api/version"`).
     pub path: String,
     /// HTTP method.
     pub method: HttpProbeMethodV1,
-    /// Capability the route proves on a 2xx response.
-    pub proves: String,
+    /// Capabilities the route proves on a 2xx response.  A single route may
+    /// prove multiple capabilities at once (e.g. an OpenAI-shaped endpoint
+    /// often proves both chat-completions and tool-calling).
+    pub proves: Vec<String>,
     /// Expected status range — defaults to 200-299 if empty.
     #[serde(default)]
     pub expect_status: Vec<u16>,
@@ -166,11 +168,13 @@ pub enum ProbeDetailV1 {
     },
 }
 
-/// Proven HTTP route — capability + path + stable fingerprint of response.
+/// Proven HTTP route — capabilities + path + stable fingerprint of response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvenRouteV1 {
-    /// Capability the route proved.
-    pub capability: String,
+    /// Capabilities the route proved.  A single proven route can satisfy
+    /// multiple capabilities; the engine re-keys this into per-capability
+    /// `ProvenRoute` entries during translation.
+    pub capabilities: Vec<String>,
     /// Path under the base URL that answered.
     pub path: String,
     /// HTTP status code returned.
@@ -221,7 +225,7 @@ mod tests {
                     routes: vec![HttpProbeRouteV1 {
                         path: "/api/version".into(),
                         method: HttpProbeMethodV1::Get,
-                        proves: "ollama_native".into(),
+                        proves: vec!["ollama_native".into()],
                         expect_status: vec![],
                         fingerprint_jsonpaths: vec!["$.version".into()],
                     }],
@@ -242,7 +246,7 @@ mod tests {
             outcome: ProbeOutcomeBodyV1::Found(ProbeDetailV1::HttpEndpoint {
                 base_url: "http://127.0.0.1:11434".into(),
                 proven_routes: vec![ProvenRouteV1 {
-                    capability: "ollama_native".into(),
+                    capabilities: vec!["ollama_native".into()],
                     path: "/api/version".into(),
                     status: 200,
                     fingerprint: "abc123".into(),

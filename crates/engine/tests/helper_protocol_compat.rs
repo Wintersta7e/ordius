@@ -20,7 +20,7 @@ fn probe_plan_engine_to_wire_roundtrip() {
                 routes: vec![wire::HttpProbeRouteV1 {
                     path: "/api/version".into(),
                     method: wire::HttpProbeMethodV1::Get,
-                    proves: "ollama_native".into(),
+                    proves: vec!["ollama_native".into()],
                     expect_status: vec![],
                     fingerprint_jsonpaths: vec!["$.version".into()],
                 }],
@@ -41,7 +41,7 @@ fn outcome_serializes_with_snake_case_tags() {
         outcome: wire::ProbeOutcomeBodyV1::Found(wire::ProbeDetailV1::HttpEndpoint {
             base_url: "http://127.0.0.1:11434".into(),
             proven_routes: vec![wire::ProvenRouteV1 {
-                capability: "ollama_native".into(),
+                capabilities: vec!["ollama_native".into()],
                 path: "/api/version".into(),
                 status: 200,
                 fingerprint: "abc".into(),

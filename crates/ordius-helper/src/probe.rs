@@ -146,7 +146,7 @@ fn probe_http(
                         Ok(body) => {
                             let fingerprint = fingerprint(&body, &route.fingerprint_jsonpaths);
                             proven.push(ProvenRouteV1 {
-                                capability: route.proves.clone(),
+                                capabilities: route.proves.clone(),
                                 path: route.path.clone(),
                                 status,
                                 fingerprint,
@@ -464,7 +464,7 @@ mod tests {
                     routes: vec![HttpProbeRouteV1 {
                         path: "/probe".into(),
                         method: HttpProbeMethodV1::Get,
-                        proves: "alive".into(),
+                        proves: vec!["alive".into()],
                         expect_status: vec![],
                         fingerprint_jsonpaths: vec![],
                     }],
