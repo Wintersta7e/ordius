@@ -4,7 +4,6 @@
 // loop can reach its `NODE_TYPE_ID` constant directly without an
 // awkward re-export shim (clippy's redundant_pub_crate /
 // unreachable_pub crossfire is unkind to that pattern).
-pub(crate) mod agent;
 pub(crate) mod checkpoint;
 pub(crate) mod compose;
 pub(crate) mod condition;
@@ -20,7 +19,6 @@ pub(crate) mod transform;
 mod util;
 pub(crate) mod wait_event;
 
-pub use agent::AgentExecutor;
 pub use checkpoint::CheckpointExecutor;
 pub use compose::ComposeExecutor;
 pub use condition::ConditionExecutor;

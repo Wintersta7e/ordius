@@ -3,7 +3,8 @@
 //! Built-ins are inserted at startup via [`Registry::with_v1_0_builtins`];
 //! manifest-loaded types land here once the manifest loader ships.
 
-use crate::executor::builtins::agent::NODE_TYPE_ID as AGENT_NODE_TYPE_ID;
+// `agent_spec` (still defined below for the next commit to delete)
+// inlines the id literal `"agent"` — the `agent` module is gone.
 use crate::executor::builtins::checkpoint::{
     NODE_TYPE_ID as CHECKPOINT_NODE_TYPE_ID, PAUSE_NODE_TYPE_ID,
 };
@@ -90,7 +91,6 @@ impl Registry {
         r.register(wait_event_spec());
         r.register(compose_spec());
         r.register(parallel_spec());
-        r.register(agent_spec());
         r.register(container_spec());
         r
     }
@@ -352,9 +352,13 @@ fn container_spec() -> NodeType {
     }
 }
 
+// Carried forward unused for one commit so the diff that removes the
+// "agent" id (and updates the llm spec to match the merged executor)
+// stays focused. Deleted in the next commit.
+#[allow(dead_code)]
 fn agent_spec() -> NodeType {
     NodeType {
-        id: AGENT_NODE_TYPE_ID.into(),
+        id: "agent".into(),
         name: "Agent".into(),
         category: Category::Llm,
         tags: vec![],
@@ -933,7 +937,12 @@ fn llm_spec() -> NodeType {
             },
         ],
         execution: in_process_execution_spec(),
-        skip_config_templates: false,
+        // The merged executor's tool-loop path evaluates inline tool
+        // body_template / result_path per invocation; pre-substituting
+        // {{args | json}} at dispatch would resolve as a missing
+        // reference. (Was false when the spec covered single-turn only;
+        // necessary now that the same id handles the tool loop too.)
+        skip_config_templates: true,
     }
 }
 

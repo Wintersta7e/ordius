@@ -1,5 +1,7 @@
-//! End-to-end smoke: `agent` invokes a mock `OpenAI` endpoint, dispatches
-//! a tool call, and terminates on the second turn.
+//! End-to-end smoke: the merged `llm` built-in. With `tools` set,
+//! invokes a mock `OpenAI` endpoint, dispatches a tool call, and
+//! terminates on the second turn. Without `tools`, the same node-type
+//! takes the single-turn path and returns text only.
 
 use ordius_engine::Engine;
 use ordius_engine::types::{Node, Pos, Trigger, Workflow};
@@ -29,11 +31,11 @@ fn agent_node(id: &str, llm_url: &str, tool_url: &str) -> Node {
     );
     config.insert("max_turns".into(), serde_json::json!(4));
     // The existing test mocks the response with a JSON body (not SSE);
-    // pin stream=false so we exercise the non-streaming path here.
-    config.insert("stream".into(), serde_json::json!(false));
+    // pin stream=off so we exercise the non-streaming path here.
+    config.insert("stream".into(), serde_json::json!("off"));
     Node {
         id: id.into(),
-        ty: "agent".into(),
+        ty: "llm".into(),
         name: String::new(),
         config,
         pos: Pos::default(),
@@ -61,7 +63,7 @@ fn workflow(id: &str, nodes: Vec<Node>) -> Workflow {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn agent_runs_a_tool_call_then_terminates() {
+async fn llm_with_tools_runs_a_tool_call_then_terminates() {
     let llm = MockServer::start().await;
     let tool = MockServer::start().await;
 
@@ -143,10 +145,10 @@ fn streaming_agent_node(id: &str, llm_url: &str, tool_url: &str) -> Node {
         }]),
     );
     config.insert("max_turns".into(), serde_json::json!(4));
-    config.insert("stream".into(), serde_json::json!(true));
+    config.insert("stream".into(), serde_json::json!("auto"));
     Node {
         id: id.into(),
-        ty: "agent".into(),
+        ty: "llm".into(),
         name: String::new(),
         config,
         pos: Pos::default(),
@@ -158,7 +160,7 @@ fn streaming_agent_node(id: &str, llm_url: &str, tool_url: &str) -> Node {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn agent_streams_assembles_tool_call_across_deltas_then_terminates() {
+async fn llm_with_tools_streams_assembles_tool_call_across_deltas_then_terminates() {
     let llm = MockServer::start().await;
     let tool = MockServer::start().await;
 
@@ -221,5 +223,54 @@ async fn agent_streams_assembles_tool_call_across_deltas_then_terminates() {
         .run_workflow(Arc::new(wf), HashMap::new(), "test", false, None)
         .await
         .expect("agent run");
+    assert_eq!(summary.status, "done");
+}
+
+fn no_tools_llm_node(id: &str, llm_url: &str) -> Node {
+    let mut config = HashMap::new();
+    config.insert("url".into(), serde_json::json!(llm_url));
+    config.insert("model".into(), serde_json::json!("test-model"));
+    config.insert(
+        "messages".into(),
+        serde_json::json!([{"role": "user", "content": "hi"}]),
+    );
+    // No `tools` key — the merged executor takes the single-turn path.
+    config.insert("stream".into(), serde_json::json!("off"));
+    Node {
+        id: id.into(),
+        ty: "llm".into(),
+        name: String::new(),
+        config,
+        pos: Pos::default(),
+        timeout_ms: None,
+        retry: None,
+        continue_on_error: false,
+        target_env: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn llm_without_tools_returns_text_only() {
+    let llm = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"total_tokens": 4},
+        })))
+        .mount(&llm)
+        .await;
+
+    let dir = TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+
+    let wf = workflow("p-notools", vec![no_tools_llm_node("a", &llm.uri())]);
+    let summary = engine
+        .run_workflow(Arc::new(wf), HashMap::new(), "test", false, None)
+        .await
+        .expect("llm single-turn run");
     assert_eq!(summary.status, "done");
 }
