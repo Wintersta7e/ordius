@@ -37,6 +37,21 @@ impl WslDispatcher {
     }
 }
 
+fn build_wsl_command(distro: &str, cmd: &ProcessCmd) -> tokio::process::Command {
+    let mut c = tokio::process::Command::new("wsl.exe");
+    c.arg("-d").arg(distro).arg("--exec").arg(&cmd.program);
+    for a in &cmd.args {
+        c.arg(a);
+    }
+    if let Some(cwd) = cmd.cwd.as_ref() {
+        c.current_dir(cwd.as_str());
+    }
+    for (k, v) in &cmd.env {
+        c.env(k, v);
+    }
+    c
+}
+
 #[async_trait]
 impl Dispatcher for WslDispatcher {
     fn info(&self) -> &EnvInfo {
@@ -63,8 +78,23 @@ impl Dispatcher for WslDispatcher {
         }
     }
 
-    fn spawn(&self, _cmd: ProcessCmd) -> std::io::Result<Supervised> {
-        Err(std::io::Error::other("WslDispatcher::spawn pending T12"))
+    fn spawn(&self, cmd: ProcessCmd) -> std::io::Result<Supervised> {
+        let mut tokio_cmd = build_wsl_command(&self.distro_name, &cmd);
+        tokio_cmd.stdin(std::process::Stdio::piped());
+        tokio_cmd.stdout(std::process::Stdio::piped());
+        tokio_cmd.stderr(std::process::Stdio::piped());
+        let mut sup = crate::executor::supervisor::spawn(tokio_cmd)?;
+        if let Some(bytes) = cmd.stdin
+            && let Some(mut child_stdin) = sup.child_mut().stdin.take()
+        {
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                // Best-effort write; child closing stdin early is legitimate.
+                drop(child_stdin.write_all(&bytes).await);
+                drop(child_stdin.shutdown().await);
+            });
+        }
+        Ok(sup)
     }
 
     fn http_transport(&self) -> Arc<dyn HttpTransport> {
@@ -179,5 +209,42 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, DispatchError::Unsupported(_)));
+    }
+
+    #[test]
+    fn build_command_uses_dash_exec_flag() {
+        let cmd = ProcessCmd {
+            program: "/bin/ls".into(),
+            args: vec!["-la".into(), "/home".into()],
+            env: HashMap::new(),
+            cwd: None,
+            stdin: None,
+        };
+        let built = build_wsl_command("Ubuntu", &cmd);
+        let dbg = format!("{built:?}");
+        assert!(dbg.contains("wsl.exe"));
+        assert!(dbg.contains("\"-d\""));
+        assert!(dbg.contains("\"Ubuntu\""));
+        assert!(dbg.contains("\"--exec\""));
+        assert!(dbg.contains("\"/bin/ls\""));
+        assert!(dbg.contains("\"-la\""));
+        assert!(dbg.contains("\"/home\""));
+    }
+
+    #[test]
+    fn build_command_preserves_arg_order() {
+        let cmd = ProcessCmd {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "echo hi".into()],
+            env: HashMap::new(),
+            cwd: None,
+            stdin: None,
+        };
+        let built = build_wsl_command("Ubuntu", &cmd);
+        let dbg = format!("{built:?}");
+        let sh_pos = dbg.find("\"/bin/sh\"").unwrap();
+        let c_pos = dbg.find("\"-c\"").unwrap();
+        let script_pos = dbg.find("\"echo hi\"").unwrap();
+        assert!(sh_pos < c_pos && c_pos < script_pos);
     }
 }
