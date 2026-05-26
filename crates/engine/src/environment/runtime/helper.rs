@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
 /// Per-target embedded helper artifact.  Bytes lifetime = `'static`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct HelperTarget {
     /// Target triple, e.g. `"x86_64-unknown-linux-musl"`.
     pub triple: &'static str,
@@ -29,6 +29,17 @@ pub struct HelperTarget {
     /// Byte length of `bytes`.  Stored explicitly to keep manifest
     /// inspection cheap without re-counting bytes.
     pub size: usize,
+}
+
+impl std::fmt::Debug for HelperTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HelperTarget")
+            .field("triple", &self.triple)
+            .field("size", &self.size)
+            .field("sha256", &self.sha256)
+            .field("bytes", &format_args!("[{} bytes elided]", self.size))
+            .finish()
+    }
 }
 
 /// Cross-compiled helper bundle embedded in the engine binary.
@@ -45,10 +56,7 @@ include!(concat!(env!("OUT_DIR"), "/helper_manifest.rs"));
 
 /// Look up the embedded helper artifact for an env's detected triple.
 pub fn helper_bytes_for_triple(triple: &str) -> Option<&'static HelperTarget> {
-    HELPER_MANIFEST
-        .targets
-        .iter()
-        .find(|t| t.triple == triple)
+    HELPER_MANIFEST.targets.iter().find(|t| t.triple == triple)
 }
 
 /// Re-hash a target's bytes and confirm the build-time sha256 matches.
@@ -77,8 +85,9 @@ base=$1
 path=$2
 url=$base$path
 if command -v curl >/dev/null 2>&1; then
-  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 1 "$url" 2>/dev/null || echo 000)
-  printf '{"status":%s}\n' "$code"
+  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 1 "$url" 2>/dev/null)
+  case "$code" in ''|*[!0-9]*) code=0 ;; esac
+  printf '{"status":%d}\n' "$code"
 elif command -v wget >/dev/null 2>&1; then
   if wget --spider -q -T 1 -t 1 "$url" 2>/dev/null; then
     printf '{"status":200}\n'
@@ -123,5 +132,31 @@ mod tests {
     fn shell_fallback_script_uses_argv_positional() {
         assert!(SHELL_FALLBACK_SCRIPT.contains("base=$1"));
         assert!(SHELL_FALLBACK_SCRIPT.contains("path=$2"));
+    }
+
+    #[test]
+    fn shell_fallback_emits_valid_json_on_curl_paths() {
+        // Sanity-check that the shell script's printf format won't produce
+        // leading-zero numbers serde_json rejects.  We can't run sh here, but
+        // we can assert the script uses %d (which coerces) not %s (which
+        // passes the string through verbatim).
+        assert!(SHELL_FALLBACK_SCRIPT.contains("printf '{\"status\":%d}"));
+        assert!(!SHELL_FALLBACK_SCRIPT.contains("|| echo 000"));
+    }
+
+    #[test]
+    fn helper_target_debug_elides_bytes() {
+        let target = HelperTarget {
+            triple: "x86_64-test",
+            bytes: &[0u8; 1000],
+            sha256: "deadbeef",
+            size: 1000,
+        };
+        let dbg = format!("{target:?}");
+        assert!(dbg.contains("1000 bytes elided"));
+        assert!(
+            !dbg.contains("0, 0, 0, 0"),
+            "Debug should not dump raw bytes"
+        );
     }
 }
