@@ -70,8 +70,9 @@ pub use registry::{RegistryInner, ResourceRegistry, ScopeKey};
 
 // ── Built-ins ────────────────────────────────────────────────────────────────
 
-/// Static `BUILTIN_RESOURCES` slice and `builtin_by_id` accessor.
-pub use builtin::{BUILTIN_RESOURCES, builtin_by_id};
+/// Static `BUILTIN_RESOURCES` slice, `builtin_by_id` accessor, and the
+/// `install_builtin_resources` seeder consumed by `Engine::new`.
+pub use builtin::{BUILTIN_RESOURCES, builtin_by_id, install_builtin_resources};
 
 // ── Traits ───────────────────────────────────────────────────────────────────
 

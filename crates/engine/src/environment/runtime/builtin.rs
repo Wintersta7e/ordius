@@ -9,6 +9,8 @@
 
 use std::sync::LazyLock;
 
+use super::error::RegistryError;
+use super::registry::{ResourceRegistry, ScopeKey};
 use super::resource::{
     ApiFlavor, Capability, HttpProbeMethod, HttpProbeRoute, ProbeSpec, ResourceDefinition,
     ResourceId, ResourceKind,
@@ -302,6 +304,24 @@ pub fn builtin_by_id(id: &str) -> Option<&'static ResourceDefinition> {
     BUILTIN_RESOURCES.iter().find(|r| r.id.0 == id)
 }
 
+/// Install every entry in [`BUILTIN_RESOURCES`] into `registry` under
+/// [`ScopeKey::Builtin`].
+///
+/// Returns the number of definitions written. Built-ins always upsert
+/// regardless of `override_lower_scope` — they sit at the bottom of the
+/// precedence chain, so they can never shadow anything.
+///
+/// Idempotent: calling this twice is safe. Each call bumps the registry
+/// revision by `BUILTIN_RESOURCES.len()` (one bump per upsert).
+pub fn install_builtin_resources(registry: &ResourceRegistry) -> Result<usize, RegistryError> {
+    let mut written = 0_usize;
+    for def in BUILTIN_RESOURCES.iter() {
+        registry.upsert(&ScopeKey::Builtin, def)?;
+        written += 1;
+    }
+    Ok(written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,5 +395,40 @@ mod tests {
         let len = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), len, "duplicate built-in ids");
+    }
+
+    #[test]
+    fn install_seeds_all_builtins_under_builtin_scope() {
+        use crate::environment::runtime::env::EnvId;
+
+        let reg = ResourceRegistry::new();
+        let count = install_builtin_resources(&reg).expect("install");
+        assert_eq!(count, BUILTIN_RESOURCES.len());
+
+        let snap = reg.snapshot();
+        assert!(snap.revision >= count as u64);
+        let builtin_layer = snap
+            .layers
+            .get(&ScopeKey::Builtin)
+            .expect("builtin layer present");
+        assert_eq!(builtin_layer.len(), BUILTIN_RESOURCES.len());
+
+        let (_def, scope) = snap
+            .resolve(&ResourceId("ollama".into()), &EnvId::local(), None)
+            .expect("ollama resolved");
+        assert_eq!(scope, ScopeKey::Builtin);
+    }
+
+    #[test]
+    fn install_is_idempotent() {
+        let reg = ResourceRegistry::new();
+        let first = install_builtin_resources(&reg).expect("first install");
+        let rev_after_first = reg.snapshot().revision;
+        let second = install_builtin_resources(&reg).expect("second install");
+        assert_eq!(first, second);
+        assert!(reg.snapshot().revision > rev_after_first);
+        let snap = reg.snapshot();
+        let layer = snap.layers.get(&ScopeKey::Builtin).unwrap();
+        assert_eq!(layer.len(), BUILTIN_RESOURCES.len());
     }
 }
