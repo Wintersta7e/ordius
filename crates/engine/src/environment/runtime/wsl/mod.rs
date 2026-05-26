@@ -8,5 +8,6 @@ pub mod bootstrap;
 pub mod dispatcher;
 pub mod enumerate;
 pub mod path;
+pub mod shell_fallback;
 
 pub use dispatcher::WslDispatcher;
