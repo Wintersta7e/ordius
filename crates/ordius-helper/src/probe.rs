@@ -12,9 +12,8 @@ use std::time::{Duration, Instant};
 
 /// Run the probe subcommand: deserialize one `ProbePlanV1`, probe each
 /// resource sequentially, emit one JSONL `ProbeOutcomeV1` per line.
-pub fn run<R: BufRead, W: Write>(input: R, mut output: W) -> anyhow::Result<()> {
+pub fn run<R: BufRead, W: Write>(mut input: R, mut output: W) -> anyhow::Result<()> {
     let mut buf = String::new();
-    let mut input = input;
     input
         .read_to_string(&mut buf)
         .context("read probe plan from stdin")?;
@@ -123,47 +122,46 @@ fn probe_http(
                 HttpProbeMethodV1::Post => agent.post(&url),
             };
 
-            match req.call() {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let accepted = if route.expect_status.is_empty() {
-                        (200..=299).contains(&status)
-                    } else {
-                        route.expect_status.contains(&status)
-                    };
-
-                    if accepted {
-                        match resp.into_string() {
-                            Ok(body) => {
-                                let fingerprint = fingerprint(&body, &route.fingerprint_jsonpaths);
-                                proven.push(ProvenRouteV1 {
-                                    capability: route.proves.clone(),
-                                    path: route.path.clone(),
-                                    status,
-                                    fingerprint,
-                                });
-                            },
-                            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                                any_timeout = true;
-                            },
-                            Err(e) => {
-                                last_err = Some(format!("read response body: {e}"));
-                            },
-                        }
-                    } else {
-                        last_err = Some(format!("status {status} not in expected range"));
-                    }
-                },
+            // ureq surfaces non-2xx as `Err(Status(code, resp))` rather than `Ok`.
+            // Normalize both arms into `(status, resp_opt)` so `expect_status`
+            // is consulted uniformly — a route declaring `expect_status: [401]`
+            // must accept the 401 path, not classify it as `ProbeFailed`.
+            let (status, resp_opt) = match req.call() {
+                Ok(resp) => (resp.status(), Some(resp)),
                 Err(err) if is_ureq_timeout(&err) => {
                     any_timeout = true;
+                    continue;
                 },
-                Err(ureq::Error::Status(code, _)) => {
-                    last_err = Some(format!("status {code}"));
-                },
+                Err(ureq::Error::Status(code, resp)) => (code, Some(resp)),
                 Err(ureq::Error::Transport(t)) => {
                     base_transport_failed = true;
                     last_err = Some(format!("transport error: {t}"));
+                    continue;
                 },
+            };
+
+            if classify_response_status(status, &route.expect_status) {
+                if let Some(resp) = resp_opt {
+                    match resp.into_string() {
+                        Ok(body) => {
+                            let fingerprint = fingerprint(&body, &route.fingerprint_jsonpaths);
+                            proven.push(ProvenRouteV1 {
+                                capability: route.proves.clone(),
+                                path: route.path.clone(),
+                                status,
+                                fingerprint,
+                            });
+                        },
+                        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                            any_timeout = true;
+                        },
+                        Err(e) => {
+                            last_err = Some(format!("read response body: {e}"));
+                        },
+                    }
+                }
+            } else {
+                last_err = Some(format!("status {status} not in expected range"));
             }
         }
 
@@ -174,6 +172,14 @@ fn probe_http(
             });
         }
 
+        // Per-base fallback semantics:
+        // * Transport errors (connection refused, DNS fail, etc.) → try the
+        //   next base. The address is unreachable, so a different base may
+        //   serve the same resource.
+        // * Status-mismatch / read-body errors → return ProbeFailed without
+        //   falling back. Reaching the server but getting an unexpected
+        //   response means *this* is the wrong server; another base would
+        //   just be a different wrong server.
         if base_transport_failed {
             continue;
         }
@@ -189,6 +195,17 @@ fn probe_http(
         ProbeOutcomeBodyV1::ProbeFailed { reason }
     } else {
         ProbeOutcomeBodyV1::NotFound
+    }
+}
+
+/// Decide whether a response status counts as a successful probe.
+/// Empty `expect_status` defaults to the 2xx range; otherwise the status
+/// must appear in the declared list.
+fn classify_response_status(status: u16, expect_status: &[u16]) -> bool {
+    if expect_status.is_empty() {
+        (200..=299).contains(&status)
+    } else {
+        expect_status.contains(&status)
     }
 }
 
@@ -466,5 +483,31 @@ mod tests {
             outcome.outcome,
             ProbeOutcomeBodyV1::ProbeFailed { .. }
         ));
+    }
+
+    #[test]
+    fn accept_logic_default_treats_2xx_as_ok() {
+        assert!(classify_response_status(200, &[]));
+        assert!(classify_response_status(204, &[]));
+        assert!(classify_response_status(299, &[]));
+    }
+
+    #[test]
+    fn accept_logic_default_rejects_4xx() {
+        assert!(!classify_response_status(401, &[]));
+        assert!(!classify_response_status(404, &[]));
+        assert!(!classify_response_status(500, &[]));
+    }
+
+    #[test]
+    fn accept_logic_custom_accepts_listed_status() {
+        assert!(classify_response_status(401, &[401]));
+        assert!(classify_response_status(404, &[401, 404, 418]));
+    }
+
+    #[test]
+    fn accept_logic_custom_rejects_other_status() {
+        assert!(!classify_response_status(200, &[401]));
+        assert!(!classify_response_status(403, &[401, 404]));
     }
 }
