@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use tokio::process::Command;
 
+use super::process::{WslExecError, run_with_timeout};
 use crate::environment::runtime::catalog::{
     ProvenRoute, ResourceCatalog, ResourceDetail, ResourceProbeOutcome, RouteOrigin,
 };
@@ -143,28 +144,22 @@ async fn run_one_route(distro: &str, base_url: &str, route: &HttpProbeRoute) -> 
     if !matches!(route.method, HttpProbeMethod::Get) {
         return ShellProbe::Skipped("shell fallback supports GET probes only".into());
     }
-    let result = tokio::time::timeout(
-        PROBE_TIMEOUT,
-        Command::new("wsl.exe")
-            .args([
-                "-d",
-                distro,
-                "--exec",
-                "/bin/sh",
-                "-c",
-                SHELL_FALLBACK_SCRIPT,
-                "--",
-                base_url,
-                &route.path,
-            ])
-            .output(),
-    )
-    .await;
-
-    let output = match result {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => return ShellProbe::Error(format!("shell-fallback spawn: {e}")),
-        Err(_) => return ShellProbe::TimedOut,
+    let mut cmd = Command::new("wsl.exe");
+    cmd.args([
+        "-d",
+        distro,
+        "--exec",
+        "/bin/sh",
+        "-c",
+        SHELL_FALLBACK_SCRIPT,
+        "--",
+        base_url,
+        &route.path,
+    ]);
+    let output = match run_with_timeout(cmd, PROBE_TIMEOUT).await {
+        Ok(o) => o,
+        Err(WslExecError::TimedOut(_)) => return ShellProbe::TimedOut,
+        Err(e) => return ShellProbe::Error(format!("shell-fallback spawn: {e}")),
     };
     if !output.status.success() {
         return ShellProbe::Error(format!(

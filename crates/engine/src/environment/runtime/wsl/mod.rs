@@ -9,12 +9,14 @@
 //! - `bootstrap`     — push helper binary, sha256-verify, atomic install.
 //! - `shell_fallback`— constrained POSIX-sh probe runner.
 //! - `host_direct`   — fingerprint + recompute for `HostDirectVerification`.
+//! - `process`       — bounded `wsl.exe` runner with kill-on-timeout semantics.
 
 pub mod bootstrap;
 pub mod dispatcher;
 pub mod enumerate;
 pub mod host_direct;
 pub mod path;
+pub mod process;
 pub mod shell_fallback;
 pub mod transport;
 

@@ -7,8 +7,9 @@ use crate::environment::runtime::helper::{
     HelperTarget, helper_bytes_for_triple, verify_target_integrity,
 };
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+
+use super::process::{WslExecError, run_with_timeout, run_with_timeout_and_stdin};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const PUSH_TIMEOUT: Duration = Duration::from_secs(20);
@@ -64,22 +65,18 @@ impl From<BootstrapError> for DispatchError {
 
 /// Detect the env's target triple via `uname -m` + `uname -s`.
 pub async fn probe_env_triple(distro: &str) -> Result<String, BootstrapError> {
-    let out = tokio::time::timeout(
-        PROBE_TIMEOUT,
-        Command::new("wsl.exe")
-            .args([
-                "-d",
-                distro,
-                "--exec",
-                "/bin/sh",
-                "-c",
-                "printf '%s-%s' \"$(uname -m)\" \"$(uname -s | tr 'A-Z' 'a-z')\"",
-            ])
-            .output(),
-    )
-    .await
-    .map_err(|_| BootstrapError::TripleProbe("timed out".into()))?
-    .map_err(|e| BootstrapError::TripleProbe(e.to_string()))?;
+    let mut cmd = Command::new("wsl.exe");
+    cmd.args([
+        "-d",
+        distro,
+        "--exec",
+        "/bin/sh",
+        "-c",
+        "printf '%s-%s' \"$(uname -m)\" \"$(uname -s | tr 'A-Z' 'a-z')\"",
+    ]);
+    let out = run_with_timeout(cmd, PROBE_TIMEOUT)
+        .await
+        .map_err(triple_probe_err)?;
     if !out.status.success() {
         return Err(BootstrapError::TripleProbe(format!(
             "uname exited with {:?}",
@@ -153,26 +150,25 @@ pub async fn bootstrap_helper(
 /// been validated against `[A-Za-z0-9_-]+`.
 async fn cleanup_old_helpers(distro: &str, triple: &str, keep_basename: &str) {
     let name_pattern = format!("helper-*-{triple}");
-    let cmd_future = Command::new("wsl.exe")
-        .args([
-            "-d",
-            distro,
-            "--exec",
-            "find",
-            "/tmp/.ordius",
-            "-maxdepth",
-            "1",
-            "-type",
-            "f",
-            "-name",
-            &name_pattern,
-            "-not",
-            "-name",
-            keep_basename,
-            "-delete",
-        ])
-        .output();
-    drop(tokio::time::timeout(PUSH_TIMEOUT, cmd_future).await);
+    let mut cmd = Command::new("wsl.exe");
+    cmd.args([
+        "-d",
+        distro,
+        "--exec",
+        "find",
+        "/tmp/.ordius",
+        "-maxdepth",
+        "1",
+        "-type",
+        "f",
+        "-name",
+        &name_pattern,
+        "-not",
+        "-name",
+        keep_basename,
+        "-delete",
+    ]);
+    drop(run_with_timeout(cmd, PUSH_TIMEOUT).await);
 }
 
 async fn push_bytes(distro: &str, dest: &str, bytes: &[u8]) -> Result<(), BootstrapError> {
@@ -181,30 +177,16 @@ async fn push_bytes(distro: &str, dest: &str, bytes: &[u8]) -> Result<(), Bootst
         format!("mkdir -p \"$(dirname {quoted_dest})\" && dd of={quoted_dest} status=none");
     let mut cmd = Command::new("wsl.exe");
     cmd.args(["-d", distro, "--exec", "/bin/sh", "-c", &cmd_str]);
-    cmd.stdin(std::process::Stdio::piped());
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| BootstrapError::Push(e.to_string()))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(bytes)
-            .await
-            .map_err(|e| BootstrapError::Push(format!("write stdin: {e}")))?;
-        stdin
-            .shutdown()
-            .await
-            .map_err(|e| BootstrapError::Push(format!("shutdown stdin: {e}")))?;
-    }
-    let status = tokio::time::timeout(PUSH_TIMEOUT, child.wait())
+    // The whole spawn + write_all + wait sequence runs inside PUSH_TIMEOUT.
+    // A stalled in-distro `dd` that stops reading from stdin would previously
+    // block `write_all` forever because the bytes outsize a pipe buffer.
+    let out = run_with_timeout_and_stdin(cmd, PUSH_TIMEOUT, bytes.to_vec())
         .await
-        .map_err(|_| BootstrapError::Push("push timed out".into()))?
-        .map_err(|e| BootstrapError::Push(e.to_string()))?;
-    if !status.success() {
+        .map_err(push_err)?;
+    if !out.status.success() {
         return Err(BootstrapError::Push(format!(
             "dd exited with {:?}",
-            status.code()
+            out.status.code()
         )));
     }
     Ok(())
@@ -219,15 +201,11 @@ async fn verify_sha_in_env(
     path: &str,
     expected_hex: &str,
 ) -> Result<(), BootstrapError> {
-    let out = tokio::time::timeout(
-        PUSH_TIMEOUT,
-        Command::new("wsl.exe")
-            .args(["-d", distro, "--exec", "sha256sum", path])
-            .output(),
-    )
-    .await
-    .map_err(|_| BootstrapError::Push("sha256sum timed out".into()))?
-    .map_err(|e| BootstrapError::Push(format!("sha256sum spawn: {e}")))?;
+    let mut cmd = Command::new("wsl.exe");
+    cmd.args(["-d", distro, "--exec", "sha256sum", path]);
+    let out = run_with_timeout(cmd, PUSH_TIMEOUT)
+        .await
+        .map_err(push_err)?;
     if !out.status.success() {
         return Err(BootstrapError::Push(format!(
             "sha256sum exited with {:?}",
@@ -249,15 +227,11 @@ async fn verify_sha_in_env(
 }
 
 async fn atomic_install(distro: &str, src: &str, dst: &str) -> Result<(), BootstrapError> {
-    let out = tokio::time::timeout(
-        PUSH_TIMEOUT,
-        Command::new("wsl.exe")
-            .args(["-d", distro, "--exec", "mv", "-f", src, dst])
-            .output(),
-    )
-    .await
-    .map_err(|_| BootstrapError::Push("mv timed out".into()))?
-    .map_err(|e| BootstrapError::Push(format!("mv spawn: {e}")))?;
+    let mut cmd = Command::new("wsl.exe");
+    cmd.args(["-d", distro, "--exec", "mv", "-f", src, dst]);
+    let out = run_with_timeout(cmd, PUSH_TIMEOUT)
+        .await
+        .map_err(push_err)?;
     if !out.status.success() {
         return Err(BootstrapError::Push(format!(
             "mv exited with {:?}",
@@ -268,15 +242,11 @@ async fn atomic_install(distro: &str, src: &str, dst: &str) -> Result<(), Bootst
 }
 
 async fn chmod_exec(distro: &str, path: &str) -> Result<(), BootstrapError> {
-    let out = tokio::time::timeout(
-        PUSH_TIMEOUT,
-        Command::new("wsl.exe")
-            .args(["-d", distro, "--exec", "chmod", "+x", path])
-            .output(),
-    )
-    .await
-    .map_err(|_| BootstrapError::Chmod("chmod timed out".into()))?
-    .map_err(|e| BootstrapError::Chmod(e.to_string()))?;
+    let mut cmd = Command::new("wsl.exe");
+    cmd.args(["-d", distro, "--exec", "chmod", "+x", path]);
+    let out = run_with_timeout(cmd, PUSH_TIMEOUT)
+        .await
+        .map_err(chmod_err)?;
     if !out.status.success() {
         return Err(BootstrapError::Chmod(format!(
             "chmod exited with {:?}",
@@ -284,6 +254,27 @@ async fn chmod_exec(distro: &str, path: &str) -> Result<(), BootstrapError> {
         )));
     }
     Ok(())
+}
+
+fn triple_probe_err(e: WslExecError) -> BootstrapError {
+    match e {
+        WslExecError::TimedOut(_) => BootstrapError::TripleProbe("timed out".into()),
+        other => BootstrapError::TripleProbe(other.to_string()),
+    }
+}
+
+fn push_err(e: WslExecError) -> BootstrapError {
+    match e {
+        WslExecError::TimedOut(_) => BootstrapError::Push("timed out".into()),
+        other => BootstrapError::Push(other.to_string()),
+    }
+}
+
+fn chmod_err(e: WslExecError) -> BootstrapError {
+    match e {
+        WslExecError::TimedOut(_) => BootstrapError::Chmod("timed out".into()),
+        other => BootstrapError::Chmod(other.to_string()),
+    }
 }
 
 #[cfg(test)]
