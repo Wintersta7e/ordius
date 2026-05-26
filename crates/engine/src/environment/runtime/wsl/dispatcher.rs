@@ -102,6 +102,7 @@ impl WslDispatcher {
         &self,
         helper_path: &str,
         def: &ResourceDefinition,
+        cancel: &CancellationToken,
     ) -> ResourceProbeOutcome {
         let (plan_json, timeout_ms) = match helper_probe_plan_json(def) {
             Ok(plan) => plan,
@@ -109,7 +110,7 @@ impl WslDispatcher {
         };
         let host_direct = self.host_direct_snapshot();
         let wire = match self
-            .run_helper_probe(helper_path, &plan_json, timeout_ms)
+            .run_helper_probe(helper_path, &plan_json, timeout_ms, cancel)
             .await
         {
             Ok(wire) => wire,
@@ -147,6 +148,7 @@ impl WslDispatcher {
         helper_path: &str,
         plan_json: &[u8],
         timeout_ms: u64,
+        cancel: &CancellationToken,
     ) -> Result<ProbeOutcomeV1, ResourceProbeOutcome> {
         let mut child = self
             .helper_probe_command(helper_path)
@@ -154,7 +156,7 @@ impl WslDispatcher {
             .map_err(|e| probe_failed(format!("spawn ordius-helper probe: {e}")))?;
 
         write_helper_plan(&mut child, plan_json).await?;
-        let output = wait_for_helper_probe(child, timeout_ms).await?;
+        let output = wait_for_helper_probe(child, timeout_ms, cancel).await?;
         parse_helper_probe_output(&output).map_err(probe_failed)
     }
 
@@ -387,9 +389,17 @@ fn abort_reader_handles(
     }
 }
 
+enum CancelOrWait {
+    Status(std::process::ExitStatus),
+    WaitErr(std::io::Error),
+    TimedOut,
+    Cancelled,
+}
+
 async fn wait_for_helper_probe(
     mut child: tokio::process::Child,
     timeout_ms: u64,
+    cancel: &CancellationToken,
 ) -> Result<std::process::Output, ResourceProbeOutcome> {
     use tokio::io::AsyncReadExt;
     let stdout_handle = child.stdout.take().map(|mut s| {
@@ -406,20 +416,34 @@ async fn wait_for_helper_probe(
             buf
         })
     });
-    let wait_outcome = tokio::time::timeout(helper_wait_timeout(timeout_ms), child.wait()).await;
+    // Race three signals: child exit, helper-wait timeout, outer cancel.
+    let wait_outcome = tokio::select! {
+        () = cancel.cancelled() => CancelOrWait::Cancelled,
+        outcome = tokio::time::timeout(helper_wait_timeout(timeout_ms), child.wait()) => match outcome {
+            Ok(Ok(status)) => CancelOrWait::Status(status),
+            Ok(Err(e)) => CancelOrWait::WaitErr(e),
+            Err(_) => CancelOrWait::TimedOut,
+        },
+    };
     let status = match wait_outcome {
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => {
+        CancelOrWait::Status(status) => status,
+        CancelOrWait::WaitErr(e) => {
             abort_reader_handles(stdout_handle.as_ref(), stderr_handle.as_ref());
             drop(child.kill().await);
             drop(child.wait().await);
             return Err(probe_failed(format!("wait for ordius-helper probe: {e}")));
         },
-        Err(_) => {
+        CancelOrWait::TimedOut => {
             abort_reader_handles(stdout_handle.as_ref(), stderr_handle.as_ref());
             drop(child.kill().await);
             drop(child.wait().await);
             return Err(ResourceProbeOutcome::TimedOut);
+        },
+        CancelOrWait::Cancelled => {
+            abort_reader_handles(stdout_handle.as_ref(), stderr_handle.as_ref());
+            drop(child.kill().await);
+            drop(child.wait().await);
+            return Err(cancelled_probe_outcome());
         },
     };
     let stdout = match stdout_handle {
@@ -589,19 +613,30 @@ impl Dispatcher for WslDispatcher {
         };
         match helper_result {
             Ok(helper) => {
-                self.probe_resource_via_helper(&helper.env_side_path, def)
+                self.probe_resource_via_helper(&helper.env_side_path, def, &cancel)
                     .await
             },
             Err(err) => {
                 tracing::debug!(error = %err, "falling back to WSL shell probe");
-                super::shell_fallback::probe_http_resource(&self.distro_name, def).await
+                // Shell fallback has its own internal per-route timeout but no
+                // cancel handling. Race the outer cancel against it so a
+                // cancelled reprobe doesn't run the full curl probe to its end.
+                tokio::select! {
+                    () = cancel.cancelled() => cancelled_probe_outcome(),
+                    outcome = super::shell_fallback::probe_http_resource(&self.distro_name, def) => outcome,
+                }
             },
         }
     }
 
     fn spawn(&self, cmd: ProcessCmd) -> std::io::Result<Supervised> {
         let mut tokio_cmd = build_wsl_command(&self.distro_name, &cmd);
-        tokio_cmd.stdin(std::process::Stdio::piped());
+        // Only pipe stdin when bytes are actually queued; otherwise the
+        // in-distro process would block on EOF (e.g. `cat` with no input).
+        // Mirrors LocalDispatcher::spawn.
+        if cmd.stdin.is_some() {
+            tokio_cmd.stdin(std::process::Stdio::piped());
+        }
         tokio_cmd.stdout(std::process::Stdio::piped());
         tokio_cmd.stderr(std::process::Stdio::piped());
         let mut sup = crate::executor::supervisor::spawn(tokio_cmd)?;
