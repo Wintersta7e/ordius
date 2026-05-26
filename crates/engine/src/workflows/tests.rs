@@ -277,7 +277,8 @@ mod scope_tests {
         let reg = ResourceRegistry::new();
         let wf = wf_with_resources("my-wf");
         super::save(home.path(), &wf).expect("save");
-        let _loaded = super::load_in_registry(home.path(), "my-wf", &reg).expect("load");
+        let (_loaded, _warnings) =
+            super::load_in_registry(home.path(), "my-wf", &reg).expect("load");
 
         let snap = reg.snapshot();
         let layer = snap
@@ -304,7 +305,8 @@ mod scope_tests {
         let reg = ResourceRegistry::new();
         let wf = wf_with_resources("doomed");
         super::save(home.path(), &wf).expect("save");
-        super::load_in_registry(home.path(), "doomed", &reg).expect("load");
+        let (_loaded, _warnings) =
+            super::load_in_registry(home.path(), "doomed", &reg).expect("load");
 
         let removed = super::delete_in_registry(home.path(), "doomed", &reg).expect("delete");
         assert!(removed);
@@ -353,6 +355,210 @@ mod scope_tests {
             )
             .is_some(),
             "clone sees own scope"
+        );
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use crate::environment::runtime::ResourceRegistry;
+    use tempfile::TempDir;
+
+    #[test]
+    fn load_in_registry_rejects_unknown_resource_id() {
+        let tmp = TempDir::new().unwrap();
+        let id = "wf-bad-resource";
+        let dir = tmp.path().join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.json"));
+        std::fs::write(
+            &path,
+            r#"{
+                "id":"wf-bad-resource","name":"x",
+                "nodes":[{"id":"n1","type":"llm","name":"x","config":{"resource":"no-such-id","model":"m","messages":[]}}],
+                "edges":[]
+            }"#,
+        )
+        .unwrap();
+        let registry = ResourceRegistry::new();
+        let err = super::load_in_registry(tmp.path(), id, &registry).unwrap_err();
+        match err {
+            super::WorkflowsError::ResourceNotInRegistry {
+                node_id,
+                resource_id,
+            } => {
+                assert_eq!(node_id, "n1");
+                assert_eq!(resource_id, "no-such-id");
+            },
+            other => panic!("expected ResourceNotInRegistry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_in_registry_rejects_unadvertised_capability() {
+        let tmp = TempDir::new().unwrap();
+        let id = "wf-bad-cap";
+        let dir = tmp.path().join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.json"));
+        // Workflow-scope resource advertises only OpenaiChatCompletions but
+        // the node requires OpenaiToolCalling.
+        std::fs::write(
+            &path,
+            r#"{
+                "id":"wf-bad-cap","name":"x",
+                "resources":[{
+                    "id":"local-llm",
+                    "kind":"http_endpoint",
+                    "advertised_capabilities":["openai_chat_completions"],
+                    "probe":{"kind":"http","ports":[7777]},
+                    "override_lower_scope":false
+                }],
+                "nodes":[{"id":"n1","type":"llm","name":"x",
+                    "config":{
+                        "resource":{"id":"local-llm","required_capability":"openai_tool_calling"},
+                        "model":"m","messages":[]
+                    }
+                }],
+                "edges":[]
+            }"#,
+        )
+        .unwrap();
+        let registry = ResourceRegistry::new();
+        let err = super::load_in_registry(tmp.path(), id, &registry).unwrap_err();
+        match err {
+            super::WorkflowsError::CapabilityNotAdvertised {
+                node_id,
+                resource_id,
+                capability,
+            } => {
+                assert_eq!(node_id, "n1");
+                assert_eq!(resource_id, "local-llm");
+                assert!(capability.contains("OpenaiToolCalling"), "got {capability}");
+            },
+            other => panic!("expected CapabilityNotAdvertised, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_in_registry_warns_on_localhost_url_with_remote_target_env() {
+        let tmp = TempDir::new().unwrap();
+        let id = "wf-lint";
+        let dir = tmp.path().join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.json"));
+        std::fs::write(
+            &path,
+            r#"{
+                "id":"wf-lint","name":"x",
+                "nodes":[{
+                    "id":"h1","type":"http","name":"ping",
+                    "target_env":"wsl:Ubuntu",
+                    "config":{"url":"http://127.0.0.1:11434/api/version","method":"GET"}
+                }],
+                "edges":[]
+            }"#,
+        )
+        .unwrap();
+        let registry = ResourceRegistry::new();
+        let (_wf, warnings) = super::load_in_registry(tmp.path(), id, &registry).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].node_id, "h1");
+        assert!(matches!(
+            warnings[0].kind,
+            super::WorkflowWarningKind::LoopbackUrlInRemoteEnv
+        ));
+    }
+
+    #[test]
+    fn load_in_registry_does_not_warn_when_target_env_is_local() {
+        let tmp = TempDir::new().unwrap();
+        let id = "wf-lint-local";
+        let dir = tmp.path().join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.json"));
+        std::fs::write(
+            &path,
+            r#"{
+                "id":"wf-lint-local","name":"x",
+                "nodes":[{
+                    "id":"h1","type":"http","name":"ping",
+                    "target_env":"local",
+                    "config":{"url":"http://127.0.0.1:11434/api/version","method":"GET"}
+                }],
+                "edges":[]
+            }"#,
+        )
+        .unwrap();
+        let registry = ResourceRegistry::new();
+        let (_wf, warnings) = super::load_in_registry(tmp.path(), id, &registry).unwrap();
+        assert!(warnings.is_empty(), "got warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn load_in_registry_does_not_warn_when_target_env_absent() {
+        let tmp = TempDir::new().unwrap();
+        let id = "wf-lint-untargeted";
+        let dir = tmp.path().join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.json"));
+        std::fs::write(
+            &path,
+            r#"{
+                "id":"wf-lint-untargeted","name":"x",
+                "nodes":[{
+                    "id":"h1","type":"http","name":"ping",
+                    "config":{"url":"http://127.0.0.1:11434/api/version","method":"GET"}
+                }],
+                "edges":[]
+            }"#,
+        )
+        .unwrap();
+        let registry = ResourceRegistry::new();
+        let (_wf, warnings) = super::load_in_registry(tmp.path(), id, &registry).unwrap();
+        assert!(warnings.is_empty(), "got warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn load_in_registry_validation_failure_rolls_back_workflow_scope() {
+        // The resource is declared in the workflow scope (visible to validation)
+        // but the node refers to an unknown id, so validation fails. After the
+        // failure, the workflow scope MUST be removed from the registry.
+        let tmp = TempDir::new().unwrap();
+        let id = "wf-rollback";
+        let dir = tmp.path().join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.json"));
+        std::fs::write(
+            &path,
+            r#"{
+                "id":"wf-rollback","name":"x",
+                "resources":[{
+                    "id":"declared",
+                    "kind":"http_endpoint",
+                    "advertised_capabilities":[],
+                    "probe":{"kind":"http","ports":[1111]},
+                    "override_lower_scope":false
+                }],
+                "nodes":[{"id":"n1","type":"llm","name":"x","config":{"resource":"missing","model":"m","messages":[]}}],
+                "edges":[]
+            }"#,
+        )
+        .unwrap();
+        let registry = ResourceRegistry::new();
+        let err = super::load_in_registry(tmp.path(), id, &registry).unwrap_err();
+        assert!(matches!(
+            err,
+            super::WorkflowsError::ResourceNotInRegistry { .. }
+        ));
+        let snap = registry.snapshot();
+        assert!(
+            !snap
+                .layers
+                .contains_key(&crate::environment::runtime::ScopeKey::Workflow {
+                    id: crate::environment::runtime::WorkflowId("wf-rollback".into())
+                }),
+            "workflow scope must be rolled back on validation failure"
         );
     }
 }

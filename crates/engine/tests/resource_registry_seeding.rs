@@ -86,8 +86,9 @@ async fn workflow_load_installs_scope() {
 
     let engine = Engine::new(dir.path().to_path_buf()).await.expect("new");
     let registry = engine.resource_registry();
-    let wf = ordius_engine::workflows::load_in_registry(dir.path(), "with-res", &registry)
-        .expect("load_in_registry");
+    let (wf, _warnings) =
+        ordius_engine::workflows::load_in_registry(dir.path(), "with-res", &registry)
+            .expect("load_in_registry");
     assert_eq!(wf.resources.len(), 1);
 
     let snap = registry.snapshot();
@@ -147,7 +148,7 @@ async fn workflow_delete_drops_scope() {
 
     let engine = Engine::new(dir.path().to_path_buf()).await.expect("new");
     let registry = engine.resource_registry();
-    let _wf =
+    let (_wf, _warnings) =
         ordius_engine::workflows::load_in_registry(dir.path(), "doomed", &registry).expect("load");
 
     let removed = ordius_engine::workflows::delete_in_registry(dir.path(), "doomed", &registry)

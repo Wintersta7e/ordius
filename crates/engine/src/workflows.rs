@@ -7,13 +7,37 @@
 //! helpers exposed here so the surface doesn't drift between them.
 
 use crate::environment::runtime::{
-    ResourceRegistry, WorkflowId, WorkflowScopeError, install_workflow_resources,
-    remove_workflow_scope,
+    EnvId, ResourceRef, ResourceRegistry, WorkflowId, WorkflowScopeError,
+    install_workflow_resources, remove_workflow_scope,
 };
 use crate::loader::{LoadError, load_workflow};
 use crate::types::Workflow;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+/// Non-fatal lint emitted during workflow load. Surfaced to the
+/// caller alongside the loaded `Workflow`. The engine does not act
+/// on warnings; the UI surfaces them in the editor (Phase F).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowWarning {
+    /// Id of the node the warning applies to.
+    pub node_id: String,
+    /// Discriminant for matching on the warning kind.
+    pub kind: WorkflowWarningKind,
+    /// Human-readable explanation suitable for UI surfacing.
+    pub message: String,
+}
+
+/// Discriminant for [`WorkflowWarning`]. Marked `#[non_exhaustive]` so
+/// later phases can add new lint kinds (Phase E will add
+/// `ResourceUnreachableInEnv`, etc.) without breaking downstream
+/// matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WorkflowWarningKind {
+    /// `http.url` is a loopback literal but the node targets a non-local env.
+    LoopbackUrlInRemoteEnv,
+}
 
 /// Failure modes for the workflow filesystem helpers.
 #[derive(Debug, Error)]
@@ -64,6 +88,37 @@ pub enum WorkflowsError {
         replacement: String,
         /// Id of the offending node inside the workflow.
         node_id: String,
+    },
+    /// A node's `config.resource` field names a resource id that is not
+    /// declared at any scope visible to the workflow.
+    #[error("workflow node '{node_id}' references unknown resource id '{resource_id}'")]
+    ResourceNotInRegistry {
+        /// Id of the offending node inside the workflow.
+        node_id: String,
+        /// Resource id that failed to resolve.
+        resource_id: String,
+    },
+    /// A node's long-form resource ref requires a capability that the
+    /// resolved resource does not advertise.
+    #[error(
+        "workflow node '{node_id}' resource '{resource_id}' does not advertise required capability '{capability}'"
+    )]
+    CapabilityNotAdvertised {
+        /// Id of the offending node inside the workflow.
+        node_id: String,
+        /// Resource id whose advertisement was insufficient.
+        resource_id: String,
+        /// Debug form of the required capability.
+        capability: String,
+    },
+    /// A node's `config` block could not be parsed into a Phase D
+    /// runtime type (e.g. malformed `ResourceRef`).
+    #[error("workflow node '{node_id}' has invalid config: {reason}")]
+    InvalidNodeConfig {
+        /// Id of the offending node inside the workflow.
+        node_id: String,
+        /// Underlying parse failure (already display-formatted).
+        reason: String,
     },
 }
 
@@ -250,18 +305,113 @@ pub fn install_resources_into_registry(
     Ok(count)
 }
 
-/// Load a workflow and install its `resources:` block into the registry.
+/// Validate workflow nodes against the resource registry. Returns
+/// non-fatal warnings; hard errors are returned via the `Err` arm.
 ///
-/// Combines [`load`] with [`install_resources_into_registry`]; rolls back
-/// the scope on any load error so a partially-installed scope never lingers.
+/// Phase D validates:
+/// - `resource.id` resolution against the registry's scope chain
+/// - `required_capability` (if set) is in the resource's
+///   `advertised_capabilities` (empty list is treated as untyped and
+///   silently allowed, matching `Tasks 9/10` behavior)
+/// - `http` nodes with literal `localhost` / `127.0.0.1` / `0.0.0.0`
+///   URLs and a non-local `target_env` (`LoopbackUrlInRemoteEnv`
+///   warning)
+///
+/// `target_env` existence validation is deferred to Phase E (no env
+/// registry exists yet). Similarly, `resource known but probe
+/// NotFound in resolved env` is Phase E (no env-scoped catalog yet).
+fn validate_nodes(
+    workflow: &Workflow,
+    registry: &ResourceRegistry,
+) -> Result<Vec<WorkflowWarning>, WorkflowsError> {
+    let snap = registry.snapshot();
+    let env = EnvId::local();
+    let wf = WorkflowId(workflow.id.clone());
+    let mut warnings: Vec<WorkflowWarning> = Vec::new();
+
+    for node in &workflow.nodes {
+        // 1. `resource` ref resolution + capability assertion.
+        if let Some(rref_val) = node.config.get("resource") {
+            let rref: ResourceRef = serde_json::from_value(rref_val.clone()).map_err(|e| {
+                WorkflowsError::InvalidNodeConfig {
+                    node_id: node.id.clone(),
+                    reason: format!("invalid resource ref: {e}"),
+                }
+            })?;
+
+            let Some((def, _scope)) = snap.resolve(rref.id(), &env, Some(&wf)) else {
+                return Err(WorkflowsError::ResourceNotInRegistry {
+                    node_id: node.id.clone(),
+                    resource_id: rref.id().0.clone(),
+                });
+            };
+
+            if let Some(cap) = rref.required_capability() {
+                let advertised = &def.advertised_capabilities;
+                if !advertised.is_empty() && !advertised.contains(&cap) {
+                    return Err(WorkflowsError::CapabilityNotAdvertised {
+                        node_id: node.id.clone(),
+                        resource_id: rref.id().0.clone(),
+                        capability: format!("{cap:?}"),
+                    });
+                }
+            }
+        }
+
+        // 2. `http` loopback-in-remote-env lint.
+        if node.ty == "http"
+            && let Some(url) = node.config.get("url").and_then(serde_json::Value::as_str)
+            && let Some(target) = &node.target_env
+        {
+            let target_str = target.as_str();
+            let is_local = target_str == EnvId::LOCAL;
+            let is_loopback_literal =
+                url.contains("127.0.0.1") || url.contains("localhost") || url.contains("0.0.0.0");
+            if !is_local && is_loopback_literal {
+                warnings.push(WorkflowWarning {
+                    node_id: node.id.clone(),
+                    kind: WorkflowWarningKind::LoopbackUrlInRemoteEnv,
+                    message: format!(
+                        "node {} targets env {target_str} but its http.url is a \
+                         loopback literal; the request will not reach the env \
+                         (likely a bug)",
+                        node.id
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(warnings)
+}
+
+/// Load a workflow, install its `resources:` block into the registry,
+/// and validate its nodes against the registry.
+///
+/// Combines [`load`] with [`install_resources_into_registry`] and the
+/// Phase D validation pass. Validation runs *after* the workflow scope
+/// is installed so workflow-scope resources are visible to it. If
+/// validation fails, the workflow scope is rolled back so the registry
+/// never carries a half-validated set. Returns the loaded workflow
+/// together with any non-fatal warnings emitted by the validator.
 pub fn load_in_registry(
     home: &Path,
     id: &str,
     registry: &ResourceRegistry,
-) -> Result<Workflow, WorkflowsError> {
+) -> Result<(Workflow, Vec<WorkflowWarning>), WorkflowsError> {
     let wf = load(home, id)?;
     install_resources_into_registry(&wf, registry)?;
-    Ok(wf)
+    let warnings = match validate_nodes(&wf, registry) {
+        Ok(w) => w,
+        Err(e) => {
+            // Roll back the workflow scope install so the registry
+            // doesn't keep resources from a workflow that failed
+            // validation. `remove_workflow_scope` is infallible.
+            let _removed = remove_workflow_scope(&WorkflowId(wf.id.clone()), registry);
+            return Err(e);
+        },
+    };
+    Ok((wf, warnings))
 }
 
 /// Delete a workflow by id and drop its scope from the registry.
