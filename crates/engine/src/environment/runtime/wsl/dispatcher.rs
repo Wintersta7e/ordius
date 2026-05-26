@@ -19,11 +19,11 @@ use crate::environment::runtime::catalog::{
     ProvenRoute, ResourceCatalog, ResourceDetail, ResourceProbeOutcome, RouteOrigin,
 };
 use crate::environment::runtime::dispatcher::{Dispatcher, HttpTransport};
-use crate::environment::runtime::env::{EnvInfo, RunId, WorkspaceBinding};
+use crate::environment::runtime::env::{EnvInfo, HostDirectVerification, RunId, WorkspaceBinding};
 use crate::environment::runtime::error::DispatchError;
 use crate::environment::runtime::plan::{ProbePlan, ProbeSummary};
 use crate::environment::runtime::resource::{
-    Capability, HttpProbeMethod, ProbeSpec, ResourceDefinition, ResourceKind,
+    Capability, HttpProbeMethod, ProbeSpec, ResourceDefinition, ResourceId, ResourceKind,
 };
 use crate::environment::runtime::transport::{EnvPath, ProcessCmd, WorkspaceHandle};
 use crate::executor::supervisor::Supervised;
@@ -39,6 +39,7 @@ pub struct WslDispatcher {
     info: EnvInfo,
     distro_name: String,
     helper_cache: Mutex<Option<BootstrappedHelper>>,
+    host_direct: Mutex<HashMap<ResourceId, HostDirectVerification>>,
 }
 
 impl Clone for WslDispatcher {
@@ -47,6 +48,7 @@ impl Clone for WslDispatcher {
             info: self.info.clone(),
             distro_name: self.distro_name.clone(),
             helper_cache: Mutex::new(self.helper_cache.lock().clone()),
+            host_direct: Mutex::new(self.host_direct.lock().clone()),
         }
     }
 }
@@ -58,12 +60,25 @@ impl WslDispatcher {
             info,
             distro_name: distro_name.into(),
             helper_cache: Mutex::new(None),
+            host_direct: Mutex::new(HashMap::new()),
         }
     }
 
     /// Return the WSL distribution name passed to `wsl.exe -d <name>`.
     pub fn distro_name(&self) -> &str {
         &self.distro_name
+    }
+
+    /// Replace the dispatcher's `HostDirect` verification map.
+    ///
+    /// Phase E wires this from `EnvSpec::WslDistro::host_direct_verifications`
+    /// whenever the environment spec changes.
+    pub fn set_host_direct(&self, verifications: HashMap<ResourceId, HostDirectVerification>) {
+        *self.host_direct.lock() = verifications;
+    }
+
+    fn host_direct_snapshot(&self) -> HashMap<ResourceId, HostDirectVerification> {
+        self.host_direct.lock().clone()
     }
 
     async fn ensure_helper(&self) -> Result<BootstrappedHelper, DispatchError> {
@@ -87,6 +102,7 @@ impl WslDispatcher {
             Ok(plan) => plan,
             Err(reason) => return probe_failed(reason),
         };
+        let host_direct = self.host_direct_snapshot();
         let wire = match self
             .run_helper_probe(helper_path, &plan_json, timeout_ms)
             .await
@@ -107,7 +123,7 @@ impl WslDispatcher {
             ));
         }
 
-        wire_outcome_to_engine(wire.outcome, def)
+        wire_outcome_to_engine(wire.outcome, def, &host_direct)
     }
 
     fn helper_probe_command(&self, helper_path: &str) -> tokio::process::Command {
@@ -147,6 +163,7 @@ impl WslDispatcher {
 
         let started = std::time::Instant::now();
         let wire_plan = build_wire_plan(plan)?;
+        let host_direct = self.host_direct_snapshot();
         let plan_json = serde_json::to_string(&wire_plan)
             .map_err(|e| DispatchError::Translation(format!("serialize probe plan: {e}")))?;
 
@@ -206,7 +223,7 @@ impl WslDispatcher {
                             };
                             resources.insert(
                                 def.id.clone(),
-                                wire_outcome_to_engine(wire.outcome, def),
+                                wire_outcome_to_engine(wire.outcome, def, &host_direct),
                             );
                         },
                         Ok(None) | Err(_) => break,
@@ -433,11 +450,9 @@ impl Dispatcher for WslDispatcher {
     }
 
     fn http_transport(&self) -> Arc<dyn HttpTransport> {
-        // Phase B: no host-direct verifications wired in yet (Phase E threads
-        // EnvSpec's HashMap through). Empty map => loopback URLs go via env wrap.
         Arc::new(super::transport::WslHttpTransport::new(
             &self.distro_name,
-            std::collections::HashMap::new(),
+            self.host_direct_snapshot(),
         ))
     }
 
@@ -580,9 +595,10 @@ fn resource_spec_v1_from_def(def: &ResourceDefinition) -> Result<ResourceSpecV1,
 fn wire_outcome_to_engine(
     body: ProbeOutcomeBodyV1,
     def: &ResourceDefinition,
+    host_direct: &HashMap<ResourceId, HostDirectVerification>,
 ) -> ResourceProbeOutcome {
     match body {
-        ProbeOutcomeBodyV1::Found(detail) => wire_detail_to_engine(detail, def),
+        ProbeOutcomeBodyV1::Found(detail) => wire_detail_to_engine(detail, def, host_direct),
         ProbeOutcomeBodyV1::NotFound => ResourceProbeOutcome::NotFound,
         ProbeOutcomeBodyV1::Skipped { reason } => ResourceProbeOutcome::Skipped { reason },
         ProbeOutcomeBodyV1::ProbeFailed { reason } => ResourceProbeOutcome::ProbeFailed { reason },
@@ -590,20 +606,31 @@ fn wire_outcome_to_engine(
     }
 }
 
-fn wire_detail_to_engine(detail: ProbeDetailV1, def: &ResourceDefinition) -> ResourceProbeOutcome {
+fn wire_detail_to_engine(
+    detail: ProbeDetailV1,
+    def: &ResourceDefinition,
+    host_direct: &HashMap<ResourceId, HostDirectVerification>,
+) -> ResourceProbeOutcome {
     match detail {
         ProbeDetailV1::HttpEndpoint {
             base_url,
             proven_routes,
-        } => ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
-            base_url,
-            routes_by_capability: routes_by_capability_from_wire(&proven_routes, def),
-            version: None,
-            models_list: None,
-            auth_secret_ref: None,
-            streaming_supported_natively: false,
-            route_origin: RouteOrigin::EnvLoopback,
-        }),
+        } => {
+            let route_origin = if host_direct.contains_key(&def.id) {
+                RouteOrigin::HostDirect
+            } else {
+                RouteOrigin::EnvLoopback
+            };
+            ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
+                base_url,
+                routes_by_capability: routes_by_capability_from_wire(&proven_routes, def),
+                version: None,
+                models_list: None,
+                auth_secret_ref: None,
+                streaming_supported_natively: false,
+                route_origin,
+            })
+        },
         ProbeDetailV1::Binary { path } => ResourceProbeOutcome::Found(ResourceDetail::Binary {
             path,
             version: None,
@@ -873,6 +900,7 @@ mod tests {
                 }],
             }),
             &def,
+            &HashMap::new(),
         );
 
         let ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
@@ -897,6 +925,65 @@ mod tests {
     }
 
     #[test]
+    fn host_direct_setter_changes_route_origin() {
+        use crate::environment::runtime::env::{HostDirectMethod, HostDirectVerification};
+
+        let d = WslDispatcher::new(info("Ubuntu"), "Ubuntu");
+        let mut hd = HashMap::new();
+        hd.insert(
+            ResourceId("ollama".into()),
+            HostDirectVerification {
+                verified_at: chrono::Utc::now(),
+                method: HostDirectMethod::WslMirroredNetworking,
+                host_url: "http://127.0.0.1:11434".into(),
+                probe_route_path: "/api/version".into(),
+                stable_fingerprint: "abc".into(),
+                recompute_jsonpaths: vec!["$.version".into()],
+            },
+        );
+
+        d.set_host_direct(hd);
+
+        let snap = d.host_direct_snapshot();
+        assert!(snap.contains_key(&ResourceId("ollama".into())));
+    }
+
+    #[test]
+    fn wire_detail_to_engine_tags_host_direct_when_verified() {
+        use crate::environment::runtime::env::{HostDirectMethod, HostDirectVerification};
+
+        let def = http_def();
+        let mut host_direct = HashMap::new();
+        host_direct.insert(
+            ResourceId("ollama".into()),
+            HostDirectVerification {
+                verified_at: chrono::Utc::now(),
+                method: HostDirectMethod::WslMirroredNetworking,
+                host_url: "http://127.0.0.1:11434".into(),
+                probe_route_path: "/api/version".into(),
+                stable_fingerprint: "abc".into(),
+                recompute_jsonpaths: vec!["$.version".into()],
+            },
+        );
+
+        let outcome = wire_detail_to_engine(
+            ProbeDetailV1::HttpEndpoint {
+                base_url: "http://127.0.0.1:11434".into(),
+                proven_routes: vec![],
+            },
+            &def,
+            &host_direct,
+        );
+
+        let ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint { route_origin, .. }) =
+            outcome
+        else {
+            panic!("expected Found HTTP outcome");
+        };
+        assert_eq!(route_origin, RouteOrigin::HostDirect);
+    }
+
+    #[test]
     fn wire_http_outcome_drops_unknown_capability() {
         let def = http_def();
         let outcome = wire_outcome_to_engine(
@@ -910,6 +997,7 @@ mod tests {
                 }],
             }),
             &def,
+            &HashMap::new(),
         );
 
         let ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
