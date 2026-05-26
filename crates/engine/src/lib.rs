@@ -402,9 +402,11 @@ mod engine_tests {
                 timeout_ms: None,
                 retry: None,
                 continue_on_error: false,
+                target_env: None,
             }],
             edges: vec![],
             resources: vec![],
+            default_env: None,
         });
 
         let handle = engine

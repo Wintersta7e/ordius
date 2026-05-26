@@ -41,6 +41,7 @@ async fn template_resolves_secret_and_redacts_in_event_log() {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     };
     let wf = Workflow {
         id: "secrets-demo".into(),
@@ -53,6 +54,7 @@ async fn template_resolves_secret_and_redacts_in_event_log() {
         nodes: vec![node.clone()],
         edges: vec![],
         resources: vec![],
+        default_env: None,
     };
 
     let rec =
@@ -98,7 +100,7 @@ async fn template_resolves_secret_and_redacts_in_event_log() {
     // what makes the redaction step necessary.
     assert!(
         rendered.contains("supersecret"),
-        "renderer should produce the raw value; got {rendered:?}",
+        "renderer should produce the raw value; got {rendered:?}"
     );
 
     em.emit_node(
@@ -118,12 +120,10 @@ async fn template_resolves_secret_and_redacts_in_event_log() {
             |r| r.get(0),
         )
         .unwrap();
+    let has_marker = payload_json.contains("<redacted:MY_KEY>");
+    let has_raw = payload_json.contains("supersecret");
     assert!(
-        payload_json.contains("<redacted:MY_KEY>"),
-        "expected redaction marker in persisted payload: {payload_json}",
-    );
-    assert!(
-        !payload_json.contains("supersecret"),
-        "expected raw secret to be absent from persisted payload: {payload_json}",
+        has_marker && !has_raw,
+        "want redaction marker and no raw secret in: {payload_json}"
     );
 }

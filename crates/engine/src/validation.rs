@@ -129,6 +129,7 @@ mod tests {
             timeout_ms: None,
             retry: None,
             continue_on_error: false,
+            target_env: None,
         }
     }
 
@@ -157,6 +158,7 @@ mod tests {
             nodes,
             edges,
             resources: vec![],
+            default_env: None,
         }
     }
 

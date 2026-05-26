@@ -43,6 +43,12 @@ pub struct Workflow {
     /// when the workflow is deleted. Defaults to empty.
     #[serde(default)]
     pub resources: Vec<ResourceDefinition>,
+    /// Default env applied to every node that does not set its own
+    /// `target_env`. Defaults to `None`, which is functionally equivalent
+    /// to the engine's `local` env in Phase D. Phase E adds env-registry
+    /// validation.
+    #[serde(default)]
+    pub default_env: Option<crate::types::EnvId>,
 }
 
 const fn default_schema_version() -> u32 {
@@ -154,6 +160,20 @@ mod tests {
         let w: Workflow =
             serde_json::from_str(r#"{"id":"w1","name":"hi","nodes":[],"edges":[]}"#).unwrap();
         assert!(w.resources.is_empty());
+    }
+
+    #[test]
+    fn workflow_default_env_defaults_to_none() {
+        let w: Workflow =
+            serde_json::from_str(r#"{"id":"w1","name":"x","nodes":[],"edges":[]}"#).unwrap();
+        assert!(w.default_env.is_none());
+    }
+
+    #[test]
+    fn workflow_default_env_loads_when_present() {
+        let json = r#"{"id":"w1","name":"x","nodes":[],"edges":[],"default_env":"wsl:Ubuntu"}"#;
+        let w: Workflow = serde_json::from_str(json).unwrap();
+        assert_eq!(w.default_env.as_ref().unwrap().as_str(), "wsl:Ubuntu");
     }
 
     #[test]

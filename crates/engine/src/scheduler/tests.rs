@@ -12,6 +12,7 @@ fn node(id: &str) -> Node {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }
 
@@ -54,6 +55,7 @@ fn wf(nodes: Vec<Node>, edges: Vec<Edge>) -> Workflow {
         nodes,
         edges,
         resources: vec![],
+        default_env: None,
     }
 }
 

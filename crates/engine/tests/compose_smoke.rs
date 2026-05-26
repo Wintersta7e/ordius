@@ -25,6 +25,7 @@ fn delay_node(id: &str, ms: u64) -> Node {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }
 
@@ -38,6 +39,7 @@ fn compose_node(id: &str, child_workflow_id: &str) -> Node {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }
 
@@ -51,6 +53,7 @@ fn shell_node(id: &str, command: &str) -> Node {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }
 
@@ -66,6 +69,7 @@ fn workflow(id: &str, nodes: Vec<Node>) -> Workflow {
         nodes,
         edges: vec![],
         resources: vec![],
+        default_env: None,
     }
 }
 

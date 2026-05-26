@@ -33,6 +33,7 @@ fn delay_node(id: &str, ms: u64) -> Node {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }
 
@@ -66,6 +67,7 @@ async fn two_delay_nodes_run_end_to_end() {
         nodes: vec![delay_node("a", 20), delay_node("b", 20)],
         edges: vec![forward_edge("e", "a", "b")],
         resources: vec![],
+        default_env: None,
     };
 
     let registry = Registry::with_v1_0_builtins();

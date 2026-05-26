@@ -129,6 +129,7 @@ mod tests {
             timeout_ms: None,
             retry: None,
             continue_on_error: false,
+            target_env: None,
         };
         let out = Dispatcher::new()
             .run(&node, &nt, &ctx, CancellationToken::new())
@@ -163,6 +164,7 @@ mod tests {
             timeout_ms: None,
             retry: None,
             continue_on_error: false,
+            target_env: None,
         };
         // No `image` config → Config error from the executor itself
         // (we don't reach docker, so this works without a daemon).

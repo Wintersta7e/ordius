@@ -40,6 +40,7 @@ fn agent_node(id: &str, llm_url: &str, tool_url: &str) -> Node {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }
 
@@ -55,6 +56,7 @@ fn workflow(id: &str, nodes: Vec<Node>) -> Workflow {
         nodes,
         edges: vec![],
         resources: vec![],
+        default_env: None,
     }
 }
 
@@ -151,6 +153,7 @@ fn streaming_agent_node(id: &str, llm_url: &str, tool_url: &str) -> Node {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }
 

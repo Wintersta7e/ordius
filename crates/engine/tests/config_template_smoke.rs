@@ -24,6 +24,7 @@ fn transform_template_node(id: &str, template: &str) -> Node {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }
 
@@ -40,6 +41,7 @@ fn http_node_with_templated_url(id: &str, url_template: &str) -> Node {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }
 
@@ -81,6 +83,7 @@ async fn http_url_template_resolves_from_vars() {
         nodes: vec![http_node_with_templated_url("fetch", &url_template)],
         edges: vec![],
         resources: vec![],
+        default_env: None,
     };
     let variables = HashMap::from([("path".to_string(), "hello".to_string())]);
     let summary = engine
@@ -119,6 +122,7 @@ async fn http_url_template_resolves_from_upstream_node_output() {
         ],
         edges: vec![forward("e1", "emit_url", "text", "fetch", "url")],
         resources: vec![],
+        default_env: None,
     };
     let summary = engine
         .run_workflow(Arc::new(wf), HashMap::new(), "test", false, None)

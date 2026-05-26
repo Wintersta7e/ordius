@@ -17,6 +17,7 @@ fn delay_node(id: &str, ms: u64) -> Node {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }
 
@@ -46,6 +47,7 @@ fn parallel_node_with_mode(
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }
 
@@ -61,6 +63,7 @@ fn workflow(id: &str, nodes: Vec<Node>) -> Workflow {
         nodes,
         edges: vec![],
         resources: vec![],
+        default_env: None,
     }
 }
 

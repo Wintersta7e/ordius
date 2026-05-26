@@ -39,6 +39,7 @@ pub(super) fn make_ctx() -> (RunContext, broadcast::Receiver<RunEvent>, TempDir)
         nodes: vec![],
         edges: vec![],
         resources: vec![],
+        default_env: None,
     };
     let rec = Arc::new(RunRecorder::start(pool, &wf, "{}", &HashMap::new(), "test").unwrap());
     let (em, rx) = Emitter::new(rec.clone());
@@ -132,5 +133,6 @@ pub(super) fn trivial_subprocess_node() -> Node {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }

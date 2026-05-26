@@ -21,6 +21,7 @@ fn condition_node(cfg: &serde_json::Value) -> Node {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }
 

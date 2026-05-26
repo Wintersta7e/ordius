@@ -1029,9 +1029,11 @@ mod tests {
                 timeout_ms: None,
                 retry: None,
                 continue_on_error: false,
+                target_env: None,
             }],
             edges: vec![],
             resources: vec![],
+            default_env: None,
         }
     }
 
@@ -1068,9 +1070,11 @@ mod tests {
                 timeout_ms: None,
                 retry: None,
                 continue_on_error: false,
+                target_env: None,
             }],
             edges: vec![],
             resources: vec![],
+            default_env: None,
         });
 
         let summary = tokio::time::timeout(
@@ -1337,6 +1341,7 @@ mod tests {
             timeout_ms: None,
             retry: None,
             continue_on_error: false,
+            target_env: None,
         };
         let mk_edge = |id: &str, from: &str, to: &str| crate::types::Edge {
             id: id.into(),
@@ -1359,6 +1364,7 @@ mod tests {
             nodes: vec![mk_delay("a"), mk_delay("b"), mk_delay("c")],
             edges: vec![mk_edge("e1", "a", "b"), mk_edge("e2", "b", "c")],
             resources: vec![],
+            default_env: None,
         });
 
         let summary = engine
@@ -1410,9 +1416,11 @@ mod tests {
                 timeout_ms: None,
                 retry: None,
                 continue_on_error: false,
+                target_env: None,
             }],
             edges: vec![],
             resources: vec![],
+            default_env: None,
         });
 
         let summary = engine
@@ -1446,9 +1454,11 @@ mod tests {
                 timeout_ms: None,
                 retry: None,
                 continue_on_error: false,
+                target_env: None,
             }],
             edges: vec![],
             resources: vec![],
+            default_env: None,
         });
 
         let handle = engine
@@ -1504,9 +1514,11 @@ mod tests {
                 timeout_ms: Some(50),
                 retry: None,
                 continue_on_error: false,
+                target_env: None,
             }],
             edges: vec![],
             resources: vec![],
+            default_env: None,
         });
 
         let summary = engine
@@ -1548,9 +1560,11 @@ mod tests {
                 timeout_ms: Some(50),
                 retry: None,
                 continue_on_error: false,
+                target_env: None,
             }],
             edges: vec![],
             resources: vec![],
+            default_env: None,
         });
 
         let start = std::time::Instant::now();
@@ -1597,9 +1611,11 @@ mod tests {
                     retry_on: RetryOn::Both,
                 }),
                 continue_on_error: false,
+                target_env: None,
             }],
             edges: vec![],
             resources: vec![],
+            default_env: None,
         });
 
         let summary = engine

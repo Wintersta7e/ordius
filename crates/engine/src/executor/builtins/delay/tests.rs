@@ -18,6 +18,7 @@ fn delay_node(ms: u64) -> Node {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }
 
@@ -62,6 +63,7 @@ async fn delay_rejects_missing_ms_config() {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     };
     let res = DelayExecutor
         .run(&node, &delay_node_type(), &ctx, CancellationToken::new())

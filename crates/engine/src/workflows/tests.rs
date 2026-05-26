@@ -209,6 +209,7 @@ mod scope_tests {
                 },
                 override_lower_scope: false,
             }],
+            default_env: None,
         }
     }
 

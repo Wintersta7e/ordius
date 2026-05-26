@@ -30,6 +30,7 @@ fn delay_node(id: &str, ms: u64) -> Node {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }
 
@@ -47,6 +48,7 @@ fn file_write_node(id: &str, path: &str, content: &str) -> Node {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }
 
@@ -63,6 +65,7 @@ fn file_read_node(id: &str, path: &str) -> Node {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }
 
@@ -79,6 +82,7 @@ fn transform_template_node(id: &str, template: &str) -> Node {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }
 
@@ -92,6 +96,7 @@ fn http_get_node(id: &str, url: &str) -> Node {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }
 
@@ -165,6 +170,7 @@ async fn five_step_workflow_runs_through_file_transform_http_to_completion() {
             fwd_edge("e5", "e_http", "body", "f_write_summary", "in"),
         ],
         resources: vec![],
+        default_env: None,
     });
 
     let summary = engine

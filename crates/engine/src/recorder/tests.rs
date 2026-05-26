@@ -14,6 +14,7 @@ fn empty_wf() -> Workflow {
         nodes: vec![],
         edges: vec![],
         resources: vec![],
+        default_env: None,
     }
 }
 

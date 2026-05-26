@@ -589,6 +589,7 @@ mod tests {
             timeout_ms: None,
             retry: None,
             continue_on_error: false,
+            target_env: None,
         }
     }
 
@@ -619,6 +620,7 @@ mod tests {
             nodes: vec![delay_node("step", 5)],
             edges: vec![],
             resources: vec![],
+            default_env: None,
         };
         crate::workflows::save(engine.home(), &wf).unwrap();
 
@@ -672,6 +674,7 @@ mod tests {
             nodes: vec![delay_node("step", 5)],
             edges: vec![],
             resources: vec![],
+            default_env: None,
         };
         crate::workflows::save(engine.home(), &wf).unwrap();
 
@@ -737,6 +740,7 @@ mod tests {
             nodes: vec![delay_node("step", 5)],
             edges: vec![],
             resources: vec![],
+            default_env: None,
         };
         crate::workflows::save(engine.home(), &wf).unwrap();
 
@@ -822,6 +826,7 @@ mod tests {
             nodes: vec![delay_node("step", 5)],
             edges: vec![],
             resources: vec![],
+            default_env: None,
         };
         crate::workflows::save(engine.home(), &wf).unwrap();
 

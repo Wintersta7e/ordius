@@ -25,6 +25,7 @@ fn empty_demo_workflow() -> Workflow {
         nodes: vec![],
         edges: vec![],
         resources: vec![],
+        default_env: None,
     }
 }
 

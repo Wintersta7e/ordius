@@ -34,6 +34,12 @@ pub struct Node {
     /// errors. Default false (errors halt the branch).
     #[serde(default)]
     pub continue_on_error: bool,
+    /// Symbolic env this node targets at run time. `None` falls back to
+    /// the workflow's `default_env`, which itself falls back to `local`.
+    /// Phase D parses the field; Phase E enforces existence against the
+    /// env registry and wires the dispatcher selection on it.
+    #[serde(default)]
+    pub target_env: Option<crate::types::EnvId>,
 }
 
 /// Canvas position for the GUI. Engine ignores; loader preserves.
@@ -128,6 +134,20 @@ mod tests {
         assert!(!n.continue_on_error);
         assert!(n.timeout_ms.is_none());
         assert!(n.retry.is_none());
+    }
+
+    #[test]
+    fn node_target_env_defaults_to_none() {
+        let n: Node =
+            serde_json::from_str(r#"{"id":"n1","type":"shell","name":"x","config":{}}"#).unwrap();
+        assert!(n.target_env.is_none());
+    }
+
+    #[test]
+    fn node_target_env_loads_when_present() {
+        let json = r#"{"id":"n1","type":"shell","name":"x","config":{},"target_env":"wsl:Ubuntu"}"#;
+        let n: Node = serde_json::from_str(json).unwrap();
+        assert_eq!(n.target_env.as_ref().unwrap().as_str(), "wsl:Ubuntu");
     }
 
     #[test]

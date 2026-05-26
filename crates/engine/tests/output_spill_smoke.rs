@@ -24,6 +24,7 @@ fn transform_template_node(id: &str, template: &str) -> Node {
         timeout_ms: None,
         retry: None,
         continue_on_error: false,
+        target_env: None,
     }
 }
 
@@ -45,6 +46,7 @@ async fn large_string_output_spills_to_disk() {
         nodes: vec![transform_template_node("emit_big", &big)],
         edges: vec![],
         resources: vec![],
+        default_env: None,
     };
     let summary = engine
         .run_workflow(Arc::new(wf), HashMap::new(), "test", false, None)
@@ -93,6 +95,7 @@ async fn small_output_stays_inline() {
         nodes: vec![transform_template_node("emit_small", small)],
         edges: vec![],
         resources: vec![],
+        default_env: None,
     };
     let summary = engine
         .run_workflow(Arc::new(wf), HashMap::new(), "test", false, None)
