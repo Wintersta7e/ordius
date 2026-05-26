@@ -31,6 +31,10 @@ pub enum DispatchError {
         env_id: String,
     },
 
+    /// Helper bootstrap into the env failed (push, sha256-verify, chmod).
+    #[error("helper bootstrap: {0}")]
+    HelperBootstrap(String),
+
     /// The requested resource id is not registered for the environment.
     #[error("resource {id} not in env {env_id}; available: {available:?}")]
     ResourceMissing {
