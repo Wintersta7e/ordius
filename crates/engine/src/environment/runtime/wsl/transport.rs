@@ -46,15 +46,14 @@ impl WslHttpTransport {
     }
 
     fn url_classification(&self, url: &Url) -> UrlClass {
-        match url.host_str() {
-            Some(host) if is_loopback_host(host) => {
-                if self.has_host_direct_for(url) {
-                    UrlClass::HostDirect
-                } else {
-                    UrlClass::EnvLoopback
-                }
-            },
-            _ => UrlClass::PublicDirect,
+        if is_loopback_url(url) {
+            if self.has_host_direct_for(url) {
+                UrlClass::HostDirect
+            } else {
+                UrlClass::EnvLoopback
+            }
+        } else {
+            UrlClass::PublicDirect
         }
     }
 
@@ -72,8 +71,13 @@ enum UrlClass {
     PublicDirect,
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
+fn is_loopback_url(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
 }
 
 #[async_trait]
@@ -359,5 +363,20 @@ mod tests {
         let (body, status) = split_curl_status(raw);
         assert_eq!(body.as_ref(), b"hello world");
         assert_eq!(status, "200");
+    }
+
+    #[test]
+    fn ipv6_loopback_classifies_env_loopback() {
+        let t = WslHttpTransport::new("Ubuntu", HashMap::new());
+        let url = Url::parse("http://[::1]:11434/api/version").unwrap();
+        assert!(matches!(t.url_classification(&url), UrlClass::EnvLoopback));
+    }
+
+    #[test]
+    fn localhost_uppercase_classifies_env_loopback() {
+        // Case-insensitive match for localhost.
+        let t = WslHttpTransport::new("Ubuntu", HashMap::new());
+        let url = Url::parse("http://LOCALHOST:11434/api/version").unwrap();
+        assert!(matches!(t.url_classification(&url), UrlClass::EnvLoopback));
     }
 }
