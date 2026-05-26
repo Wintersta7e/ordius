@@ -264,7 +264,22 @@ mod tests {
         };
         let s = serde_json::to_string(&o).unwrap();
         assert!(s.contains("\"outcome\":{\"kind\":\"found\""));
-        assert!(s.contains("\"http_endpoint\""));
+        // Pin the renamed inner tag explicitly — using `"http_endpoint"` as a
+        // bare substring would not detect a regression to `"kind":"http_endpoint"`
+        // that re-introduces the BUG-09 duplicate-`kind` failure.
+        assert!(
+            s.contains("\"detail\":\"http_endpoint\""),
+            "inner tag must be `detail`, got: {s}"
+        );
+        // Confirm serde_json can parse the wire form back. The duplicate-`kind`
+        // bug surfaced as a deserialise-time error; serialise-only assertions
+        // missed it.
+        let back: ProbeOutcomeV1 =
+            serde_json::from_str(&s).expect("Found outcome must round-trip cleanly");
+        assert!(matches!(
+            back.outcome,
+            ProbeOutcomeBodyV1::Found(ProbeDetailV1::HttpEndpoint { .. })
+        ));
     }
 
     #[test]
