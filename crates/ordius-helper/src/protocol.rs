@@ -197,7 +197,8 @@ pub struct ExecRequestV1 {
     /// Working directory for the spawned process. `None` inherits the helper's cwd.
     #[serde(default)]
     pub cwd: Option<String>,
-    /// Optional stdin payload base64-encoded; absent or empty means no stdin.
+    /// Optional stdin payload as standard base64 (RFC 4648, `+/` alphabet,
+    /// padded).  Absent or empty means no stdin.
     #[serde(default)]
     pub stdin_b64: Option<String>,
 }

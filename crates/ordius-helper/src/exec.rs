@@ -49,19 +49,30 @@ pub fn run<R: BufRead>(mut input: R) -> anyhow::Result<()> {
 
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("spawn `{}` failed (program not found?)", req.program))?;
+        .with_context(|| format!("spawn `{}` failed", req.program))?;
     if let Some(bytes) = stdin_bytes
         && let Some(mut child_stdin) = child.stdin.take()
     {
         use std::io::Write;
-        child_stdin
-            .write_all(&bytes)
-            .context("write stdin payload to child")?;
+        // BrokenPipe = the child closed stdin before consuming the full
+        // payload (legitimate for e.g. `head -n 1`).  Other I/O errors are
+        // unusual but we still wait() and treat the child's exit status as
+        // the authoritative outcome.
+        drop(child_stdin.write_all(&bytes));
+        drop(child_stdin); // close stdin so child reads EOF
     }
     let status = child.wait().context("wait on child")?;
-    let code = status
-        .code()
-        .unwrap_or_else(|| i32::from(!status.success()));
+    // POSIX shell / ssh convention: signal-killed children report 128 + signum.
+    // On Windows there's no signal concept so the fallback stays at 1.
+    #[cfg(unix)]
+    let code = {
+        use std::os::unix::process::ExitStatusExt;
+        status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+    };
+    #[cfg(not(unix))]
+    let code = status.code().unwrap_or(1);
     if code == 0 {
         Ok(())
     } else {
@@ -115,4 +126,16 @@ mod tests {
     // Note: the success path can't easily run as a unit test without calling
     // a real binary that exits 0; that's exercised in T5's integration test
     // file (`tests/smoke.rs`) where echo / true are reliably available.
+
+    #[test]
+    fn decode_b64_handles_empty() {
+        let v = decode_b64("").unwrap();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn decode_b64_rejects_invalid() {
+        let err = decode_b64("not!valid?base64").unwrap_err();
+        assert!(err.to_string().contains("invalid base64"));
+    }
 }
