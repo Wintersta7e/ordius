@@ -61,7 +61,10 @@ pub struct ResourceDefinition {
     pub kind: ResourceKind,
     /// Capabilities the resource *advertises*. The dispatcher must *prove*
     /// each via a successful probe of that capability's route before
-    /// surfacing it on the catalog.
+    /// surfacing it on the catalog. Defaults to empty so a user-authored
+    /// TOML/JSON entry can omit the field for resources whose probe doesn't
+    /// declare a capability (Binary / Toolchain).
+    #[serde(default)]
     pub advertised_capabilities: Vec<Capability>,
     /// How to probe for this resource.
     pub probe: ProbeSpec,
@@ -79,6 +82,9 @@ pub enum ProbeSpec {
         /// Ports to attempt in order; first successful bind wins.
         ports: Vec<u16>,
         /// Routes to probe; each route proves zero or more capabilities.
+        /// Defaults to empty so a liveness-only probe (port-open check
+        /// with no route assertions) can omit the field entirely.
+        #[serde(default)]
         routes: Vec<HttpProbeRoute>,
         /// Override `ProbePlan.per_resource_timeout` for this resource.
         timeout_ms: Option<u64>,

@@ -234,9 +234,16 @@ pub fn delete_in_registry(
     id: &str,
     registry: &ResourceRegistry,
 ) -> Result<bool, WorkflowsError> {
+    // Delete the file first. If that fails (permission, locked, etc.),
+    // the workflow remains on disk and its in-memory scope MUST stay
+    // installed so a future probe can still resolve its resources. Only
+    // after a successful Ok(true)/Ok(false) do we clear the scope. The
+    // orphaned-scope cleanup (file removed out-of-band) still works
+    // because `delete` returns Ok(false) for the missing-file case.
+    let removed = delete(home, id)?;
     let wf_id = WorkflowId(id.to_string());
-    let _removed = remove_workflow_scope(&wf_id, registry);
-    delete(home, id)
+    let _scope_count = remove_workflow_scope(&wf_id, registry);
+    Ok(removed)
 }
 
 /// Duplicate a workflow and install the clone's scope into the registry.

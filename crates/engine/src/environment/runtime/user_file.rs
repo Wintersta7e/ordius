@@ -207,6 +207,31 @@ routes = []
     }
 
     #[test]
+    fn parses_without_optional_arrays() {
+        // `advertised_capabilities` and the HTTP `routes` array now default
+        // to empty, so a port-only liveness probe is the smallest valid
+        // user-authored TOML entry.
+        let toml_src = r#"
+[[resource]]
+id = "ping-only"
+kind = "http_endpoint"
+
+[resource.probe]
+kind = "http"
+ports = [8080]
+"#;
+        let file: UserResourcesFile = toml::from_str(toml_src).expect("parse");
+        assert_eq!(file.resources.len(), 1);
+        let r = &file.resources[0];
+        assert!(r.advertised_capabilities.is_empty());
+        let ProbeSpec::Http { routes, ports, .. } = &r.probe else {
+            panic!("http probe")
+        };
+        assert_eq!(ports, &vec![8080u16]);
+        assert!(routes.is_empty());
+    }
+
+    #[test]
     fn valid_file_upserts_under_user_global_scope() {
         let tmp = TempDir::new().unwrap();
         let body = r#"
