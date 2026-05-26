@@ -168,13 +168,46 @@ pub enum ApiFlavor {
 
 /// Carried in node config — references a resource by id, optionally asserting
 /// a required capability that must be proven before the node may dispatch.
+///
+/// Untagged so the wire form accepts either the short `"resource": "openai"`
+/// (just the id) or the long form
+/// `"resource": { "id": "openai", "required_capability": "openai_tool_calling" }`.
+/// Both round-trip through the same field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceRef {
-    /// The resource to use.
-    pub id: ResourceId,
-    /// If set, the dispatcher enforces this capability before dispatch.
-    #[serde(default)]
-    pub required_capability: Option<Capability>,
+#[serde(untagged)]
+pub enum ResourceRef {
+    /// Short form — bare resource id, no capability filter.
+    Bare(ResourceId),
+    /// Long form — id plus optional capability filter.
+    Detailed {
+        /// The resource to use.
+        id: ResourceId,
+        /// If set, the dispatcher enforces this capability before dispatch.
+        #[serde(default)]
+        required_capability: Option<Capability>,
+    },
+}
+
+impl ResourceRef {
+    /// View the underlying `ResourceId`.
+    #[must_use]
+    pub const fn id(&self) -> &ResourceId {
+        match self {
+            Self::Bare(id) | Self::Detailed { id, .. } => id,
+        }
+    }
+
+    /// View the capability constraint, if any.
+    #[must_use]
+    pub const fn required_capability(&self) -> Option<Capability> {
+        match self {
+            Self::Bare(_) => None,
+            Self::Detailed {
+                required_capability,
+                ..
+            } => *required_capability,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -244,5 +277,36 @@ mod tests {
         assert!(s.contains("\"override_lower_scope\":true"));
         let back: ResourceDefinition = serde_json::from_str(&s).unwrap();
         assert_eq!(def, back);
+    }
+
+    #[test]
+    fn resource_ref_short_form_roundtrips() {
+        let json = r#""openai""#;
+        let r: ResourceRef = serde_json::from_str(json).unwrap();
+        assert_eq!(r.id().0, "openai");
+        assert!(r.required_capability().is_none());
+        let back = serde_json::to_string(&r).unwrap();
+        assert_eq!(back, json);
+    }
+
+    #[test]
+    fn resource_ref_long_form_with_capability_roundtrips() {
+        let json = r#"{"id":"openai","required_capability":"openai_tool_calling"}"#;
+        let r: ResourceRef = serde_json::from_str(json).unwrap();
+        assert_eq!(r.id().0, "openai");
+        assert_eq!(
+            r.required_capability().unwrap(),
+            Capability::OpenaiToolCalling
+        );
+        let back = serde_json::to_string(&r).unwrap();
+        assert_eq!(back, json);
+    }
+
+    #[test]
+    fn resource_ref_long_form_without_capability_is_valid() {
+        let json = r#"{"id":"openai"}"#;
+        let r: ResourceRef = serde_json::from_str(json).unwrap();
+        assert_eq!(r.id().0, "openai");
+        assert!(r.required_capability().is_none());
     }
 }

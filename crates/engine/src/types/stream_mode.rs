@@ -5,7 +5,7 @@
 //! config. Phase E's dispatcher layer enforces the `Force` variant
 //! against the resolved route's `streaming_supported` flag.
 //!
-//! Spec: docs/plans/environment-runtime.md §4 ("StreamMode").
+//! Spec: docs/plans/environment-runtime.md §4 ("`StreamMode`").
 
 use serde::{Deserialize, Serialize};
 
