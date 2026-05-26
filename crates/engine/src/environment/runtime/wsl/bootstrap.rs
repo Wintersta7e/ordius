@@ -87,11 +87,32 @@ pub async fn probe_env_triple(distro: &str) -> Result<String, BootstrapError> {
         )));
     }
     let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    Ok(match raw.as_str() {
-        "x86_64-linux" => "x86_64-unknown-linux-musl".into(),
-        "aarch64-linux" => "aarch64-unknown-linux-musl".into(),
+    let normalized = match raw.as_str() {
+        "x86_64-linux" => "x86_64-unknown-linux-musl".to_string(),
+        "aarch64-linux" => "aarch64-unknown-linux-musl".to_string(),
         other => other.to_string(),
-    })
+    };
+    validate_triple(&normalized)?;
+    Ok(normalized)
+}
+
+/// Reject triples whose characters fall outside `[A-Za-z0-9_-]` — they are
+/// interpolated into shell-visible paths (e.g. `/tmp/.ordius/helper-…`) and
+/// argv lists that re-enter the WSL distro. Real Rust target triples never
+/// contain other characters.
+fn validate_triple(raw: &str) -> Result<(), BootstrapError> {
+    if raw.is_empty() {
+        return Err(BootstrapError::TripleProbe("empty triple".into()));
+    }
+    if !raw
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(BootstrapError::TripleProbe(format!(
+            "triple contains unexpected characters: {raw:?}"
+        )));
+    }
+    Ok(())
 }
 
 /// Push helper bytes into the env, verify sha256, rename, and chmod +x.
@@ -110,20 +131,48 @@ pub async fn bootstrap_helper(
             triple: triple.to_string(),
         });
     }
-    let final_path = format!(
-        "/tmp/.ordius/helper-{}-{}",
-        env!("CARGO_PKG_VERSION"),
-        triple
-    );
+    validate_triple(triple)?;
+    let keep_basename = format!("helper-{}-{}", env!("CARGO_PKG_VERSION"), triple);
+    let final_path = format!("/tmp/.ordius/{keep_basename}");
     let tmp_path = format!("{final_path}.tmp");
     push_bytes(distro, &tmp_path, target.bytes).await?;
     verify_sha_in_env(distro, &tmp_path, target.sha256).await?;
     atomic_install(distro, &tmp_path, &final_path).await?;
     chmod_exec(distro, &final_path).await?;
+    cleanup_old_helpers(distro, triple, &keep_basename).await;
     Ok(BootstrappedHelper {
         triple: triple.to_string(),
         env_side_path: final_path,
     })
+}
+
+/// Best-effort: drop leftover helper binaries from prior engine versions for
+/// the same triple. Uses `find` via `wsl.exe --exec` so no shell is involved;
+/// the glob pattern is interpreted by `find -name`, not by a shell. Failures
+/// are swallowed — the just-installed helper is already usable. `triple` has
+/// been validated against `[A-Za-z0-9_-]+`.
+async fn cleanup_old_helpers(distro: &str, triple: &str, keep_basename: &str) {
+    let name_pattern = format!("helper-*-{triple}");
+    let cmd_future = Command::new("wsl.exe")
+        .args([
+            "-d",
+            distro,
+            "--exec",
+            "find",
+            "/tmp/.ordius",
+            "-maxdepth",
+            "1",
+            "-type",
+            "f",
+            "-name",
+            &name_pattern,
+            "-not",
+            "-name",
+            keep_basename,
+            "-delete",
+        ])
+        .output();
+    drop(tokio::time::timeout(PUSH_TIMEOUT, cmd_future).await);
 }
 
 async fn push_bytes(distro: &str, dest: &str, bytes: &[u8]) -> Result<(), BootstrapError> {
@@ -170,11 +219,15 @@ async fn verify_sha_in_env(
     path: &str,
     expected_hex: &str,
 ) -> Result<(), BootstrapError> {
-    let out = Command::new("wsl.exe")
-        .args(["-d", distro, "--exec", "sha256sum", path])
-        .output()
-        .await
-        .map_err(|e| BootstrapError::Push(format!("sha256sum spawn: {e}")))?;
+    let out = tokio::time::timeout(
+        PUSH_TIMEOUT,
+        Command::new("wsl.exe")
+            .args(["-d", distro, "--exec", "sha256sum", path])
+            .output(),
+    )
+    .await
+    .map_err(|_| BootstrapError::Push("sha256sum timed out".into()))?
+    .map_err(|e| BootstrapError::Push(format!("sha256sum spawn: {e}")))?;
     if !out.status.success() {
         return Err(BootstrapError::Push(format!(
             "sha256sum exited with {:?}",
@@ -196,11 +249,15 @@ async fn verify_sha_in_env(
 }
 
 async fn atomic_install(distro: &str, src: &str, dst: &str) -> Result<(), BootstrapError> {
-    let out = Command::new("wsl.exe")
-        .args(["-d", distro, "--exec", "mv", "-f", src, dst])
-        .output()
-        .await
-        .map_err(|e| BootstrapError::Push(format!("mv spawn: {e}")))?;
+    let out = tokio::time::timeout(
+        PUSH_TIMEOUT,
+        Command::new("wsl.exe")
+            .args(["-d", distro, "--exec", "mv", "-f", src, dst])
+            .output(),
+    )
+    .await
+    .map_err(|_| BootstrapError::Push("mv timed out".into()))?
+    .map_err(|e| BootstrapError::Push(format!("mv spawn: {e}")))?;
     if !out.status.success() {
         return Err(BootstrapError::Push(format!(
             "mv exited with {:?}",
@@ -211,11 +268,15 @@ async fn atomic_install(distro: &str, src: &str, dst: &str) -> Result<(), Bootst
 }
 
 async fn chmod_exec(distro: &str, path: &str) -> Result<(), BootstrapError> {
-    let out = Command::new("wsl.exe")
-        .args(["-d", distro, "--exec", "chmod", "+x", path])
-        .output()
-        .await
-        .map_err(|e| BootstrapError::Chmod(e.to_string()))?;
+    let out = tokio::time::timeout(
+        PUSH_TIMEOUT,
+        Command::new("wsl.exe")
+            .args(["-d", distro, "--exec", "chmod", "+x", path])
+            .output(),
+    )
+    .await
+    .map_err(|_| BootstrapError::Chmod("chmod timed out".into()))?
+    .map_err(|e| BootstrapError::Chmod(e.to_string()))?;
     if !out.status.success() {
         return Err(BootstrapError::Chmod(format!(
             "chmod exited with {:?}",
@@ -246,5 +307,50 @@ mod tests {
         }
         .into();
         assert!(matches!(e, DispatchError::HelperBootstrap(_)));
+    }
+
+    #[test]
+    fn shell_quote_wraps_plain_value_in_single_quotes() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+    }
+
+    #[test]
+    fn shell_quote_escapes_embedded_single_quote() {
+        // POSIX rule: close, escape, reopen — `with'quote` becomes
+        // `'with'\''quote'` so the shell sees a single literal value.
+        assert_eq!(shell_quote("with'quote"), "'with'\\''quote'");
+    }
+
+    #[test]
+    fn shell_quote_handles_empty_string() {
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn validate_triple_accepts_real_targets() {
+        assert!(validate_triple("x86_64-unknown-linux-musl").is_ok());
+        assert!(validate_triple("aarch64-unknown-linux-musl").is_ok());
+    }
+
+    #[test]
+    fn validate_triple_rejects_path_traversal() {
+        let err = validate_triple("../../etc/passwd").unwrap_err();
+        assert!(matches!(err, BootstrapError::TripleProbe(_)));
+    }
+
+    #[test]
+    fn validate_triple_rejects_empty() {
+        let err = validate_triple("").unwrap_err();
+        assert!(matches!(err, BootstrapError::TripleProbe(_)));
+    }
+
+    #[test]
+    fn validate_triple_rejects_shell_metacharacters() {
+        for bad in ["foo;rm -rf", "foo$bar", "foo`baz`", "foo bar", "foo'bar"] {
+            assert!(
+                validate_triple(bad).is_err(),
+                "triple {bad:?} should have been rejected"
+            );
+        }
     }
 }
