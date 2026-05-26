@@ -156,6 +156,7 @@ mod tests {
             triggers: Vec::new(),
             nodes,
             edges,
+            resources: vec![],
         }
     }
 

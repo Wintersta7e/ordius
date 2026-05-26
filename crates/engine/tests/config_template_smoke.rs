@@ -80,6 +80,7 @@ async fn http_url_template_resolves_from_vars() {
         triggers: vec![Trigger::Manual],
         nodes: vec![http_node_with_templated_url("fetch", &url_template)],
         edges: vec![],
+        resources: vec![],
     };
     let variables = HashMap::from([("path".to_string(), "hello".to_string())]);
     let summary = engine
@@ -117,6 +118,7 @@ async fn http_url_template_resolves_from_upstream_node_output() {
             http_node_with_templated_url("fetch", "{{inputs.url}}"),
         ],
         edges: vec![forward("e1", "emit_url", "text", "fetch", "url")],
+        resources: vec![],
     };
     let summary = engine
         .run_workflow(Arc::new(wf), HashMap::new(), "test", false, None)

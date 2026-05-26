@@ -574,6 +574,7 @@ mod tests {
             edges: vec![],
             created_at: None,
             updated_at: None,
+            resources: vec![],
         };
         let dto = JsonCamel(wf);
         let json = serde_json::to_string(&dto).unwrap();

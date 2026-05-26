@@ -52,6 +52,7 @@ async fn template_resolves_secret_and_redacts_in_event_log() {
         triggers: vec![],
         nodes: vec![node.clone()],
         edges: vec![],
+        resources: vec![],
     };
 
     let rec =

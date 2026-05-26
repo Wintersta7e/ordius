@@ -54,6 +54,7 @@ fn workflow(id: &str, nodes: Vec<Node>) -> Workflow {
         triggers: vec![Trigger::Manual],
         nodes,
         edges: vec![],
+        resources: vec![],
     }
 }
 

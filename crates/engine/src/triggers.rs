@@ -618,6 +618,7 @@ mod tests {
             }],
             nodes: vec![delay_node("step", 5)],
             edges: vec![],
+            resources: vec![],
         };
         crate::workflows::save(engine.home(), &wf).unwrap();
 
@@ -670,6 +671,7 @@ mod tests {
             }],
             nodes: vec![delay_node("step", 5)],
             edges: vec![],
+            resources: vec![],
         };
         crate::workflows::save(engine.home(), &wf).unwrap();
 
@@ -734,6 +736,7 @@ mod tests {
             triggers: vec![WfTrigger::Webhook { secret_token: None }],
             nodes: vec![delay_node("step", 5)],
             edges: vec![],
+            resources: vec![],
         };
         crate::workflows::save(engine.home(), &wf).unwrap();
 
@@ -818,6 +821,7 @@ mod tests {
             }],
             nodes: vec![delay_node("step", 5)],
             edges: vec![],
+            resources: vec![],
         };
         crate::workflows::save(engine.home(), &wf).unwrap();
 

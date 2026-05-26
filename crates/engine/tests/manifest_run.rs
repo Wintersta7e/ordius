@@ -66,6 +66,7 @@ execution:
             continue_on_error: false,
         }],
         edges: vec![],
+        resources: vec![],
     });
 
     let summary = engine

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::environment::runtime::resource::ResourceDefinition;
 use crate::types::{Edge, Node};
 
 /// A complete workflow: identity, schema metadata, variables, triggers,
@@ -37,6 +38,11 @@ pub struct Workflow {
     /// All edges between nodes.
     #[serde(default)]
     pub edges: Vec<Edge>,
+    /// Workflow-scoped resource definitions. Installed under
+    /// `ScopeKey::Workflow { id }` when the workflow is loaded; removed
+    /// when the workflow is deleted. Defaults to empty.
+    #[serde(default)]
+    pub resources: Vec<ResourceDefinition>,
 }
 
 const fn default_schema_version() -> u32 {
@@ -141,5 +147,60 @@ mod tests {
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.contains(r#""type":"file-watch""#), "kebab tag: {json}");
         assert!(json.contains(r#""debounce_ms":500"#), "snake field: {json}");
+    }
+
+    #[test]
+    fn workflow_resources_block_defaults_empty() {
+        let w: Workflow =
+            serde_json::from_str(r#"{"id":"w1","name":"hi","nodes":[],"edges":[]}"#).unwrap();
+        assert!(w.resources.is_empty());
+    }
+
+    #[test]
+    fn workflow_resources_block_loads_when_present() {
+        let json = r#"{
+            "id": "w1",
+            "name": "x",
+            "nodes": [],
+            "edges": [],
+            "resources": [
+                {
+                    "id": "wf-local-llm",
+                    "kind": "http_endpoint",
+                    "advertised_capabilities": ["openai_chat_completions"],
+                    "probe": {
+                        "kind": "http",
+                        "ports": [7777],
+                        "routes": [
+                            {
+                                "path": "/v1/models",
+                                "method": "get",
+                                "flavor": "openai_chat",
+                                "proves": ["openai_chat_completions"],
+                                "models_jsonpath": null,
+                                "fingerprint_jsonpaths": []
+                            }
+                        ]
+                    },
+                    "override_lower_scope": false
+                },
+                {
+                    "id": "wf-second",
+                    "kind": "binary",
+                    "advertised_capabilities": [],
+                    "probe": {
+                        "kind": "binary",
+                        "bin": "my-tool",
+                        "version_args": ["--version"],
+                        "version_regex": "(\\d+\\.\\d+)"
+                    },
+                    "override_lower_scope": false
+                }
+            ]
+        }"#;
+        let w: Workflow = serde_json::from_str(json).unwrap();
+        assert_eq!(w.resources.len(), 2);
+        assert_eq!(w.resources[0].id.0, "wf-local-llm");
+        assert_eq!(w.resources[1].id.0, "wf-second");
     }
 }

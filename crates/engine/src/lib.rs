@@ -361,6 +361,7 @@ mod engine_tests {
                 continue_on_error: false,
             }],
             edges: vec![],
+            resources: vec![],
         });
 
         let handle = engine

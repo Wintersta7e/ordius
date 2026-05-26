@@ -164,6 +164,7 @@ async fn five_step_workflow_runs_through_file_transform_http_to_completion() {
             fwd_edge("e4", "d_render", "text", "e_http", "in"),
             fwd_edge("e5", "e_http", "body", "f_write_summary", "in"),
         ],
+        resources: vec![],
     });
 
     let summary = engine

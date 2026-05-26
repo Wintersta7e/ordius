@@ -65,6 +65,7 @@ async fn two_delay_nodes_run_end_to_end() {
         triggers: vec![],
         nodes: vec![delay_node("a", 20), delay_node("b", 20)],
         edges: vec![forward_edge("e", "a", "b")],
+        resources: vec![],
     };
 
     let registry = Registry::with_v1_0_builtins();

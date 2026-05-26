@@ -44,6 +44,7 @@ async fn large_string_output_spills_to_disk() {
         triggers: vec![Trigger::Manual],
         nodes: vec![transform_template_node("emit_big", &big)],
         edges: vec![],
+        resources: vec![],
     };
     let summary = engine
         .run_workflow(Arc::new(wf), HashMap::new(), "test", false, None)
@@ -91,6 +92,7 @@ async fn small_output_stays_inline() {
         triggers: vec![Trigger::Manual],
         nodes: vec![transform_template_node("emit_small", small)],
         edges: vec![],
+        resources: vec![],
     };
     let summary = engine
         .run_workflow(Arc::new(wf), HashMap::new(), "test", false, None)

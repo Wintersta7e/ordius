@@ -13,6 +13,7 @@ fn empty_wf() -> Workflow {
         triggers: vec![],
         nodes: vec![],
         edges: vec![],
+        resources: vec![],
     }
 }
 

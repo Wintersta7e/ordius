@@ -53,6 +53,7 @@ fn wf(nodes: Vec<Node>, edges: Vec<Edge>) -> Workflow {
         triggers: vec![],
         nodes,
         edges,
+        resources: vec![],
     }
 }
 

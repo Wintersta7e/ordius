@@ -1031,6 +1031,7 @@ mod tests {
                 continue_on_error: false,
             }],
             edges: vec![],
+            resources: vec![],
         }
     }
 
@@ -1069,6 +1070,7 @@ mod tests {
                 continue_on_error: false,
             }],
             edges: vec![],
+            resources: vec![],
         });
 
         let summary = tokio::time::timeout(
@@ -1356,6 +1358,7 @@ mod tests {
             triggers: vec![],
             nodes: vec![mk_delay("a"), mk_delay("b"), mk_delay("c")],
             edges: vec![mk_edge("e1", "a", "b"), mk_edge("e2", "b", "c")],
+            resources: vec![],
         });
 
         let summary = engine
@@ -1409,6 +1412,7 @@ mod tests {
                 continue_on_error: false,
             }],
             edges: vec![],
+            resources: vec![],
         });
 
         let summary = engine
@@ -1444,6 +1448,7 @@ mod tests {
                 continue_on_error: false,
             }],
             edges: vec![],
+            resources: vec![],
         });
 
         let handle = engine
@@ -1501,6 +1506,7 @@ mod tests {
                 continue_on_error: false,
             }],
             edges: vec![],
+            resources: vec![],
         });
 
         let summary = engine
@@ -1544,6 +1550,7 @@ mod tests {
                 continue_on_error: false,
             }],
             edges: vec![],
+            resources: vec![],
         });
 
         let start = std::time::Instant::now();
@@ -1592,6 +1599,7 @@ mod tests {
                 continue_on_error: false,
             }],
             edges: vec![],
+            resources: vec![],
         });
 
         let summary = engine

@@ -24,6 +24,7 @@ fn empty_demo_workflow() -> Workflow {
         triggers: vec![],
         nodes: vec![],
         edges: vec![],
+        resources: vec![],
     }
 }
 

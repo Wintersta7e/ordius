@@ -38,6 +38,7 @@ pub(super) fn make_ctx() -> (RunContext, broadcast::Receiver<RunEvent>, TempDir)
         triggers: vec![],
         nodes: vec![],
         edges: vec![],
+        resources: vec![],
     };
     let rec = Arc::new(RunRecorder::start(pool, &wf, "{}", &HashMap::new(), "test").unwrap());
     let (em, rx) = Emitter::new(rec.clone());
