@@ -89,7 +89,7 @@ impl Registry {
         r.register(wait_event_spec());
         r.register(compose_spec());
         r.register(parallel_spec());
-        r.register(container_spec());
+        r.register(docker_run_spec());
         r
     }
 }
@@ -248,16 +248,22 @@ fn checkpoint_spec() -> NodeType {
     }
 }
 
-fn container_spec() -> NodeType {
+// `ContainerExecutor` (the executor struct) matches by
+// `ExecutionBackend::Container`, not by node-type id, so renaming the
+// id here does not touch the executor. The "container" identifier is
+// reserved (see `RESERVED_NODE_TYPE_IDS` in workflows.rs) for the
+// future long-lived container env target type.
+fn docker_run_spec() -> NodeType {
     NodeType {
-        id: "container".into(),
-        name: "Container".into(),
+        id: "docker-run".into(),
+        name: "Docker run".into(),
         category: Category::Execution,
         tags: vec![],
         icon: "box".into(),
-        description: "Run a command in a Docker container. Workspace dir is \
+        description: "Run a command in a one-shot Docker container on the \
+                      target env's Docker daemon. Workspace dir is \
                       bind-mounted at /workspace; default network is none. \
-                      Requires `docker` on PATH at run time."
+                      Requires `docker` available on the target env's PATH."
             .into(),
         inputs: vec![],
         outputs: vec![
