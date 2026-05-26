@@ -8,6 +8,8 @@
 //! `condition` node), not an executor concern.
 
 use super::util::{config_str, config_str_or, config_u64_or};
+use crate::environment::runtime::env::{EnvId, WorkflowId};
+use crate::environment::runtime::resource::{ProbeSpec, ResourceRef};
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::types::{Node, NodeType, PortValue};
 use async_trait::async_trait;
@@ -18,6 +20,27 @@ use tokio_util::sync::CancellationToken;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 #[allow(unreachable_pub)]
 pub const NODE_TYPE_ID: &str = "http";
+
+/// Where an HTTP request originates from when the node has a
+/// `target_env` set. `Env` (default) means the request runs from
+/// inside the target env (e.g. `wsl.exe --exec curl …` for WSL).
+/// `Host` forces the request to originate from the Ordius host
+/// process even when `target_env != local` — useful for "talk to
+/// the public Internet from my host even though this node otherwise
+/// runs in WSL".
+///
+/// Phase D parses the field; Phase E's dispatcher selection honours
+/// it. Until then, every http call goes through the host's reqwest
+/// client regardless of this value.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+enum Origin {
+    #[default]
+    Env,
+    Host,
+}
 
 /// HTTP executor — see module docs for failure policy.
 pub struct HttpExecutor;
@@ -32,10 +55,20 @@ impl NodeExecutor for HttpExecutor {
         &self,
         node: &Node,
         _nt: &NodeType,
-        _ctx: &RunContext,
+        ctx: &RunContext,
         cancel: CancellationToken,
     ) -> Result<NodeOutputs, NodeError> {
-        let url = config_str(&node.config, "url", "http")?;
+        // origin: structural-only in Phase D; Phase E threads through dispatcher.
+        let _origin: Origin = node
+            .config
+            .get("origin")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| NodeError::Config(format!("http: invalid origin: {e}")))?
+            .unwrap_or_default();
+
+        let url = resolve_url(node, ctx)?;
         let method_str = config_str_or(&node.config, "method", "GET");
         let method = Method::from_bytes(method_str.as_bytes())
             .map_err(|e| NodeError::Config(format!("http: invalid method '{method_str}': {e}")))?;
@@ -91,6 +124,82 @@ impl NodeExecutor for HttpExecutor {
         out.insert("headers".into(), PortValue::Json(resp_headers));
         Ok(out)
     }
+}
+
+/// Resolve the node's effective URL from either:
+///
+/// - `url`: literal string → returned as-is.
+/// - `resource` + `path`: registry-driven. The resource id is looked up via
+///   the engine's [`ResourceRegistry`] in the chain
+///   `Workflow → EnvLocal(local) → UserGlobal → Builtin`, the resource's
+///   HTTP probe ports are used to synthesize `http://127.0.0.1:<port>`, and
+///   the `path` field is concatenated on.
+///
+/// Mutually exclusive: setting both is rejected. `resource` without `path`
+/// is rejected. Neither field surfaces the original missing-`url` error
+/// from [`config_str`].
+///
+/// Phase D synthesizes the base URL from `ProbeSpec::Http.ports[0]` since
+/// the engine has no probe-driven catalog wired into dispatch yet. Phase E
+/// swaps this out for `ResourceCatalog::route_for_capability` once
+/// env-scoped catalogs are kept on `Engine`.
+fn resolve_url(node: &Node, ctx: &RunContext) -> Result<String, NodeError> {
+    let has_resource = node.config.contains_key("resource");
+    let has_url = node.config.contains_key("url");
+
+    if has_resource && has_url {
+        return Err(NodeError::Config(
+            "http: 'url' and 'resource' are mutually exclusive".into(),
+        ));
+    }
+
+    if has_resource {
+        let rref_val = node
+            .config
+            .get("resource")
+            .expect("has_resource just checked");
+        let rref: ResourceRef = serde_json::from_value(rref_val.clone())
+            .map_err(|e| NodeError::Config(format!("http: invalid resource ref: {e}")))?;
+        let path = node
+            .config
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                NodeError::Config("http: 'path' required when 'resource' is set".into())
+            })?;
+
+        let engine = ctx.engine.upgrade().ok_or(NodeError::Cancelled)?;
+        let registry = engine.resource_registry();
+        let snap = registry.snapshot();
+        let workflow_id = WorkflowId(ctx.workflow_id.clone());
+        let (def, _scope) = snap
+            .resolve(rref.id(), &EnvId::local(), Some(&workflow_id))
+            .ok_or_else(|| {
+                NodeError::Config(format!(
+                    "http: resource '{}' not found in registry",
+                    rref.id().0
+                ))
+            })?;
+
+        // Phase D port-synthesis (Phase E swaps to route_for_capability).
+        let ProbeSpec::Http { ports, .. } = &def.probe else {
+            return Err(NodeError::Config(format!(
+                "http: resource '{}' is not an HTTP endpoint",
+                rref.id().0
+            )));
+        };
+        let port = ports.first().copied().ok_or_else(|| {
+            NodeError::Config(format!(
+                "http: resource '{}' declares no probe ports",
+                rref.id().0
+            ))
+        })?;
+        let base_url = format!("http://127.0.0.1:{port}");
+        return Ok(format!("{base_url}{path}"));
+    }
+
+    // Legacy literal form. Preserves the original missing-field error.
+    Ok(config_str(&node.config, "url", "http")?.to_string())
 }
 
 fn parse_headers(val: &serde_json::Value) -> Result<HeaderMap, NodeError> {
@@ -272,5 +381,150 @@ mod tests {
             .expect_err("network failure must raise NodeError");
 
         assert!(matches!(err, NodeError::Http(_)), "got {err:?}");
+    }
+
+    // ── resolve_url tests ───────────────────────────────────────────────────
+    //
+    // These cover the alt config path that names a resource by id + path
+    // instead of a literal `url`. Resolution flows through the shared
+    // registry seeded in Phase C; Phase E swaps the synthesizer for the
+    // probed catalog's `route_for_capability`.
+
+    use crate::Engine;
+    use crate::checkpoints::CheckpointRegistry;
+    use crate::db::open;
+    use crate::emitter::Emitter;
+    use crate::environment::runtime::install_workflow_resources;
+    use crate::environment::runtime::resource::{
+        ProbeSpec, ResourceDefinition, ResourceId, ResourceKind,
+    };
+    use crate::executor::wrap_process_env;
+    use crate::recorder::RunRecorder;
+    use crate::types::Workflow;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
+
+    /// Build a `RunContext` wired to a real Engine so `resolve_url` can
+    /// upgrade the `Weak<Engine>` and read the live registry.
+    async fn ctx_with_engine(workflow_id: &str) -> (Arc<Engine>, RunContext, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+        let pool = open(dir.path().join("ctx.db")).unwrap();
+        let wf = Workflow {
+            id: workflow_id.into(),
+            name: String::new(),
+            schema_version: 1,
+            created_at: None,
+            updated_at: None,
+            variables: HashMap::new(),
+            triggers: vec![],
+            nodes: vec![],
+            edges: vec![],
+            resources: vec![],
+            default_env: None,
+        };
+        let rec = Arc::new(RunRecorder::start(pool, &wf, "{}", &HashMap::new(), "test").unwrap());
+        let (em, _rx) = Emitter::new(rec.clone());
+        let ctx = RunContext {
+            run_id: rec.run_id.clone(),
+            workflow_id: workflow_id.into(),
+            workflow_name: String::new(),
+            started_at_iso: String::new(),
+            workspace: dir.path().to_path_buf(),
+            variables: HashMap::new(),
+            recorder: rec,
+            emitter: Arc::new(em),
+            secrets_store: None,
+            env: wrap_process_env(),
+            current_inputs: HashMap::new(),
+            upstream_outputs: HashMap::new(),
+            checkpoints: Arc::new(CheckpointRegistry::new()),
+            events: Arc::new(crate::events_registry::EventRegistry::new()),
+            engine: Arc::downgrade(&engine),
+            compose_depth: 0,
+            iteration: 1,
+            attempt: AtomicU32::new(1),
+            auto_resume: false,
+        };
+        (engine, ctx, dir)
+    }
+
+    fn http_node_with(config: HashMap<String, serde_json::Value>) -> Node {
+        Node {
+            id: "n".into(),
+            ty: NODE_TYPE_ID.into(),
+            name: String::new(),
+            config,
+            pos: Pos::default(),
+            timeout_ms: None,
+            retry: None,
+            continue_on_error: false,
+            target_env: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn url_and_resource_mutually_exclusive() {
+        let (_engine, ctx, _dir) = ctx_with_engine("wf-excl").await;
+        let mut cfg: HashMap<String, serde_json::Value> = HashMap::new();
+        cfg.insert("url".into(), serde_json::json!("http://example.invalid/x"));
+        cfg.insert("resource".into(), serde_json::json!("anything"));
+        cfg.insert("path".into(), serde_json::json!("/y"));
+        let node = http_node_with(cfg);
+
+        let err = resolve_url(&node, &ctx).expect_err("both fields set must reject");
+        let msg = format!("{err:?}");
+        assert!(matches!(err, NodeError::Config(_)), "got {msg}");
+        assert!(
+            msg.contains("mutually exclusive"),
+            "expected mutually-exclusive hint, got {msg}",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resource_without_path_errors() {
+        let (_engine, ctx, _dir) = ctx_with_engine("wf-nopath").await;
+        let mut cfg: HashMap<String, serde_json::Value> = HashMap::new();
+        cfg.insert("resource".into(), serde_json::json!("anything"));
+        let node = http_node_with(cfg);
+
+        let err = resolve_url(&node, &ctx).expect_err("missing path must reject");
+        let msg = format!("{err:?}");
+        assert!(matches!(err, NodeError::Config(_)), "got {msg}");
+        assert!(
+            msg.contains("'path' required"),
+            "expected path-required hint, got {msg}",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resource_plus_path_concatenates_url() {
+        let (engine, ctx, _dir) = ctx_with_engine("wf-ok").await;
+        let resource = ResourceDefinition {
+            id: ResourceId("wf-api".into()),
+            kind: ResourceKind::HttpEndpoint,
+            // Empty advertised caps = untyped; Phase D allows.
+            advertised_capabilities: vec![],
+            probe: ProbeSpec::Http {
+                ports: vec![7777],
+                routes: vec![],
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        };
+        install_workflow_resources(
+            &WorkflowId("wf-ok".into()),
+            &[resource],
+            &engine.resource_registry(),
+        )
+        .expect("install");
+
+        let mut cfg: HashMap<String, serde_json::Value> = HashMap::new();
+        cfg.insert("resource".into(), serde_json::json!("wf-api"));
+        cfg.insert("path".into(), serde_json::json!("/v1/ping"));
+        let node = http_node_with(cfg);
+
+        let url = resolve_url(&node, &ctx).expect("resource + path resolves");
+        assert_eq!(url, "http://127.0.0.1:7777/v1/ping");
     }
 }
