@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod dispatcher;
 pub mod env;
 pub mod error;
+pub mod helper;
 pub mod local;
 pub mod plan;
 pub mod registry;

@@ -66,3 +66,7 @@ AGENTS.md
 
 # Staged cross-built Windows binaries (not source)
 /dist-win/
+
+# Embedded helper binaries — produced out-of-band via build-helpers.sh
+crates/engine/embedded/helper/**/ordius-helper
+crates/engine/embedded/helper/**/ordius-helper.exe
