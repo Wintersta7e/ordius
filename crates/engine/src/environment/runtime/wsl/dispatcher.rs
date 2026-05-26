@@ -1,25 +1,54 @@
 //! `WslDispatcher` — `Dispatcher` impl for a Windows Subsystem for Linux distro.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use ordius_helper::protocol::{
+    HttpProbeMethodV1, HttpProbeRouteV1, ProbeDetailV1, ProbeOutcomeBodyV1, ProbeOutcomeV1,
+    ProbePlanV1, ProvenRouteV1, ResourceKindV1, ResourceSpecV1,
+};
+use parking_lot::Mutex;
+use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::environment::runtime::catalog::ResourceProbeOutcome;
+use crate::environment::runtime::catalog::{
+    ProvenRoute, ResourceDetail, ResourceProbeOutcome, RouteOrigin,
+};
 use crate::environment::runtime::dispatcher::{Dispatcher, HttpTransport};
 use crate::environment::runtime::env::{EnvInfo, RunId, WorkspaceBinding};
 use crate::environment::runtime::error::DispatchError;
 use crate::environment::runtime::plan::{ProbePlan, ProbeSummary};
-use crate::environment::runtime::resource::ResourceDefinition;
+use crate::environment::runtime::resource::{
+    Capability, HttpProbeMethod, ProbeSpec, ResourceDefinition, ResourceKind,
+};
 use crate::environment::runtime::transport::{EnvPath, ProcessCmd, WorkspaceHandle};
 use crate::executor::supervisor::Supervised;
 
+use super::bootstrap::BootstrappedHelper;
+
+const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+const HELPER_PROBE_GRACE: Duration = Duration::from_secs(2);
+
 /// `Dispatcher` implementation backed by a named WSL distribution.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct WslDispatcher {
     info: EnvInfo,
     distro_name: String,
+    helper_cache: Mutex<Option<BootstrappedHelper>>,
+}
+
+impl Clone for WslDispatcher {
+    fn clone(&self) -> Self {
+        Self {
+            info: self.info.clone(),
+            distro_name: self.distro_name.clone(),
+            helper_cache: Mutex::new(self.helper_cache.lock().clone()),
+        }
+    }
 }
 
 impl WslDispatcher {
@@ -28,12 +57,164 @@ impl WslDispatcher {
         Self {
             info,
             distro_name: distro_name.into(),
+            helper_cache: Mutex::new(None),
         }
     }
 
     /// Return the WSL distribution name passed to `wsl.exe -d <name>`.
     pub fn distro_name(&self) -> &str {
         &self.distro_name
+    }
+
+    async fn ensure_helper(&self) -> Result<BootstrappedHelper, DispatchError> {
+        let cached_helper = self.helper_cache.lock().clone();
+        if let Some(helper) = cached_helper {
+            return Ok(helper);
+        }
+
+        let triple = super::bootstrap::probe_env_triple(&self.distro_name).await?;
+        let helper = super::bootstrap::bootstrap_helper(&self.distro_name, &triple).await?;
+        *self.helper_cache.lock() = Some(helper.clone());
+        Ok(helper)
+    }
+
+    async fn probe_resource_via_helper(
+        &self,
+        helper_path: &str,
+        def: &ResourceDefinition,
+    ) -> ResourceProbeOutcome {
+        let (plan_json, timeout_ms) = match helper_probe_plan_json(def) {
+            Ok(plan) => plan,
+            Err(reason) => return probe_failed(reason),
+        };
+        let wire = match self
+            .run_helper_probe(helper_path, &plan_json, timeout_ms)
+            .await
+        {
+            Ok(wire) => wire,
+            Err(outcome) => return outcome,
+        };
+        if wire.version != 1 {
+            return probe_failed(format!(
+                "unsupported helper probe outcome version: {}",
+                wire.version
+            ));
+        }
+        if wire.id != def.id.0 {
+            return probe_failed(format!(
+                "helper returned outcome for {}, expected {}",
+                wire.id, def.id
+            ));
+        }
+
+        wire_outcome_to_engine(wire.outcome, def)
+    }
+
+    fn helper_probe_command(&self, helper_path: &str) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("wsl.exe");
+        command
+            .args(["-d", &self.distro_name, "--exec", helper_path, "probe"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        command
+    }
+
+    async fn run_helper_probe(
+        &self,
+        helper_path: &str,
+        plan_json: &[u8],
+        timeout_ms: u64,
+    ) -> Result<ProbeOutcomeV1, ResourceProbeOutcome> {
+        let mut child = self
+            .helper_probe_command(helper_path)
+            .spawn()
+            .map_err(|e| probe_failed(format!("spawn ordius-helper probe: {e}")))?;
+
+        write_helper_plan(&mut child, plan_json).await?;
+        let output = wait_for_helper_probe(child, timeout_ms).await?;
+        parse_helper_probe_output(&output).map_err(probe_failed)
+    }
+}
+
+async fn write_helper_plan(
+    child: &mut tokio::process::Child,
+    plan_json: &[u8],
+) -> Result<(), ResourceProbeOutcome> {
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err(probe_failed("ordius-helper probe stdin unavailable"));
+    };
+    stdin
+        .write_all(plan_json)
+        .await
+        .map_err(|e| probe_failed(format!("write helper probe plan: {e}")))?;
+    stdin
+        .shutdown()
+        .await
+        .map_err(|e| probe_failed(format!("finish helper probe plan: {e}")))?;
+    Ok(())
+}
+
+async fn wait_for_helper_probe(
+    child: tokio::process::Child,
+    timeout_ms: u64,
+) -> Result<std::process::Output, ResourceProbeOutcome> {
+    match tokio::time::timeout(helper_wait_timeout(timeout_ms), child.wait_with_output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(probe_failed(format!("wait for ordius-helper probe: {e}"))),
+        Err(_) => Err(ResourceProbeOutcome::TimedOut),
+    }
+}
+
+fn parse_helper_probe_output(output: &std::process::Output) -> Result<ProbeOutcomeV1, String> {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        tracing::debug!(
+            status = ?output.status.code(),
+            stderr,
+            "ordius-helper probe exited unsuccessfully"
+        );
+        return if stderr.is_empty() {
+            Err(format!(
+                "ordius-helper probe exited with {:?}",
+                output.status.code()
+            ))
+        } else {
+            Err(format!(
+                "ordius-helper probe exited with {:?}: {stderr}",
+                output.status.code()
+            ))
+        };
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| "ordius-helper probe emitted no outcome".to_string())?;
+    serde_json::from_str(line.trim()).map_err(|e| format!("parse helper probe outcome: {e}"))
+}
+
+fn helper_probe_plan_json(def: &ResourceDefinition) -> Result<(Vec<u8>, u64), String> {
+    let spec = resource_spec_v1_from_def(def)?;
+    let timeout_ms = probe_timeout_ms(def);
+    let plan = ProbePlanV1 {
+        version: 1,
+        per_resource_timeout_ms: timeout_ms,
+        max_concurrency: 1,
+        overall_budget_ms: timeout_ms,
+        resources: vec![spec],
+    };
+    serde_json::to_vec(&plan)
+        .map(|json| (json, timeout_ms))
+        .map_err(|e| format!("serialize helper probe plan: {e}"))
+}
+
+fn probe_failed(reason: impl Into<String>) -> ResourceProbeOutcome {
+    ResourceProbeOutcome::ProbeFailed {
+        reason: reason.into(),
     }
 }
 
@@ -70,11 +251,22 @@ impl Dispatcher for WslDispatcher {
 
     async fn probe_resource(
         &self,
-        _def: &ResourceDefinition,
-        _cancel: CancellationToken,
+        def: &ResourceDefinition,
+        cancel: CancellationToken,
     ) -> ResourceProbeOutcome {
-        ResourceProbeOutcome::Skipped {
-            reason: "WslDispatcher::probe_resource pending T17".into(),
+        if cancel.is_cancelled() {
+            return cancelled_probe_outcome();
+        }
+
+        match self.ensure_helper().await {
+            Ok(helper) => {
+                self.probe_resource_via_helper(&helper.env_side_path, def)
+                    .await
+            },
+            Err(err) => {
+                tracing::debug!(error = %err, "falling back to WSL shell probe");
+                super::shell_fallback::probe_http_resource(&self.distro_name, def).await
+            },
         }
     }
 
@@ -140,12 +332,221 @@ impl Dispatcher for WslDispatcher {
     }
 }
 
+fn probe_timeout_ms(def: &ResourceDefinition) -> u64 {
+    match &def.probe {
+        ProbeSpec::Http { timeout_ms, .. }
+        | ProbeSpec::Binary { timeout_ms, .. }
+        | ProbeSpec::Toolchain { timeout_ms, .. } => {
+            timeout_ms.unwrap_or_else(default_probe_timeout_ms)
+        },
+    }
+}
+
+fn default_probe_timeout_ms() -> u64 {
+    u64::try_from(DEFAULT_PROBE_TIMEOUT.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn helper_wait_timeout(timeout_ms: u64) -> Duration {
+    if timeout_ms == 0 {
+        DEFAULT_PROBE_TIMEOUT + HELPER_PROBE_GRACE
+    } else {
+        Duration::from_millis(timeout_ms).saturating_add(HELPER_PROBE_GRACE)
+    }
+}
+
+fn cancelled_probe_outcome() -> ResourceProbeOutcome {
+    ResourceProbeOutcome::Skipped {
+        reason: "cancelled".into(),
+    }
+}
+
+fn resource_spec_v1_from_def(def: &ResourceDefinition) -> Result<ResourceSpecV1, String> {
+    let kind = match &def.probe {
+        ProbeSpec::Http { ports, routes, .. } => {
+            if def.kind != ResourceKind::HttpEndpoint {
+                return Err(format!(
+                    "resource {} has HTTP probe but {:?} kind",
+                    def.id, def.kind
+                ));
+            }
+            ResourceKindV1::Http {
+                bases: ports
+                    .iter()
+                    .map(|port| format!("http://127.0.0.1:{port}"))
+                    .collect(),
+                routes: routes
+                    .iter()
+                    .map(|route| HttpProbeRouteV1 {
+                        path: route.path.clone(),
+                        method: match route.method {
+                            HttpProbeMethod::Get | HttpProbeMethod::Head => HttpProbeMethodV1::Get,
+                        },
+                        proves: route
+                            .proves
+                            .first()
+                            .map_or_else(String::new, |cap| capability_to_wire(*cap)),
+                        expect_status: Vec::new(),
+                        fingerprint_jsonpaths: route.fingerprint_jsonpaths.clone(),
+                    })
+                    .collect(),
+            }
+        },
+        ProbeSpec::Binary {
+            bin,
+            extra_search_paths,
+            ..
+        } => {
+            if def.kind != ResourceKind::Binary {
+                return Err(format!(
+                    "resource {} has binary probe but {:?} kind",
+                    def.id, def.kind
+                ));
+            }
+            ResourceKindV1::Binary {
+                bin: bin.clone(),
+                extra_search_paths: extra_search_paths.clone(),
+            }
+        },
+        ProbeSpec::Toolchain {
+            bin,
+            version_args,
+            version_regex,
+            ..
+        } => {
+            if def.kind != ResourceKind::Toolchain {
+                return Err(format!(
+                    "resource {} has toolchain probe but {:?} kind",
+                    def.id, def.kind
+                ));
+            }
+            ResourceKindV1::Toolchain {
+                bin: bin.clone(),
+                version_args: version_args.clone(),
+                version_regex: version_regex.clone(),
+                extra_search_paths: Vec::new(),
+            }
+        },
+    };
+
+    Ok(ResourceSpecV1 {
+        id: def.id.0.clone(),
+        kind,
+    })
+}
+
+fn wire_outcome_to_engine(
+    body: ProbeOutcomeBodyV1,
+    def: &ResourceDefinition,
+) -> ResourceProbeOutcome {
+    match body {
+        ProbeOutcomeBodyV1::Found(detail) => wire_detail_to_engine(detail, def),
+        ProbeOutcomeBodyV1::NotFound => ResourceProbeOutcome::NotFound,
+        ProbeOutcomeBodyV1::Skipped { reason } => ResourceProbeOutcome::Skipped { reason },
+        ProbeOutcomeBodyV1::ProbeFailed { reason } => ResourceProbeOutcome::ProbeFailed { reason },
+        ProbeOutcomeBodyV1::TimedOut => ResourceProbeOutcome::TimedOut,
+    }
+}
+
+fn wire_detail_to_engine(detail: ProbeDetailV1, def: &ResourceDefinition) -> ResourceProbeOutcome {
+    match detail {
+        ProbeDetailV1::HttpEndpoint {
+            base_url,
+            proven_routes,
+        } => ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
+            base_url,
+            routes_by_capability: routes_by_capability_from_wire(&proven_routes, def),
+            version: None,
+            models_list: None,
+            auth_secret_ref: None,
+            streaming_supported_natively: false,
+            route_origin: RouteOrigin::EnvLoopback,
+        }),
+        ProbeDetailV1::Binary { path } => ResourceProbeOutcome::Found(ResourceDetail::Binary {
+            path,
+            version: None,
+            capabilities: def.advertised_capabilities.clone(),
+        }),
+        ProbeDetailV1::Toolchain { path, version } => match &def.probe {
+            ProbeSpec::Binary { .. } => ResourceProbeOutcome::Found(ResourceDetail::Binary {
+                path,
+                version: Some(version),
+                capabilities: def.advertised_capabilities.clone(),
+            }),
+            ProbeSpec::Http { .. } | ProbeSpec::Toolchain { .. } => {
+                ResourceProbeOutcome::Found(ResourceDetail::Toolchain {
+                    name: def.id.0.clone(),
+                    version: Some(version),
+                    exe_path: path,
+                })
+            },
+        },
+    }
+}
+
+fn routes_by_capability_from_wire(
+    proven_routes: &[ProvenRouteV1],
+    def: &ResourceDefinition,
+) -> HashMap<Capability, ProvenRoute> {
+    let ProbeSpec::Http { routes, .. } = &def.probe else {
+        return HashMap::new();
+    };
+
+    let mut by_capability = HashMap::new();
+    for wire_route in proven_routes {
+        let Some(capability) = capability_from_wire(&wire_route.capability) else {
+            continue;
+        };
+        let Some(route) = routes
+            .iter()
+            .find(|route| route.path == wire_route.path && route.proves.contains(&capability))
+        else {
+            tracing::debug!(
+                capability = %wire_route.capability,
+                path = %wire_route.path,
+                "dropping helper proven route absent from original probe definition"
+            );
+            continue;
+        };
+
+        by_capability
+            .entry(capability)
+            .or_insert_with(|| ProvenRoute {
+                path: wire_route.path.clone(),
+                method: route.method,
+                flavor: route.flavor,
+            });
+    }
+    by_capability
+}
+
+fn capability_to_wire(capability: Capability) -> String {
+    match serde_json::to_value(capability).expect("capability serializes as JSON") {
+        serde_json::Value::String(value) => value,
+        other => unreachable!("capability serialized to non-string JSON value: {other:?}"),
+    }
+}
+
+fn capability_from_wire(value: &str) -> Option<Capability> {
+    serde_json::from_value(serde_json::Value::String(value.to_string()))
+        .inspect_err(|err| {
+            tracing::debug!(
+                capability = value,
+                error = %err,
+                "dropping helper proven route with unknown capability"
+            );
+        })
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use super::*;
     use crate::environment::runtime::env::{EnvId, EnvSpec, EnvState};
+    use crate::environment::runtime::resource::{
+        ApiFlavor, Capability, HttpProbeRoute, ResourceId,
+    };
 
     fn info(distro: &str) -> EnvInfo {
         EnvInfo {
@@ -251,5 +652,151 @@ mod tests {
         let c_pos = dbg.find("\"-c\"").unwrap();
         let script_pos = dbg.find("\"echo hi\"").unwrap();
         assert!(sh_pos < c_pos && c_pos < script_pos);
+    }
+
+    #[tokio::test]
+    async fn probe_resource_cancelled_skips_before_bootstrap() {
+        let d = WslDispatcher::new(info("Ubuntu"), "Ubuntu");
+        let def = http_def();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let outcome = d.probe_resource(&def, cancel).await;
+
+        assert_eq!(
+            outcome,
+            ResourceProbeOutcome::Skipped {
+                reason: "cancelled".into()
+            }
+        );
+    }
+
+    #[test]
+    fn resource_spec_maps_http_ports_head_and_first_capability() {
+        let def = ResourceDefinition {
+            id: ResourceId("api".into()),
+            kind: ResourceKind::HttpEndpoint,
+            advertised_capabilities: vec![
+                Capability::OpenaiChatCompletions,
+                Capability::OpenaiToolCalling,
+            ],
+            probe: ProbeSpec::Http {
+                ports: vec![11434, 1234],
+                routes: vec![HttpProbeRoute {
+                    path: "/v1/models".into(),
+                    method: HttpProbeMethod::Head,
+                    flavor: ApiFlavor::OpenaiChat,
+                    proves: vec![
+                        Capability::OpenaiChatCompletions,
+                        Capability::OpenaiToolCalling,
+                    ],
+                    models_jsonpath: None,
+                    fingerprint_jsonpaths: vec!["$.version".into()],
+                }],
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        };
+
+        let spec = resource_spec_v1_from_def(&def).expect("spec");
+        let ResourceKindV1::Http { bases, routes } = spec.kind else {
+            panic!("expected HTTP spec");
+        };
+
+        assert_eq!(
+            bases,
+            vec![
+                "http://127.0.0.1:11434".to_string(),
+                "http://127.0.0.1:1234".to_string(),
+            ]
+        );
+        assert_eq!(routes.len(), 1);
+        assert!(matches!(routes[0].method, HttpProbeMethodV1::Get));
+        assert_eq!(routes[0].proves, "openai_chat_completions");
+        assert!(routes[0].expect_status.is_empty());
+    }
+
+    #[test]
+    fn wire_http_outcome_rebuilds_routes_by_capability() {
+        let def = http_def();
+        let outcome = wire_outcome_to_engine(
+            ProbeOutcomeBodyV1::Found(ProbeDetailV1::HttpEndpoint {
+                base_url: "http://127.0.0.1:11434".into(),
+                proven_routes: vec![ProvenRouteV1 {
+                    capability: "ollama_native".into(),
+                    path: "/api/version".into(),
+                    status: 200,
+                    fingerprint: "abc".into(),
+                }],
+            }),
+            &def,
+        );
+
+        let ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
+            routes_by_capability,
+            route_origin,
+            streaming_supported_natively,
+            ..
+        }) = outcome
+        else {
+            panic!("expected Found HTTP outcome");
+        };
+        assert_eq!(route_origin, RouteOrigin::EnvLoopback);
+        assert!(!streaming_supported_natively);
+        assert_eq!(
+            routes_by_capability.get(&Capability::OllamaNative),
+            Some(&ProvenRoute {
+                path: "/api/version".into(),
+                method: HttpProbeMethod::Get,
+                flavor: ApiFlavor::OllamaNative,
+            })
+        );
+    }
+
+    #[test]
+    fn wire_http_outcome_drops_unknown_capability() {
+        let def = http_def();
+        let outcome = wire_outcome_to_engine(
+            ProbeOutcomeBodyV1::Found(ProbeDetailV1::HttpEndpoint {
+                base_url: "http://127.0.0.1:11434".into(),
+                proven_routes: vec![ProvenRouteV1 {
+                    capability: "not_a_capability".into(),
+                    path: "/api/version".into(),
+                    status: 200,
+                    fingerprint: "abc".into(),
+                }],
+            }),
+            &def,
+        );
+
+        let ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
+            routes_by_capability,
+            ..
+        }) = outcome
+        else {
+            panic!("expected Found HTTP outcome");
+        };
+        assert!(routes_by_capability.is_empty());
+    }
+
+    fn http_def() -> ResourceDefinition {
+        ResourceDefinition {
+            id: ResourceId("ollama".into()),
+            kind: ResourceKind::HttpEndpoint,
+            advertised_capabilities: vec![Capability::OllamaNative],
+            probe: ProbeSpec::Http {
+                ports: vec![11434],
+                routes: vec![HttpProbeRoute {
+                    path: "/api/version".into(),
+                    method: HttpProbeMethod::Get,
+                    flavor: ApiFlavor::OllamaNative,
+                    proves: vec![Capability::OllamaNative],
+                    models_jsonpath: None,
+                    fingerprint_jsonpaths: vec![],
+                }],
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        }
     }
 }

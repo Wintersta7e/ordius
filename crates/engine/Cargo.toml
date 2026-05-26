@@ -44,6 +44,7 @@ reqwest = { workspace = true }
 keyring-core = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
+ordius-helper = { path = "../ordius-helper", default-features = false }
 
 [build-dependencies]
 sha2 = { workspace = true }
