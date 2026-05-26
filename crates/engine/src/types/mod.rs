@@ -1,15 +1,14 @@
 //! Engine type system. Each submodule defines one logical type cluster.
 
 pub mod edge;
-pub mod env;
 pub mod node;
 pub mod node_type;
 pub mod port;
 pub mod stream_mode;
 pub mod workflow;
 
+pub use crate::environment::runtime::EnvId;
 pub use edge::{Edge, EdgeType};
-pub use env::EnvId;
 pub use node::{BackoffStrategy, Node, Pos, RetryOn, RetryPolicy};
 pub use node_type::{
     Category, ConfigFieldDef, ConfigFieldType, ExecutionBackend, ExecutionSpec, NodeType,
