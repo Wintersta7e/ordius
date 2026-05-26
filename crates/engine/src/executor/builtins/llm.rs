@@ -16,7 +16,7 @@
 
 use super::util::{config_f64_or, config_str, config_str_opt, config_str_or, config_u64_or};
 use crate::environment::runtime::env::{EnvId, WorkflowId};
-use crate::environment::runtime::resource::{Capability, ProbeSpec, ResourceRef};
+use crate::environment::runtime::resource::{ApiFlavor, Capability, ProbeSpec, ResourceRef};
 use crate::events::EventType;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::template::{
@@ -146,12 +146,40 @@ fn substitute_llm_config(
     Ok(substituted)
 }
 
+/// Return the parent-directory stem of a probe path. The result is
+/// concatenated onto `http://127.0.0.1:<port>` to form the base URL
+/// for `/chat/completions`. Examples (and the edge cases we care about):
+///
+/// - `"/v1/models"` → `"/v1"` (the normal OpenAI-compat shape)
+/// - `"/api/version"` → `"/api"` (Ollama-native, but kept generic)
+/// - `"/"` or `""` → `""` (nothing to derive a stem from)
+/// - `"/chat/completions"` → `"/chat"` (would be unusual but consistent)
+/// - `"models"` (no leading slash) → `""` (no parent segment exists)
+/// - `"/v1/"` (trailing slash, empty leaf) → `"/v1"` (drop the trailing
+///   slash before taking the parent)
+///
+/// The stem is meant to be appended verbatim to `http://host:port`, so
+/// the empty string degrades gracefully to the bare host:port form.
+fn path_parent_stem(path: &str) -> String {
+    // Drop a trailing slash so paths like "/v1/" don't collapse to "/v1"
+    // with an empty leaf segment that then yields "/v1" anyway — the
+    // trim happens up-front so the rfind below sees the real leaf.
+    let trimmed = path.trim_end_matches('/');
+    let Some(idx) = trimmed.rfind('/') else {
+        // No slash anywhere → there's no parent segment to lift.
+        return String::new();
+    };
+    // `trimmed[..idx]` keeps everything before the last `/`. For
+    // `"/v1/models"` that's `"/v1"`; for `"/models"` it's `""`.
+    trimmed[..idx].to_string()
+}
+
 /// Resolve the optional `resource` config field on an `llm` node into
 /// a base URL via the shared resource registry. Returns:
 ///
 /// - `Ok(Some(base_url))` when the node has a resource ref AND the
-///   registry resolved it. `base_url` is `scheme://host:port` with no
-///   trailing slash and no path — the caller appends `/chat/completions`.
+///   registry resolved it. `base_url` is `scheme://host:port[/stem]`
+///   with no trailing slash — the caller appends `/chat/completions`.
 /// - `Ok(None)` when the node has no `resource` field (caller falls
 ///   back to the legacy literal `url` config).
 ///
@@ -166,11 +194,18 @@ fn substitute_llm_config(
 /// `true` → `OpenaiToolCalling`. The detailed form's
 /// `required_capability` overrides the inference.
 ///
-/// Phase D resolves to a base URL via `ProbeSpec::Http.ports[0]`
-/// (synthesizing `http://127.0.0.1:<port>`) since the engine has no
-/// probe-driven catalog wired into dispatch yet. Phase E swaps this
-/// out for `ResourceCatalog::route_for_capability` once env-scoped
-/// catalogs are kept on `Engine`.
+/// Phase D derives the base path by looking for an OpenAI-flavored
+/// probe route on the resource whose `proves` list contains the
+/// effective capability (user-stated `required_capability` if present,
+/// otherwise the inferred one). The parent directory of that route's
+/// `path` becomes the stem appended to `http://127.0.0.1:<port>` so
+/// the final URL is `http://127.0.0.1:<port>/v1/chat/completions` for
+/// the typical `routes: [{ path: "/v1/models", flavor: openai_chat, ...}]`
+/// shape. Resources without a matching route fall back to the bare
+/// `http://127.0.0.1:<port>` form — that's a Phase-D bridge that keeps
+/// existing user configs working. Phase E replaces this with
+/// `ResourceCatalog::route_for_capability` once env-scoped catalogs are
+/// kept on `Engine`.
 fn resolve_resource_url(
     node: &Node,
     ctx: &RunContext,
@@ -182,7 +217,9 @@ fn resolve_resource_url(
     let rref: ResourceRef = serde_json::from_value(rref_val.clone())
         .map_err(|e| NodeError::Config(format!("llm: invalid resource ref: {e}")))?;
 
-    let engine = ctx.engine.upgrade().ok_or(NodeError::Cancelled)?;
+    let engine = ctx.engine.upgrade().ok_or_else(|| {
+        NodeError::Config("internal: engine handle gone before resource lookup".into())
+    })?;
     let registry = engine.resource_registry();
     let snap = registry.snapshot();
 
@@ -199,8 +236,8 @@ fn resolve_resource_url(
     // Untyped resources (empty advertised list) resolve unconditionally
     // for bare ResourceRefs whose capability is inferred. The inferred
     // capability (tools_present → OpenaiToolCalling, else
-    // OpenaiChatCompletions) is structural-only in Phase D; Phase E's
-    // `route_for_capability` consumes it for route selection.
+    // OpenaiChatCompletions) feeds the route lookup below so the stem
+    // we derive matches the capability the caller actually wants.
     if let Some(required_cap) = rref.required_capability()
         && !def.advertised_capabilities.contains(&required_cap)
     {
@@ -209,13 +246,14 @@ fn resolve_resource_url(
             rref.id().0
         )));
     }
-    let _inferred_cap = if tools_present {
+    let inferred_cap = if tools_present {
         Capability::OpenaiToolCalling
     } else {
         Capability::OpenaiChatCompletions
     };
+    let effective_cap = rref.required_capability().unwrap_or(inferred_cap);
 
-    let ProbeSpec::Http { ports, .. } = &def.probe else {
+    let ProbeSpec::Http { ports, routes, .. } = &def.probe else {
         return Err(NodeError::Config(format!(
             "llm: resource '{}' is not an HTTP endpoint",
             rref.id().0
@@ -227,7 +265,18 @@ fn resolve_resource_url(
             rref.id().0
         ))
     })?;
-    Ok(Some(format!("http://127.0.0.1:{port}")))
+
+    // Find an OpenAI-flavored proving route for the capability we need
+    // and lift its parent path segment. Resources without such a route
+    // fall back to the bare host:port form so legacy configs that put
+    // `/v1` into a non-standard place still work.
+    let stem = routes
+        .iter()
+        .find(|r| matches!(r.flavor, ApiFlavor::OpenaiChat) && r.proves.contains(&effective_cap))
+        .map(|r| path_parent_stem(&r.path))
+        .unwrap_or_default();
+
+    Ok(Some(format!("http://127.0.0.1:{port}{stem}")))
 }
 
 /// Single-turn chat completion. Honors `stream: StreamMode` (Auto +
@@ -254,6 +303,7 @@ async fn run_single_turn(
     let temperature = config_f64_or(&node.config, "temperature", DEFAULT_MODEL_TEMP);
     let max_tokens = node.config.get("max_tokens").cloned();
     let stream_mode = read_stream_mode(node)?;
+    warn_if_force_stream(node, stream_mode);
     let stream = !matches!(stream_mode, StreamMode::Off);
     let api_key = config_str_opt(&node.config, "api_key").map(str::to_string);
     let timeout_ms = config_u64_or(&node.config, "timeout_ms", DEFAULT_TIMEOUT_MS);
@@ -332,6 +382,7 @@ async fn run_tool_loop(
         .map(str::to_string);
     let timeout_ms = config_u64_or(&node.config, "timeout_ms", DEFAULT_TIMEOUT_MS);
     let stream_mode = read_stream_mode(node)?;
+    warn_if_force_stream(node, stream_mode);
     let stream = !matches!(stream_mode, StreamMode::Off);
 
     let initial_messages = node
@@ -497,6 +548,22 @@ fn read_stream_mode(node: &Node) -> Result<StreamMode, NodeError> {
                 .map_err(|e| NodeError::Config(format!("llm: invalid stream value: {e}")))
         },
     )
+}
+
+/// Phase D treats `StreamMode::Force` identically to `Auto` (both attempt
+/// SSE without a capability check). The docstring on `StreamMode::Force`
+/// promises an error when streaming is unavailable — that promise is
+/// kept only after Phase E's dispatcher layer adds the route-capability
+/// gate. Until then, emit a warning when Force is selected so the
+/// surprising no-op is visible under `RUST_LOG=warn`.
+fn warn_if_force_stream(node: &Node, stream_mode: StreamMode) {
+    if matches!(stream_mode, StreamMode::Force) {
+        tracing::warn!(
+            node_id = %node.id,
+            "llm: StreamMode::Force is selected but Phase D treats it as Auto; \
+             Phase E adds the route-capability check that makes Force errorable"
+        );
+    }
 }
 
 fn non_success_outputs(code: u16) -> NodeOutputs {
@@ -1623,21 +1690,46 @@ mod tests {
         }
     }
 
+    /// Build an HTTP resource fixture whose single `/v1/models` probe route
+    /// proves every capability the caller advertises. This keeps the stem-
+    /// derivation lookup in `resolve_resource_url` happy for whichever
+    /// capability the test ends up inferring (chat / tool-calling / etc.).
     fn http_resource(id: &str, port: u16, caps: Vec<Capability>) -> ResourceDefinition {
         ResourceDefinition {
             id: ResourceId(id.into()),
             kind: ResourceKind::HttpEndpoint,
-            advertised_capabilities: caps,
+            advertised_capabilities: caps.clone(),
             probe: ProbeSpec::Http {
                 ports: vec![port],
                 routes: vec![HttpProbeRoute {
                     path: "/v1/models".into(),
                     method: HttpProbeMethod::Get,
                     flavor: ApiFlavor::OpenaiChat,
-                    proves: vec![Capability::OpenaiChatCompletions],
+                    proves: caps,
                     models_jsonpath: None,
                     fingerprint_jsonpaths: vec![],
                 }],
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        }
+    }
+
+    /// Build an HTTP resource whose probe route has no openai-flavored
+    /// proving entry — used to exercise the Phase-D fallback that yields
+    /// a bare `http://host:port` URL when no matching route exists.
+    fn http_resource_without_openai_route(
+        id: &str,
+        port: u16,
+        caps: Vec<Capability>,
+    ) -> ResourceDefinition {
+        ResourceDefinition {
+            id: ResourceId(id.into()),
+            kind: ResourceKind::HttpEndpoint,
+            advertised_capabilities: caps,
+            probe: ProbeSpec::Http {
+                ports: vec![port],
+                routes: vec![],
                 timeout_ms: None,
             },
             override_lower_scope: false,
@@ -1655,6 +1747,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn resource_short_form_resolves_to_synthesized_base_url() {
+        // The fixture's `/v1/models` proving route lifts its parent path
+        // segment (`/v1`) onto the base URL so callers can append
+        // `/chat/completions` and reach the standard OpenAI-compat shape.
         let (engine, ctx, _dir) = ctx_with_engine("wf-short").await;
         let resource = http_resource("wf-llm", 39_111, vec![Capability::OpenaiChatCompletions]);
         install_workflow_resources(
@@ -1668,7 +1763,34 @@ mod tests {
         let url = resolve_resource_url(&node, &ctx, false)
             .expect("ok")
             .expect("some");
-        assert_eq!(url, "http://127.0.0.1:39111");
+        assert_eq!(url, "http://127.0.0.1:39111/v1");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resource_without_matching_route_falls_back_to_host_port_only() {
+        // No openai-flavored proving route → the Phase-D bridge degrades
+        // gracefully to the bare `http://host:port` form. This preserves
+        // existing user configs that put `/v1` into the resource's URL by
+        // some other convention; Phase E's `route_for_capability` removes
+        // the fallback entirely.
+        let (engine, ctx, _dir) = ctx_with_engine("wf-fallback").await;
+        let resource = http_resource_without_openai_route(
+            "wf-no-route",
+            39_114,
+            vec![Capability::OpenaiChatCompletions],
+        );
+        install_workflow_resources(
+            &WorkflowId("wf-fallback".into()),
+            &[resource],
+            &engine.resource_registry(),
+        )
+        .expect("install");
+
+        let node = llm_node_with_resource(serde_json::json!("wf-no-route"));
+        let url = resolve_resource_url(&node, &ctx, false)
+            .expect("ok")
+            .expect("some");
+        assert_eq!(url, "http://127.0.0.1:39114");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1694,11 +1816,12 @@ mod tests {
             "required_capability": "openai_tool_calling",
         }));
         // tools_present=false would otherwise default to ChatCompletions, but
-        // the long-form ref's explicit `required_capability` overrides it.
+        // the long-form ref's explicit `required_capability` overrides it,
+        // so the stem-derivation picks up the route that proves ToolCalling.
         let url = resolve_resource_url(&node, &ctx, false)
             .expect("ok")
             .expect("some");
-        assert_eq!(url, "http://127.0.0.1:39112");
+        assert_eq!(url, "http://127.0.0.1:39112/v1");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1719,10 +1842,16 @@ mod tests {
         .expect("install");
 
         let node = llm_node_with_resource(serde_json::json!("wf-tools-only"));
+        // tools_present=true → inferred ToolCalling → matches the proving
+        // route → stem `/v1` is appended.
         let url_with_tools = resolve_resource_url(&node, &ctx, true)
             .expect("tools_present=true bare-ref resolves")
             .expect("some");
-        assert_eq!(url_with_tools, "http://127.0.0.1:39113");
+        assert_eq!(url_with_tools, "http://127.0.0.1:39113/v1");
+        // tools_present=false → inferred ChatCompletions → the resource's
+        // route only proves ToolCalling, so the fallback kicks in and we
+        // get the bare host:port form. Resolution still succeeds because
+        // there is no user-stated capability constraint to enforce.
         let url_without_tools = resolve_resource_url(&node, &ctx, false)
             .expect("tools_present=false bare-ref also resolves (no user-stated cap)")
             .expect("some");

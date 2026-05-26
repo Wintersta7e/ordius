@@ -83,9 +83,13 @@ fn mock_port(server: &MockServer) -> u16 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn llm_resource_form_dispatches_via_registry() {
     let llm = MockServer::start().await;
-    // expect exactly one POST to /chat/completions.
+    // The resource below declares an OpenAI-flavored probe route at
+    // `/v1/models`, which lifts `/v1` onto the base URL — so the final
+    // request lands on `/v1/chat/completions`, matching the layout of
+    // every real OpenAI-compat server (Ollama-compat, llama.cpp, vLLM,
+    // LM Studio).
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "choices": [{
                 "message": {"role": "assistant", "content": "ok"},
@@ -101,7 +105,24 @@ async fn llm_resource_form_dispatches_via_registry() {
     let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
 
     let port = mock_port(&llm);
-    let resource = http_resource("wf-llm", port, vec![Capability::OpenaiChatCompletions]);
+    let resource = ResourceDefinition {
+        id: ResourceId("wf-llm".into()),
+        kind: ResourceKind::HttpEndpoint,
+        advertised_capabilities: vec![Capability::OpenaiChatCompletions],
+        probe: ProbeSpec::Http {
+            ports: vec![port],
+            routes: vec![HttpProbeRoute {
+                path: "/v1/models".into(),
+                method: HttpProbeMethod::Get,
+                flavor: ApiFlavor::OpenaiChat,
+                proves: vec![Capability::OpenaiChatCompletions],
+                models_jsonpath: None,
+                fingerprint_jsonpaths: vec![],
+            }],
+            timeout_ms: None,
+        },
+        override_lower_scope: false,
+    };
 
     let mut cfg: HashMap<String, serde_json::Value> = HashMap::new();
     cfg.insert("resource".into(), serde_json::json!("wf-llm"));

@@ -169,7 +169,9 @@ fn resolve_url(node: &Node, ctx: &RunContext) -> Result<String, NodeError> {
                 NodeError::Config("http: 'path' required when 'resource' is set".into())
             })?;
 
-        let engine = ctx.engine.upgrade().ok_or(NodeError::Cancelled)?;
+        let engine = ctx.engine.upgrade().ok_or_else(|| {
+            NodeError::Config("internal: engine handle gone before resource lookup".into())
+        })?;
         let registry = engine.resource_registry();
         let snap = registry.snapshot();
         let workflow_id = WorkflowId(ctx.workflow_id.clone());
