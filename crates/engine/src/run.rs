@@ -98,6 +98,19 @@ impl Engine {
         workspace_override: Option<std::path::PathBuf>,
     ) -> Result<RunHandle> {
         crate::validation::validate(&wf)?;
+        // Safety net: ensure the workflow's `resources:` block is installed
+        // under `ScopeKey::Workflow { id }` before any node executes.
+        // Production callers should funnel through `load_workflow_for_run`,
+        // but programmatic `Workflow` construction (tests, future entry
+        // points) bypasses that path and would otherwise hit a
+        // "resource not in registry" failure at dispatch time. The install
+        // is replace-then-install so re-running an already-loaded workflow
+        // remains idempotent.
+        crate::environment::runtime::install_workflow_resources(
+            &crate::environment::runtime::WorkflowId(wf.id.clone()),
+            &wf.resources,
+            &self.resource_registry,
+        )?;
 
         let rec = Arc::new(RunRecorder::start(
             self.pool(),

@@ -27,7 +27,6 @@ use crate::dto::{
 use crate::state::AppState;
 use ordius_engine::settings::Settings as EngineSettings;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 /// Workflow ids become the filename stem under `<home>/workflows/`, so a
 /// hostile webview payload like `../../etc/passwd` would escape the dir.
@@ -136,8 +135,23 @@ pub async fn run_workflow(
 ) -> Result<RunStartedDto, String> {
     validate_workflow_id(&args.workflow_id)?;
     let engine = state.engine.clone();
-    let wf = ordius_engine::workflows::load(engine.home(), &args.workflow_id)
+    // Centralised path: validates retired-id rejection inside the loader
+    // and seeds the workflow's `resources:` block into the engine's
+    // registry before any node dispatches. Non-fatal warnings are
+    // logged via `tracing` for this fix wave; surfacing them in the IPC
+    // response is tracked as a follow-up so the UI can render them
+    // alongside structural-validation errors.
+    let (wf, warnings) = engine
+        .load_workflow_for_run(engine.home(), &args.workflow_id)
         .map_err(|e| e.to_string())?;
+    for warning in &warnings {
+        tracing::warn!(
+            workflow_id = %args.workflow_id,
+            node_id = %warning.node_id,
+            message = %warning.message,
+            "workflow load warning",
+        );
+    }
 
     // Resolve workspace selection against the user's registered
     // workspaces. `None` falls back to the engine's per-run scratch
@@ -149,7 +163,7 @@ pub async fn run_workflow(
 
     let handle = engine
         .start_run(
-            Arc::new(wf),
+            wf,
             args.variables,
             "gui",
             args.auto_resume,

@@ -42,7 +42,7 @@ pub use executor::{
     EnvResolver, InProcessExecutor, NodeError, NodeExecutor, NodeOutputs, RunContext,
     wrap_process_env,
 };
-pub use loader::{LoadError, load_workflow};
+pub use loader::{LoadError, load_workflow, load_workflow_unchecked, reject_reserved_node_types};
 pub use recorder::{NodeRunRow, RunRecorder, sweep_stale_locks};
 pub use run::{RunHandle, RunSummary};
 pub use scheduler::{LoopFire, NodeState, Scheduler};
@@ -248,6 +248,27 @@ impl Engine {
     #[must_use]
     pub fn home(&self) -> &Path {
         &self.home
+    }
+
+    /// Load a workflow from disk and install its `resources:` block into
+    /// the engine's registry under `ScopeKey::Workflow { id }`.
+    ///
+    /// Centralised entry point for every user-facing run path (CLI `run`,
+    /// Tauri `run_workflow`). Wraps [`crate::workflows::load_in_registry`]
+    /// with the engine's `Arc<ResourceRegistry>` and returns the loaded
+    /// workflow alongside any non-fatal validation warnings.
+    ///
+    /// Callers that construct `Workflow` values programmatically (tests,
+    /// future entry points) can rely on [`Self::start_run`]'s safety-net
+    /// install instead.
+    pub fn load_workflow_for_run(
+        &self,
+        home: &Path,
+        id: &str,
+    ) -> std::result::Result<(Arc<types::Workflow>, Vec<workflows::WorkflowWarning>), EngineError>
+    {
+        let (wf, warnings) = workflows::load_in_registry(home, id, &self.resource_registry)?;
+        Ok((Arc::new(wf), warnings))
     }
 
     /// Subscribe to a run's event stream. Returns `None` if the

@@ -11,7 +11,9 @@ use clap::{Parser, Subcommand};
 use ordius_engine::registry::Registry;
 use ordius_engine::types::Workflow;
 use ordius_engine::types::{Category, NodeType};
-use ordius_engine::{Engine, EngineError, EventType, Store, load_workflow, validate};
+use ordius_engine::{
+    Engine, EngineError, EventType, Store, load_workflow, reject_reserved_node_types, validate,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -876,9 +878,6 @@ fn runs_rm(
 
 async fn cmd_run(home: &Path, args: RunArgs) -> anyhow::Result<u8> {
     init_keyring()?;
-    let wf_path = workflow_path(home, &args.id);
-    let wf = load_workflow(&wf_path)
-        .with_context(|| format!("load workflow {} from {}", args.id, wf_path.display()))?;
     let variables = collect_variables(&args)?;
 
     let engine = Arc::new(
@@ -886,6 +885,18 @@ async fn cmd_run(home: &Path, args: RunArgs) -> anyhow::Result<u8> {
             .await
             .context("open engine")?,
     );
+
+    // Centralised path: validates reserved-id rejection inside the loader
+    // and seeds the workflow's `resources:` block into the engine's
+    // registry before any node dispatches. Non-fatal warnings (e.g. a
+    // loopback URL with a non-local target env) print to stderr so the
+    // user sees them without contaminating the optional NDJSON stream.
+    let (wf, warnings) = engine
+        .load_workflow_for_run(home, &args.id)
+        .with_context(|| format!("load workflow {}", args.id))?;
+    for warning in &warnings {
+        eprintln!("warning: {}: {}", warning.node_id, warning.message);
+    }
     let engine_for_signal = engine.clone();
     let signal_task = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -905,24 +916,23 @@ async fn cmd_run(home: &Path, args: RunArgs) -> anyhow::Result<u8> {
         None => None,
     };
 
-    let handle =
-        match engine.start_run(Arc::new(wf), variables, "cli", args.yes, workspace_override) {
-            Ok(h) => h,
-            Err(EngineError::Validation(e)) => {
-                eprintln!("ordius: validation failed: {e}");
-                signal_task.abort();
-                return Ok(2);
-            },
-            Err(EngineError::AlreadyRunning { id, run_id }) => {
-                eprintln!("ordius: workflow {id} already running (run_id={run_id})");
-                signal_task.abort();
-                return Ok(3);
-            },
-            Err(e) => {
-                signal_task.abort();
-                return Err(e).context("start workflow run");
-            },
-        };
+    let handle = match engine.start_run(wf, variables, "cli", args.yes, workspace_override) {
+        Ok(h) => h,
+        Err(EngineError::Validation(e)) => {
+            eprintln!("ordius: validation failed: {e}");
+            signal_task.abort();
+            return Ok(2);
+        },
+        Err(EngineError::AlreadyRunning { id, run_id }) => {
+            eprintln!("ordius: workflow {id} already running (run_id={run_id})");
+            signal_task.abort();
+            return Ok(3);
+        },
+        Err(e) => {
+            signal_task.abort();
+            return Err(e).context("start workflow run");
+        },
+    };
 
     let run_id = handle.run_id.clone();
     if args.json_events {
@@ -1027,11 +1037,16 @@ fn parse_workflow_str(body: &str) -> anyhow::Result<Workflow> {
     // route everything through serde_yaml, but that obscures parse
     // errors for JSON-only callers.
     let first = body.trim_start().chars().next();
-    if matches!(first, Some('{' | '[')) {
-        serde_json::from_str(body).context("parse as JSON")
+    let wf: Workflow = if matches!(first, Some('{' | '[')) {
+        serde_json::from_str(body).context("parse as JSON")?
     } else {
-        serde_yaml::from_str(body).context("parse as YAML")
-    }
+        serde_yaml::from_str(body).context("parse as YAML")?
+    };
+    // Surface the retired-id rename hint at the import boundary so the
+    // user can't sneak a stale workflow past the file loader by piping
+    // it in via stdin.
+    reject_reserved_node_types(&wf).context("workflow node-type check")?;
+    Ok(wf)
 }
 
 fn confirm(prompt: &str) -> anyhow::Result<bool> {

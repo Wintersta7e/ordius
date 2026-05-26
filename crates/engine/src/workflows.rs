@@ -122,31 +122,25 @@ pub enum WorkflowsError {
     },
 }
 
-/// Old node-type ids that workflow JSON files might still reference.
-/// Each entry maps the deprecated id to its rename target. The loader
-/// rejects workflows containing any of these ids with an explicit
-/// `ReservedNodeType` error so users see the rename hint instead of
-/// a generic "unknown type" error.
-const RESERVED_NODE_TYPE_IDS: &[(&str, &str)] = &[("agent", "llm"), ("container", "docker-run")];
-
-/// Walk the workflow's nodes and reject any that reference a retired
-/// node-type id. Called from [`load`] and [`load_in_registry`] right
-/// after deserialisation so callers get the rename hint before any
-/// downstream processing (scope install, validation) runs.
-fn reject_reserved_node_types(wf: &Workflow) -> Result<(), WorkflowsError> {
-    for node in &wf.nodes {
-        if let Some((_, replacement)) = RESERVED_NODE_TYPE_IDS
-            .iter()
-            .find(|(old, _)| *old == node.ty)
-        {
-            return Err(WorkflowsError::ReservedNodeType {
-                id: node.ty.clone(),
-                replacement: (*replacement).to_string(),
-                node_id: node.id.clone(),
-            });
-        }
+/// Convert the loader's [`LoadError`] into a [`WorkflowsError`], preserving
+/// the distinguished `ReservedNodeType` variant so tests + UI surfaces can
+/// still pattern-match on it without inspecting the wrapped loader error.
+fn loader_err(path: &Path, err: LoadError) -> WorkflowsError {
+    match err {
+        LoadError::ReservedNodeType {
+            id,
+            replacement,
+            node_id,
+        } => WorkflowsError::ReservedNodeType {
+            id,
+            replacement,
+            node_id,
+        },
+        other => WorkflowsError::Load {
+            path: path.display().to_string(),
+            source: other,
+        },
     }
-    Ok(())
 }
 
 /// `<home>/workflows/`.
@@ -207,14 +201,14 @@ pub fn list(home: &Path) -> Result<(Vec<Workflow>, Vec<LoadFailure>), WorkflowsE
 /// Load a single workflow by id. Returns the loader's error type
 /// directly so callers can distinguish missing-file from parse
 /// errors.
+///
+/// Delegates to [`crate::loader::load_workflow`] which already runs the
+/// reserved-id check, so callers automatically surface
+/// [`WorkflowsError::ReservedNodeType`] for retired node-type ids
+/// without a separate post-load pass.
 pub fn load(home: &Path, id: &str) -> Result<Workflow, WorkflowsError> {
     let p = path(home, id);
-    let wf = load_workflow(&p).map_err(|e| WorkflowsError::Load {
-        path: p.display().to_string(),
-        source: e,
-    })?;
-    reject_reserved_node_types(&wf)?;
-    Ok(wf)
+    load_workflow(&p).map_err(|e| loader_err(&p, e))
 }
 
 /// Persist a workflow to `<home>/workflows/<wf.id>.json`. Creates

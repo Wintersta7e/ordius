@@ -408,3 +408,173 @@ async fn loopback_url_with_remote_target_env_warns() {
     assert_eq!(w.node_id, "fetch");
     assert_eq!(w.kind, WorkflowWarningKind::LoopbackUrlInRemoteEnv);
 }
+
+// ── test 7: engine.load_workflow_for_run end-to-end ───────────────────────
+//
+// Pins BLOCKER 2: a saved workflow with a `resources:` block + a node
+// that names it via `resource: "<id>"` runs successfully end-to-end when
+// loaded through the centralised entry point. Before the fix, production
+// CLI / Tauri paths called `workflows::load` (or raw `loader::load_workflow`)
+// without seeding the workflow scope, so the dispatcher hit
+// `ResourceNotInRegistry` at run time even though the workflow file
+// declared the resource correctly.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_load_workflow_for_run_seeds_scope_and_runs_end_to_end() {
+    let llm = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"total_tokens": 4},
+        })))
+        .expect(1)
+        .mount(&llm)
+        .await;
+
+    let dir = TempDir::new().unwrap();
+    let port = mock_port(&llm);
+
+    let wf_dir = dir.path().join("workflows");
+    std::fs::create_dir_all(&wf_dir).unwrap();
+    let body = format!(
+        r#"{{
+            "id": "lwfr-smoke",
+            "name": "load_workflow_for_run smoke",
+            "schema_version": 1,
+            "resources": [
+                {{
+                    "id": "wf-llm",
+                    "kind": "http_endpoint",
+                    "advertised_capabilities": ["openai_chat_completions"],
+                    "probe": {{
+                        "kind": "http",
+                        "ports": [{port}],
+                        "routes": [{{
+                            "path": "/v1/models",
+                            "method": "get",
+                            "flavor": "openai_chat",
+                            "proves": ["openai_chat_completions"]
+                        }}]
+                    }}
+                }}
+            ],
+            "nodes": [
+                {{
+                    "id": "n",
+                    "type": "llm",
+                    "name": "ask",
+                    "config": {{
+                        "resource": "wf-llm",
+                        "model": "test-model",
+                        "messages": [{{"role": "user", "content": "hi"}}],
+                        "stream": "off"
+                    }}
+                }}
+            ],
+            "edges": []
+        }}"#,
+    );
+    std::fs::write(wf_dir.join("lwfr-smoke.json"), body).unwrap();
+
+    let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+
+    // The centralised entry point: validates retired-id rejection,
+    // installs the workflow's resources into the registry, and returns
+    // the workflow + non-fatal warnings.
+    let (wf, warnings) = engine
+        .load_workflow_for_run(dir.path(), "lwfr-smoke")
+        .expect("load_workflow_for_run");
+    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+
+    let summary = engine
+        .run_workflow(wf, HashMap::new(), "test", false, None)
+        .await
+        .expect("run");
+    assert_eq!(summary.status, "done");
+    // MockServer `expect(1)` verifies on drop that exactly one
+    // chat/completions call was issued — proving the workflow-scope
+    // resource was resolved at dispatch.
+}
+
+// ── test 8: Engine::start_run safety-net install ──────────────────────────
+//
+// Pins the safety-net path: callers that construct a `Workflow`
+// programmatically (and so bypass `load_workflow_for_run`) still get
+// their `resources:` block installed into the registry before the run
+// starts, so node dispatch resolves the resource correctly.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn start_run_installs_workflow_scope_as_safety_net() {
+    let llm = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"total_tokens": 4},
+        })))
+        .expect(1)
+        .mount(&llm)
+        .await;
+
+    let dir = TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+    let port = mock_port(&llm);
+
+    let resource = ResourceDefinition {
+        id: ResourceId("safety-net-llm".into()),
+        kind: ResourceKind::HttpEndpoint,
+        advertised_capabilities: vec![Capability::OpenaiChatCompletions],
+        probe: ProbeSpec::Http {
+            ports: vec![port],
+            routes: vec![HttpProbeRoute {
+                path: "/v1/models".into(),
+                method: HttpProbeMethod::Get,
+                flavor: ApiFlavor::OpenaiChat,
+                proves: vec![Capability::OpenaiChatCompletions],
+                models_jsonpath: None,
+                fingerprint_jsonpaths: vec![],
+            }],
+            timeout_ms: None,
+        },
+        override_lower_scope: false,
+    };
+
+    let mut cfg: HashMap<String, serde_json::Value> = HashMap::new();
+    cfg.insert("resource".into(), serde_json::json!("safety-net-llm"));
+    cfg.insert("model".into(), serde_json::json!("test-model"));
+    cfg.insert(
+        "messages".into(),
+        serde_json::json!([{"role": "user", "content": "hi"}]),
+    );
+    cfg.insert("stream".into(), serde_json::json!("off"));
+    let node = Node {
+        id: "n".into(),
+        ty: "llm".into(),
+        name: String::new(),
+        config: cfg,
+        pos: Pos::default(),
+        timeout_ms: None,
+        retry: None,
+        continue_on_error: false,
+        target_env: None,
+    };
+    let wf = workflow_with_resource("safety-net-wf", vec![node], vec![resource]);
+
+    // NOTE: deliberately NOT calling `install_workflow_resources` here.
+    // `run_workflow` ultimately calls `start_run`, whose safety-net install
+    // must seed the workflow scope so the dispatcher resolves
+    // `safety-net-llm` even though the caller skipped the centralised
+    // loader.
+    let summary = engine
+        .run_workflow(Arc::new(wf), HashMap::new(), "test", false, None)
+        .await
+        .expect("run");
+    assert_eq!(summary.status, "done");
+}

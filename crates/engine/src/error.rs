@@ -70,6 +70,18 @@ pub enum EngineError {
     /// rejections so callers don't need to know which layer produced the failure.
     #[error("resources: {0}")]
     Resources(#[from] crate::environment::runtime::user_file::ResourcesFileError),
+    /// Workflow filesystem helper (load / save / scope install / scope
+    /// removal) failed. Covers retired-id rejection, unknown-resource
+    /// references, unadvertised capabilities, and workflow-scope install
+    /// errors raised by the centralised `load_workflow_for_run` path.
+    #[error("workflow: {0}")]
+    Workflows(#[from] crate::workflows::WorkflowsError),
+    /// Workflow-scope installation rejected by the registry. Surfaced by
+    /// the safety-net install at the top of [`crate::Engine::start_run`]
+    /// for programmatic `Workflow` construction paths that bypass the
+    /// centralised loader.
+    #[error("workflow scope: {0}")]
+    Scope(#[from] crate::environment::runtime::WorkflowScopeError),
     /// A code path that intentionally returns `NotImplemented` in this
     /// release. The static string identifies the missing capability
     /// (e.g. `"container backend"` for the v1.0 stub).
