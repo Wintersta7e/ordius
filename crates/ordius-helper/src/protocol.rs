@@ -95,6 +95,9 @@ pub struct HttpProbeRouteV1 {
 pub enum HttpProbeMethodV1 {
     /// HTTP GET.
     Get,
+    /// HTTP HEAD — body discarded; useful for probes that check existence
+    /// without pulling a response payload.
+    Head,
     /// HTTP POST.
     Post,
 }
@@ -144,8 +147,13 @@ pub enum ProbeOutcomeBodyV1 {
 }
 
 /// Concrete detail for a successful probe.
+///
+/// The tag is `"detail"` (not `"kind"`) so it doesn't collide with the outer
+/// `ProbeOutcomeBodyV1` discriminator. Both are internally-tagged and flatten
+/// into the same JSON object; using the same name produced duplicate `kind`
+/// keys that `serde_json` rejects on deserialization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "detail", rename_all = "snake_case")]
 pub enum ProbeDetailV1 {
     /// HTTP service — wire counterpart of engine's `ResourceDetail::HttpEndpoint`.
     HttpEndpoint {
