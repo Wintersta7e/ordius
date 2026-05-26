@@ -15,6 +15,8 @@
 //! is also accumulated into the `text` output port.
 
 use super::util::{config_f64_or, config_str, config_str_opt, config_str_or, config_u64_or};
+use crate::environment::runtime::env::{EnvId, WorkflowId};
+use crate::environment::runtime::resource::{Capability, ProbeSpec, ResourceRef};
 use crate::events::EventType;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::types::{Node, NodeType, PortValue, StreamMode};
@@ -68,6 +70,90 @@ impl NodeExecutor for LlmExecutor {
     }
 }
 
+/// Resolve the optional `resource` config field on an `llm` node into
+/// a base URL via the shared resource registry. Returns:
+///
+/// - `Ok(Some(base_url))` when the node has a resource ref AND the
+///   registry resolved it. `base_url` is `scheme://host:port` with no
+///   trailing slash and no path — the caller appends `/chat/completions`.
+/// - `Ok(None)` when the node has no `resource` field (caller falls
+///   back to the legacy literal `url` config).
+///
+/// Errors with [`NodeError::Config`] on a malformed ref, an unknown
+/// resource id, a non-HTTP resource (Binary / Toolchain), an HTTP
+/// resource without any ports declared, or an advertised-capability
+/// mismatch when a capability constraint is in effect.
+///
+/// `tools_present` is the same `tools.is_empty()` bool the caller
+/// already computed and is used to infer the required capability when
+/// the ref is the bare-id form: `false` → `OpenaiChatCompletions`,
+/// `true` → `OpenaiToolCalling`. The detailed form's
+/// `required_capability` overrides the inference.
+///
+/// Phase D resolves to a base URL via `ProbeSpec::Http.ports[0]`
+/// (synthesizing `http://127.0.0.1:<port>`) since the engine has no
+/// probe-driven catalog wired into dispatch yet. Phase E swaps this
+/// out for `ResourceCatalog::route_for_capability` once env-scoped
+/// catalogs are kept on `Engine`.
+fn resolve_resource_url(
+    node: &Node,
+    ctx: &RunContext,
+    tools_present: bool,
+) -> Result<Option<String>, NodeError> {
+    let Some(rref_val) = node.config.get("resource") else {
+        return Ok(None);
+    };
+    let rref: ResourceRef = serde_json::from_value(rref_val.clone())
+        .map_err(|e| NodeError::Config(format!("llm: invalid resource ref: {e}")))?;
+
+    let engine = ctx.engine.upgrade().ok_or(NodeError::Cancelled)?;
+    let registry = engine.resource_registry();
+    let snap = registry.snapshot();
+
+    let required_cap = rref.required_capability().unwrap_or({
+        if tools_present {
+            Capability::OpenaiToolCalling
+        } else {
+            Capability::OpenaiChatCompletions
+        }
+    });
+
+    // The workflow scope is the highest precedence; pair it with the
+    // local env so the chain walks `Workflow → EnvLocal(local) →
+    // UserGlobal → Builtin`. Env-aware resolution lands in Phase E.
+    let workflow_id = WorkflowId(ctx.workflow_id.clone());
+    let (def, _scope) = snap
+        .resolve(rref.id(), &EnvId::local(), Some(&workflow_id))
+        .ok_or_else(|| NodeError::Config(format!("llm: unknown resource id '{}'", rref.id().0)))?;
+
+    // Capability gating: when the resource declares advertised caps,
+    // refuse if the required one isn't among them. An empty advertised
+    // list means "untyped" — let it through so workflow-scoped
+    // user-defined resources without an explicit caps list still work.
+    if !def.advertised_capabilities.is_empty()
+        && !def.advertised_capabilities.contains(&required_cap)
+    {
+        return Err(NodeError::Config(format!(
+            "llm: resource '{}' does not advertise {required_cap:?}",
+            rref.id().0
+        )));
+    }
+
+    let ProbeSpec::Http { ports, .. } = &def.probe else {
+        return Err(NodeError::Config(format!(
+            "llm: resource '{}' is not an HTTP endpoint",
+            rref.id().0
+        )));
+    };
+    let port = ports.first().copied().ok_or_else(|| {
+        NodeError::Config(format!(
+            "llm: resource '{}' declares no probe ports",
+            rref.id().0
+        ))
+    })?;
+    Ok(Some(format!("http://127.0.0.1:{port}")))
+}
+
 /// Single-turn chat completion. Honors `stream: StreamMode` (Auto +
 /// Force both attempt SSE in Phase D; Phase E's dispatcher layer will
 /// enforce Force against the route's advertised capabilities).
@@ -77,7 +163,12 @@ async fn run_single_turn(
     ctx: &RunContext,
     cancel: CancellationToken,
 ) -> Result<NodeOutputs, NodeError> {
-    let base_url = config_str_or(&node.config, "url", DEFAULT_URL).trim_end_matches('/');
+    let resolved = resolve_resource_url(node, ctx, false)?;
+    let base_url: String = resolved.unwrap_or_else(|| {
+        config_str_or(&node.config, "url", DEFAULT_URL)
+            .trim_end_matches('/')
+            .to_string()
+    });
     let model = config_str(&node.config, "model", "llm")?;
     let messages = node
         .config
@@ -148,7 +239,12 @@ async fn run_tool_loop(
     cancel: CancellationToken,
     tools: &[InlineTool],
 ) -> Result<NodeOutputs, NodeError> {
-    let base_url = config_str_or(&node.config, "url", DEFAULT_URL).trim_end_matches('/');
+    let resolved = resolve_resource_url(node, ctx, true)?;
+    let base_url: String = resolved.unwrap_or_else(|| {
+        config_str_or(&node.config, "url", DEFAULT_URL)
+            .trim_end_matches('/')
+            .to_string()
+    });
     let model = config_str(&node.config, "model", "llm")?.to_string();
     let temperature = config_f64_or(&node.config, "temperature", DEFAULT_MODEL_TEMP);
     let max_tokens = node.config.get("max_tokens").cloned();
@@ -1127,5 +1223,249 @@ mod tests {
             matches!(err, NodeError::Config(_)),
             "expected Config error, got {err:?}"
         );
+    }
+
+    // ── resolve_resource_url tests ───────────────────────────────────────────
+    //
+    // These cover the alt config path that names a resource by id instead of
+    // a literal `url`. Resolution flows through the shared registry seeded
+    // in Phase C; Phase E swaps the synthesizer for the probed catalog's
+    // `route_for_capability`.
+
+    use crate::Engine;
+    use crate::checkpoints::CheckpointRegistry;
+    use crate::db::open;
+    use crate::emitter::Emitter;
+    use crate::environment::runtime::install_workflow_resources;
+    use crate::environment::runtime::resource::{
+        ApiFlavor, HttpProbeMethod, HttpProbeRoute, ProbeSpec, ResourceDefinition, ResourceId,
+        ResourceKind,
+    };
+    use crate::executor::wrap_process_env;
+    use crate::recorder::RunRecorder;
+    use crate::types::Workflow;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
+
+    /// Build a `RunContext` wired to a real Engine so `resolve_resource_url`
+    /// can upgrade the `Weak<Engine>` and read the live registry.
+    async fn ctx_with_engine(workflow_id: &str) -> (Arc<Engine>, RunContext, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+        let pool = open(dir.path().join("ctx.db")).unwrap();
+        let wf = Workflow {
+            id: workflow_id.into(),
+            name: String::new(),
+            schema_version: 1,
+            created_at: None,
+            updated_at: None,
+            variables: HashMap::new(),
+            triggers: vec![],
+            nodes: vec![],
+            edges: vec![],
+            resources: vec![],
+            default_env: None,
+        };
+        let rec = Arc::new(RunRecorder::start(pool, &wf, "{}", &HashMap::new(), "test").unwrap());
+        let (em, _rx) = Emitter::new(rec.clone());
+        let ctx = RunContext {
+            run_id: rec.run_id.clone(),
+            workflow_id: workflow_id.into(),
+            workflow_name: String::new(),
+            started_at_iso: String::new(),
+            workspace: dir.path().to_path_buf(),
+            variables: HashMap::new(),
+            recorder: rec,
+            emitter: Arc::new(em),
+            secrets_store: None,
+            env: wrap_process_env(),
+            current_inputs: HashMap::new(),
+            upstream_outputs: HashMap::new(),
+            checkpoints: Arc::new(CheckpointRegistry::new()),
+            events: Arc::new(crate::events_registry::EventRegistry::new()),
+            engine: Arc::downgrade(&engine),
+            compose_depth: 0,
+            iteration: 1,
+            attempt: AtomicU32::new(1),
+            auto_resume: false,
+        };
+        (engine, ctx, dir)
+    }
+
+    fn llm_node_with_resource(resource_cfg: serde_json::Value) -> Node {
+        let mut config: HashMap<String, serde_json::Value> = HashMap::new();
+        config.insert("resource".into(), resource_cfg);
+        config.insert("model".into(), serde_json::json!("test-model"));
+        config.insert(
+            "messages".into(),
+            serde_json::json!([{"role": "user", "content": "hi"}]),
+        );
+        Node {
+            id: "n".into(),
+            ty: NODE_TYPE_ID.into(),
+            name: String::new(),
+            config,
+            pos: Pos::default(),
+            timeout_ms: None,
+            retry: None,
+            continue_on_error: false,
+            target_env: None,
+        }
+    }
+
+    fn http_resource(id: &str, port: u16, caps: Vec<Capability>) -> ResourceDefinition {
+        ResourceDefinition {
+            id: ResourceId(id.into()),
+            kind: ResourceKind::HttpEndpoint,
+            advertised_capabilities: caps,
+            probe: ProbeSpec::Http {
+                ports: vec![port],
+                routes: vec![HttpProbeRoute {
+                    path: "/v1/models".into(),
+                    method: HttpProbeMethod::Get,
+                    flavor: ApiFlavor::OpenaiChat,
+                    proves: vec![Capability::OpenaiChatCompletions],
+                    models_jsonpath: None,
+                    fingerprint_jsonpaths: vec![],
+                }],
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resource_missing_returns_ok_none() {
+        // Legacy literal-url path: no `resource` key → caller falls back.
+        let (_engine, ctx, _dir) = ctx_with_engine("wf-no-res").await;
+        let node = llm_node("http://example.invalid", false);
+        let out = resolve_resource_url(&node, &ctx, false).expect("ok");
+        assert!(out.is_none(), "no resource field → None, got {out:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resource_short_form_resolves_to_synthesized_base_url() {
+        let (engine, ctx, _dir) = ctx_with_engine("wf-short").await;
+        let resource = http_resource("wf-llm", 39_111, vec![Capability::OpenaiChatCompletions]);
+        install_workflow_resources(
+            &WorkflowId("wf-short".into()),
+            &[resource],
+            &engine.resource_registry(),
+        )
+        .expect("install");
+
+        let node = llm_node_with_resource(serde_json::json!("wf-llm"));
+        let url = resolve_resource_url(&node, &ctx, false)
+            .expect("ok")
+            .expect("some");
+        assert_eq!(url, "http://127.0.0.1:39111");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resource_long_form_with_required_capability_resolves() {
+        let (engine, ctx, _dir) = ctx_with_engine("wf-long").await;
+        let resource = http_resource(
+            "wf-tool",
+            39_112,
+            vec![
+                Capability::OpenaiChatCompletions,
+                Capability::OpenaiToolCalling,
+            ],
+        );
+        install_workflow_resources(
+            &WorkflowId("wf-long".into()),
+            &[resource],
+            &engine.resource_registry(),
+        )
+        .expect("install");
+
+        let node = llm_node_with_resource(serde_json::json!({
+            "id": "wf-tool",
+            "required_capability": "openai_tool_calling",
+        }));
+        // tools_present=false would otherwise default to ChatCompletions, but
+        // the long-form ref's explicit `required_capability` overrides it.
+        let url = resolve_resource_url(&node, &ctx, false)
+            .expect("ok")
+            .expect("some");
+        assert_eq!(url, "http://127.0.0.1:39112");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resource_capability_inferred_from_tools_present() {
+        let (engine, ctx, _dir) = ctx_with_engine("wf-infer").await;
+        // Only advertises ToolCalling — caller with tools_present=true must
+        // pass the cap check via the inference rule.
+        let resource = http_resource("wf-tools-only", 39_113, vec![Capability::OpenaiToolCalling]);
+        install_workflow_resources(
+            &WorkflowId("wf-infer".into()),
+            &[resource],
+            &engine.resource_registry(),
+        )
+        .expect("install");
+
+        let node = llm_node_with_resource(serde_json::json!("wf-tools-only"));
+        let url = resolve_resource_url(&node, &ctx, true)
+            .expect("tools_present=true → infer OpenaiToolCalling")
+            .expect("some");
+        assert_eq!(url, "http://127.0.0.1:39113");
+
+        // And same registry with tools_present=false → infer ChatCompletions,
+        // which the resource does NOT advertise → Config error.
+        let err = resolve_resource_url(&node, &ctx, false).expect_err("missing cap rejects");
+        assert!(matches!(err, NodeError::Config(_)), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resource_unknown_id_is_a_config_error() {
+        let (_engine, ctx, _dir) = ctx_with_engine("wf-missing").await;
+        let node = llm_node_with_resource(serde_json::json!("nobody-here"));
+        let err = resolve_resource_url(&node, &ctx, false).expect_err("unknown id rejects");
+        assert!(matches!(err, NodeError::Config(_)), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resource_non_http_kind_is_a_config_error() {
+        // Install a Binary-kind resource that *does* advertise the capability
+        // the caller asks for, so the cap check passes and we exercise the
+        // "not HttpEndpoint" branch below it.
+        let (engine, ctx, _dir) = ctx_with_engine("wf-binary").await;
+        let resource = ResourceDefinition {
+            id: ResourceId("misdeclared-bin".into()),
+            kind: ResourceKind::Binary,
+            advertised_capabilities: vec![Capability::OpenaiChatCompletions],
+            probe: ProbeSpec::Binary {
+                bin: "true".into(),
+                version_args: vec!["--version".into()],
+                version_regex: r"(\d+)".into(),
+                extra_search_paths: vec![],
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        };
+        install_workflow_resources(
+            &WorkflowId("wf-binary".into()),
+            &[resource],
+            &engine.resource_registry(),
+        )
+        .expect("install");
+
+        let node = llm_node_with_resource(serde_json::json!("misdeclared-bin"));
+        let err = resolve_resource_url(&node, &ctx, false).expect_err("non-http resource rejects");
+        let msg = format!("{err:?}");
+        assert!(matches!(err, NodeError::Config(_)), "got {msg}");
+        assert!(
+            msg.contains("not an HTTP endpoint"),
+            "expected non-http hint, got {msg}",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resource_malformed_ref_is_a_config_error() {
+        let (_engine, ctx, _dir) = ctx_with_engine("wf-bad").await;
+        // Numeric scalar can't deserialize into ResourceRef.
+        let node = llm_node_with_resource(serde_json::json!(42));
+        let err = resolve_resource_url(&node, &ctx, false).expect_err("bad shape rejects");
+        assert!(matches!(err, NodeError::Config(_)), "got {err:?}");
     }
 }
