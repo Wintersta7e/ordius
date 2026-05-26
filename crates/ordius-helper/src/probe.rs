@@ -10,6 +10,17 @@ use jsonpath_rust::JsonPath;
 use std::io::{BufRead, Read, Write};
 use std::time::{Duration, Instant};
 
+/// Hard cap on HTTP probe body size. Fingerprint extraction parses the body as
+/// JSON; without a cap a malicious endpoint could OOM the helper.
+const MAX_PROBE_BODY_BYTES: u64 = 1 << 20; // 1 MiB
+/// Hard cap on `fingerprint_jsonpaths` count. Each path runs a full `JSONPath`
+/// query against the body; unbounded paths × large bodies is quadratic.
+const MAX_FINGERPRINT_JSONPATHS: usize = 32;
+/// Hard cap on toolchain version-probe stdout/stderr capture. Version output
+/// is small (KBs); the cap protects against pathological tools writing
+/// megabytes to stdio before exiting.
+const MAX_VERSION_OUTPUT_BYTES: u64 = 64 * 1024;
+
 /// Run the probe subcommand: deserialize one `ProbePlanV1`, probe each
 /// resource sequentially, emit one JSONL `ProbeOutcomeV1` per line.
 pub fn run<R: BufRead, W: Write>(mut input: R, mut output: W) -> anyhow::Result<()> {
@@ -119,6 +130,7 @@ fn probe_http(
             let url = format!("{}{}", base.trim_end_matches('/'), route.path);
             let req = match route.method {
                 HttpProbeMethodV1::Get => agent.get(&url),
+                HttpProbeMethodV1::Head => agent.head(&url),
                 HttpProbeMethodV1::Post => agent.post(&url),
             };
 
@@ -142,8 +154,13 @@ fn probe_http(
 
             if classify_response_status(status, &route.expect_status) {
                 if let Some(resp) = resp_opt {
-                    match resp.into_string() {
-                        Ok(body) => {
+                    let mut body = String::new();
+                    match resp
+                        .into_reader()
+                        .take(MAX_PROBE_BODY_BYTES)
+                        .read_to_string(&mut body)
+                    {
+                        Ok(_) => {
                             let fingerprint = fingerprint(&body, &route.fingerprint_jsonpaths);
                             proven.push(ProvenRouteV1 {
                                 capabilities: route.proves.clone(),
@@ -247,18 +264,16 @@ fn probe_toolchain(
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            re.captures(&combined).map_or_else(
-                || ProbeOutcomeBodyV1::ProbeFailed {
-                    reason: "version regex did not match output".into(),
-                },
-                |caps| {
-                    let version = caps
-                        .get(1)
-                        .or_else(|| caps.get(0))
-                        .map_or_else(String::new, |m| m.as_str().to_string());
-                    ProbeOutcomeBodyV1::Found(ProbeDetailV1::Toolchain { path, version })
-                },
-            )
+            // A no-match doesn't mean "binary missing" — the binary is there
+            // and ran; we just couldn't extract a version string. Mirror the
+            // local dispatcher's behavior and surface as `Found` with an
+            // empty version so the catalog stays consistent across envs.
+            let version = re.captures(&combined).map_or_else(String::new, |caps| {
+                caps.get(1)
+                    .or_else(|| caps.get(0))
+                    .map_or_else(String::new, |m| m.as_str().to_string())
+            });
+            ProbeOutcomeBodyV1::Found(ProbeDetailV1::Toolchain { path, version })
         },
         RunResult::Timeout => ProbeOutcomeBodyV1::TimedOut,
         RunResult::SpawnError(e) => ProbeOutcomeBodyV1::ProbeFailed {
@@ -317,11 +332,15 @@ fn run_with_timeout(mut cmd: std::process::Command, timeout: Duration) -> RunRes
 
     let mut stdout_buf = Vec::new();
     let mut stderr_buf = Vec::new();
-    if let Some(mut s) = child.stdout.take() {
-        let _read_result = s.read_to_end(&mut stdout_buf);
+    if let Some(s) = child.stdout.take() {
+        let _read_result = s
+            .take(MAX_VERSION_OUTPUT_BYTES)
+            .read_to_end(&mut stdout_buf);
     }
-    if let Some(mut s) = child.stderr.take() {
-        let _read_result = s.read_to_end(&mut stderr_buf);
+    if let Some(s) = child.stderr.take() {
+        let _read_result = s
+            .take(MAX_VERSION_OUTPUT_BYTES)
+            .read_to_end(&mut stderr_buf);
     }
 
     RunResult::Output(std::process::Output {
@@ -335,6 +354,13 @@ fn fingerprint(body: &str, jsonpaths: &[String]) -> String {
     if jsonpaths.is_empty() {
         return String::new();
     }
+    // Truncate adversarial / misconfigured probe plans so a runaway path list
+    // can't push the helper into quadratic time over a large JSON body.
+    let jsonpaths = if jsonpaths.len() > MAX_FINGERPRINT_JSONPATHS {
+        &jsonpaths[..MAX_FINGERPRINT_JSONPATHS]
+    } else {
+        jsonpaths
+    };
     let v: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(_) => return String::new(),
@@ -509,5 +535,102 @@ mod tests {
     fn accept_logic_custom_rejects_other_status() {
         assert!(!classify_response_status(200, &[401]));
         assert!(!classify_response_status(403, &[401, 404]));
+    }
+
+    #[test]
+    fn fingerprint_empty_jsonpaths_returns_empty() {
+        assert_eq!(fingerprint(r#"{"a":1}"#, &[]), "");
+    }
+
+    #[test]
+    fn fingerprint_invalid_json_returns_empty() {
+        assert_eq!(fingerprint("not json at all", &["$.version".into()]), "");
+    }
+
+    #[test]
+    fn fingerprint_missing_path_returns_empty() {
+        assert_eq!(fingerprint(r#"{"a":1}"#, &["$.missing".into()]), "");
+    }
+
+    #[test]
+    fn fingerprint_multi_path_joins_with_unit_separator() {
+        let body = r#"{"version":"1.0","build":"abc"}"#;
+        let fp = fingerprint(body, &["$.version".into(), "$.build".into()]);
+        assert!(fp.contains('\u{1f}'), "expected unit separator in {fp:?}");
+        assert!(fp.contains("1.0"));
+        assert!(fp.contains("abc"));
+    }
+
+    #[test]
+    fn fingerprint_clamps_excess_jsonpaths() {
+        // A pathological caller hands in 1000 paths; the helper should only
+        // process the first MAX_FINGERPRINT_JSONPATHS to avoid quadratic CPU
+        // against a large response body.
+        let mut paths: Vec<String> = (0..1000).map(|_| "$.version".to_string()).collect();
+        paths.push("$.never_evaluated_because_we_clamped".into());
+        let fp = fingerprint(r#"{"version":"1.0"}"#, &paths);
+        // Survives clamp without panic and still produces a fingerprint.
+        assert!(!fp.is_empty());
+    }
+
+    #[test]
+    fn probe_http_all_bases_unreachable_emits_probe_failed() {
+        // Two closed ports on loopback — confirms the all-bases-transport-failed
+        // path completes deterministically. (Connection-refused surfaces as
+        // ProbeFailed via ureq's Transport error, not NotFound.)
+        let plan = ProbePlanV1 {
+            version: 1,
+            per_resource_timeout_ms: 300,
+            max_concurrency: 1,
+            overall_budget_ms: 5000,
+            resources: vec![ResourceSpecV1 {
+                id: "double-dead".into(),
+                kind: ResourceKindV1::Http {
+                    bases: vec!["http://127.0.0.1:1".into(), "http://127.0.0.1:2".into()],
+                    routes: vec![HttpProbeRouteV1 {
+                        path: "/healthz".into(),
+                        method: HttpProbeMethodV1::Get,
+                        proves: vec!["alive".into()],
+                        expect_status: vec![],
+                        fingerprint_jsonpaths: vec![],
+                    }],
+                },
+            }],
+        };
+        let input = serde_json::to_string(&plan).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        run(input.as_bytes(), &mut out).unwrap();
+        let line = std::str::from_utf8(&out).unwrap();
+        let outcome: ProbeOutcomeV1 = serde_json::from_str(line.trim()).unwrap();
+        assert!(matches!(
+            outcome.outcome,
+            ProbeOutcomeBodyV1::ProbeFailed { .. }
+        ));
+    }
+
+    #[test]
+    fn toolchain_regex_no_match_returns_found_with_empty_version() {
+        // Use `true` on Unix — it produces no output but exits zero. Our
+        // toolchain probe should still report it Found (matching the local
+        // dispatcher's behavior) rather than ProbeFailed.
+        #[cfg(unix)]
+        {
+            let outcome = probe_toolchain(
+                "true",
+                &[],
+                r"version (\S+)",
+                &[],
+                Some(Duration::from_secs(2)),
+            );
+            match outcome {
+                ProbeOutcomeBodyV1::Found(ProbeDetailV1::Toolchain { version, .. }) => {
+                    assert!(
+                        version.is_empty(),
+                        "expected empty version, got {version:?}"
+                    );
+                },
+                other => panic!("expected Found(Toolchain), got {other:?}"),
+            }
+        }
     }
 }
