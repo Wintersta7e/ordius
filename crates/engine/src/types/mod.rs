@@ -5,6 +5,7 @@ pub mod env;
 pub mod node;
 pub mod node_type;
 pub mod port;
+pub mod stream_mode;
 pub mod workflow;
 
 pub use edge::{Edge, EdgeType};
@@ -15,4 +16,5 @@ pub use node_type::{
     OutputParse,
 };
 pub use port::{PortDef, PortType, PortValue};
+pub use stream_mode::StreamMode;
 pub use workflow::{Trigger, Workflow};
