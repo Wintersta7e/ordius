@@ -1,8 +1,14 @@
-//! WSL dispatcher implementation.
+//! WSL dispatcher: `WslDispatcher` runs against a named WSL distribution
+//! via `wsl.exe -d <name> --exec`.
 //!
-//! Provides `WslDispatcher` (Dispatcher trait impl), `WslHttpTransport`
-//! (env-loopback wrap vs `HostDirect` direct vs public direct), path
-//! translation via `wslpath`, and helper bootstrap inside the distro.
+//! Submodules:
+//! - `enumerate`     — `wsl.exe -l --verbose` parser, distro state.
+//! - `path`          — host ↔ env path translation (inline + `wslpath`).
+//! - `dispatcher`    — `WslDispatcher` (`Dispatcher` impl).
+//! - `transport`     — `WslHttpTransport` (env-loopback wrap / `HostDirect` direct / public).
+//! - `bootstrap`     — push helper binary, sha256-verify, atomic install.
+//! - `shell_fallback`— constrained POSIX-sh probe runner.
+//! - `host_direct`   — fingerprint + recompute for `HostDirectVerification`.
 
 pub mod bootstrap;
 pub mod dispatcher;
@@ -13,3 +19,5 @@ pub mod shell_fallback;
 pub mod transport;
 
 pub use dispatcher::WslDispatcher;
+pub use enumerate::{WslDistro, WslState, enumerate, enumerate_running, is_running};
+pub use transport::WslHttpTransport;
