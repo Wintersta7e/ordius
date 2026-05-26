@@ -375,6 +375,18 @@ async fn write_helper_plan(
     Ok(())
 }
 
+fn abort_reader_handles(
+    stdout_handle: Option<&tokio::task::JoinHandle<Vec<u8>>>,
+    stderr_handle: Option<&tokio::task::JoinHandle<Vec<u8>>>,
+) {
+    if let Some(h) = stdout_handle {
+        h.abort();
+    }
+    if let Some(h) = stderr_handle {
+        h.abort();
+    }
+}
+
 async fn wait_for_helper_probe(
     mut child: tokio::process::Child,
     timeout_ms: u64,
@@ -398,11 +410,13 @@ async fn wait_for_helper_probe(
     let status = match wait_outcome {
         Ok(Ok(status)) => status,
         Ok(Err(e)) => {
+            abort_reader_handles(stdout_handle.as_ref(), stderr_handle.as_ref());
             drop(child.kill().await);
             drop(child.wait().await);
             return Err(probe_failed(format!("wait for ordius-helper probe: {e}")));
         },
         Err(_) => {
+            abort_reader_handles(stdout_handle.as_ref(), stderr_handle.as_ref());
             drop(child.kill().await);
             drop(child.wait().await);
             return Err(ResourceProbeOutcome::TimedOut);
@@ -524,14 +538,20 @@ impl Dispatcher for WslDispatcher {
             return Err(DispatchError::Cancelled);
         }
 
-        match self.ensure_helper().await {
+        // Race the bootstrap against the cancel token; otherwise a cancelled
+        // probe would block until the cold helper push completes (~tens of
+        // seconds in the worst case).
+        let helper_result = tokio::select! {
+            () = cancel.cancelled() => return Err(DispatchError::Cancelled),
+            r = self.ensure_helper() => r,
+        };
+        match helper_result {
             Ok(helper) => {
                 self.probe_plan_via_helper(&helper.env_side_path, &plan, &cancel)
                     .await
             },
             Err(err) => {
                 tracing::debug!(error = %err, "falling back to WSL shell probe plan");
-                let total_probed = plan.defs.len();
                 let catalog = super::shell_fallback::probe_plan_shell_fallback(
                     &self.distro_name,
                     plan.env_id.clone(),
@@ -540,6 +560,11 @@ impl Dispatcher for WslDispatcher {
                     plan.overall_budget,
                 )
                 .await?;
+                let total_probed = catalog
+                    .resources
+                    .values()
+                    .filter(|o| !matches!(o, ResourceProbeOutcome::Skipped { .. }))
+                    .count();
                 Ok(ProbeSummary {
                     catalog,
                     total_probed,
@@ -558,7 +583,11 @@ impl Dispatcher for WslDispatcher {
             return cancelled_probe_outcome();
         }
 
-        match self.ensure_helper().await {
+        let helper_result = tokio::select! {
+            () = cancel.cancelled() => return cancelled_probe_outcome(),
+            r = self.ensure_helper() => r,
+        };
+        match helper_result {
             Ok(helper) => {
                 self.probe_resource_via_helper(&helper.env_side_path, def)
                     .await
@@ -1167,6 +1196,71 @@ mod tests {
 
         let snap = d.host_direct_snapshot();
         assert!(snap.contains_key(&ResourceId("ollama".into())));
+    }
+
+    #[test]
+    fn set_host_direct_visible_through_cached_http_transport() {
+        // The dispatcher caches `Arc<WslHttpTransport>` and shares the
+        // `Arc<ArcSwap<HostDirectMap>>` with it. A `set_host_direct` update
+        // must be observable to the already-handed-out transport — otherwise
+        // requests post-update would still route through env-loopback.
+        use crate::environment::runtime::env::{HostDirectMethod, HostDirectVerification};
+        use url::Url;
+
+        let d = WslDispatcher::new(info("Ubuntu"), "Ubuntu");
+        let transport = d.http_transport();
+        // Pre-update: nothing in host_direct → loopback URLs are NOT streamable
+        // (env-loopback can't stream).
+        let url = Url::parse("http://127.0.0.1:11434/v1/chat/completions").unwrap();
+        assert!(!transport.can_stream(&url));
+
+        let mut hd = HashMap::new();
+        hd.insert(
+            ResourceId("ollama".into()),
+            HostDirectVerification {
+                verified_at: chrono::Utc::now(),
+                method: HostDirectMethod::WslMirroredNetworking,
+                host_url: "http://127.0.0.1:11434".into(),
+                probe_route_path: "/api/version".into(),
+                stable_fingerprint: "abc".into(),
+                recompute_jsonpaths: vec!["$.version".into()],
+            },
+        );
+        d.set_host_direct(hd);
+
+        // Post-update: same handed-out transport now classifies the URL as
+        // HostDirect and CAN stream.
+        assert!(transport.can_stream(&url));
+    }
+
+    #[test]
+    fn build_wire_plan_kind_mismatch_returns_plan_build_error() {
+        // `resource_spec_v1_from_def` rejects definitions whose declared `kind`
+        // and `probe` disagree; the surrounding `build_wire_plan` wraps that
+        // failure as `DispatchError::PlanBuild`. Phase E's scheduler will rely
+        // on this discrimination to route plan-build failures distinctly from
+        // path-translation failures.
+        let mismatched = ResourceDefinition {
+            id: ResourceId("oops".into()),
+            kind: ResourceKind::Binary,
+            advertised_capabilities: vec![],
+            probe: ProbeSpec::Http {
+                ports: vec![11434],
+                routes: vec![],
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        };
+        let plan = ProbePlan {
+            env_id: crate::environment::runtime::env::EnvId::wsl("Ubuntu"),
+            registry_revision: 0,
+            defs: vec![mismatched],
+            per_resource_timeout: Duration::from_secs(1),
+            max_concurrency: 1,
+            overall_budget: Duration::from_secs(5),
+        };
+        let err = build_wire_plan(&plan).unwrap_err();
+        assert!(matches!(err, DispatchError::PlanBuild(_)), "got {err:?}");
     }
 
     #[test]
