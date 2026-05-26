@@ -180,6 +180,64 @@ fn duplicate_of_numbered_clone_strips_numeric_suffix() {
     assert_eq!(clone_of_numbered.id, "demo-copy-3");
 }
 
+#[test]
+fn load_rejects_agent_node_type_with_rename_hint() {
+    let home = TempDir::new().unwrap();
+    let id = "wf-uses-agent";
+    write_workflow(
+        &home,
+        id,
+        r#"{
+            "id": "wf-uses-agent",
+            "name": "x",
+            "nodes": [{"id":"n1","type":"agent","name":"x","config":{}}],
+            "edges": []
+        }"#,
+    );
+    let err = load(home.path(), id).unwrap_err();
+    match err {
+        WorkflowsError::ReservedNodeType {
+            id,
+            replacement,
+            node_id,
+        } => {
+            assert_eq!(id, "agent");
+            assert_eq!(replacement, "llm");
+            assert_eq!(node_id, "n1");
+        },
+        other => panic!("expected ReservedNodeType, got {other:?}"),
+    }
+}
+
+#[test]
+fn load_rejects_container_node_type_with_rename_hint() {
+    let home = TempDir::new().unwrap();
+    let id = "wf-uses-container";
+    write_workflow(
+        &home,
+        id,
+        r#"{
+            "id": "wf-uses-container",
+            "name": "x",
+            "nodes": [{"id":"n1","type":"container","name":"x","config":{"image":"x"}}],
+            "edges": []
+        }"#,
+    );
+    let err = load(home.path(), id).unwrap_err();
+    match err {
+        WorkflowsError::ReservedNodeType {
+            id,
+            replacement,
+            node_id,
+        } => {
+            assert_eq!(id, "container");
+            assert_eq!(replacement, "docker-run");
+            assert_eq!(node_id, "n1");
+        },
+        other => panic!("expected ReservedNodeType, got {other:?}"),
+    }
+}
+
 #[cfg(test)]
 mod scope_tests {
     use crate::environment::runtime::{EnvId, ResourceId, ResourceRegistry, ScopeKey, WorkflowId};

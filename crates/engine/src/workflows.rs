@@ -53,6 +53,45 @@ pub enum WorkflowsError {
     /// variants — e.g. clone-id collision space exhausted.
     #[error("{0}")]
     Other(String),
+    /// Workflow JSON references a node-type id that has been retired in
+    /// favour of a new name. The loader surfaces the rename target so the
+    /// user can fix the file without guessing.
+    #[error("workflow node '{node_id}' uses reserved type id '{id}'; rename to '{replacement}'")]
+    ReservedNodeType {
+        /// Retired node-type id that appeared in the workflow.
+        id: String,
+        /// Current node-type id the user should switch to.
+        replacement: String,
+        /// Id of the offending node inside the workflow.
+        node_id: String,
+    },
+}
+
+/// Old node-type ids that workflow JSON files might still reference.
+/// Each entry maps the deprecated id to its rename target. The loader
+/// rejects workflows containing any of these ids with an explicit
+/// `ReservedNodeType` error so users see the rename hint instead of
+/// a generic "unknown type" error.
+const RESERVED_NODE_TYPE_IDS: &[(&str, &str)] = &[("agent", "llm"), ("container", "docker-run")];
+
+/// Walk the workflow's nodes and reject any that reference a retired
+/// node-type id. Called from [`load`] and [`load_in_registry`] right
+/// after deserialisation so callers get the rename hint before any
+/// downstream processing (scope install, validation) runs.
+fn reject_reserved_node_types(wf: &Workflow) -> Result<(), WorkflowsError> {
+    for node in &wf.nodes {
+        if let Some((_, replacement)) = RESERVED_NODE_TYPE_IDS
+            .iter()
+            .find(|(old, _)| *old == node.ty)
+        {
+            return Err(WorkflowsError::ReservedNodeType {
+                id: node.ty.clone(),
+                replacement: (*replacement).to_string(),
+                node_id: node.id.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// `<home>/workflows/`.
@@ -115,10 +154,12 @@ pub fn list(home: &Path) -> Result<(Vec<Workflow>, Vec<LoadFailure>), WorkflowsE
 /// errors.
 pub fn load(home: &Path, id: &str) -> Result<Workflow, WorkflowsError> {
     let p = path(home, id);
-    load_workflow(&p).map_err(|e| WorkflowsError::Load {
+    let wf = load_workflow(&p).map_err(|e| WorkflowsError::Load {
         path: p.display().to_string(),
         source: e,
-    })
+    })?;
+    reject_reserved_node_types(&wf)?;
+    Ok(wf)
 }
 
 /// Persist a workflow to `<home>/workflows/<wf.id>.json`. Creates

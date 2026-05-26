@@ -3,8 +3,6 @@
 //! Built-ins are inserted at startup via [`Registry::with_v1_0_builtins`];
 //! manifest-loaded types land here once the manifest loader ships.
 
-// `agent_spec` (still defined below for the next commit to delete)
-// inlines the id literal `"agent"` — the `agent` module is gone.
 use crate::executor::builtins::checkpoint::{
     NODE_TYPE_ID as CHECKPOINT_NODE_TYPE_ID, PAUSE_NODE_TYPE_ID,
 };
@@ -349,115 +347,6 @@ fn container_spec() -> NodeType {
             output_map: HashMap::new(),
         },
         skip_config_templates: false,
-    }
-}
-
-// Carried forward unused for one commit so the diff that removes the
-// "agent" id (and updates the llm spec to match the merged executor)
-// stays focused. Deleted in the next commit.
-#[allow(dead_code)]
-fn agent_spec() -> NodeType {
-    NodeType {
-        id: "agent".into(),
-        name: "Agent".into(),
-        category: Category::Llm,
-        tags: vec![],
-        icon: "cpu".into(),
-        description: "OpenAI-compatible chat-completions loop with inline HTTP \
-                      tool calls. Stops when the assistant emits no tool calls \
-                      or max_turns is reached."
-            .into(),
-        inputs: vec![],
-        outputs: vec![
-            PortDef {
-                name: "text".into(),
-                ty: PortType::String,
-                required: false,
-            },
-            PortDef {
-                name: "transcript".into(),
-                ty: PortType::Json,
-                required: false,
-            },
-            PortDef {
-                name: "finish_reason".into(),
-                ty: PortType::String,
-                required: false,
-            },
-            PortDef {
-                name: "tokens_used".into(),
-                ty: PortType::Number,
-                required: false,
-            },
-            PortDef {
-                name: "tool_calls".into(),
-                ty: PortType::Json,
-                required: false,
-            },
-        ],
-        config: vec![
-            ConfigFieldDef {
-                name: "url".into(),
-                label: "Base URL".into(),
-                ty: ConfigFieldType::String,
-                default: Some(serde_json::json!("https://api.openai.com/v1")),
-                required: false,
-            },
-            ConfigFieldDef {
-                name: "model".into(),
-                label: "Model".into(),
-                ty: ConfigFieldType::String,
-                default: None,
-                required: true,
-            },
-            ConfigFieldDef {
-                name: "messages".into(),
-                label: "Messages (JSON array)".into(),
-                ty: ConfigFieldType::Textarea,
-                default: None,
-                required: true,
-            },
-            ConfigFieldDef {
-                name: "tools".into(),
-                label: "Tools (JSON array)".into(),
-                ty: ConfigFieldType::Textarea,
-                default: None,
-                required: false,
-            },
-            ConfigFieldDef {
-                name: "temperature".into(),
-                label: "Temperature".into(),
-                ty: ConfigFieldType::Number,
-                default: Some(serde_json::json!(0.7)),
-                required: false,
-            },
-            ConfigFieldDef {
-                name: "max_tokens".into(),
-                label: "Max tokens per turn".into(),
-                ty: ConfigFieldType::Number,
-                default: None,
-                required: false,
-            },
-            ConfigFieldDef {
-                name: "max_turns".into(),
-                label: "Max turns".into(),
-                ty: ConfigFieldType::Number,
-                default: Some(serde_json::json!(8)),
-                required: false,
-            },
-            ConfigFieldDef {
-                name: "api_key".into(),
-                label: "API key (or template)".into(),
-                ty: ConfigFieldType::Secret,
-                default: None,
-                required: false,
-            },
-        ],
-        execution: in_process_execution_spec(),
-        // Agent's tool body_template / result_path are evaluated per
-        // invocation by the executor itself; pre-substitution at
-        // dispatch would resolve {{args | json}} as a missing reference.
-        skip_config_templates: true,
     }
 }
 
@@ -857,6 +746,85 @@ fn file_spec() -> NodeType {
     }
 }
 
+/// Config schema for the merged `llm` node: union of the old single-turn
+/// chat fields + the agent tool-loop fields (`tools`, `max_turns`,
+/// `stream` as the three-mode select). Lives in its own helper so
+/// `llm_spec` stays under the workspace clippy line cap.
+fn llm_config_fields() -> Vec<ConfigFieldDef> {
+    vec![
+        ConfigFieldDef {
+            name: "url".into(),
+            label: "Base URL".into(),
+            ty: ConfigFieldType::String,
+            default: Some(serde_json::json!("http://localhost:11434/v1")),
+            required: false,
+        },
+        ConfigFieldDef {
+            name: "model".into(),
+            label: "Model".into(),
+            ty: ConfigFieldType::String,
+            default: None,
+            required: true,
+        },
+        ConfigFieldDef {
+            name: "messages".into(),
+            label: "Messages (JSON array)".into(),
+            ty: ConfigFieldType::Textarea,
+            default: None,
+            required: true,
+        },
+        ConfigFieldDef {
+            name: "tools".into(),
+            label: "Tools (JSON array, optional)".into(),
+            ty: ConfigFieldType::Textarea,
+            default: Some(serde_json::json!([])),
+            required: false,
+        },
+        ConfigFieldDef {
+            name: "temperature".into(),
+            label: "Temperature".into(),
+            ty: ConfigFieldType::Number,
+            default: Some(serde_json::json!(0.7)),
+            required: false,
+        },
+        ConfigFieldDef {
+            name: "max_tokens".into(),
+            label: "Max tokens".into(),
+            ty: ConfigFieldType::Number,
+            default: None,
+            required: false,
+        },
+        ConfigFieldDef {
+            name: "max_turns".into(),
+            label: "Max tool-call turns".into(),
+            ty: ConfigFieldType::Number,
+            default: Some(serde_json::json!(8)),
+            required: false,
+        },
+        ConfigFieldDef {
+            name: "stream".into(),
+            label: "Stream mode".into(),
+            ty: ConfigFieldType::Select,
+            default: Some(serde_json::json!(["auto", "force", "off"])),
+            required: false,
+        },
+        ConfigFieldDef {
+            name: "api_key".into(),
+            label: "API key (or {{secrets.NAME}})".into(),
+            ty: ConfigFieldType::Secret,
+            default: None,
+            required: false,
+        },
+        ConfigFieldDef {
+            name: "timeout_ms".into(),
+            label: "Timeout (ms)".into(),
+            ty: ConfigFieldType::Number,
+            default: Some(serde_json::json!(120_000)),
+            required: false,
+        },
+    ]
+}
+
 fn llm_spec() -> NodeType {
     NodeType {
         id: LLM_NODE_TYPE_ID.into(),
@@ -885,57 +853,7 @@ fn llm_spec() -> NodeType {
                 required: false,
             },
         ],
-        config: vec![
-            ConfigFieldDef {
-                name: "url".into(),
-                label: "Base URL".into(),
-                ty: ConfigFieldType::String,
-                default: Some(serde_json::json!("http://localhost:11434/v1")),
-                required: false,
-            },
-            ConfigFieldDef {
-                name: "model".into(),
-                label: "Model".into(),
-                ty: ConfigFieldType::String,
-                default: None,
-                required: true,
-            },
-            ConfigFieldDef {
-                name: "messages".into(),
-                label: "Messages".into(),
-                ty: ConfigFieldType::Textarea,
-                default: None,
-                required: true,
-            },
-            ConfigFieldDef {
-                name: "temperature".into(),
-                label: "Temperature".into(),
-                ty: ConfigFieldType::Number,
-                default: Some(serde_json::json!(0.7)),
-                required: false,
-            },
-            ConfigFieldDef {
-                name: "max_tokens".into(),
-                label: "Max tokens".into(),
-                ty: ConfigFieldType::Number,
-                default: None,
-                required: false,
-            },
-            ConfigFieldDef {
-                name: "stream".into(),
-                label: "Stream".into(),
-                ty: ConfigFieldType::Boolean,
-                default: Some(serde_json::json!(true)),
-                required: false,
-            },
-            ConfigFieldDef {
-                name: "api_key".into(),
-                label: "API key".into(),
-                ty: ConfigFieldType::Secret,
-                default: None,
-                required: false,
-            },
-        ],
+        config: llm_config_fields(),
         execution: in_process_execution_spec(),
         // The merged executor's tool-loop path evaluates inline tool
         // body_template / result_path per invocation; pre-substituting
