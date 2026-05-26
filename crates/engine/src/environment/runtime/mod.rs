@@ -15,6 +15,7 @@ pub mod plan;
 pub mod registry;
 pub mod resource;
 pub mod transport;
+pub mod wsl;
 
 /// Test-support fixtures (requires `features = ["testing"]` or `#[cfg(test)]`).
 #[cfg(any(test, feature = "testing"))]
