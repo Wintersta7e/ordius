@@ -74,6 +74,10 @@ pub enum DispatchError {
         reason: String,
     },
 
+    /// The dispatcher knows about this operation but a later phase implements it.
+    #[error("not implemented: {0}")]
+    NotImplemented(String),
+
     /// Spawning a process inside the environment failed.
     #[error("spawn failed in {env_id}: {source}")]
     Spawn {
