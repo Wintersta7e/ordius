@@ -16,7 +16,7 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::environment::runtime::catalog::{
-    ProvenRoute, ResourceDetail, ResourceProbeOutcome, RouteOrigin,
+    ProvenRoute, ResourceCatalog, ResourceDetail, ResourceProbeOutcome, RouteOrigin,
 };
 use crate::environment::runtime::dispatcher::{Dispatcher, HttpTransport};
 use crate::environment::runtime::env::{EnvInfo, RunId, WorkspaceBinding};
@@ -136,6 +136,105 @@ impl WslDispatcher {
         let output = wait_for_helper_probe(child, timeout_ms).await?;
         parse_helper_probe_output(&output).map_err(probe_failed)
     }
+
+    async fn probe_plan_via_helper(
+        &self,
+        helper_path: &str,
+        plan: &ProbePlan,
+        cancel: &CancellationToken,
+    ) -> Result<ProbeSummary, DispatchError> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let started = std::time::Instant::now();
+        let wire_plan = build_wire_plan(plan)?;
+        let plan_json = serde_json::to_string(&wire_plan)
+            .map_err(|e| DispatchError::Translation(format!("serialize probe plan: {e}")))?;
+
+        let mut child = self
+            .helper_probe_command(helper_path)
+            .spawn()
+            .map_err(|e| DispatchError::HelperBootstrap(format!("helper spawn: {e}")))?;
+
+        let Some(mut stdin) = child.stdin.take() else {
+            return Err(DispatchError::HelperBootstrap(
+                "helper stdin missing".into(),
+            ));
+        };
+        stdin
+            .write_all(plan_json.as_bytes())
+            .await
+            .map_err(|e| DispatchError::HelperBootstrap(format!("helper stdin: {e}")))?;
+        drop(stdin.shutdown().await);
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| DispatchError::HelperBootstrap("helper stdout missing".into()))?;
+        let mut reader = BufReader::new(stdout).lines();
+        let mut resources: HashMap<_, _> = HashMap::default();
+        let defs_by_id: HashMap<&str, &ResourceDefinition> = plan
+            .defs
+            .iter()
+            .map(|def| (def.id.0.as_str(), def))
+            .collect();
+
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => {
+                    drop(child.kill().await);
+                    for def in &plan.defs {
+                        resources
+                            .entry(def.id.clone())
+                            .or_insert_with(cancelled_probe_outcome);
+                    }
+                    break;
+                },
+                line = reader.next_line() => {
+                    match line {
+                        Ok(Some(line)) => {
+                            if line.trim().is_empty() {
+                                continue;
+                            }
+                            let Ok(wire) = serde_json::from_str::<ProbeOutcomeV1>(&line) else {
+                                continue;
+                            };
+                            if wire.version != 1 {
+                                continue;
+                            }
+                            let Some(def) = defs_by_id.get(wire.id.as_str()).copied() else {
+                                continue;
+                            };
+                            resources.insert(
+                                def.id.clone(),
+                                wire_outcome_to_engine(wire.outcome, def),
+                            );
+                        },
+                        Ok(None) | Err(_) => break,
+                    }
+                },
+            }
+        }
+        drop(child.wait().await);
+
+        for def in &plan.defs {
+            resources
+                .entry(def.id.clone())
+                .or_insert_with(|| ResourceProbeOutcome::Skipped {
+                    reason: "helper did not return an outcome".into(),
+                });
+        }
+
+        Ok(ProbeSummary {
+            catalog: ResourceCatalog {
+                env_id: plan.env_id.clone(),
+                registry_revision: plan.registry_revision,
+                probed_at: chrono::Utc::now(),
+                resources,
+            },
+            total_probed: plan.defs.len(),
+            elapsed: started.elapsed(),
+        })
+    }
 }
 
 async fn write_helper_plan(
@@ -212,6 +311,26 @@ fn helper_probe_plan_json(def: &ResourceDefinition) -> Result<(Vec<u8>, u64), St
         .map_err(|e| format!("serialize helper probe plan: {e}"))
 }
 
+fn build_wire_plan(plan: &ProbePlan) -> Result<ProbePlanV1, DispatchError> {
+    let mut resources = Vec::with_capacity(plan.defs.len());
+    for def in &plan.defs {
+        let spec = resource_spec_v1_from_def(def)
+            .map_err(|e| DispatchError::Translation(format!("plan build: {e}")))?;
+        resources.push(spec);
+    }
+    Ok(ProbePlanV1 {
+        version: 1,
+        per_resource_timeout_ms: duration_millis_u64(plan.per_resource_timeout),
+        max_concurrency: u32::try_from(plan.max_concurrency).unwrap_or(u32::MAX),
+        overall_budget_ms: duration_millis_u64(plan.overall_budget),
+        resources,
+    })
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn probe_failed(reason: impl Into<String>) -> ResourceProbeOutcome {
     ResourceProbeOutcome::ProbeFailed {
         reason: reason.into(),
@@ -241,12 +360,36 @@ impl Dispatcher for WslDispatcher {
 
     async fn probe(
         &self,
-        _plan: ProbePlan,
-        _cancel: CancellationToken,
+        plan: ProbePlan,
+        cancel: CancellationToken,
     ) -> Result<ProbeSummary, DispatchError> {
-        Err(DispatchError::NotImplemented(
-            "WslDispatcher::probe pending T18".into(),
-        ))
+        if cancel.is_cancelled() {
+            return Err(DispatchError::Cancelled);
+        }
+
+        match self.ensure_helper().await {
+            Ok(helper) => {
+                self.probe_plan_via_helper(&helper.env_side_path, &plan, &cancel)
+                    .await
+            },
+            Err(err) => {
+                tracing::debug!(error = %err, "falling back to WSL shell probe plan");
+                let total_probed = plan.defs.len();
+                let catalog = super::shell_fallback::probe_plan_shell_fallback(
+                    &self.distro_name,
+                    plan.env_id.clone(),
+                    plan.registry_revision,
+                    &plan.defs,
+                    plan.overall_budget,
+                )
+                .await?;
+                Ok(ProbeSummary {
+                    catalog,
+                    total_probed,
+                    elapsed: Duration::ZERO,
+                })
+            },
+        }
     }
 
     async fn probe_resource(

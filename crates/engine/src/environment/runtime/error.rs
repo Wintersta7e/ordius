@@ -35,6 +35,10 @@ pub enum DispatchError {
     #[error("helper bootstrap: {0}")]
     HelperBootstrap(String),
 
+    /// Probe / spawn cancelled by the caller.
+    #[error("cancelled")]
+    Cancelled,
+
     /// The requested resource id is not registered for the environment.
     #[error("resource {id} not in env {env_id}; available: {available:?}")]
     ResourceMissing {
