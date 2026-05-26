@@ -91,6 +91,10 @@ pub enum DispatchError {
     /// A host ↔ env path translation rule didn't match.
     #[error("path translation: {0}")]
     Translation(String),
+
+    /// The dispatcher does not handle this binding/operation for the given env type.
+    #[error("operation unsupported: {0}")]
+    Unsupported(String),
 }
 
 /// Error raised by `ResourceRegistry` operations.

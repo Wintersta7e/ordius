@@ -77,13 +77,31 @@ impl Dispatcher for WslDispatcher {
 
     async fn prepare_workspace(
         &self,
-        _workspace_host: &Path,
-        _binding: &WorkspaceBinding,
+        workspace_host: &Path,
+        binding: &WorkspaceBinding,
         _run_id: &RunId,
     ) -> Result<WorkspaceHandle, DispatchError> {
-        Err(DispatchError::NotImplemented(
-            "WslDispatcher::prepare_workspace pending T11".into(),
-        ))
+        match binding {
+            WorkspaceBinding::Translated => {
+                let env_path = super::path::translate_path(&self.distro_name, workspace_host)?;
+                Ok(WorkspaceHandle {
+                    env_path,
+                    teardown: None,
+                })
+            },
+            WorkspaceBinding::Shared => Err(DispatchError::Unsupported(
+                "WSL distros cannot use Shared binding (host filesystem differs)".into(),
+            )),
+            WorkspaceBinding::BindMount { .. } => Err(DispatchError::Unsupported(
+                "BindMount binding is container-only".into(),
+            )),
+            WorkspaceBinding::Sync { .. } => Err(DispatchError::Unsupported(
+                "Sync binding is SSH-only (Phase G)".into(),
+            )),
+            WorkspaceBinding::Unsupported => Err(DispatchError::Unsupported(
+                "workspace binding declared Unsupported".into(),
+            )),
+        }
     }
 }
 
@@ -118,5 +136,48 @@ mod tests {
         assert_eq!(d.info().id.as_str(), "wsl:Ubuntu");
         // Exercise the trait-bound check so the helper isn't dead code.
         assert_dispatcher_impl(&d);
+    }
+
+    #[tokio::test]
+    async fn translated_binding_returns_mapped_path() {
+        let d = WslDispatcher::new(info("Ubuntu"), "Ubuntu");
+        let host = std::path::PathBuf::from(r"C:\Users\me\runs\abc");
+        let run = crate::environment::runtime::env::RunId("abc".into());
+        let handle = d
+            .prepare_workspace(&host, &WorkspaceBinding::Translated, &run)
+            .await
+            .unwrap();
+        assert_eq!(handle.env_path.as_str(), "/mnt/c/Users/me/runs/abc");
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn shared_binding_errors_on_wsl() {
+        let d = WslDispatcher::new(info("Ubuntu"), "Ubuntu");
+        let host = std::path::PathBuf::from(r"C:\Users\me\runs\abc");
+        let run = crate::environment::runtime::env::RunId("abc".into());
+        let err = d
+            .prepare_workspace(&host, &WorkspaceBinding::Shared, &run)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DispatchError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn bind_mount_binding_errors_on_wsl() {
+        let d = WslDispatcher::new(info("Ubuntu"), "Ubuntu");
+        let host = std::path::PathBuf::from(r"C:\x");
+        let run = crate::environment::runtime::env::RunId("a".into());
+        let err = d
+            .prepare_workspace(
+                &host,
+                &WorkspaceBinding::BindMount {
+                    env_path: "/work".into(),
+                },
+                &run,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DispatchError::Unsupported(_)));
     }
 }
