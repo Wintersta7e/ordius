@@ -1,8 +1,13 @@
 //! Typed environment runtime.
 //!
-//! Phase A of the env-runtime rewrite (`docs/plans/environment-runtime.md`).
+//! Implementation of `docs/plans/environment-runtime.md`. The Engine seeds
+//! a [`ResourceRegistry`] from [`BUILTIN_RESOURCES`] plus `<home>/resources.toml`
+//! at boot; workflows install their own `resources:` block under
+//! `ScopeKey::Workflow { id }` at load time. Dispatchers (`LocalDispatcher`,
+//! `WslDispatcher`) read the resolved view of the registry when probing.
+//!
 //! Coexists with the legacy `environment::{types, detect, local, wsl, custom}`
-//! modules until later phases wire this into `Engine` and IPC.
+//! modules until later phases wire this into IPC.
 
 pub mod builtin;
 pub mod catalog;
