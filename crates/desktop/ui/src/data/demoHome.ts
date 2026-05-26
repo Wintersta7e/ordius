@@ -15,8 +15,8 @@ export function demoHomeData(now: number): {
 } {
   const workflows: SavedWorkflow[] = [
     {
-      id: "wf-critique",
-      name: "code-critique-loop",
+      id: "wf-review",
+      name: "code-review-loop",
       triggersCount: 1,
       nodesCount: 7,
       category: "execution",
@@ -67,7 +67,7 @@ export function demoHomeData(now: number): {
   const runs: RunRow[] = [
     {
       runId: "run_00028",
-      workflowId: "wf-critique",
+      workflowId: "wf-review",
       status: "done",
       startedAt: now - 8 * 60 * 1000,
       finishedAt: now - 8 * 60 * 1000 + 5180,
@@ -94,7 +94,7 @@ export function demoHomeData(now: number): {
     },
     {
       runId: "run_00025",
-      workflowId: "wf-critique",
+      workflowId: "wf-review",
       status: "error",
       startedAt: now - HOUR,
       finishedAt: now - HOUR + 4720,
@@ -122,7 +122,7 @@ export function demoHomeData(now: number): {
   ];
 
   const workspaces: Workspace[] = [
-    { id: "ws-josh", name: "josh", path: "~/code/project-a" },
+    { id: "ws-dev", name: "dev", path: "~/code/project-a" },
   ];
 
   const status: SystemStatus = {

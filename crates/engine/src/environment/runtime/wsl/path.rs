@@ -124,9 +124,9 @@ mod tests {
 
     #[test]
     fn drive_letter_lowercase() {
-        let p = PathBuf::from(r"E:\Renpy\Game");
+        let p = PathBuf::from(r"E:\Projects\Foo");
         let env = translate_path("Ubuntu", &p).unwrap();
-        assert_eq!(env.as_str(), "/mnt/e/Renpy/Game");
+        assert_eq!(env.as_str(), "/mnt/e/Projects/Foo");
     }
 
     #[test]

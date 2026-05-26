@@ -1,8 +1,8 @@
-//! Integration test for spec §8 / Codex round-2 MINOR #11:
-//! `LocalDispatcher` and `FakeRemoteDispatcher` both "serve" port 11434
-//! with DIFFERENT content. A node targeting `fake` must reach the fake
-//! resource; a node targeting `local` must reach the local resource.
-//! Route identity preserved across dispatchers on a shared port number.
+//! Port-collision identity test: `LocalDispatcher` and
+//! `FakeRemoteDispatcher` both "serve" port 11434 with DIFFERENT
+//! content. A node targeting `fake` must reach the fake resource; a
+//! node targeting `local` must reach the local resource. Route
+//! identity preserved across dispatchers on a shared port number.
 
 #![cfg(feature = "testing")]
 

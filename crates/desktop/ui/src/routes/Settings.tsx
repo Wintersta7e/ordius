@@ -142,13 +142,13 @@ export function Settings({
       setWorkspaces([
         {
           id: "demo-ws-1",
-          name: "code-critique-loop",
-          path: "/home/josh/code/critique-bot",
+          name: "code-review-loop",
+          path: "/home/user/code/project-a",
         },
         {
           id: "demo-ws-2",
           name: "personal-notes",
-          path: "/home/josh/notes",
+          path: "/home/user/notes",
         },
       ]);
       return;
@@ -889,7 +889,7 @@ function WorkspacesSection({
           <TextInput
             value={path}
             onChange={setPath}
-            placeholder="/home/josh/code/my-project"
+            placeholder="/home/user/code/my-project"
           />
         </Field>
         <div style={{ padding: "8px 16px 14px" }}>
