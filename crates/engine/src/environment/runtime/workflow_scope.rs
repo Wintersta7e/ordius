@@ -28,13 +28,16 @@ pub enum WorkflowScopeError {
     },
 }
 
-/// Install each definition in `resources` under
-/// `ScopeKey::Workflow { id: workflow_id.clone() }`.
+/// Replace the workflow's scope with `resources`.
 ///
-/// Returns the count of installed definitions on success. On failure the
-/// caller is responsible for rolling back (typically by calling
-/// [`remove_workflow_scope`]) — leaving a half-installed scope behind would
-/// hide later definitions of the same id.
+/// Drops any existing entries under `ScopeKey::Workflow { id }` first, then
+/// upserts each definition in `resources`. On any upsert failure the workflow
+/// scope is wiped before returning `Err`, so the registry never carries a
+/// half-installed scope. Returns the count of installed definitions on
+/// success.
+///
+/// This is "replace", not "upsert into existing": reloading a workflow whose
+/// `resources:` block has shrunk or had ids renamed drops the gone entries.
 pub fn install_workflow_resources(
     workflow_id: &WorkflowId,
     resources: &[ResourceDefinition],
@@ -43,15 +46,20 @@ pub fn install_workflow_resources(
     let scope = ScopeKey::Workflow {
         id: workflow_id.clone(),
     };
+    // Start from an empty scope so a previous load's entries don't linger.
+    registry.remove_scope(&scope);
     let mut written = 0_usize;
     for def in resources {
-        registry
-            .upsert(&scope, def)
-            .map_err(|e| WorkflowScopeError::Registry {
+        if let Err(e) = registry.upsert(&scope, def) {
+            // Roll back the partially-installed entries so the failed load
+            // doesn't leak resources 1..written into the registry.
+            registry.remove_scope(&scope);
+            return Err(WorkflowScopeError::Registry {
                 workflow_id: workflow_id.0.clone(),
                 id: def.id.0.clone(),
                 source: e,
-            })?;
+            });
+        }
         written += 1;
     }
     Ok(written)
@@ -145,5 +153,73 @@ mod tests {
         clone.override_lower_scope = false;
         let err = install_workflow_resources(&wf, &[clone], &reg).expect_err("collision");
         assert!(matches!(err, WorkflowScopeError::Registry { .. }));
+    }
+
+    #[test]
+    fn reload_replaces_previous_scope() {
+        // First load gives the workflow scope {old}. Edit + reload gives
+        // {new}. The first install's `old` must NOT linger after the second
+        // install — old upsert-only semantics would have left it visible.
+        let reg = ResourceRegistry::new();
+        let wf = WorkflowId("editing".into());
+        install_workflow_resources(&wf, &[wf_def("old")], &reg).expect("first load");
+        let layer_first = reg
+            .snapshot()
+            .layers
+            .get(&ScopeKey::Workflow { id: wf.clone() })
+            .cloned()
+            .unwrap();
+        assert!(layer_first.contains_key(&ResourceId("old".into())));
+
+        // Reload with a different id; the previous `old` must be gone.
+        install_workflow_resources(&wf, &[wf_def("new")], &reg).expect("reload");
+        let snap = reg.snapshot();
+        let scope = ScopeKey::Workflow { id: wf };
+        let layer = snap.layers.get(&scope).unwrap();
+        assert!(layer.contains_key(&ResourceId("new".into())));
+        assert!(
+            !layer.contains_key(&ResourceId("old".into())),
+            "old must not linger after reload"
+        );
+    }
+
+    #[test]
+    fn reload_with_empty_resources_drops_previous_scope() {
+        let reg = ResourceRegistry::new();
+        let wf = WorkflowId("emptying".into());
+        install_workflow_resources(&wf, &[wf_def("a"), wf_def("b")], &reg).expect("first");
+        // Reload with no resources should leave the workflow scope absent (or
+        // empty) so the entries don't outlive the workflow's `resources:`
+        // block being deleted.
+        install_workflow_resources(&wf, &[], &reg).expect("empty reload");
+        let snap = reg.snapshot();
+        let scope = ScopeKey::Workflow { id: wf };
+        let layer = snap.layers.get(&scope);
+        assert!(
+            layer.is_none() || layer.unwrap().is_empty(),
+            "scope must be empty after reload-with-empty-resources"
+        );
+    }
+
+    #[test]
+    fn partial_install_failure_rolls_back_prior_entries() {
+        // Seed builtin `ollama`. The workflow asks for [`safe`, `ollama` (no
+        // override)] — `safe` succeeds, `ollama` collides. The Err return must
+        // not leave `safe` installed under the workflow scope.
+        let reg = ResourceRegistry::new();
+        reg.upsert(&ScopeKey::Builtin, &wf_def("ollama")).unwrap();
+        let wf = WorkflowId("partial".into());
+        let mut colliding = wf_def("ollama");
+        colliding.override_lower_scope = false;
+        let err = install_workflow_resources(&wf, &[wf_def("safe"), colliding], &reg)
+            .expect_err("collision");
+        assert!(matches!(err, WorkflowScopeError::Registry { .. }));
+
+        let snap = reg.snapshot();
+        let layer = snap.layers.get(&ScopeKey::Workflow { id: wf });
+        assert!(
+            layer.is_none() || !layer.unwrap().contains_key(&ResourceId("safe".into())),
+            "safe must not linger after rollback"
+        );
     }
 }
