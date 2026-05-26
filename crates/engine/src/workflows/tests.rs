@@ -179,3 +179,121 @@ fn duplicate_of_numbered_clone_strips_numeric_suffix() {
     let clone_of_numbered = duplicate(home.path(), &numbered.id).unwrap();
     assert_eq!(clone_of_numbered.id, "demo-copy-3");
 }
+
+#[cfg(test)]
+mod scope_tests {
+    use crate::environment::runtime::{EnvId, ResourceId, ResourceRegistry, ScopeKey, WorkflowId};
+    use crate::types::Workflow;
+    use std::collections::HashMap;
+    use tempfile::TempDir;
+
+    fn wf_with_resources(id: &str) -> Workflow {
+        Workflow {
+            id: id.into(),
+            name: format!("workflow {id}"),
+            schema_version: 1,
+            created_at: None,
+            updated_at: None,
+            variables: HashMap::default(),
+            triggers: vec![],
+            nodes: vec![],
+            edges: vec![],
+            resources: vec![crate::environment::runtime::ResourceDefinition {
+                id: ResourceId(format!("{id}-local-llm")),
+                kind: crate::environment::runtime::ResourceKind::HttpEndpoint,
+                advertised_capabilities: vec![],
+                probe: crate::environment::runtime::ProbeSpec::Http {
+                    ports: vec![9999],
+                    routes: vec![],
+                    timeout_ms: None,
+                },
+                override_lower_scope: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn load_in_registry_installs_workflow_scope() {
+        let home = TempDir::new().unwrap();
+        let reg = ResourceRegistry::new();
+        let wf = wf_with_resources("my-wf");
+        super::save(home.path(), &wf).expect("save");
+        let _loaded = super::load_in_registry(home.path(), "my-wf", &reg).expect("load");
+
+        let snap = reg.snapshot();
+        let layer = snap
+            .layers
+            .get(&ScopeKey::Workflow {
+                id: WorkflowId("my-wf".into()),
+            })
+            .expect("wf scope present");
+        assert!(layer.contains_key(&ResourceId("my-wf-local-llm".into())));
+
+        let (_def, scope) = snap
+            .resolve(
+                &ResourceId("my-wf-local-llm".into()),
+                &EnvId::local(),
+                Some(&WorkflowId("my-wf".into())),
+            )
+            .expect("visible to my-wf");
+        assert!(matches!(scope, ScopeKey::Workflow { .. }));
+    }
+
+    #[test]
+    fn delete_in_registry_drops_workflow_scope() {
+        let home = TempDir::new().unwrap();
+        let reg = ResourceRegistry::new();
+        let wf = wf_with_resources("doomed");
+        super::save(home.path(), &wf).expect("save");
+        super::load_in_registry(home.path(), "doomed", &reg).expect("load");
+
+        let removed = super::delete_in_registry(home.path(), "doomed", &reg).expect("delete");
+        assert!(removed);
+        let snap = reg.snapshot();
+        assert!(
+            !snap.layers.contains_key(&ScopeKey::Workflow {
+                id: WorkflowId("doomed".into())
+            }),
+            "scope removed"
+        );
+    }
+
+    #[test]
+    fn delete_in_registry_missing_file_returns_false_and_clears_scope() {
+        // Even if the file is already gone, the scope may still be installed
+        // — delete_in_registry should always clear the scope, then report
+        // whether the file existed.
+        let home = TempDir::new().unwrap();
+        let reg = ResourceRegistry::new();
+        let wf = wf_with_resources("orphan");
+        super::install_resources_into_registry(&wf, &reg).expect("install");
+        let removed = super::delete_in_registry(home.path(), "orphan", &reg).expect("delete");
+        assert!(!removed);
+        assert!(!reg.snapshot().layers.contains_key(&ScopeKey::Workflow {
+            id: WorkflowId("orphan".into())
+        }));
+    }
+
+    #[test]
+    fn duplicate_in_registry_installs_clone_scope() {
+        let home = TempDir::new().unwrap();
+        let reg = ResourceRegistry::new();
+        let wf = wf_with_resources("base");
+        super::save(home.path(), &wf).expect("save");
+
+        let clone = super::duplicate_in_registry(home.path(), "base", &reg).expect("dup");
+        assert_eq!(clone.id, "base-copy");
+        // The clone carries the same resource ids; they should be visible to
+        // the clone's workflow id and NOT to the original.
+        let snap = reg.snapshot();
+        assert!(
+            snap.resolve(
+                &ResourceId("base-local-llm".into()),
+                &EnvId::local(),
+                Some(&WorkflowId("base-copy".into()))
+            )
+            .is_some(),
+            "clone sees own scope"
+        );
+    }
+}

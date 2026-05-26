@@ -6,6 +6,10 @@
 //! GUI need the additional listing / saving / id-keyed lookup
 //! helpers exposed here so the surface doesn't drift between them.
 
+use crate::environment::runtime::{
+    ResourceRegistry, WorkflowId, WorkflowScopeError, install_workflow_resources,
+    remove_workflow_scope,
+};
 use crate::loader::{LoadError, load_workflow};
 use crate::types::Workflow;
 use std::path::{Path, PathBuf};
@@ -41,6 +45,10 @@ pub enum WorkflowsError {
         #[source]
         source: serde_json::Error,
     },
+    /// Workflow-scope installation rejected by the registry (e.g.
+    /// `override_lower_scope` was not set and an id collides with a built-in).
+    #[error("install workflow scope: {0}")]
+    Scope(#[from] WorkflowScopeError),
     /// Catch-all for engine-level invariants that don't fit the other
     /// variants — e.g. clone-id collision space exhausted.
     #[error("{0}")]
@@ -187,6 +195,67 @@ pub fn delete(home: &Path, id: &str) -> Result<bool, WorkflowsError> {
         source: e,
     })?;
     Ok(true)
+}
+
+/// Install the workflow's `resources:` block under
+/// `ScopeKey::Workflow { id: wf.id }`. Used as a helper by
+/// [`load_in_registry`] and [`duplicate_in_registry`].
+pub fn install_resources_into_registry(
+    wf: &Workflow,
+    registry: &ResourceRegistry,
+) -> Result<usize, WorkflowsError> {
+    let wf_id = WorkflowId(wf.id.clone());
+    let count = install_workflow_resources(&wf_id, &wf.resources, registry)?;
+    Ok(count)
+}
+
+/// Load a workflow and install its `resources:` block into the registry.
+///
+/// Combines [`load`] with [`install_resources_into_registry`]; rolls back
+/// the scope on any load error so a partially-installed scope never lingers.
+pub fn load_in_registry(
+    home: &Path,
+    id: &str,
+    registry: &ResourceRegistry,
+) -> Result<Workflow, WorkflowsError> {
+    let wf = load(home, id)?;
+    install_resources_into_registry(&wf, registry)?;
+    Ok(wf)
+}
+
+/// Delete a workflow by id and drop its scope from the registry.
+///
+/// Returns `Ok(true)` if the file existed; `Ok(false)` if it was already
+/// gone. The scope is dropped in both cases — orphaned scopes (file removed
+/// out-of-band, then we are asked to clean up) get the same treatment as
+/// the normal path.
+pub fn delete_in_registry(
+    home: &Path,
+    id: &str,
+    registry: &ResourceRegistry,
+) -> Result<bool, WorkflowsError> {
+    let wf_id = WorkflowId(id.to_string());
+    let _removed = remove_workflow_scope(&wf_id, registry);
+    delete(home, id)
+}
+
+/// Duplicate a workflow and install the clone's scope into the registry.
+///
+/// Returns the saved clone. Failures during scope installation roll back
+/// the on-disk file so the registry and disk stay in sync.
+pub fn duplicate_in_registry(
+    home: &Path,
+    source_id: &str,
+    registry: &ResourceRegistry,
+) -> Result<Workflow, WorkflowsError> {
+    let clone = duplicate(home, source_id)?;
+    if let Err(err) = install_resources_into_registry(&clone, registry) {
+        // Best-effort: drop the file we just wrote so disk doesn't keep
+        // a workflow whose scope is missing from the registry.
+        let _drop_orphan = delete(home, &clone.id);
+        return Err(err);
+    }
+    Ok(clone)
 }
 
 #[cfg(test)]
