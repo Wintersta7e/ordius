@@ -38,11 +38,25 @@ fn empty_kv(_: &str) -> Option<String> {
     None
 }
 
+fn empty_resources(_: &str, _: &str) -> Option<String> {
+    None
+}
+
 fn ctx_for<'a>(
     f: &'a Fixture,
     secrets: &'a dyn Fn(&str) -> Option<String>,
     kv: &'a dyn Fn(&str) -> Option<String>,
     env: &'a dyn Fn(&str) -> Option<String>,
+) -> SubstitutionContext<'a> {
+    ctx_for_with_resources(f, secrets, kv, env, &empty_resources)
+}
+
+fn ctx_for_with_resources<'a>(
+    f: &'a Fixture,
+    secrets: &'a dyn Fn(&str) -> Option<String>,
+    kv: &'a dyn Fn(&str) -> Option<String>,
+    env: &'a dyn Fn(&str) -> Option<String>,
+    resources: &'a dyn Fn(&str, &str) -> Option<String>,
 ) -> SubstitutionContext<'a> {
     SubstitutionContext {
         vars: &f.vars,
@@ -53,6 +67,7 @@ fn ctx_for<'a>(
         kv,
         env,
         env_allowlist: &f.env_allowlist,
+        resources,
         run_id: "run-1",
         workspace: &f.workspace,
         started_at_iso: "2026-05-19T12:00:00Z",
@@ -386,4 +401,48 @@ fn file_value_is_path_string() {
     )
     .unwrap();
     assert_eq!(s, "/tmp/x.png");
+}
+
+#[test]
+fn resource_namespace_resolves_base_url() {
+    let f = Fixture::new();
+    let env = map_env(&f.env_map);
+    let resources = |id: &str, field: &str| -> Option<String> {
+        match (id, field) {
+            ("openai", "base_url") => Some("https://api.openai.com/v1".into()),
+            _ => None,
+        }
+    };
+    let s = substitute(
+        "URL = {{resource.openai.base_url}}",
+        &ctx_for_with_resources(&f, &empty_secrets, &empty_kv, &env, &resources),
+    )
+    .unwrap();
+    assert_eq!(s, "URL = https://api.openai.com/v1");
+}
+
+#[test]
+fn resource_namespace_missing_field_errors_undefined() {
+    let f = Fixture::new();
+    let env = map_env(&f.env_map);
+    let resources = |_id: &str, _field: &str| -> Option<String> { None };
+    let err = substitute(
+        "{{resource.x.y}}",
+        &ctx_for_with_resources(&f, &empty_secrets, &empty_kv, &env, &resources),
+    )
+    .unwrap_err();
+    assert!(matches!(err, TemplateError::Undefined(_)));
+}
+
+#[test]
+fn resource_namespace_missing_field_syntax_errors() {
+    let f = Fixture::new();
+    let env = map_env(&f.env_map);
+    let resources = |_id: &str, _field: &str| -> Option<String> { None };
+    let err = substitute(
+        "{{resource.x}}",
+        &ctx_for_with_resources(&f, &empty_secrets, &empty_kv, &env, &resources),
+    )
+    .unwrap_err();
+    assert!(matches!(err, TemplateError::Syntax(_)));
 }

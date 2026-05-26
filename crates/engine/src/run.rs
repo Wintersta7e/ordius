@@ -353,6 +353,7 @@ impl Engine {
                         &current_inputs,
                         &self.secrets_store(),
                         &emitter,
+                        &self.resource_registry(),
                         &recorder.run_id,
                         &workspace,
                         &wf.id,
@@ -973,6 +974,7 @@ fn substitute_node_config(
     current_inputs: &HashMap<String, PortValue>,
     secrets_store: &Arc<crate::secrets::Store>,
     emitter: &Arc<crate::emitter::Emitter>,
+    resource_registry: &Arc<crate::environment::runtime::ResourceRegistry>,
     run_id: &str,
     workspace: &std::path::Path,
     workflow_id: &str,
@@ -986,6 +988,10 @@ fn substitute_node_config(
     let kv_resolver = |_: &str| None;
     let env_resolver = wrap_process_env();
     let env_allow = crate::template::default_env_allowlist();
+    let resources_resolver = crate::template::build_resources_resolver(
+        Arc::clone(resource_registry),
+        workflow_id.to_string(),
+    );
     let original_config = config.clone();
     let sub_ctx = crate::template::SubstitutionContext {
         vars: variables,
@@ -996,6 +1002,7 @@ fn substitute_node_config(
         kv: &kv_resolver,
         env: &*env_resolver,
         env_allowlist: &env_allow,
+        resources: &resources_resolver,
         run_id,
         workspace,
         started_at_iso: "",

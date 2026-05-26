@@ -33,6 +33,13 @@ pub fn default_env_allowlist() -> HashSet<String> {
         .collect()
 }
 
+/// Boxed resolver for `{{resource.<id>.<field>}}` references.
+///
+/// Call sites that build a closure conditionally (`Some(engine) ⇒
+/// build_resources_resolver(...)` vs noop on `Weak::upgrade` failure)
+/// store the result in this type to satisfy `clippy::type_complexity`.
+pub type BoxedResourceResolver = Box<dyn Fn(&str, &str) -> Option<String>>;
+
 /// Per-substitution context.
 ///
 /// Every field is a borrow — the substituter never owns its
@@ -59,6 +66,11 @@ pub struct SubstitutionContext<'a> {
     pub env: &'a dyn Fn(&str) -> Option<String>,
     /// Allowlist for `{{env.NAME}}` resolution.
     pub env_allowlist: &'a HashSet<String>,
+    /// Resolver for `{{resource.<id>.<field>}}` — returns the field
+    /// value (Phase D supports `base_url` only) or `None` if the id
+    /// or field is unknown. Production callers wrap the engine's
+    /// `ResourceRegistry` snapshot at substitution time.
+    pub resources: &'a dyn Fn(&str, &str) -> Option<String>,
     /// Run id (`{{run.id}}`).
     pub run_id: &'a str,
     /// Run workspace directory (`{{run.workspace}}`).
@@ -96,6 +108,8 @@ pub enum TemplateError {
 /// - `{{nodes.NID.outputs.PORT}}`
 /// - `{{run.id}}` / `{{run.workspace}}` / `{{run.startedAt}}`
 /// - `{{workflow.id}}` / `{{workflow.name}}`
+/// - `{{resource.<id>.<field>}}` — registry-resolved resource field
+///   (Phase D supports `base_url` only)
 /// - `{{json EXPR}}` — JSON-escape the resolved expression
 ///
 /// Undefined references fail loud — they never silently render
@@ -211,8 +225,32 @@ fn resolve(
                 .transpose()?
                 .ok_or_else(|| TemplateError::Undefined(format!("nodes.{nid}.outputs.{port}")))
         },
+        "resource" => resolve_resource(expr, &mut parts, ctx),
         other => Err(TemplateError::Syntax(format!("unknown namespace: {other}"))),
     }
+}
+
+/// `{{resource.<id>.<field>}}` lookup — kept out-of-line to keep
+/// the main `resolve` function under `clippy::too_many_lines`.
+fn resolve_resource(
+    expr: &str,
+    parts: &mut std::str::Split<'_, char>,
+    ctx: &SubstitutionContext<'_>,
+) -> Result<String, TemplateError> {
+    let id = parts
+        .next()
+        .ok_or_else(|| TemplateError::Syntax("resource.<id>.<field> required".into()))?;
+    if id.is_empty() {
+        return Err(TemplateError::Syntax(format!(
+            "resource ref missing id: {expr}"
+        )));
+    }
+    let field = parts
+        .next()
+        .ok_or_else(|| TemplateError::Syntax(format!("resource ref missing field: {expr}")))?;
+    no_trailing(parts, "resource.<id>.<field>")?;
+    (ctx.resources)(id, field)
+        .ok_or_else(|| TemplateError::Undefined(format!("resource.{id}.{field}")))
 }
 
 fn single_key<F>(
@@ -303,6 +341,42 @@ pub fn substitute_in_config(
         out.insert(k.clone(), substitute_in_value(v.clone(), ctx)?);
     }
     Ok(out)
+}
+
+/// Build the standard `resources` closure for `SubstitutionContext`.
+///
+/// Captures the registry handle + workflow id; resolves `base_url`
+/// on resources whose probe is `ProbeSpec::Http` by synthesizing
+/// `http://127.0.0.1:<first-port>` (the Phase D pattern — Phase E
+/// swaps to `ResourceCatalog::route_for_capability` once the per-env
+/// probed catalog is wired to the run loop).
+///
+/// Unknown ids and unsupported fields return `None`; the template
+/// engine then surfaces the failure as `TemplateError::Undefined`.
+pub fn build_resources_resolver(
+    registry: std::sync::Arc<crate::environment::runtime::ResourceRegistry>,
+    workflow_id: String,
+) -> impl Fn(&str, &str) -> Option<String> + Send + Sync + 'static {
+    move |id: &str, field: &str| {
+        use crate::environment::runtime::env::{EnvId, WorkflowId};
+        use crate::environment::runtime::resource::{ProbeSpec, ResourceId};
+
+        let snap = registry.snapshot();
+        let wf = WorkflowId(workflow_id.clone());
+        let env = EnvId::local();
+        let (def, _scope) = snap.resolve(&ResourceId(id.to_string()), &env, Some(&wf))?;
+
+        match field {
+            "base_url" => match &def.probe {
+                ProbeSpec::Http { ports, .. } => {
+                    let port = ports.first()?;
+                    Some(format!("http://127.0.0.1:{port}"))
+                },
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

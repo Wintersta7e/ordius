@@ -322,6 +322,15 @@ fn base_vars_from_config(
     let secrets_resolver = crate::executor::context::make_secrets_resolver(ctx);
     let kv_resolver = |_: &str| None;
     let env_allow = crate::template::default_env_allowlist();
+    let resources_resolver: crate::template::BoxedResourceResolver =
+        if let Some(engine) = ctx.engine.upgrade() {
+            Box::new(crate::template::build_resources_resolver(
+                engine.resource_registry(),
+                ctx.workflow_id.clone(),
+            ))
+        } else {
+            Box::new(|_, _| None)
+        };
     let empty_config: HashMap<String, serde_json::Value> = HashMap::new();
     let sub_ctx = crate::template::SubstitutionContext {
         vars: &ctx.variables,
@@ -332,6 +341,7 @@ fn base_vars_from_config(
         kv: &kv_resolver,
         env: &*ctx.env,
         env_allowlist: &env_allow,
+        resources: &resources_resolver,
         run_id: &ctx.run_id,
         workspace: &ctx.workspace,
         started_at_iso: &ctx.started_at_iso,
