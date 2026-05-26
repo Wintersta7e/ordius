@@ -5,11 +5,15 @@ use std::collections::HashMap;
 
 // --- Probe plan input ---------------------------------------------------
 
-/// Wire form of a probe plan.
+/// Wire shape of a probe plan exchanged over the helper's stdin protocol.
 ///
-/// Mirrors `engine::environment::runtime::plan::ProbePlan` but stays declared
-/// inside this crate so the helper compiles without the engine.  Field shape
-/// is pinned by a compat test in the engine crate.
+/// This is a separate type from `engine::environment::runtime::plan::ProbePlan`
+/// — the engine translates *into* this shape before piping it to the helper,
+/// and the helper produces matching [`ProbeOutcomeV1`] lines on stdout.
+/// Keeping the wire form distinct lets the helper crate compile without the
+/// engine and lets the two sides evolve their internal representations
+/// independently.  The shared JSON contract is pinned by a compat test in
+/// the engine crate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbePlanV1 {
     /// Format version. Always `1` for this protocol revision.
@@ -108,7 +112,14 @@ pub struct ProbeOutcomeV1 {
     pub elapsed_ms: u64,
 }
 
-/// Outcome variants — keep in lock-step with engine's `ResourceProbeOutcome`.
+/// Wire outcome variants.
+///
+/// Distinct from engine's `ResourceProbeOutcome` — both sides intentionally
+/// pick their own serde tag name (`"kind"` here vs engine's `"outcome"`)
+/// because the two types serve different consumers (helper JSONL on stdout
+/// vs engine catalog persisted to `SQLite`).  The translation layer lives in
+/// the engine (`runtime::wsl::dispatcher` will add `wire_outcome_to_engine`
+/// in T17).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProbeOutcomeBodyV1 {
@@ -134,7 +145,7 @@ pub enum ProbeOutcomeBodyV1 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProbeDetailV1 {
-    /// HTTP service.  Mirrors `ResourceDetail::HttpEndpoint`.
+    /// HTTP service — wire counterpart of engine's `ResourceDetail::HttpEndpoint`.
     HttpEndpoint {
         /// Base URL that successfully answered at least one route.
         base_url: String,
