@@ -667,4 +667,128 @@ mod validation_tests {
             "workflow scope must be rolled back on validation failure"
         );
     }
+
+    #[test]
+    fn load_in_registry_failure_preserves_prior_valid_scope() {
+        // 1. Initial load of `wf-preserve` succeeds with resource `keep`
+        //    declared and a node that references it.
+        // 2. Overwrite the workflow file with a version that still declares
+        //    `keep` but routes the node to an unknown id `missing`.
+        // 3. Reload — validation fails — the registry MUST still resolve
+        //    `keep` for the workflow id (the prior scope is preserved).
+        let tmp = TempDir::new().unwrap();
+        let id = "wf-preserve";
+        let dir = tmp.path().join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.json"));
+
+        let good_body = r#"{
+            "id":"wf-preserve","name":"x",
+            "resources":[{
+                "id":"keep",
+                "kind":"http_endpoint",
+                "advertised_capabilities":[],
+                "probe":{"kind":"http","ports":[2222]},
+                "override_lower_scope":false
+            }],
+            "nodes":[{"id":"n1","type":"llm","name":"x","config":{"resource":"keep","model":"m","messages":[]}}],
+            "edges":[]
+        }"#;
+        std::fs::write(&path, good_body).unwrap();
+
+        let registry = ResourceRegistry::new();
+        super::load_in_registry(tmp.path(), id, &registry).expect("initial load ok");
+
+        // Sanity: the prior scope resolves `keep`.
+        let wf_id = crate::environment::runtime::WorkflowId(id.into());
+        let snap = registry.snapshot();
+        assert!(
+            snap.resolve(
+                &crate::environment::runtime::ResourceId("keep".into()),
+                &crate::environment::runtime::EnvId::local(),
+                Some(&wf_id),
+            )
+            .is_some(),
+            "initial load made `keep` resolvable"
+        );
+
+        // Now rewrite with a node referring to a non-existent resource id.
+        let bad_body = r#"{
+            "id":"wf-preserve","name":"x",
+            "resources":[{
+                "id":"keep",
+                "kind":"http_endpoint",
+                "advertised_capabilities":[],
+                "probe":{"kind":"http","ports":[2222]},
+                "override_lower_scope":false
+            }],
+            "nodes":[{"id":"n1","type":"llm","name":"x","config":{"resource":"missing","model":"m","messages":[]}}],
+            "edges":[]
+        }"#;
+        std::fs::write(&path, bad_body).unwrap();
+
+        let err = super::load_in_registry(tmp.path(), id, &registry).unwrap_err();
+        assert!(matches!(
+            err,
+            super::WorkflowsError::ResourceNotInRegistry { .. }
+        ));
+
+        // The prior scope must still resolve `keep`. Old buggy behaviour
+        // would have wiped the scope (`resolve` returns `None`).
+        let snap = registry.snapshot();
+        let (def, scope) = snap
+            .resolve(
+                &crate::environment::runtime::ResourceId("keep".into()),
+                &crate::environment::runtime::EnvId::local(),
+                Some(&wf_id),
+            )
+            .expect("prior `keep` still visible after failed reload");
+        assert!(matches!(
+            scope,
+            crate::environment::runtime::ScopeKey::Workflow { .. }
+        ));
+        assert_eq!(def.id.0, "keep");
+    }
+
+    #[test]
+    fn load_in_registry_failure_clears_scope_when_no_prior_existed() {
+        // First-ever load fails validation — there's no prior scope to
+        // restore, so the registry MUST have NO scope for the workflow id.
+        let tmp = TempDir::new().unwrap();
+        let id = "wf-no-prior";
+        let dir = tmp.path().join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.json"));
+        std::fs::write(
+            &path,
+            r#"{
+                "id":"wf-no-prior","name":"x",
+                "resources":[{
+                    "id":"declared",
+                    "kind":"http_endpoint",
+                    "advertised_capabilities":[],
+                    "probe":{"kind":"http","ports":[3333]},
+                    "override_lower_scope":false
+                }],
+                "nodes":[{"id":"n1","type":"llm","name":"x","config":{"resource":"missing","model":"m","messages":[]}}],
+                "edges":[]
+            }"#,
+        )
+        .unwrap();
+        let registry = ResourceRegistry::new();
+        let err = super::load_in_registry(tmp.path(), id, &registry).unwrap_err();
+        assert!(matches!(
+            err,
+            super::WorkflowsError::ResourceNotInRegistry { .. }
+        ));
+        let snap = registry.snapshot();
+        assert!(
+            !snap
+                .layers
+                .contains_key(&crate::environment::runtime::ScopeKey::Workflow {
+                    id: crate::environment::runtime::WorkflowId(id.into())
+                }),
+            "failed first-ever load rolls back to no-scope state"
+        );
+    }
 }

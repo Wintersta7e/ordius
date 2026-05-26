@@ -73,6 +73,32 @@ pub fn remove_workflow_scope(workflow_id: &WorkflowId, registry: &ResourceRegist
     })
 }
 
+/// Take a structured snapshot of the resources currently held at
+/// `ScopeKey::Workflow { id }`. Returns owned [`ResourceDefinition`]s
+/// — empty if no scope exists.
+///
+/// Used by the workflow loader to roll back to the pre-install state when
+/// subsequent validation fails: a reload that fails validation must not
+/// wipe a previously-valid scope, so the loader snapshots before mutating
+/// and re-installs the snapshot on failure.
+///
+/// Clones the definitions out of the snapshot so the returned `Vec` is
+/// self-contained and not lifetime-bound to the registry's internal state.
+pub fn snapshot_workflow_scope(
+    workflow_id: &WorkflowId,
+    registry: &ResourceRegistry,
+) -> Vec<ResourceDefinition> {
+    let scope = ScopeKey::Workflow {
+        id: workflow_id.clone(),
+    };
+    registry
+        .snapshot()
+        .layers
+        .get(&scope)
+        .map(|layer| layer.values().cloned().collect())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

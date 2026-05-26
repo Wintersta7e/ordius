@@ -89,8 +89,10 @@ pub use user_file::{ResourcesFileError, UserResourcesFile, load_user_resources};
 
 // ── Workflow-scoped resources ────────────────────────────────────────────────
 
-/// Install / remove workflow-scoped resources from the registry.
-pub use workflow_scope::{WorkflowScopeError, install_workflow_resources, remove_workflow_scope};
+/// Install / remove / snapshot workflow-scoped resources from the registry.
+pub use workflow_scope::{
+    WorkflowScopeError, install_workflow_resources, remove_workflow_scope, snapshot_workflow_scope,
+};
 
 // ── Traits ───────────────────────────────────────────────────────────────────
 

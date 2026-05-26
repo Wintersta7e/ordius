@@ -8,7 +8,7 @@
 
 use crate::environment::runtime::{
     EnvId, ResourceRef, ResourceRegistry, WorkflowId, WorkflowScopeError,
-    install_workflow_resources, remove_workflow_scope,
+    install_workflow_resources, remove_workflow_scope, snapshot_workflow_scope,
 };
 use crate::loader::{LoadError, load_workflow};
 use crate::types::Workflow;
@@ -407,25 +407,47 @@ fn validate_nodes(
 /// and validate its nodes against the registry.
 ///
 /// Combines [`load`] with [`install_resources_into_registry`] and the
-/// Phase D validation pass. Validation runs *after* the workflow scope
-/// is installed so workflow-scope resources are visible to it. If
-/// validation fails, the workflow scope is rolled back so the registry
-/// never carries a half-validated set. Returns the loaded workflow
-/// together with any non-fatal warnings emitted by the validator.
+/// validation pass. Validation runs *after* the workflow scope is
+/// installed so workflow-scope resources are visible to it. Returns the
+/// loaded workflow together with any non-fatal warnings emitted by the
+/// validator.
+///
+/// `install_workflow_resources` is replace-then-install: it drops the
+/// existing scope before installing the new one. If a workflow id was
+/// already loaded with a valid scope and the *reload* fails validation,
+/// naively calling `remove_workflow_scope` as cleanup would wipe the
+/// previously-valid scope entirely. Instead, snapshot the prior scope
+/// before mutating and restore it on validation failure: callers that
+/// fail to reload keep the last-known-good resources visible.
 pub fn load_in_registry(
     home: &Path,
     id: &str,
     registry: &ResourceRegistry,
 ) -> Result<(Workflow, Vec<WorkflowWarning>), WorkflowsError> {
     let wf = load(home, id)?;
+    let wf_id = WorkflowId(wf.id.clone());
+
+    // Snapshot before any mutation so we can restore on validation failure.
+    let prior_scope = snapshot_workflow_scope(&wf_id, registry);
+
     install_resources_into_registry(&wf, registry)?;
+
     let warnings = match validate_nodes(&wf, registry) {
         Ok(w) => w,
         Err(e) => {
-            // Roll back the workflow scope install so the registry
-            // doesn't keep resources from a workflow that failed
-            // validation. `remove_workflow_scope` is infallible.
-            let _removed = remove_workflow_scope(&WorkflowId(wf.id.clone()), registry);
+            // Restore the prior scope. If prior was empty this collapses
+            // to `remove_workflow_scope`; if prior had resources, re-install
+            // them to recover the pre-install state.
+            let _removed = remove_workflow_scope(&wf_id, registry);
+            if !prior_scope.is_empty()
+                && let Err(install_err) = install_workflow_resources(&wf_id, &prior_scope, registry)
+            {
+                tracing::error!(
+                    workflow_id = %wf_id.0,
+                    ?install_err,
+                    "load_in_registry: failed to restore prior workflow scope after validation failure"
+                );
+            }
             return Err(e);
         },
     };
