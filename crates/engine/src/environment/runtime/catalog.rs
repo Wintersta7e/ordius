@@ -123,6 +123,54 @@ pub enum RouteOrigin {
     ContainerBridge,
 }
 
+/// Concrete HTTP target for a (resource, capability) pair.
+///
+/// Returned by [`ResourceCatalog::route_for_capability`]. The merged
+/// `llm` + `http` node dispatchers build the request URL by joining
+/// `base_url` with `path` and applying `method`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteAddress {
+    /// Scheme + host + port. No trailing slash, no path.
+    pub base_url: String,
+    /// Path component to append (already includes the leading `/`).
+    pub path: String,
+    /// HTTP method to use.
+    pub method: HttpProbeMethod,
+}
+
+impl ResourceCatalog {
+    /// Return the HTTP target for a given (resource id, capability) pair.
+    ///
+    /// Returns `None` when any of these hold:
+    /// - the resource id is not in the catalog
+    /// - the resource was probed but did not return [`ResourceProbeOutcome::Found`]
+    /// - the proven detail is not [`ResourceDetail::HttpEndpoint`] (binaries
+    ///   and toolchains have no HTTP routes)
+    /// - the HTTP endpoint did not prove the requested capability
+    #[must_use]
+    pub fn route_for_capability(
+        &self,
+        id: &ResourceId,
+        capability: Capability,
+    ) -> Option<RouteAddress> {
+        match self.resources.get(id)? {
+            ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
+                base_url,
+                routes_by_capability,
+                ..
+            }) => {
+                let route = routes_by_capability.get(&capability)?;
+                Some(RouteAddress {
+                    base_url: base_url.clone(),
+                    path: route.path.clone(),
+                    method: route.method,
+                })
+            },
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +223,164 @@ mod tests {
     fn route_origin_serializes_snake_case() {
         let ro = RouteOrigin::ForwardedTunnel;
         assert_eq!(serde_json::to_string(&ro).unwrap(), "\"forwarded_tunnel\"");
+    }
+
+    use crate::environment::runtime::resource::Capability;
+
+    fn http_outcome_with_routes(
+        port: u16,
+        routes: Vec<(Capability, &str, HttpProbeMethod, ApiFlavor)>,
+    ) -> ResourceProbeOutcome {
+        let mut map = HashMap::new();
+        for (cap, p, m, f) in routes {
+            map.insert(
+                cap,
+                ProvenRoute {
+                    path: p.into(),
+                    method: m,
+                    flavor: f,
+                },
+            );
+        }
+        ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
+            base_url: format!("http://127.0.0.1:{port}"),
+            routes_by_capability: map,
+            version: None,
+            models_list: None,
+            auth_secret_ref: None,
+            streaming_supported_natively: true,
+            route_origin: RouteOrigin::EnvLoopback,
+        })
+    }
+
+    #[test]
+    fn route_for_capability_returns_full_address() {
+        let mut catalog = ResourceCatalog {
+            env_id: EnvId::local(),
+            registry_revision: 1,
+            probed_at: Utc::now(),
+            resources: HashMap::new(),
+        };
+        let id = crate::environment::runtime::resource::ResourceId("ollama".into());
+        catalog.resources.insert(
+            id.clone(),
+            http_outcome_with_routes(
+                11434,
+                vec![
+                    (
+                        Capability::OpenaiChatCompletions,
+                        "/v1/chat/completions",
+                        HttpProbeMethod::Get,
+                        ApiFlavor::OpenaiChat,
+                    ),
+                    (
+                        Capability::OllamaNative,
+                        "/api/chat",
+                        HttpProbeMethod::Get,
+                        ApiFlavor::OllamaNative,
+                    ),
+                ],
+            ),
+        );
+
+        let chat = catalog
+            .route_for_capability(&id, Capability::OpenaiChatCompletions)
+            .expect("chat route");
+        assert_eq!(chat.base_url, "http://127.0.0.1:11434");
+        assert_eq!(chat.path, "/v1/chat/completions");
+        assert_eq!(chat.method, HttpProbeMethod::Get);
+
+        let native = catalog
+            .route_for_capability(&id, Capability::OllamaNative)
+            .expect("native route");
+        assert_eq!(native.path, "/api/chat");
+    }
+
+    #[test]
+    fn route_for_capability_missing_capability_returns_none() {
+        let mut catalog = ResourceCatalog {
+            env_id: EnvId::local(),
+            registry_revision: 1,
+            probed_at: Utc::now(),
+            resources: HashMap::new(),
+        };
+        let id = crate::environment::runtime::resource::ResourceId("ollama".into());
+        catalog.resources.insert(
+            id.clone(),
+            http_outcome_with_routes(
+                11434,
+                vec![(
+                    Capability::OpenaiChatCompletions,
+                    "/v1/chat/completions",
+                    HttpProbeMethod::Get,
+                    ApiFlavor::OpenaiChat,
+                )],
+            ),
+        );
+        assert!(
+            catalog
+                .route_for_capability(&id, Capability::OllamaNative)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn route_for_capability_unknown_resource_returns_none() {
+        let catalog = ResourceCatalog {
+            env_id: EnvId::local(),
+            registry_revision: 1,
+            probed_at: Utc::now(),
+            resources: HashMap::new(),
+        };
+        let id = crate::environment::runtime::resource::ResourceId("ghost".into());
+        assert!(
+            catalog
+                .route_for_capability(&id, Capability::OpenaiChatCompletions)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn route_for_capability_non_http_resource_returns_none() {
+        let mut catalog = ResourceCatalog {
+            env_id: EnvId::local(),
+            registry_revision: 1,
+            probed_at: Utc::now(),
+            resources: HashMap::new(),
+        };
+        let id = crate::environment::runtime::resource::ResourceId("claude-code".into());
+        catalog.resources.insert(
+            id.clone(),
+            ResourceProbeOutcome::Found(ResourceDetail::Binary {
+                path: "/usr/local/bin/claude".into(),
+                version: Some("1.2.3".into()),
+                capabilities: vec![Capability::CliAgentPrint],
+            }),
+        );
+        // Binary is not an HTTP endpoint; the helper deliberately returns None.
+        assert!(
+            catalog
+                .route_for_capability(&id, Capability::CliAgentPrint)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn route_for_capability_unreached_resource_returns_none() {
+        let mut catalog = ResourceCatalog {
+            env_id: EnvId::local(),
+            registry_revision: 1,
+            probed_at: Utc::now(),
+            resources: HashMap::new(),
+        };
+        let id = crate::environment::runtime::resource::ResourceId("vllm".into());
+        catalog
+            .resources
+            .insert(id.clone(), ResourceProbeOutcome::NotFound);
+        assert!(
+            catalog
+                .route_for_capability(&id, Capability::OpenaiChatCompletions)
+                .is_none()
+        );
     }
 }

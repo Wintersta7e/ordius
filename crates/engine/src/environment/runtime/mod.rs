@@ -45,7 +45,7 @@ pub use resource::{
 
 /// Catalog holding post-probe outcomes per resource; detail and route types.
 pub use catalog::{
-    ProvenRoute, ResourceCatalog, ResourceDetail, ResourceProbeOutcome, RouteOrigin,
+    ProvenRoute, ResourceCatalog, ResourceDetail, ResourceProbeOutcome, RouteAddress, RouteOrigin,
 };
 
 // ── Probe plan + summary ─────────────────────────────────────────────────────
