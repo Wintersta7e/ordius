@@ -1,1 +1,267 @@
 //! Wire protocol types exchanged over stdin/stdout between engine and helper.
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+// --- Probe plan input ---------------------------------------------------
+
+/// Wire form of a probe plan.
+///
+/// Mirrors `engine::environment::runtime::plan::ProbePlan` but stays declared
+/// inside this crate so the helper compiles without the engine.  Field shape
+/// is pinned by a compat test in the engine crate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbePlanV1 {
+    /// Format version. Always `1` for this protocol revision.
+    pub version: u32,
+    /// Per-resource timeout in milliseconds. `0` means "no per-resource cap".
+    pub per_resource_timeout_ms: u64,
+    /// Max concurrent in-flight probes.  Helper enforces sequentially when
+    /// this is 1; in v1 the helper always runs sequentially regardless.
+    pub max_concurrency: u32,
+    /// Overall budget in milliseconds. `0` means "no overall cap".
+    pub overall_budget_ms: u64,
+    /// Resource specs to probe, in declaration order.
+    pub resources: Vec<ResourceSpecV1>,
+}
+
+/// Wire form of a single resource specification to probe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceSpecV1 {
+    /// Stable resource id (e.g. `"ollama"`).
+    pub id: String,
+    /// Kind discriminator.
+    pub kind: ResourceKindV1,
+}
+
+/// Resource kind tag.  Each variant carries its own concrete config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResourceKindV1 {
+    /// HTTP service probed by one or more route patterns.
+    Http {
+        /// Base URLs to try (in priority order).
+        bases: Vec<String>,
+        /// Probe routes keyed by capability.
+        routes: Vec<HttpProbeRouteV1>,
+    },
+    /// Local binary discovered via PATH lookup.
+    Binary {
+        /// Binary name (`which` lookup).
+        bin: String,
+        /// Optional extra search paths beyond `PATH`.
+        extra_search_paths: Vec<String>,
+    },
+    /// Toolchain — binary plus a `--version`-style invocation whose output
+    /// must match `version_regex` to count as Found.
+    Toolchain {
+        /// Binary name.
+        bin: String,
+        /// Argv to invoke for the version check.
+        version_args: Vec<String>,
+        /// Regex string applied to stdout; first capture group becomes the version.
+        version_regex: String,
+        /// Optional extra search paths beyond `PATH`.
+        extra_search_paths: Vec<String>,
+    },
+}
+
+/// One HTTP probe route, carrying the capability it proves.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpProbeRouteV1 {
+    /// Path under the base URL (e.g. `"/api/version"`).
+    pub path: String,
+    /// HTTP method.
+    pub method: HttpProbeMethodV1,
+    /// Capability the route proves on a 2xx response.
+    pub proves: String,
+    /// Expected status range — defaults to 200-299 if empty.
+    #[serde(default)]
+    pub expect_status: Vec<u16>,
+    /// `JSONPath` expressions used to derive the stable fingerprint of the response.
+    #[serde(default)]
+    pub fingerprint_jsonpaths: Vec<String>,
+}
+
+/// HTTP method.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpProbeMethodV1 {
+    /// HTTP GET.
+    Get,
+    /// HTTP POST.
+    Post,
+}
+
+// --- Probe outcome output ----------------------------------------------
+
+/// One JSONL line per probed resource.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbeOutcomeV1 {
+    /// Format version.
+    pub version: u32,
+    /// Resource id this outcome corresponds to.
+    pub id: String,
+    /// Concrete outcome.
+    pub outcome: ProbeOutcomeBodyV1,
+    /// Wall-clock probe duration in milliseconds.
+    pub elapsed_ms: u64,
+}
+
+/// Outcome variants — keep in lock-step with engine's `ResourceProbeOutcome`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProbeOutcomeBodyV1 {
+    /// Resource was reachable; carries the proven details.
+    Found(ProbeDetailV1),
+    /// Resource was not reachable on any declared route.
+    NotFound,
+    /// Probe was deliberately skipped (cancelled, budget elapsed, etc.).
+    Skipped {
+        /// Human-readable reason the probe was skipped.
+        reason: String,
+    },
+    /// Probe reached the resource but the response was invalid.
+    ProbeFailed {
+        /// Human-readable description of why the probe failed.
+        reason: String,
+    },
+    /// Per-resource deadline elapsed before a response arrived.
+    TimedOut,
+}
+
+/// Concrete detail for a successful probe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProbeDetailV1 {
+    /// HTTP service.  Mirrors `ResourceDetail::HttpEndpoint`.
+    HttpEndpoint {
+        /// Base URL that successfully answered at least one route.
+        base_url: String,
+        /// Routes that responded with an acceptable status.
+        proven_routes: Vec<ProvenRouteV1>,
+    },
+    /// Local binary.
+    Binary {
+        /// Resolved absolute path to the binary.
+        path: String,
+    },
+    /// Toolchain with extracted version.
+    Toolchain {
+        /// Resolved absolute path to the binary.
+        path: String,
+        /// Version string captured from the version command output.
+        version: String,
+    },
+}
+
+/// Proven HTTP route — capability + path + stable fingerprint of response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvenRouteV1 {
+    /// Capability the route proved.
+    pub capability: String,
+    /// Path under the base URL that answered.
+    pub path: String,
+    /// HTTP status code returned.
+    pub status: u16,
+    /// Stable fingerprint of the response payload (per `fingerprint_jsonpaths`).
+    pub fingerprint: String,
+}
+
+// --- Exec request -------------------------------------------------------
+
+/// Argv-only exec request.  Read from helper stdin in `Exec { argv_json: true }`
+/// mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecRequestV1 {
+    /// Format version. Always `1` for this protocol revision.
+    pub version: u32,
+    /// Program to execute (looked up on `PATH` if not absolute).
+    pub program: String,
+    /// Positional arguments passed to the program.
+    pub args: Vec<String>,
+    /// Extra environment variables overlaid on the helper's environment.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Working directory for the spawned process. `None` inherits the helper's cwd.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Optional stdin payload base64-encoded; absent or empty means no stdin.
+    #[serde(default)]
+    pub stdin_b64: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_plan_roundtrips() {
+        let plan = ProbePlanV1 {
+            version: 1,
+            per_resource_timeout_ms: 1000,
+            max_concurrency: 8,
+            overall_budget_ms: 5000,
+            resources: vec![ResourceSpecV1 {
+                id: "ollama".into(),
+                kind: ResourceKindV1::Http {
+                    bases: vec!["http://127.0.0.1:11434".into()],
+                    routes: vec![HttpProbeRouteV1 {
+                        path: "/api/version".into(),
+                        method: HttpProbeMethodV1::Get,
+                        proves: "ollama_native".into(),
+                        expect_status: vec![],
+                        fingerprint_jsonpaths: vec!["$.version".into()],
+                    }],
+                },
+            }],
+        };
+        let s = serde_json::to_string(&plan).unwrap();
+        let back: ProbePlanV1 = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.resources.len(), 1);
+        assert_eq!(back.resources[0].id, "ollama");
+    }
+
+    #[test]
+    fn probe_outcome_jsonl_shape() {
+        let o = ProbeOutcomeV1 {
+            version: 1,
+            id: "ollama".into(),
+            outcome: ProbeOutcomeBodyV1::Found(ProbeDetailV1::HttpEndpoint {
+                base_url: "http://127.0.0.1:11434".into(),
+                proven_routes: vec![ProvenRouteV1 {
+                    capability: "ollama_native".into(),
+                    path: "/api/version".into(),
+                    status: 200,
+                    fingerprint: "abc123".into(),
+                }],
+            }),
+            elapsed_ms: 42,
+        };
+        let s = serde_json::to_string(&o).unwrap();
+        assert!(s.contains("\"outcome\":{\"kind\":\"found\""));
+        assert!(s.contains("\"http_endpoint\""));
+    }
+
+    #[test]
+    fn exec_request_optional_stdin() {
+        let s = r#"{"version":1,"program":"echo","args":["hi"]}"#;
+        let req: ExecRequestV1 = serde_json::from_str(s).unwrap();
+        assert_eq!(req.program, "echo");
+        assert!(req.stdin_b64.is_none());
+        assert!(req.cwd.is_none());
+        assert!(req.env.is_empty());
+    }
+
+    #[test]
+    fn outcome_not_found_serializes_compact() {
+        let o = ProbeOutcomeV1 {
+            version: 1,
+            id: "missing".into(),
+            outcome: ProbeOutcomeBodyV1::NotFound,
+            elapsed_ms: 1,
+        };
+        let s = serde_json::to_string(&o).unwrap();
+        assert!(s.contains("\"kind\":\"not_found\""));
+    }
+}
