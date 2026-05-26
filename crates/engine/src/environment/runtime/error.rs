@@ -87,6 +87,10 @@ pub enum DispatchError {
         #[source]
         source: std::io::Error,
     },
+
+    /// A host ↔ env path translation rule didn't match.
+    #[error("path translation: {0}")]
+    Translation(String),
 }
 
 /// Error raised by `ResourceRegistry` operations.

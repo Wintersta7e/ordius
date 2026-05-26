@@ -71,10 +71,8 @@ impl Dispatcher for WslDispatcher {
         panic!("WslDispatcher::http_transport pending T15")
     }
 
-    fn translate_path(&self, _host_path: &Path) -> Result<EnvPath, DispatchError> {
-        Err(DispatchError::NotImplemented(
-            "WslDispatcher::translate_path pending T10".into(),
-        ))
+    fn translate_path(&self, host_path: &Path) -> Result<EnvPath, DispatchError> {
+        super::path::translate_path(&self.distro_name, host_path)
     }
 
     async fn prepare_workspace(

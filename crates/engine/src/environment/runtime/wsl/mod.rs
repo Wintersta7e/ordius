@@ -6,5 +6,6 @@
 
 pub mod dispatcher;
 pub mod enumerate;
+pub mod path;
 
 pub use dispatcher::WslDispatcher;
