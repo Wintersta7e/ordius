@@ -446,3 +446,34 @@ fn resource_namespace_missing_field_syntax_errors() {
     .unwrap_err();
     assert!(matches!(err, TemplateError::Syntax(_)));
 }
+
+#[test]
+fn resource_namespace_supports_dotted_ids() {
+    let f = Fixture::new();
+    let env = map_env(&f.env_map);
+    let resources = |id: &str, field: &str| -> Option<String> {
+        match (id, field) {
+            ("openai.gpt-4", "base_url") => Some("https://api.openai.com/v1".into()),
+            _ => None,
+        }
+    };
+    let s = substitute(
+        "URL = {{resource.openai.gpt-4.base_url}}",
+        &ctx_for_with_resources(&f, &empty_secrets, &empty_kv, &env, &resources),
+    )
+    .unwrap();
+    assert_eq!(s, "URL = https://api.openai.com/v1");
+}
+
+#[test]
+fn resource_namespace_rejects_empty_id_with_trailing_field() {
+    let f = Fixture::new();
+    let env = map_env(&f.env_map);
+    let resources = |_id: &str, _field: &str| -> Option<String> { None };
+    let err = substitute(
+        "{{resource..base_url}}",
+        &ctx_for_with_resources(&f, &empty_secrets, &empty_kv, &env, &resources),
+    )
+    .unwrap_err();
+    assert!(matches!(err, TemplateError::Syntax(_)));
+}

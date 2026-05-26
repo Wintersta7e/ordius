@@ -225,30 +225,36 @@ fn resolve(
                 .transpose()?
                 .ok_or_else(|| TemplateError::Undefined(format!("nodes.{nid}.outputs.{port}")))
         },
-        "resource" => resolve_resource(expr, &mut parts, ctx),
+        "resource" => resolve_resource(expr, ctx),
         other => Err(TemplateError::Syntax(format!("unknown namespace: {other}"))),
     }
 }
 
 /// `{{resource.<id>.<field>}}` lookup — kept out-of-line to keep
 /// the main `resolve` function under `clippy::too_many_lines`.
-fn resolve_resource(
-    expr: &str,
-    parts: &mut std::str::Split<'_, char>,
-    ctx: &SubstitutionContext<'_>,
-) -> Result<String, TemplateError> {
-    let id = parts
-        .next()
-        .ok_or_else(|| TemplateError::Syntax("resource.<id>.<field> required".into()))?;
+///
+/// `expr` is the full inner reference, e.g. `resource.openai.gpt-4.base_url`.
+/// Strip the `resource.` namespace prefix and right-split on `.` so the
+/// last segment is the field and everything before it is the id — ids
+/// can legitimately contain `.` (e.g. `openai.gpt-4`). The dispatcher's
+/// pre-split `parts` iterator is ignored here for that reason.
+fn resolve_resource(expr: &str, ctx: &SubstitutionContext<'_>) -> Result<String, TemplateError> {
+    let after_ns = expr
+        .strip_prefix("resource.")
+        .ok_or_else(|| TemplateError::Syntax(format!("resource ref missing namespace: {expr}")))?;
+    let (id, field) = after_ns
+        .rsplit_once('.')
+        .ok_or_else(|| TemplateError::Syntax(format!("resource ref missing field: {expr}")))?;
     if id.is_empty() {
         return Err(TemplateError::Syntax(format!(
             "resource ref missing id: {expr}"
         )));
     }
-    let field = parts
-        .next()
-        .ok_or_else(|| TemplateError::Syntax(format!("resource ref missing field: {expr}")))?;
-    no_trailing(parts, "resource.<id>.<field>")?;
+    if field.is_empty() {
+        return Err(TemplateError::Syntax(format!(
+            "resource ref missing field: {expr}"
+        )));
+    }
     (ctx.resources)(id, field)
         .ok_or_else(|| TemplateError::Undefined(format!("resource.{id}.{field}")))
 }
