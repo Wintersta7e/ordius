@@ -9,5 +9,6 @@ pub mod dispatcher;
 pub mod enumerate;
 pub mod path;
 pub mod shell_fallback;
+pub mod transport;
 
 pub use dispatcher::WslDispatcher;

@@ -98,7 +98,12 @@ impl Dispatcher for WslDispatcher {
     }
 
     fn http_transport(&self) -> Arc<dyn HttpTransport> {
-        panic!("WslDispatcher::http_transport pending T15")
+        // Phase B: no host-direct verifications wired in yet (Phase E threads
+        // EnvSpec's HashMap through). Empty map => loopback URLs go via env wrap.
+        Arc::new(super::transport::WslHttpTransport::new(
+            &self.distro_name,
+            std::collections::HashMap::new(),
+        ))
     }
 
     fn translate_path(&self, host_path: &Path) -> Result<EnvPath, DispatchError> {
