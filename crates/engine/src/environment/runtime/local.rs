@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::TryStreamExt;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -68,83 +67,16 @@ impl Default for LocalHttpTransport {
 #[async_trait]
 impl HttpTransport for LocalHttpTransport {
     async fn execute(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
-        let method = http_method_to_reqwest(req.method);
-        let mut builder = self.client.request(method, &req.url).timeout(req.timeout);
-        let timeout = req.timeout;
-        for (k, v) in &req.headers {
-            builder = builder.header(k, v);
-        }
-        if let Some(b) = req.body {
-            builder = builder.body(b);
-        }
-        let resp = builder.send().await.map_err(|e| {
-            if e.is_timeout() {
-                HttpError::Timeout(timeout)
-            } else {
-                HttpError::Transport(e.to_string())
-            }
-        })?;
-        let status = resp.status().as_u16();
-        let headers = resp
-            .headers()
-            .iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
-            .collect();
-        let body = resp.bytes().await.map_err(|e| {
-            if e.is_timeout() {
-                HttpError::Timeout(timeout)
-            } else {
-                HttpError::Transport(e.to_string())
-            }
-        })?;
-        Ok(HttpResponse {
-            status,
-            headers,
-            body,
-        })
+        super::transport::reqwest_direct_execute(&self.client, req).await
     }
 
     async fn execute_stream(&self, req: HttpRequest) -> Result<ResponseStream, HttpError> {
-        // Streaming is only wired for GET and POST; other methods require
-        // buffered `execute` instead. Callers that probe via HEAD or PUT should
-        // not request streaming.
-        let method = match req.method {
-            HttpMethod::Get => reqwest::Method::GET,
-            HttpMethod::Post => reqwest::Method::POST,
-            _ => return Err(HttpError::Transport("stream supports GET/POST only".into())),
-        };
-        let mut builder = self.client.request(method, &req.url).timeout(req.timeout);
-        for (k, v) in &req.headers {
-            builder = builder.header(k, v);
-        }
-        if let Some(b) = req.body {
-            builder = builder.body(b);
-        }
-        let resp = builder
-            .send()
-            .await
-            .map_err(|e| HttpError::Transport(e.to_string()))?;
-        let stream = resp
-            .bytes_stream()
-            .map_err(|e: reqwest::Error| HttpError::Transport(e.to_string()));
-        Ok(Box::pin(stream))
+        super::transport::reqwest_direct_execute_stream(&self.client, req).await
     }
 
     /// Local transports can always stream — no routing or tunnel constraints.
     fn can_stream(&self, _url: &Url) -> bool {
         true
-    }
-}
-
-/// Map the 6-variant `HttpMethod` enum onto `reqwest::Method`.
-const fn http_method_to_reqwest(m: HttpMethod) -> reqwest::Method {
-    match m {
-        HttpMethod::Get => reqwest::Method::GET,
-        HttpMethod::Head => reqwest::Method::HEAD,
-        HttpMethod::Post => reqwest::Method::POST,
-        HttpMethod::Put => reqwest::Method::PUT,
-        HttpMethod::Patch => reqwest::Method::PATCH,
-        HttpMethod::Delete => reqwest::Method::DELETE,
     }
 }
 
@@ -277,11 +209,20 @@ impl Dispatcher for LocalDispatcher {
         if let Some(cwd) = &cmd.cwd {
             command.current_dir(cwd.as_str());
         }
-        // Note: ProcessCmd.stdin is currently ignored; the supervisor takes
-        // ownership of the Child after spawn. Callers that need stdin should
-        // pipe it after spawn via Supervised::child_mut(), matching the pattern
-        // in executor/builtins/subprocess.rs.
-        crate::executor::supervisor::spawn(command)
+        if cmd.stdin.is_some() {
+            command.stdin(std::process::Stdio::piped());
+        }
+        let mut sup = crate::executor::supervisor::spawn(command)?;
+        if let Some(bytes) = cmd.stdin
+            && let Some(mut child_stdin) = sup.child_mut().stdin.take()
+        {
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                drop(child_stdin.write_all(&bytes).await);
+                drop(child_stdin.shutdown().await);
+            });
+        }
+        Ok(sup)
     }
 
     /// Return the host-network HTTP transport.

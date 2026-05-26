@@ -6,9 +6,9 @@ use std::process::Output;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::TryStreamExt;
 use tokio::io::AsyncWriteExt;
 use url::Url;
 
@@ -17,31 +17,48 @@ use crate::environment::runtime::env::HostDirectVerification;
 use crate::environment::runtime::resource::ResourceId;
 use crate::environment::runtime::transport::{HttpError, HttpMethod, HttpRequest, HttpResponse};
 
+/// Shared, mutation-observable host-direct verification map.
+pub type HostDirectMap = Arc<ArcSwap<HashMap<ResourceId, HostDirectVerification>>>;
+
 const CURL_STATUS_WRITE_OUT: &str = "\n\n%{http_code}\n";
 const CURL_STATUS_DELIMITER: &[u8] = b"\n\n";
 
 /// WSL-aware HTTP transport that routes env-loopback requests through curl
 /// inside the distro while keeping verified host-direct and public URLs direct.
+///
+/// The `host_direct` map is held behind `Arc<ArcSwap<_>>` so the dispatcher
+/// can share it and live-update it (via `WslDispatcher::set_host_direct`)
+/// without rebuilding the transport — and therefore without throwing away
+/// the underlying `reqwest::Client`'s connection pool.
 #[derive(Debug, Clone)]
 pub struct WslHttpTransport {
     distro: String,
     direct: reqwest::Client,
-    host_direct: Arc<HashMap<ResourceId, HostDirectVerification>>,
+    host_direct: HostDirectMap,
 }
 
 impl WslHttpTransport {
-    /// Construct a new transport with a 30-second default direct-client timeout.
+    /// Construct a transport that owns its own (initially empty or seeded)
+    /// host-direct snapshot. Test ergonomics — production code uses
+    /// [`Self::with_host_direct`] to share state with the dispatcher.
     pub fn new(
         distro: impl Into<String>,
         host_direct: HashMap<ResourceId, HostDirectVerification>,
     ) -> Self {
+        Self::with_host_direct(distro, Arc::new(ArcSwap::from_pointee(host_direct)))
+    }
+
+    /// Construct a transport that shares a host-direct verification map with
+    /// its owning dispatcher; `WslDispatcher::set_host_direct` updates are
+    /// visible without reconstructing the transport.
+    pub fn with_host_direct(distro: impl Into<String>, host_direct: HostDirectMap) -> Self {
         Self {
             distro: distro.into(),
             direct: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("reqwest client"),
-            host_direct: Arc::new(host_direct),
+            host_direct,
         }
     }
 
@@ -60,6 +77,7 @@ impl WslHttpTransport {
     fn has_host_direct_for(&self, url: &Url) -> bool {
         let target = url.as_str();
         self.host_direct
+            .load()
             .values()
             .any(|verification| target.starts_with(&verification.host_url))
     }
@@ -69,6 +87,23 @@ enum UrlClass {
     EnvLoopback,
     HostDirect,
     PublicDirect,
+}
+
+/// Reject header names/values containing CR or LF (or `:` in a name) so curl's
+/// argv-level `--header "name: value"` cannot smuggle a forged second header
+/// into the HTTP request line.
+fn validate_headers(req: &HttpRequest) -> Result<(), HttpError> {
+    for (k, v) in &req.headers {
+        if k.is_empty() || k.contains(['\r', '\n', ':']) {
+            return Err(HttpError::Transport(format!("invalid header name: {k:?}")));
+        }
+        if v.contains(['\r', '\n']) {
+            return Err(HttpError::Transport(format!(
+                "invalid header value for {k}: contains CR/LF"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn is_loopback_url(url: &Url) -> bool {
@@ -83,22 +118,29 @@ fn is_loopback_url(url: &Url) -> bool {
 #[async_trait]
 impl HttpTransport for WslHttpTransport {
     async fn execute(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
+        validate_headers(&req)?;
         let url =
             Url::parse(&req.url).map_err(|e| HttpError::Transport(format!("invalid url: {e}")))?;
         match self.url_classification(&url) {
             UrlClass::PublicDirect | UrlClass::HostDirect => {
-                execute_direct(&self.direct, req).await
+                crate::environment::runtime::transport::reqwest_direct_execute(&self.direct, req)
+                    .await
             },
             UrlClass::EnvLoopback => execute_wrapped(&self.distro, req).await,
         }
     }
 
     async fn execute_stream(&self, req: HttpRequest) -> Result<ResponseStream, HttpError> {
+        validate_headers(&req)?;
         let url =
             Url::parse(&req.url).map_err(|e| HttpError::Transport(format!("invalid url: {e}")))?;
         match self.url_classification(&url) {
             UrlClass::PublicDirect | UrlClass::HostDirect => {
-                execute_stream_direct(&self.direct, req).await
+                crate::environment::runtime::transport::reqwest_direct_execute_stream(
+                    &self.direct,
+                    req,
+                )
+                .await
             },
             UrlClass::EnvLoopback => Err(HttpError::StreamingUnsupported {
                 route_origin: "env_loopback".into(),
@@ -109,72 +151,6 @@ impl HttpTransport for WslHttpTransport {
     fn can_stream(&self, url: &Url) -> bool {
         !matches!(self.url_classification(url), UrlClass::EnvLoopback)
     }
-}
-
-async fn execute_direct(
-    client: &reqwest::Client,
-    req: HttpRequest,
-) -> Result<HttpResponse, HttpError> {
-    let method = http_method_to_reqwest(req.method);
-    let mut builder = client.request(method, &req.url).timeout(req.timeout);
-    let timeout = req.timeout;
-    for (k, v) in &req.headers {
-        builder = builder.header(k, v);
-    }
-    if let Some(b) = req.body {
-        builder = builder.body(b);
-    }
-    let resp = builder.send().await.map_err(|e| {
-        if e.is_timeout() {
-            HttpError::Timeout(timeout)
-        } else {
-            HttpError::Transport(e.to_string())
-        }
-    })?;
-    let status = resp.status().as_u16();
-    let headers = resp
-        .headers()
-        .iter()
-        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
-        .collect();
-    let body = resp.bytes().await.map_err(|e| {
-        if e.is_timeout() {
-            HttpError::Timeout(timeout)
-        } else {
-            HttpError::Transport(e.to_string())
-        }
-    })?;
-    Ok(HttpResponse {
-        status,
-        headers,
-        body,
-    })
-}
-
-async fn execute_stream_direct(
-    client: &reqwest::Client,
-    req: HttpRequest,
-) -> Result<ResponseStream, HttpError> {
-    let method = match req.method {
-        HttpMethod::Get => reqwest::Method::GET,
-        HttpMethod::Post => reqwest::Method::POST,
-        _ => return Err(HttpError::Transport("stream supports GET/POST only".into())),
-    };
-    let mut builder = client.request(method, &req.url).timeout(req.timeout);
-    for (k, v) in &req.headers {
-        builder = builder.header(k, v);
-    }
-    if let Some(b) = req.body {
-        builder = builder.body(b);
-    }
-    let resp = builder
-        .send()
-        .await
-        .map_err(|e| HttpError::Transport(e.to_string()))?;
-    let stream = resp
-        .bytes_stream()
-        .map_err(|e: reqwest::Error| HttpError::Transport(e.to_string()));
-    Ok(Box::pin(stream))
 }
 
 async fn execute_wrapped(distro: &str, req: HttpRequest) -> Result<HttpResponse, HttpError> {
@@ -293,18 +269,6 @@ fn split_curl_status(raw: &[u8]) -> (Bytes, String) {
     (body, status)
 }
 
-/// Map the 6-variant `HttpMethod` enum onto `reqwest::Method`.
-const fn http_method_to_reqwest(m: HttpMethod) -> reqwest::Method {
-    match m {
-        HttpMethod::Get => reqwest::Method::GET,
-        HttpMethod::Head => reqwest::Method::HEAD,
-        HttpMethod::Post => reqwest::Method::POST,
-        HttpMethod::Put => reqwest::Method::PUT,
-        HttpMethod::Patch => reqwest::Method::PATCH,
-        HttpMethod::Delete => reqwest::Method::DELETE,
-    }
-}
-
 const fn http_method_as_str(m: HttpMethod) -> &'static str {
     match m {
         HttpMethod::Get => "GET",
@@ -378,5 +342,81 @@ mod tests {
         let t = WslHttpTransport::new("Ubuntu", HashMap::new());
         let url = Url::parse("http://LOCALHOST:11434/api/version").unwrap();
         assert!(matches!(t.url_classification(&url), UrlClass::EnvLoopback));
+    }
+
+    #[test]
+    fn localhost_without_explicit_port_classifies_env_loopback() {
+        let t = WslHttpTransport::new("Ubuntu", HashMap::new());
+        let url = Url::parse("http://localhost/api/version").unwrap();
+        assert!(matches!(t.url_classification(&url), UrlClass::EnvLoopback));
+    }
+
+    #[test]
+    fn localhost_subdomain_does_not_classify_as_loopback() {
+        // `localhost.evil.example` must NOT match the loopback rule; otherwise
+        // requests to an attacker-controlled hostname would be proxied
+        // through the distro's curl instead of going direct.
+        let t = WslHttpTransport::new("Ubuntu", HashMap::new());
+        let url = Url::parse("http://localhost.evil.example/api/version").unwrap();
+        assert!(matches!(t.url_classification(&url), UrlClass::PublicDirect));
+    }
+
+    #[test]
+    fn split_curl_status_no_delimiter_returns_empty_status() {
+        let raw = b"rawbody";
+        let (body, status) = split_curl_status(raw);
+        assert_eq!(body.as_ref(), b"rawbody");
+        assert_eq!(status, "");
+    }
+
+    #[test]
+    fn split_curl_status_empty_input_returns_empty_pair() {
+        let (body, status) = split_curl_status(b"");
+        assert_eq!(body.as_ref(), b"");
+        assert_eq!(status, "");
+    }
+
+    #[test]
+    fn validate_headers_rejects_crlf_in_value() {
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            url: "http://localhost/".into(),
+            headers: HashMap::from([(
+                "X-Forwarded".to_string(),
+                "ok\r\nAuthorization: bearer evil".to_string(),
+            )]),
+            body: None,
+            timeout: Duration::from_secs(1),
+        };
+        let err = validate_headers(&req).unwrap_err();
+        assert!(matches!(err, HttpError::Transport(_)));
+    }
+
+    #[test]
+    fn validate_headers_rejects_colon_in_name() {
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            url: "http://localhost/".into(),
+            headers: HashMap::from([("bogus:name".to_string(), "x".to_string())]),
+            body: None,
+            timeout: Duration::from_secs(1),
+        };
+        let err = validate_headers(&req).unwrap_err();
+        assert!(matches!(err, HttpError::Transport(_)));
+    }
+
+    #[test]
+    fn validate_headers_accepts_normal_headers() {
+        let req = HttpRequest {
+            method: HttpMethod::Get,
+            url: "http://localhost/".into(),
+            headers: HashMap::from([
+                ("Accept".to_string(), "application/json".to_string()),
+                ("Authorization".to_string(), "bearer x".to_string()),
+            ]),
+            body: None,
+            timeout: Duration::from_secs(1),
+        };
+        assert!(validate_headers(&req).is_ok());
     }
 }

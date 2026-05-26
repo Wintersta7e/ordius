@@ -47,6 +47,10 @@ pub trait Dispatcher: Send + Sync {
 
     /// Spawn a process inside this environment and return a supervised handle.
     /// The supervisor owns process-group / Job-Object lifetime.
+    ///
+    /// Implementations MUST honor `cmd.stdin`: pipe the bytes to the child's
+    /// stdin and close it. A child that closes stdin early is legitimate; do
+    /// not surface the resulting `BrokenPipe` as an error.
     fn spawn(&self, cmd: ProcessCmd) -> std::io::Result<Supervised>;
 
     /// Return the HTTP transport bound to this environment.

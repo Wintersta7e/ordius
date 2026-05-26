@@ -1,12 +1,20 @@
 //! Transport types used by Dispatcher trait: HTTP req/resp, process command,
 //! env-side path, workspace handle.
+//!
+//! Also exposes free helpers `reqwest_direct_execute*` so HTTP transports that
+//! talk to the network directly (Local, WSL on HostDirect/PublicDirect paths)
+//! share one implementation of header iteration, timeout mapping, and body
+//! collection.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use super::dispatcher::ResponseStream;
 
 /// HTTP method for dispatch-level requests.
 ///
@@ -136,6 +144,90 @@ impl Drop for WorkspaceHandle {
         if let Some(td) = self.teardown.take() {
             td();
         }
+    }
+}
+
+/// Execute an `HttpRequest` against a shared `reqwest::Client`.
+///
+/// Used by `LocalHttpTransport` and by `WslHttpTransport`'s
+/// `HostDirect`/`PublicDirect` routes — both share one implementation.
+pub async fn reqwest_direct_execute(
+    client: &reqwest::Client,
+    req: HttpRequest,
+) -> Result<HttpResponse, HttpError> {
+    let method = http_method_to_reqwest(req.method);
+    let mut builder = client.request(method, &req.url).timeout(req.timeout);
+    let timeout = req.timeout;
+    for (k, v) in &req.headers {
+        builder = builder.header(k, v);
+    }
+    if let Some(b) = req.body {
+        builder = builder.body(b);
+    }
+    let resp = builder.send().await.map_err(|e| {
+        if e.is_timeout() {
+            HttpError::Timeout(timeout)
+        } else {
+            HttpError::Transport(e.to_string())
+        }
+    })?;
+    let status = resp.status().as_u16();
+    let headers = resp
+        .headers()
+        .iter()
+        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
+        .collect();
+    let body = resp.bytes().await.map_err(|e| {
+        if e.is_timeout() {
+            HttpError::Timeout(timeout)
+        } else {
+            HttpError::Transport(e.to_string())
+        }
+    })?;
+    Ok(HttpResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+/// Execute an `HttpRequest` and return a streaming response body. Streaming is
+/// supported only for GET and POST.
+pub async fn reqwest_direct_execute_stream(
+    client: &reqwest::Client,
+    req: HttpRequest,
+) -> Result<ResponseStream, HttpError> {
+    let method = match req.method {
+        HttpMethod::Get => reqwest::Method::GET,
+        HttpMethod::Post => reqwest::Method::POST,
+        _ => return Err(HttpError::Transport("stream supports GET/POST only".into())),
+    };
+    let mut builder = client.request(method, &req.url).timeout(req.timeout);
+    for (k, v) in &req.headers {
+        builder = builder.header(k, v);
+    }
+    if let Some(b) = req.body {
+        builder = builder.body(b);
+    }
+    let resp = builder
+        .send()
+        .await
+        .map_err(|e| HttpError::Transport(e.to_string()))?;
+    let stream = resp
+        .bytes_stream()
+        .map_err(|e: reqwest::Error| HttpError::Transport(e.to_string()));
+    Ok(Box::pin(stream))
+}
+
+/// Map the 6-variant `HttpMethod` enum onto `reqwest::Method`.
+const fn http_method_to_reqwest(m: HttpMethod) -> reqwest::Method {
+    match m {
+        HttpMethod::Get => reqwest::Method::GET,
+        HttpMethod::Head => reqwest::Method::HEAD,
+        HttpMethod::Post => reqwest::Method::POST,
+        HttpMethod::Put => reqwest::Method::PUT,
+        HttpMethod::Patch => reqwest::Method::PATCH,
+        HttpMethod::Delete => reqwest::Method::DELETE,
     }
 }
 
