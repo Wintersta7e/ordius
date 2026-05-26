@@ -6,13 +6,14 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use ordius_helper::protocol::{
     HttpProbeMethodV1, HttpProbeRouteV1, ProbeDetailV1, ProbeOutcomeBodyV1, ProbeOutcomeV1,
     ProbePlanV1, ProvenRouteV1, ResourceKindV1, ResourceSpecV1,
 };
-use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
 use crate::environment::runtime::catalog::{
@@ -34,33 +35,36 @@ const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const HELPER_PROBE_GRACE: Duration = Duration::from_secs(2);
 
 /// `Dispatcher` implementation backed by a named WSL distribution.
-#[derive(Debug)]
+///
+/// `helper_cache`, `host_direct`, and `transport` are `Arc`-shared so clones
+/// observe the same bootstrap result, `set_host_direct` updates, and (critically)
+/// the same `reqwest::Client` connection pool — rebuilding the client per call
+/// was a measurable hot-path leak before this was cached.
+#[derive(Debug, Clone)]
 pub struct WslDispatcher {
     info: EnvInfo,
     distro_name: String,
-    helper_cache: Mutex<Option<BootstrappedHelper>>,
-    host_direct: Mutex<HashMap<ResourceId, HostDirectVerification>>,
-}
-
-impl Clone for WslDispatcher {
-    fn clone(&self) -> Self {
-        Self {
-            info: self.info.clone(),
-            distro_name: self.distro_name.clone(),
-            helper_cache: Mutex::new(self.helper_cache.lock().clone()),
-            host_direct: Mutex::new(self.host_direct.lock().clone()),
-        }
-    }
+    helper_cache: Arc<OnceCell<BootstrappedHelper>>,
+    host_direct: super::transport::HostDirectMap,
+    transport: Arc<super::transport::WslHttpTransport>,
 }
 
 impl WslDispatcher {
     /// Build a `WslDispatcher` for the given environment metadata and distro name.
     pub fn new(info: EnvInfo, distro_name: impl Into<String>) -> Self {
+        let distro_name = distro_name.into();
+        let host_direct: super::transport::HostDirectMap =
+            Arc::new(ArcSwap::from_pointee(HashMap::new()));
+        let transport = Arc::new(super::transport::WslHttpTransport::with_host_direct(
+            &distro_name,
+            Arc::clone(&host_direct),
+        ));
         Self {
             info,
-            distro_name: distro_name.into(),
-            helper_cache: Mutex::new(None),
-            host_direct: Mutex::new(HashMap::new()),
+            distro_name,
+            helper_cache: Arc::new(OnceCell::new()),
+            host_direct,
+            transport,
         }
     }
 
@@ -69,28 +73,29 @@ impl WslDispatcher {
         &self.distro_name
     }
 
-    /// Replace the dispatcher's `HostDirect` verification map.
+    /// Replace the dispatcher's `HostDirect` verification map. Visible to all
+    /// clones because the map is stored behind an `Arc<ArcSwap<_>>`.
     ///
     /// Phase E wires this from `EnvSpec::WslDistro::host_direct_verifications`
     /// whenever the environment spec changes.
     pub fn set_host_direct(&self, verifications: HashMap<ResourceId, HostDirectVerification>) {
-        *self.host_direct.lock() = verifications;
+        self.host_direct.store(Arc::new(verifications));
     }
 
     fn host_direct_snapshot(&self) -> HashMap<ResourceId, HostDirectVerification> {
-        self.host_direct.lock().clone()
+        (*self.host_direct.load_full()).clone()
     }
 
     async fn ensure_helper(&self) -> Result<BootstrappedHelper, DispatchError> {
-        let cached_helper = self.helper_cache.lock().clone();
-        if let Some(helper) = cached_helper {
-            return Ok(helper);
-        }
-
-        let triple = super::bootstrap::probe_env_triple(&self.distro_name).await?;
-        let helper = super::bootstrap::bootstrap_helper(&self.distro_name, &triple).await?;
-        *self.helper_cache.lock() = Some(helper.clone());
-        Ok(helper)
+        self.helper_cache
+            .get_or_try_init(|| async {
+                let triple = super::bootstrap::probe_env_triple(&self.distro_name).await?;
+                super::bootstrap::bootstrap_helper(&self.distro_name, &triple)
+                    .await
+                    .map_err(DispatchError::from)
+            })
+            .await
+            .cloned()
     }
 
     async fn probe_resource_via_helper(
@@ -159,13 +164,11 @@ impl WslDispatcher {
         plan: &ProbePlan,
         cancel: &CancellationToken,
     ) -> Result<ProbeSummary, DispatchError> {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-
         let started = std::time::Instant::now();
         let wire_plan = build_wire_plan(plan)?;
         let host_direct = self.host_direct_snapshot();
         let plan_json = serde_json::to_string(&wire_plan)
-            .map_err(|e| DispatchError::Translation(format!("serialize probe plan: {e}")))?;
+            .map_err(|e| DispatchError::PlanBuild(format!("serialize probe plan: {e}")))?;
 
         let mut child = self
             .helper_probe_command(helper_path)
@@ -174,76 +177,50 @@ impl WslDispatcher {
 
         // Drain the helper's stderr in the background so a chatty helper can't
         // fill the ~64 KB pipe buffer and deadlock the stdout reader below.
-        if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "ordius::wsl::helper", "helper stderr: {line}");
-                }
-            });
-        }
+        // Track the handle so we can abort it on any exit path.
+        let stderr_drainer = spawn_stderr_drainer(&mut child);
 
-        let Some(mut stdin) = child.stdin.take() else {
+        let shutdown_err = match write_plan_to_helper(&mut child, plan_json.as_bytes()).await {
+            Ok(err) => err,
+            Err(e) => {
+                abort_drainer(stderr_drainer);
+                return Err(e);
+            },
+        };
+
+        let Some(stdout) = child.stdout.take() else {
+            abort_drainer(stderr_drainer);
             return Err(DispatchError::HelperBootstrap(
-                "helper stdin missing".into(),
+                "helper stdout missing".into(),
             ));
         };
-        stdin
-            .write_all(plan_json.as_bytes())
-            .await
-            .map_err(|e| DispatchError::HelperBootstrap(format!("helper stdin: {e}")))?;
-        drop(stdin.shutdown().await);
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| DispatchError::HelperBootstrap("helper stdout missing".into()))?;
-        let mut reader = BufReader::new(stdout).lines();
-        let mut resources: HashMap<_, _> = HashMap::default();
-        let defs_by_id: HashMap<&str, &ResourceDefinition> = plan
-            .defs
-            .iter()
-            .map(|def| (def.id.0.as_str(), def))
-            .collect();
+        let outcome = consume_helper_stream(&mut child, stdout, plan, &host_direct, cancel).await;
+        let exit_status = child.wait().await;
+        abort_drainer(stderr_drainer);
 
-        loop {
-            tokio::select! {
-                () = cancel.cancelled() => {
-                    drop(child.kill().await);
-                    for def in &plan.defs {
-                        resources
-                            .entry(def.id.clone())
-                            .or_insert_with(cancelled_probe_outcome);
-                    }
-                    break;
-                },
-                line = reader.next_line() => {
-                    match line {
-                        Ok(Some(line)) => {
-                            if line.trim().is_empty() {
-                                continue;
-                            }
-                            let Ok(wire) = serde_json::from_str::<ProbeOutcomeV1>(&line) else {
-                                continue;
-                            };
-                            if wire.version != 1 {
-                                continue;
-                            }
-                            let Some(def) = defs_by_id.get(wire.id.as_str()).copied() else {
-                                continue;
-                            };
-                            resources.insert(
-                                def.id.clone(),
-                                wire_outcome_to_engine(wire.outcome, def, &host_direct),
-                            );
-                        },
-                        Ok(None) | Err(_) => break,
-                    }
-                },
+        // Helper exited non-zero before emitting any outcomes — likely a crash
+        // (linker mismatch, corrupt binary). Surface as DispatchError so the
+        // caller can decide whether to fall back, instead of silently flooding
+        // the catalog with "no outcome" skips.
+        if !outcome.cancelled
+            && outcome.total_probed == 0
+            && !plan.defs.is_empty()
+            && let Ok(status) = &exit_status
+            && !status.success()
+        {
+            use std::fmt::Write as _;
+            let mut msg = format!(
+                "helper exited with {:?} before emitting outcomes",
+                status.code()
+            );
+            if let Some(err) = &shutdown_err {
+                let _ = write!(msg, " (stdin shutdown: {err})");
             }
+            return Err(DispatchError::HelperBootstrap(msg));
         }
-        drop(child.wait().await);
 
+        let mut resources = outcome.resources;
         for def in &plan.defs {
             resources
                 .entry(def.id.clone())
@@ -259,9 +236,124 @@ impl WslDispatcher {
                 probed_at: chrono::Utc::now(),
                 resources,
             },
-            total_probed: plan.defs.len(),
+            total_probed: outcome.total_probed,
             elapsed: started.elapsed(),
         })
+    }
+}
+
+struct HelperStreamOutcome {
+    resources: HashMap<ResourceId, ResourceProbeOutcome>,
+    total_probed: usize,
+    cancelled: bool,
+}
+
+fn spawn_stderr_drainer(child: &mut tokio::process::Child) -> Option<tokio::task::JoinHandle<()>> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    child.stderr.take().map(|stderr| {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::debug!(target: "ordius::wsl::helper", "helper stderr: {line}");
+            }
+        })
+    })
+}
+
+fn abort_drainer(drainer: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(handle) = drainer {
+        handle.abort();
+    }
+}
+
+/// Pipe the probe-plan JSON into the helper's stdin and close it. Returns the
+/// shutdown error if it was anything other than `BrokenPipe` (a tolerated
+/// child-closes-early condition).
+async fn write_plan_to_helper(
+    child: &mut tokio::process::Child,
+    plan_json: &[u8],
+) -> Result<Option<std::io::Error>, DispatchError> {
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err(DispatchError::HelperBootstrap(
+            "helper stdin missing".into(),
+        ));
+    };
+    stdin
+        .write_all(plan_json)
+        .await
+        .map_err(|e| DispatchError::HelperBootstrap(format!("helper stdin: {e}")))?;
+    let shutdown_err = stdin
+        .shutdown()
+        .await
+        .err()
+        .and_then(|e| (e.kind() != std::io::ErrorKind::BrokenPipe).then_some(e));
+    Ok(shutdown_err)
+}
+
+async fn consume_helper_stream(
+    child: &mut tokio::process::Child,
+    stdout: tokio::process::ChildStdout,
+    plan: &ProbePlan,
+    host_direct: &HashMap<ResourceId, HostDirectVerification>,
+    cancel: &CancellationToken,
+) -> HelperStreamOutcome {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut reader = BufReader::new(stdout).lines();
+    let mut resources: HashMap<ResourceId, ResourceProbeOutcome> = HashMap::default();
+    let mut total_probed: usize = 0;
+    let defs_by_id: HashMap<&str, &ResourceDefinition> = plan
+        .defs
+        .iter()
+        .map(|def| (def.id.0.as_str(), def))
+        .collect();
+    let mut cancelled = false;
+
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => {
+                drop(child.kill().await);
+                cancelled = true;
+                for def in &plan.defs {
+                    resources
+                        .entry(def.id.clone())
+                        .or_insert_with(cancelled_probe_outcome);
+                }
+                break;
+            },
+            line = reader.next_line() => {
+                match line {
+                    Ok(Some(line)) => {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        let Ok(wire) = serde_json::from_str::<ProbeOutcomeV1>(&line) else {
+                            continue;
+                        };
+                        if wire.version != 1 {
+                            continue;
+                        }
+                        let Some(def) = defs_by_id.get(wire.id.as_str()).copied() else {
+                            continue;
+                        };
+                        if resources
+                            .insert(
+                                def.id.clone(),
+                                wire_outcome_to_engine(wire.outcome, def, host_direct),
+                            )
+                            .is_none()
+                        {
+                            total_probed += 1;
+                        }
+                    },
+                    Ok(None) | Err(_) => break,
+                }
+            },
+        }
+    }
+    HelperStreamOutcome {
+        resources,
+        total_probed,
+        cancelled,
     }
 }
 
@@ -284,36 +376,68 @@ async fn write_helper_plan(
 }
 
 async fn wait_for_helper_probe(
-    child: tokio::process::Child,
+    mut child: tokio::process::Child,
     timeout_ms: u64,
 ) -> Result<std::process::Output, ResourceProbeOutcome> {
-    match tokio::time::timeout(helper_wait_timeout(timeout_ms), child.wait_with_output()).await {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(e)) => Err(probe_failed(format!("wait for ordius-helper probe: {e}"))),
-        Err(_) => Err(ResourceProbeOutcome::TimedOut),
-    }
+    use tokio::io::AsyncReadExt;
+    let stdout_handle = child.stdout.take().map(|mut s| {
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            drop(s.read_to_end(&mut buf).await);
+            buf
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut s| {
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            drop(s.read_to_end(&mut buf).await);
+            buf
+        })
+    });
+    let wait_outcome = tokio::time::timeout(helper_wait_timeout(timeout_ms), child.wait()).await;
+    let status = match wait_outcome {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => {
+            drop(child.kill().await);
+            drop(child.wait().await);
+            return Err(probe_failed(format!("wait for ordius-helper probe: {e}")));
+        },
+        Err(_) => {
+            drop(child.kill().await);
+            drop(child.wait().await);
+            return Err(ResourceProbeOutcome::TimedOut);
+        },
+    };
+    let stdout = match stdout_handle {
+        Some(h) => h.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let stderr = match stderr_handle {
+        Some(h) => h.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn parse_helper_probe_output(output: &std::process::Output) -> Result<ProbeOutcomeV1, String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
+        let code = output.status.code();
         tracing::debug!(
-            status = ?output.status.code(),
+            status = ?code,
             stderr,
             "ordius-helper probe exited unsuccessfully"
         );
-        return if stderr.is_empty() {
-            Err(format!(
-                "ordius-helper probe exited with {:?}",
-                output.status.code()
-            ))
+        return Err(if stderr.is_empty() {
+            format!("ordius-helper probe exited with {code:?}")
         } else {
-            Err(format!(
-                "ordius-helper probe exited with {:?}: {stderr}",
-                output.status.code()
-            ))
-        };
+            format!("ordius-helper probe exited with {code:?}: {stderr}")
+        });
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -343,7 +467,7 @@ fn build_wire_plan(plan: &ProbePlan) -> Result<ProbePlanV1, DispatchError> {
     let mut resources = Vec::with_capacity(plan.defs.len());
     for def in &plan.defs {
         let spec = resource_spec_v1_from_def(def)
-            .map_err(|e| DispatchError::Translation(format!("plan build: {e}")))?;
+            .map_err(|e| DispatchError::PlanBuild(format!("plan build: {e}")))?;
         resources.push(spec);
     }
     Ok(ProbePlanV1 {
@@ -466,10 +590,7 @@ impl Dispatcher for WslDispatcher {
     }
 
     fn http_transport(&self) -> Arc<dyn HttpTransport> {
-        Arc::new(super::transport::WslHttpTransport::new(
-            &self.distro_name,
-            self.host_direct_snapshot(),
-        ))
+        self.transport.clone()
     }
 
     fn translate_path(&self, host_path: &Path) -> Result<EnvPath, DispatchError> {
@@ -511,13 +632,9 @@ fn probe_timeout_ms(def: &ResourceDefinition) -> u64 {
         ProbeSpec::Http { timeout_ms, .. }
         | ProbeSpec::Binary { timeout_ms, .. }
         | ProbeSpec::Toolchain { timeout_ms, .. } => {
-            timeout_ms.unwrap_or_else(default_probe_timeout_ms)
+            timeout_ms.unwrap_or_else(|| duration_millis_u64(DEFAULT_PROBE_TIMEOUT))
         },
     }
-}
-
-fn default_probe_timeout_ms() -> u64 {
-    u64::try_from(DEFAULT_PROBE_TIMEOUT.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn helper_wait_timeout(timeout_ms: u64) -> Duration {
@@ -553,7 +670,8 @@ fn resource_spec_v1_from_def(def: &ResourceDefinition) -> Result<ResourceSpecV1,
                     .map(|route| HttpProbeRouteV1 {
                         path: route.path.clone(),
                         method: match route.method {
-                            HttpProbeMethod::Get | HttpProbeMethod::Head => HttpProbeMethodV1::Get,
+                            HttpProbeMethod::Get => HttpProbeMethodV1::Get,
+                            HttpProbeMethod::Head => HttpProbeMethodV1::Head,
                         },
                         proves: route
                             .proves
@@ -919,7 +1037,7 @@ mod tests {
             ]
         );
         assert_eq!(routes.len(), 1);
-        assert!(matches!(routes[0].method, HttpProbeMethodV1::Get));
+        assert!(matches!(routes[0].method, HttpProbeMethodV1::Head));
         assert_eq!(
             routes[0].proves,
             vec![
