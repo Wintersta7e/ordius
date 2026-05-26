@@ -346,38 +346,56 @@ fn validate_nodes(
                 });
             };
 
-            if let Some(cap) = rref.required_capability() {
-                let advertised = &def.advertised_capabilities;
-                if !advertised.is_empty() && !advertised.contains(&cap) {
-                    return Err(WorkflowsError::CapabilityNotAdvertised {
-                        node_id: node.id.clone(),
-                        resource_id: rref.id().0.clone(),
-                        capability: format!("{cap:?}"),
-                    });
-                }
+            if let Some(cap) = rref.required_capability()
+                && !def.advertised_capabilities.contains(&cap)
+            {
+                // Strict: an explicit required_capability must be in the
+                // resource's advertised list. Untyped resources (empty
+                // advertised list) only resolve through bare ResourceRefs
+                // that don't request a specific capability.
+                return Err(WorkflowsError::CapabilityNotAdvertised {
+                    node_id: node.id.clone(),
+                    resource_id: rref.id().0.clone(),
+                    capability: format!("{cap:?}"),
+                });
             }
         }
 
-        // 2. `http` loopback-in-remote-env lint.
-        if node.ty == "http"
-            && let Some(url) = node.config.get("url").and_then(serde_json::Value::as_str)
-            && let Some(target) = &node.target_env
-        {
-            let target_str = target.as_str();
-            let is_local = target_str == EnvId::LOCAL;
-            let is_loopback_literal =
-                url.contains("127.0.0.1") || url.contains("localhost") || url.contains("0.0.0.0");
-            if !is_local && is_loopback_literal {
-                warnings.push(WorkflowWarning {
-                    node_id: node.id.clone(),
-                    kind: WorkflowWarningKind::LoopbackUrlInRemoteEnv,
-                    message: format!(
-                        "node {} targets env {target_str} but its http.url is a \
-                         loopback literal; the request will not reach the env \
-                         (likely a bug)",
-                        node.id
-                    ),
-                });
+        // 2. `http` node validations.
+        if node.ty == "http" {
+            // 2a. Validate `origin` wire form at load so users get the
+            //     error at edit/load rather than mid-run.
+            if let Some(origin_val) = node.config.get("origin") {
+                let _origin: crate::executor::builtins::http::Origin =
+                    serde_json::from_value(origin_val.clone()).map_err(|e| {
+                        WorkflowsError::InvalidNodeConfig {
+                            node_id: node.id.clone(),
+                            reason: format!("invalid origin: {e}"),
+                        }
+                    })?;
+            }
+
+            // 2b. Loopback-in-remote-env lint.
+            if let Some(url) = node.config.get("url").and_then(serde_json::Value::as_str)
+                && let Some(target) = &node.target_env
+            {
+                let target_str = target.as_str();
+                let is_local = target_str == EnvId::LOCAL;
+                let is_loopback_literal = url.contains("127.0.0.1")
+                    || url.contains("localhost")
+                    || url.contains("0.0.0.0");
+                if !is_local && is_loopback_literal {
+                    warnings.push(WorkflowWarning {
+                        node_id: node.id.clone(),
+                        kind: WorkflowWarningKind::LoopbackUrlInRemoteEnv,
+                        message: format!(
+                            "node {} targets env {target_str} but its http.url is a \
+                             loopback literal; the request will not reach the env \
+                             (likely a bug)",
+                            node.id
+                        ),
+                    });
+                }
             }
         }
     }

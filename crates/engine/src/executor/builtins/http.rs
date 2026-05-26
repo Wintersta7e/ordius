@@ -36,7 +36,8 @@ pub const NODE_TYPE_ID: &str = "http";
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
-enum Origin {
+#[allow(unreachable_pub)]
+pub enum Origin {
     #[default]
     Env,
     Host,

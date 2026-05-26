@@ -110,14 +110,6 @@ fn resolve_resource_url(
     let registry = engine.resource_registry();
     let snap = registry.snapshot();
 
-    let required_cap = rref.required_capability().unwrap_or({
-        if tools_present {
-            Capability::OpenaiToolCalling
-        } else {
-            Capability::OpenaiChatCompletions
-        }
-    });
-
     // The workflow scope is the highest precedence; pair it with the
     // local env so the chain walks `Workflow → EnvLocal(local) →
     // UserGlobal → Builtin`. Env-aware resolution lands in Phase E.
@@ -126,11 +118,14 @@ fn resolve_resource_url(
         .resolve(rref.id(), &EnvId::local(), Some(&workflow_id))
         .ok_or_else(|| NodeError::Config(format!("llm: unknown resource id '{}'", rref.id().0)))?;
 
-    // Capability gating: when the resource declares advertised caps,
-    // refuse if the required one isn't among them. An empty advertised
-    // list means "untyped" — let it through so workflow-scoped
-    // user-defined resources without an explicit caps list still work.
-    if !def.advertised_capabilities.is_empty()
+    // Capability gating mirrors `workflows::validate_nodes`: only
+    // enforce when the user explicitly stated `required_capability`.
+    // Untyped resources (empty advertised list) resolve unconditionally
+    // for bare ResourceRefs whose capability is inferred. The inferred
+    // capability (tools_present → OpenaiToolCalling, else
+    // OpenaiChatCompletions) is structural-only in Phase D; Phase E's
+    // `route_for_capability` consumes it for route selection.
+    if let Some(required_cap) = rref.required_capability()
         && !def.advertised_capabilities.contains(&required_cap)
     {
         return Err(NodeError::Config(format!(
@@ -138,6 +133,11 @@ fn resolve_resource_url(
             rref.id().0
         )));
     }
+    let _inferred_cap = if tools_present {
+        Capability::OpenaiToolCalling
+    } else {
+        Capability::OpenaiChatCompletions
+    };
 
     let ProbeSpec::Http { ports, .. } = &def.probe else {
         return Err(NodeError::Config(format!(
@@ -1392,10 +1392,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn resource_capability_inferred_from_tools_present() {
+    async fn resource_inferred_capability_does_not_gate_bare_ref() {
+        // Bare ResourceRef ("wf-tools-only") never asks the loader/executor
+        // to enforce a specific capability — the inference rule only feeds
+        // Phase E's route selection. So a resource that advertises ONLY
+        // ToolCalling still resolves for a tools_present=false (single-turn)
+        // call. User-stated `required_capability` is the only thing that
+        // gates Phase D.
         let (engine, ctx, _dir) = ctx_with_engine("wf-infer").await;
-        // Only advertises ToolCalling — caller with tools_present=true must
-        // pass the cap check via the inference rule.
         let resource = http_resource("wf-tools-only", 39_113, vec![Capability::OpenaiToolCalling]);
         install_workflow_resources(
             &WorkflowId("wf-infer".into()),
@@ -1405,14 +1409,23 @@ mod tests {
         .expect("install");
 
         let node = llm_node_with_resource(serde_json::json!("wf-tools-only"));
-        let url = resolve_resource_url(&node, &ctx, true)
-            .expect("tools_present=true → infer OpenaiToolCalling")
+        let url_with_tools = resolve_resource_url(&node, &ctx, true)
+            .expect("tools_present=true bare-ref resolves")
             .expect("some");
-        assert_eq!(url, "http://127.0.0.1:39113");
+        assert_eq!(url_with_tools, "http://127.0.0.1:39113");
+        let url_without_tools = resolve_resource_url(&node, &ctx, false)
+            .expect("tools_present=false bare-ref also resolves (no user-stated cap)")
+            .expect("some");
+        assert_eq!(url_without_tools, "http://127.0.0.1:39113");
 
-        // And same registry with tools_present=false → infer ChatCompletions,
-        // which the resource does NOT advertise → Config error.
-        let err = resolve_resource_url(&node, &ctx, false).expect_err("missing cap rejects");
+        // But the long-form ref with an explicit required_capability that
+        // the resource doesn't advertise → Config error regardless of tools.
+        let strict_node = llm_node_with_resource(serde_json::json!({
+            "id": "wf-tools-only",
+            "required_capability": "openai_chat_completions",
+        }));
+        let err =
+            resolve_resource_url(&strict_node, &ctx, false).expect_err("user-stated cap rejects");
         assert!(matches!(err, NodeError::Config(_)), "got {err:?}");
     }
 

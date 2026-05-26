@@ -441,6 +441,112 @@ mod validation_tests {
     }
 
     #[test]
+    fn load_in_registry_rejects_empty_advertised_capabilities_with_required_cap() {
+        // Tightening: an empty advertised_capabilities list used to act as
+        // a wildcard for required_capability checks. Now strict — if you
+        // ask for a capability, the resource must explicitly advertise it.
+        let tmp = TempDir::new().unwrap();
+        let id = "wf-empty-caps";
+        let dir = tmp.path().join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.json"));
+        std::fs::write(
+            &path,
+            r#"{
+                "id":"wf-empty-caps","name":"x",
+                "resources":[{
+                    "id":"untyped-llm",
+                    "kind":"http_endpoint",
+                    "probe":{"kind":"http","ports":[7777]},
+                    "override_lower_scope":false
+                }],
+                "nodes":[{"id":"n1","type":"llm","name":"x",
+                    "config":{
+                        "resource":{"id":"untyped-llm","required_capability":"openai_chat_completions"},
+                        "model":"m","messages":[]
+                    }
+                }],
+                "edges":[]
+            }"#,
+        )
+        .unwrap();
+        let registry = ResourceRegistry::new();
+        let err = super::load_in_registry(tmp.path(), id, &registry).unwrap_err();
+        match err {
+            super::WorkflowsError::CapabilityNotAdvertised {
+                node_id,
+                resource_id,
+                ..
+            } => {
+                assert_eq!(node_id, "n1");
+                assert_eq!(resource_id, "untyped-llm");
+            },
+            other => panic!("expected CapabilityNotAdvertised, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_in_registry_allows_untyped_resource_via_bare_ref() {
+        // The "untyped" escape hatch: a bare ResourceRef against a resource
+        // with empty advertised_capabilities resolves cleanly. The strict
+        // capability check only fires for explicit required_capability asks.
+        let tmp = TempDir::new().unwrap();
+        let id = "wf-untyped-ok";
+        let dir = tmp.path().join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.json"));
+        std::fs::write(
+            &path,
+            r#"{
+                "id":"wf-untyped-ok","name":"x",
+                "resources":[{
+                    "id":"untyped-svc",
+                    "kind":"http_endpoint",
+                    "probe":{"kind":"http","ports":[8080]},
+                    "override_lower_scope":false
+                }],
+                "nodes":[{"id":"n1","type":"http","name":"ping",
+                    "config":{"resource":"untyped-svc","path":"/health","method":"GET"}
+                }],
+                "edges":[]
+            }"#,
+        )
+        .unwrap();
+        let registry = ResourceRegistry::new();
+        let (_wf, warnings) = super::load_in_registry(tmp.path(), id, &registry).unwrap();
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn load_in_registry_rejects_invalid_origin_value() {
+        let tmp = TempDir::new().unwrap();
+        let id = "wf-bad-origin";
+        let dir = tmp.path().join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.json"));
+        std::fs::write(
+            &path,
+            r#"{
+                "id":"wf-bad-origin","name":"x",
+                "nodes":[{"id":"n1","type":"http","name":"x",
+                    "config":{"url":"http://example.com","origin":"sideways"}
+                }],
+                "edges":[]
+            }"#,
+        )
+        .unwrap();
+        let registry = ResourceRegistry::new();
+        let err = super::load_in_registry(tmp.path(), id, &registry).unwrap_err();
+        match err {
+            super::WorkflowsError::InvalidNodeConfig { node_id, reason } => {
+                assert_eq!(node_id, "n1");
+                assert!(reason.contains("origin"), "got {reason}");
+            },
+            other => panic!("expected InvalidNodeConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn load_in_registry_warns_on_localhost_url_with_remote_target_env() {
         let tmp = TempDir::new().unwrap();
         let id = "wf-lint";
