@@ -4099,9 +4099,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "jsonpath-rust",
+ "regex",
  "serde",
  "serde_json",
  "ureq",
+ "wait-timeout",
  "which 6.0.3",
 ]
 
