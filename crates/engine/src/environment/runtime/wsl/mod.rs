@@ -7,6 +7,7 @@
 pub mod bootstrap;
 pub mod dispatcher;
 pub mod enumerate;
+pub mod host_direct;
 pub mod path;
 pub mod shell_fallback;
 pub mod transport;
