@@ -179,6 +179,35 @@ impl ResourceRegistry {
     pub fn snapshot(&self) -> Arc<RegistryInner> {
         self.inner.load_full()
     }
+
+    /// Drop a whole scope from the registry. Returns the number of
+    /// definitions that were removed; `0` if the scope was absent.
+    ///
+    /// Bumps the registry revision exactly when at least one definition was
+    /// removed, so callers using `revision` to invalidate caches don't see a
+    /// spurious refresh signal when this is a no-op.
+    pub fn remove_scope(&self, scope: &ScopeKey) -> usize {
+        loop {
+            let current = self.inner.load_full();
+            let Some(layer) = current.layers.get(scope) else {
+                return 0;
+            };
+            let removed = layer.len();
+            if removed == 0 {
+                return 0;
+            }
+            let mut new_layers = current.layers.clone();
+            new_layers.remove(scope);
+            let new = Arc::new(RegistryInner {
+                revision: current.revision + 1,
+                layers: new_layers,
+            });
+            let previous = self.inner.compare_and_swap(&current, new);
+            if Arc::ptr_eq(&current, &previous) {
+                return removed;
+            }
+        }
+    }
 }
 
 impl Default for ResourceRegistry {
@@ -409,5 +438,31 @@ mod tests {
                 .unwrap()
                 .contains_key(&ResourceId("vllm".into()))
         );
+    }
+
+    #[test]
+    fn remove_scope_drops_layer_and_bumps_revision() {
+        let reg = ResourceRegistry::new();
+        let scope = ScopeKey::Workflow {
+            id: crate::environment::runtime::env::WorkflowId("wf1".into()),
+        };
+        let _ = reg.upsert(&scope, &def("custom", false)).unwrap();
+        let rev_before_remove = reg.snapshot().revision;
+        let removed = reg.remove_scope(&scope);
+        assert_eq!(removed, 1);
+        let snap = reg.snapshot();
+        assert!(snap.revision > rev_before_remove);
+        assert!(!snap.layers.contains_key(&scope));
+    }
+
+    #[test]
+    fn remove_scope_missing_returns_zero() {
+        let reg = ResourceRegistry::new();
+        let scope = ScopeKey::Workflow {
+            id: crate::environment::runtime::env::WorkflowId("ghost".into()),
+        };
+        assert_eq!(reg.remove_scope(&scope), 0);
+        // No revision bump when nothing changed.
+        assert_eq!(reg.snapshot().revision, 0);
     }
 }

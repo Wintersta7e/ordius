@@ -16,6 +16,7 @@ pub mod registry;
 pub mod resource;
 pub mod transport;
 pub mod user_file;
+pub mod workflow_scope;
 pub mod wsl;
 
 /// Test-support fixtures (requires `features = ["testing"]` or `#[cfg(test)]`).
@@ -79,6 +80,11 @@ pub use builtin::{BUILTIN_RESOURCES, builtin_by_id, install_builtin_resources};
 
 /// User-global `resources.toml` loader.
 pub use user_file::{ResourcesFileError, UserResourcesFile, load_user_resources};
+
+// ── Workflow-scoped resources ────────────────────────────────────────────────
+
+/// Install / remove workflow-scoped resources from the registry.
+pub use workflow_scope::{WorkflowScopeError, install_workflow_resources, remove_workflow_scope};
 
 // ── Traits ───────────────────────────────────────────────────────────────────
 
