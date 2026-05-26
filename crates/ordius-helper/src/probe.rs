@@ -287,14 +287,57 @@ fn find_in_path(bin: &str, extra_search_paths: &[String]) -> Option<String> {
         return Some(p.to_string_lossy().into_owned());
     }
 
-    for extra in extra_search_paths {
-        let candidate = std::path::Path::new(extra).join(bin);
+    for dir in expand_search_paths(extra_search_paths) {
+        let candidate = dir.join(bin);
         if candidate.is_file() {
             return Some(candidate.to_string_lossy().into_owned());
         }
     }
 
     None
+}
+
+/// Expand a slice of search-path patterns into concrete directories.
+///
+/// Mirrors `crates/engine/src/environment/runtime/search_paths.rs::expand`
+/// but lives here so the helper crate can stay standalone — the helper
+/// must compile + run without a transitive engine dependency.
+fn expand_search_paths(patterns: &[String]) -> Vec<std::path::PathBuf> {
+    let home = home_dir();
+    let mut out = Vec::new();
+    for raw in patterns {
+        let expanded = expand_tilde(raw, &home);
+        if expanded.contains('*') || expanded.contains('?') || expanded.contains('[') {
+            if let Ok(iter) = glob::glob(&expanded) {
+                let mut matches: Vec<std::path::PathBuf> = iter.filter_map(Result::ok).collect();
+                matches.sort();
+                out.extend(matches);
+            }
+        } else {
+            out.push(std::path::PathBuf::from(expanded));
+        }
+    }
+    out
+}
+
+fn expand_tilde(raw: &str, home: &std::path::Path) -> String {
+    if raw == "~" {
+        return home.display().to_string();
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return home.join(rest).display().to_string();
+    }
+    raw.to_string()
+}
+
+fn home_dir() -> std::path::PathBuf {
+    if let Ok(h) = std::env::var("HOME") {
+        return std::path::PathBuf::from(h);
+    }
+    if let Ok(h) = std::env::var("USERPROFILE") {
+        return std::path::PathBuf::from(h);
+    }
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
 enum RunResult {
@@ -658,5 +701,43 @@ mod tests {
                 other => panic!("expected Found(Toolchain), got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn find_in_path_expands_tilde_and_glob() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = home.path().join(".nvm/versions/node/v20.0.0/bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin_name = "ordius-helper-fake-bin";
+        let p = dir.join(bin_name);
+        std::fs::write(&p, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: `std::env::set_var` is unsafe in edition 2024; tests in this
+        // module are single-threaded for env mutation. `HOME` is restored
+        // before this test returns regardless of assertion outcome.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+        let resolved = find_in_path(bin_name, &["~/.nvm/versions/node/*/bin".to_string()]);
+        unsafe {
+            if let Some(h) = prev_home {
+                std::env::set_var("HOME", h);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+
+        assert!(resolved.is_some());
+        assert!(
+            resolved
+                .unwrap()
+                .ends_with("v20.0.0/bin/ordius-helper-fake-bin")
+        );
     }
 }

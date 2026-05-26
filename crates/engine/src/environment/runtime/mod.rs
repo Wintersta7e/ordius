@@ -14,6 +14,7 @@ pub mod local;
 pub mod plan;
 pub mod registry;
 pub mod resource;
+pub mod search_paths;
 pub mod transport;
 pub mod user_file;
 pub mod workflow_scope;

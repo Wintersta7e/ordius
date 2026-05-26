@@ -296,6 +296,7 @@ impl LocalDispatcher {
                 bin,
                 version_args,
                 version_regex,
+                extra_search_paths,
                 timeout_ms,
             } => {
                 self.probe_binary_or_toolchain(BinaryProbe {
@@ -303,7 +304,7 @@ impl LocalDispatcher {
                     bin,
                     version_args,
                     version_regex,
-                    extra_search_paths: &[],
+                    extra_search_paths,
                     timeout_ms: *timeout_ms,
                     default_timeout,
                     cancel,
@@ -492,19 +493,38 @@ fn cancelled_probe_outcome() -> ResourceProbeOutcome {
 
 /// Resolve `bin` to an absolute path.
 ///
-/// Tries `which::which` first (honours `PATH`), then walks `extra_search_paths`
-/// appending `bin` directly. Returns the first candidate that is a regular file.
+/// Tries `which::which` first (honours `PATH`), then expands `extras`
+/// through [`super::search_paths::expand`] (resolves `~/...` and `*`-glob
+/// patterns against the user's home directory) and walks the resulting
+/// directories appending `bin`. Returns the first candidate that is a
+/// regular file.
 fn which_with_fallback(bin: &str, extras: &[String]) -> Option<PathBuf> {
     if let Ok(p) = which::which(bin) {
         return Some(p);
     }
-    for dir in extras {
-        let cand = PathBuf::from(dir).join(bin);
+    let home = home_dir();
+    for dir in super::search_paths::expand(extras, &home) {
+        let cand = dir.join(bin);
         if cand.is_file() {
             return Some(cand);
         }
     }
     None
+}
+
+/// Best-effort host home-directory resolution.
+///
+/// Uses `$HOME` on Unix and `%USERPROFILE%` on Windows. Falls back to the
+/// current directory when neither is set — extras starting with `~` then
+/// silently drop, which is harmless for an extras-only fallback.
+fn home_dir() -> std::path::PathBuf {
+    if let Ok(h) = std::env::var("HOME") {
+        return std::path::PathBuf::from(h);
+    }
+    if let Ok(h) = std::env::var("USERPROFILE") {
+        return std::path::PathBuf::from(h);
+    }
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
 #[cfg(test)]
@@ -666,6 +686,7 @@ mod tests {
                 bin: "git".into(),
                 version_args: vec!["--version".into()],
                 version_regex: r"^git version (\S+)".into(),
+                extra_search_paths: vec![],
                 timeout_ms: None,
             },
             override_lower_scope: false,
@@ -956,6 +977,7 @@ mod tests {
                         bin: "git".into(),
                         version_args: vec!["--version".into()],
                         version_regex: r"^git version (\S+)".into(),
+                        extra_search_paths: vec![],
                         timeout_ms: None,
                     },
                     override_lower_scope: false,
@@ -981,5 +1003,45 @@ mod tests {
             summary.catalog.resources.get(&ResourceId("git".into())),
             Some(ResourceProbeOutcome::Found(_))
         ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn which_with_fallback_finds_binary_under_tilde_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Lay out a fake home with a binary at <home>/.cargo/bin/<name>,
+        // point HOME at it, and ensure the resolver finds it. We pick a name
+        // that almost certainly is not on PATH so `which` falls through.
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = home.path().join(".cargo/bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary_name = "ordius-fake-resolver-target";
+        let bin_path = dir.join(binary_name);
+        std::fs::write(&bin_path, b"#!/bin/sh\necho ok\n").unwrap();
+        std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // SAFETY: tests are intentionally single-threaded for env mutation.
+        // The local mod's other tests do not read HOME, so swapping it for
+        // this test does not collide.
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: `std::env::set_var` is unsafe in edition 2024.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+        }
+
+        let found = super::which_with_fallback(binary_name, &["~/.cargo/bin".to_string()]);
+
+        // Restore HOME even if the assertion below would fail.
+        unsafe {
+            if let Some(h) = prev_home {
+                std::env::set_var("HOME", h);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+        assert!(found.is_some());
+        assert_eq!(found.unwrap(), bin_path);
     }
 }

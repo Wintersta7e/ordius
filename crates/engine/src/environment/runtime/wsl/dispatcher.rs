@@ -768,6 +768,7 @@ fn resource_spec_v1_from_def(def: &ResourceDefinition) -> Result<ResourceSpecV1,
             bin,
             version_args,
             version_regex,
+            extra_search_paths,
             ..
         } => {
             if def.kind != ResourceKind::Toolchain {
@@ -780,7 +781,7 @@ fn resource_spec_v1_from_def(def: &ResourceDefinition) -> Result<ResourceSpecV1,
                 bin: bin.clone(),
                 version_args: version_args.clone(),
                 version_regex: version_regex.clone(),
-                extra_search_paths: Vec::new(),
+                extra_search_paths: extra_search_paths.clone(),
             }
         },
     };

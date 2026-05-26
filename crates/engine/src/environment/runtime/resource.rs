@@ -99,12 +99,17 @@ pub enum ProbeSpec {
     },
     /// Probe a language toolchain binary.
     Toolchain {
-        /// Executable name (looked up on PATH).
+        /// Executable name (looked up on PATH + `extra_search_paths`).
         bin: String,
         /// Arguments passed to get a version string.
         version_args: Vec<String>,
         /// Regex with one capture group extracting the version number.
         version_regex: String,
+        /// Additional directories to search before PATH. Supports `~` home
+        /// expansion and `*` glob patterns; engine + helper both expand these
+        /// before probing.
+        #[serde(default)]
+        extra_search_paths: Vec<String>,
         /// Override `ProbePlan.per_resource_timeout` for this resource.
         timeout_ms: Option<u64>,
     },

@@ -4,8 +4,9 @@
 //! Ordius can probe in any environment. Per-env and per-workflow definitions
 //! in the registry layer shadow these at higher precedence.
 //!
-//! Helpers [`http`], [`binary`], and [`toolchain`] keep the list terse.
-//! [`builtin_by_id`] provides O(n) lookup (n ≤ ~25; `LazyLock` amortises init).
+//! Helpers [`http`], [`binary_with_extras`], and [`toolchain`] keep the list
+//! terse. [`builtin_by_id`] provides O(n) lookup (n ≤ ~25; `LazyLock`
+//! amortises init).
 
 use std::sync::LazyLock;
 
@@ -51,13 +52,15 @@ fn http(
     }
 }
 
-/// Build a [`Binary`](ResourceKind::Binary) [`ResourceDefinition`].
-fn binary(
+/// Build a [`Binary`](ResourceKind::Binary) [`ResourceDefinition`] with
+/// the AgentDeck-shaped extra search paths the CLI-agent fallbacks need.
+fn binary_with_extras(
     id: &str,
     bin: &str,
     version_args: &[&str],
     version_regex: &str,
     caps: &[Capability],
+    extras: &[&str],
 ) -> ResourceDefinition {
     ResourceDefinition {
         id: ResourceId(id.into()),
@@ -67,7 +70,7 @@ fn binary(
             bin: bin.into(),
             version_args: version_args.iter().map(|s| (*s).to_string()).collect(),
             version_regex: version_regex.into(),
-            extra_search_paths: vec![],
+            extra_search_paths: extras.iter().map(|s| (*s).to_string()).collect(),
             timeout_ms: None,
         },
         override_lower_scope: false,
@@ -80,6 +83,7 @@ fn toolchain(
     bin: &str,
     version_args: &[&str],
     version_regex: &str,
+    extras: &[&str],
 ) -> ResourceDefinition {
     ResourceDefinition {
         id: ResourceId(id.into()),
@@ -89,11 +93,59 @@ fn toolchain(
             bin: bin.into(),
             version_args: version_args.iter().map(|s| (*s).to_string()).collect(),
             version_regex: version_regex.into(),
+            extra_search_paths: extras.iter().map(|s| (*s).to_string()).collect(),
             timeout_ms: None,
         },
         override_lower_scope: false,
     }
 }
+
+// ── AgentDeck-shaped extras lists ─────────────────────────────────────────────
+//
+// All slices of &'static str so they can be reused without allocation.
+// Patterns may include `~/` (home expansion) and `*` (glob).
+
+/// Search paths used by every CLI-agent built-in. The official Anthropic
+/// claude / codex installers drop binaries at `~/.local/bin`; everything
+/// else lives in one of the Node version-manager directories or the system
+/// npm prefix.
+const NODE_AGENT_EXTRAS: &[&str] = &[
+    "~/.local/bin",
+    "~/.nvm/versions/node/*/bin",
+    "~/.volta/bin",
+    "~/.fnm/aliases/*/bin",
+    "~/.fnm/node-versions/*/installation/bin",
+    "~/.npm-global/bin",
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+];
+
+const NODE_EXTRAS: &[&str] = &[
+    "~/.nvm/versions/node/*/bin",
+    "~/.volta/bin",
+    "~/.fnm/aliases/*/bin",
+    "~/.fnm/node-versions/*/installation/bin",
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+];
+
+const PYTHON_EXTRAS: &[&str] = &[
+    "~/.local/bin",
+    "~/.pyenv/shims",
+    "~/.pyenv/versions/*/bin",
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+];
+
+const RUST_EXTRAS: &[&str] = &["~/.cargo/bin", "~/.rustup/toolchains/*/bin"];
+
+const GO_EXTRAS: &[&str] = &["~/go/bin", "/usr/local/go/bin", "/opt/homebrew/bin"];
+
+const FFMPEG_EXTRAS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin"];
+
+const GIT_EXTRAS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin"];
+
+const DOCKER_EXTRAS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin"];
 
 // ── Static list ───────────────────────────────────────────────────────────────
 
@@ -216,80 +268,119 @@ pub static BUILTIN_RESOURCES: LazyLock<Vec<ResourceDefinition>> = LazyLock::new(
         //
         // IDs are AgentDeck-aligned. Note: binary name for claude-code is "claude"
         // (not "claude-code") — the npm package installs a bare `claude` binary.
-        binary(
+        binary_with_extras(
             "claude-code",
             "claude",
             &["--version"],
             r"^(\d+\.\d+\.\d+)",
             &[Capability::CliAgentPrint],
+            NODE_AGENT_EXTRAS,
         ),
-        binary(
+        binary_with_extras(
             "codex",
             "codex",
             &["--version"],
             r"(\d+\.\d+\.\d+)",
             &[Capability::CliAgentPrint],
+            NODE_AGENT_EXTRAS,
         ),
-        binary(
+        binary_with_extras(
             "aider",
             "aider",
             &["--version"],
             r"^aider (\d+\.\d+\.\d+)",
             &[Capability::CliAgentPrint],
+            NODE_AGENT_EXTRAS,
         ),
         // Renamed from "gemini" to "gemini-cli" (round-3 correction).
         // The CLI binary itself is still called `gemini`.
-        binary(
+        binary_with_extras(
             "gemini-cli",
             "gemini",
             &["--version"],
             r"(\d+\.\d+\.\d+)",
             &[Capability::CliAgentPrint],
+            NODE_AGENT_EXTRAS,
         ),
         // Goose uses `goose version` (subcommand), not `goose --version`.
-        binary(
+        binary_with_extras(
             "goose",
             "goose",
             &["version"],
             r"(\d+\.\d+\.\d+)",
             &[Capability::CliAgentPrint],
+            NODE_AGENT_EXTRAS,
         ),
-        binary(
+        binary_with_extras(
             "amazon-q",
             "q",
             &["--version"],
             r"(\d+\.\d+\.\d+)",
             &[Capability::CliAgentPrint],
+            NODE_AGENT_EXTRAS,
         ),
         // opencode uses `opencode version` subcommand.
-        binary(
+        binary_with_extras(
             "opencode",
             "opencode",
             &["version"],
             r"(\d+\.\d+\.\d+)",
             &[Capability::CliAgentPrint],
+            NODE_AGENT_EXTRAS,
         ),
-        binary(
+        binary_with_extras(
             "cursor-cli",
             "cursor-agent",
             &["--version"],
             r"(\d+\.\d+\.\d+)",
             &[Capability::CliAgentPrint],
+            NODE_AGENT_EXTRAS,
         ),
         // ── Runtimes / toolchains ─────────────────────────────────────────────
-        toolchain("git", "git", &["--version"], r"^git version (\S+)"),
-        toolchain("docker", "docker", &["--version"], r"^Docker version (\S+)"),
-        toolchain("node", "node", &["--version"], r"^v(\d+\.\d+\.\d+)"),
+        toolchain(
+            "git",
+            "git",
+            &["--version"],
+            r"^git version (\S+)",
+            GIT_EXTRAS,
+        ),
+        toolchain(
+            "docker",
+            "docker",
+            &["--version"],
+            r"^Docker version (\S+)",
+            DOCKER_EXTRAS,
+        ),
+        toolchain(
+            "node",
+            "node",
+            &["--version"],
+            r"^v(\d+\.\d+\.\d+)",
+            NODE_EXTRAS,
+        ),
         toolchain(
             "python",
             "python3",
             &["--version"],
             r"^Python (\d+\.\d+\.\d+)",
+            PYTHON_EXTRAS,
         ),
-        toolchain("rust", "rustc", &["--version"], r"^rustc (\d+\.\d+\.\d+)"),
+        toolchain(
+            "rust",
+            "rustc",
+            &["--version"],
+            r"^rustc (\d+\.\d+\.\d+)",
+            RUST_EXTRAS,
+        ),
         // Go uses `go version` subcommand.
-        toolchain("go", "go", &["version"], r"^go version go(\S+)"),
-        toolchain("ffmpeg", "ffmpeg", &["-version"], r"^ffmpeg version (\S+)"),
+        toolchain("go", "go", &["version"], r"^go version go(\S+)", GO_EXTRAS),
+        toolchain(
+            "ffmpeg",
+            "ffmpeg",
+            &["-version"],
+            r"^ffmpeg version (\S+)",
+            FFMPEG_EXTRAS,
+        ),
     ]
 });
 
@@ -430,5 +521,54 @@ mod tests {
         let snap = reg.snapshot();
         let layer = snap.layers.get(&ScopeKey::Builtin).unwrap();
         assert_eq!(layer.len(), BUILTIN_RESOURCES.len());
+    }
+
+    #[test]
+    fn rust_toolchain_has_cargo_bin_extra() {
+        let r = builtin_by_id("rust").unwrap();
+        let ProbeSpec::Toolchain {
+            extra_search_paths, ..
+        } = &r.probe
+        else {
+            panic!("toolchain")
+        };
+        assert!(
+            extra_search_paths.iter().any(|p| p == "~/.cargo/bin"),
+            "rust toolchain must include ~/.cargo/bin"
+        );
+    }
+
+    #[test]
+    fn node_toolchain_has_nvm_glob() {
+        let r = builtin_by_id("node").unwrap();
+        let ProbeSpec::Toolchain {
+            extra_search_paths, ..
+        } = &r.probe
+        else {
+            panic!("toolchain")
+        };
+        assert!(
+            extra_search_paths
+                .iter()
+                .any(|p| p == "~/.nvm/versions/node/*/bin"),
+            "node toolchain must include the nvm glob"
+        );
+    }
+
+    #[test]
+    fn claude_code_has_node_agent_extras() {
+        let r = builtin_by_id("claude-code").unwrap();
+        let ProbeSpec::Binary {
+            extra_search_paths, ..
+        } = &r.probe
+        else {
+            panic!("binary")
+        };
+        assert!(extra_search_paths.iter().any(|p| p == "~/.local/bin"));
+        assert!(
+            extra_search_paths
+                .iter()
+                .any(|p| p == "~/.nvm/versions/node/*/bin")
+        );
     }
 }
