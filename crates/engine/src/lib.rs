@@ -56,6 +56,9 @@ pub use types::{
 pub use validation::{ValidationError, validate};
 
 use crate::db::DbPool;
+use crate::environment::runtime::{
+    ResourceRegistry, install_builtin_resources, load_user_resources,
+};
 use crate::registry::Registry;
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
@@ -79,6 +82,9 @@ use tokio_util::sync::CancellationToken;
 pub struct Engine {
     pool: DbPool,
     registry: Arc<Registry>,
+    /// Scoped resource registry: built-in + user-global at construction,
+    /// per-workflow definitions installed at workflow-load time.
+    resource_registry: Arc<ResourceRegistry>,
     checkpoints: Arc<CheckpointRegistry>,
     events: Arc<events_registry::EventRegistry>,
     home: PathBuf,
@@ -128,6 +134,18 @@ impl Engine {
         if seeded > 0 {
             tracing::info!(count = seeded, "installed starter workflows");
         }
+        let resource_registry = Arc::new(ResourceRegistry::new());
+        // Built-ins land at the bottom of the precedence chain; the upsert
+        // can never trip OverrideRequired here, so we surface the panic
+        // as a programmer error instead of an EngineError variant.
+        let builtin_count = install_builtin_resources(&resource_registry)
+            .expect("install_builtin_resources cannot collide at Builtin scope");
+        let user_count = load_user_resources(&home, &resource_registry)?;
+        tracing::info!(
+            builtins = builtin_count,
+            user_resources = user_count,
+            "seeded resource registry",
+        );
         let env_report = environment::detect(&home, &pool).await;
         tracing::info!(
             platform = ?env_report.platform,
@@ -138,6 +156,7 @@ impl Engine {
         Ok(Self {
             pool,
             registry: Arc::new(registry),
+            resource_registry,
             checkpoints: Arc::new(CheckpointRegistry::new()),
             events: Arc::new(events_registry::EventRegistry::new()),
             home,
@@ -189,6 +208,13 @@ impl Engine {
     #[must_use]
     pub fn registry(&self) -> Arc<Registry> {
         self.registry.clone()
+    }
+
+    /// Shared resource registry — pass into resource-aware dispatchers and
+    /// into workflow-scope install / remove calls.
+    #[must_use]
+    pub fn resource_registry(&self) -> Arc<ResourceRegistry> {
+        self.resource_registry.clone()
     }
 
     /// Shared checkpoint registry — pass into `RunContext`.
@@ -319,6 +345,23 @@ mod engine_tests {
         }
         assert!(eng.subscribe_run("nope").is_none());
         assert!(!eng.cancel_run("nope"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_seeds_builtin_resources() {
+        use crate::environment::runtime::{ResourceId, ScopeKey};
+
+        let dir = TempDir::new().unwrap();
+        let engine = Engine::new(dir.path().to_path_buf()).await.expect("new");
+        let snap = engine.resource_registry().snapshot();
+        let builtin_layer = snap
+            .layers
+            .get(&ScopeKey::Builtin)
+            .expect("builtin layer present");
+        assert!(
+            builtin_layer.contains_key(&ResourceId("ollama".into())),
+            "ollama in builtins",
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

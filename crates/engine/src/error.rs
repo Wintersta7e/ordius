@@ -65,6 +65,11 @@ pub enum EngineError {
     /// or spawn failure).
     #[error("dispatch: {0}")]
     Dispatch(#[from] crate::environment::runtime::error::DispatchError),
+    /// User-global / built-in / workflow resource registry seeding failed.
+    /// Wraps both the TOML loader error and registry-side override-required
+    /// rejections so callers don't need to know which layer produced the failure.
+    #[error("resources: {0}")]
+    Resources(#[from] crate::environment::runtime::user_file::ResourcesFileError),
     /// A code path that intentionally returns `NotImplemented` in this
     /// release. The static string identifies the missing capability
     /// (e.g. `"container backend"` for the v1.0 stub).
