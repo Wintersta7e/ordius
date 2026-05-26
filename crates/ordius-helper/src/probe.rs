@@ -303,13 +303,31 @@ enum RunResult {
     SpawnError(std::io::Error),
 }
 
-fn run_command(mut cmd: std::process::Command, timeout: Option<Duration>) -> RunResult {
+fn run_command(cmd: std::process::Command, timeout: Option<Duration>) -> RunResult {
     match timeout {
         Some(timeout) => run_with_timeout(cmd, timeout),
-        None => match cmd.output() {
-            Ok(output) => RunResult::Output(output),
-            Err(e) => RunResult::SpawnError(e),
-        },
+        // No-timeout path also caps stdio reads so the output cap is an
+        // invariant of `run_command`, not a coincidence of which branch ran.
+        None => run_unbounded(cmd),
+    }
+}
+
+fn run_unbounded(mut cmd: std::process::Command) -> RunResult {
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return RunResult::SpawnError(e),
+    };
+    let (stdout, stderr) = capture_capped_stdio(&mut child);
+    match child.wait() {
+        Ok(status) => RunResult::Output(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        Err(e) => RunResult::SpawnError(e),
     }
 }
 
@@ -330,6 +348,19 @@ fn run_with_timeout(mut cmd: std::process::Command, timeout: Duration) -> RunRes
         Err(e) => return RunResult::SpawnError(e),
     };
 
+    let (stdout, stderr) = capture_capped_stdio(&mut child);
+    RunResult::Output(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Drain `child`'s stdout/stderr pipes up to `MAX_VERSION_OUTPUT_BYTES` each.
+/// Read errors are intentionally swallowed: the caller has already decided
+/// the process produced output worth capturing, and a partial read is more
+/// useful for diagnostics than an aborted probe.
+fn capture_capped_stdio(child: &mut std::process::Child) -> (Vec<u8>, Vec<u8>) {
     let mut stdout_buf = Vec::new();
     let mut stderr_buf = Vec::new();
     if let Some(s) = child.stdout.take() {
@@ -342,12 +373,7 @@ fn run_with_timeout(mut cmd: std::process::Command, timeout: Duration) -> RunRes
             .take(MAX_VERSION_OUTPUT_BYTES)
             .read_to_end(&mut stderr_buf);
     }
-
-    RunResult::Output(std::process::Output {
-        status,
-        stdout: stdout_buf,
-        stderr: stderr_buf,
-    })
+    (stdout_buf, stderr_buf)
 }
 
 fn fingerprint(body: &str, jsonpaths: &[String]) -> String {
