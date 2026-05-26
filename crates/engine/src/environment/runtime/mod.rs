@@ -15,6 +15,7 @@ pub mod plan;
 pub mod registry;
 pub mod resource;
 pub mod transport;
+pub mod user_file;
 pub mod wsl;
 
 /// Test-support fixtures (requires `features = ["testing"]` or `#[cfg(test)]`).
@@ -73,6 +74,11 @@ pub use registry::{RegistryInner, ResourceRegistry, ScopeKey};
 /// Static `BUILTIN_RESOURCES` slice, `builtin_by_id` accessor, and the
 /// `install_builtin_resources` seeder consumed by `Engine::new`.
 pub use builtin::{BUILTIN_RESOURCES, builtin_by_id, install_builtin_resources};
+
+// ── User-global resources file ───────────────────────────────────────────────
+
+/// User-global `resources.toml` loader.
+pub use user_file::{ResourcesFileError, UserResourcesFile, load_user_resources};
 
 // ── Traits ───────────────────────────────────────────────────────────────────
 
