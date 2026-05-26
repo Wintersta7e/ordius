@@ -27,3 +27,4 @@ which = { workspace = true }
 regex = { workspace = true }
 wait-timeout = { workspace = true }
 jsonpath-rust = { workspace = true }
+glob = { workspace = true }

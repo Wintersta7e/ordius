@@ -21,6 +21,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # serde_yaml is deprecated upstream; using the actively-maintained fork via Cargo package rename.
 serde_yaml = { version = "0.10", package = "serde_yaml_ng" }
+toml = "0.8"
 
 # Errors / logging
 thiserror = "2"
