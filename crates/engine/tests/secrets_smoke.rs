@@ -5,6 +5,7 @@
 use ordius_engine::checkpoints::CheckpointRegistry;
 use ordius_engine::db::open;
 use ordius_engine::emitter::Emitter;
+use ordius_engine::environment::runtime::{EnvId, ResourceRegistry, RunSnapshot, WorkflowId};
 use ordius_engine::events::EventType;
 use ordius_engine::executor::{InProcessExecutor, NodeExecutor, RunContext, wrap_process_env};
 use ordius_engine::recorder::RunRecorder;
@@ -15,18 +16,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn template_resolves_secret_and_redacts_in_event_log() {
-    keyring::use_sample_store(&HashMap::from([("persist", "false")])).unwrap();
+fn empty_run_snapshot(run_id: &str, workflow_id: &str) -> Arc<RunSnapshot> {
+    Arc::new(RunSnapshot {
+        run_id: run_id.to_string(),
+        workflow_id: WorkflowId(workflow_id.to_string()),
+        default_env: EnvId::local(),
+        registry: ResourceRegistry::new().snapshot(),
+        dispatchers: Arc::new(HashMap::new()),
+        catalogs: Arc::new(HashMap::new()),
+        specs: Arc::new(HashMap::new()),
+    })
+}
 
-    let dir = tempfile::TempDir::new().unwrap();
-    let pool = open(dir.path().join("t.db")).unwrap();
-    let secrets = Arc::new(Store::with_index_path(
-        dir.path().join("secrets-index.json"),
-    ));
-    secrets.set("MY_KEY", "supersecret").unwrap();
-
-    let node = Node {
+fn render_node() -> Node {
+    Node {
         id: "render".into(),
         ty: "transform".into(),
         name: "render".into(),
@@ -42,7 +45,21 @@ async fn template_resolves_secret_and_redacts_in_event_log() {
         retry: None,
         continue_on_error: false,
         target_env: None,
-    };
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn template_resolves_secret_and_redacts_in_event_log() {
+    keyring::use_sample_store(&HashMap::from([("persist", "false")])).unwrap();
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let pool = open(dir.path().join("t.db")).unwrap();
+    let secrets = Arc::new(Store::with_index_path(
+        dir.path().join("secrets-index.json"),
+    ));
+    secrets.set("MY_KEY", "supersecret").unwrap();
+
+    let node = render_node();
     let wf = Workflow {
         id: "secrets-demo".into(),
         name: "Secrets demo".into(),
@@ -61,6 +78,7 @@ async fn template_resolves_secret_and_redacts_in_event_log() {
         Arc::new(RunRecorder::start(pool.clone(), &wf, "{}", &HashMap::new(), "test").unwrap());
     let (em, _rx) = Emitter::new(rec.clone());
     let em = Arc::new(em);
+    let run_snapshot = empty_run_snapshot(&rec.run_id, &wf.id);
     let ctx = RunContext {
         run_id: rec.run_id.clone(),
         workflow_id: wf.id.clone(),
@@ -76,6 +94,7 @@ async fn template_resolves_secret_and_redacts_in_event_log() {
         upstream_outputs: HashMap::new(),
         checkpoints: Arc::new(CheckpointRegistry::new()),
         events: Arc::new(ordius_engine::events_registry::EventRegistry::new()),
+        run_snapshot,
         engine: std::sync::Weak::new(),
         compose_depth: 0,
         iteration: 1,

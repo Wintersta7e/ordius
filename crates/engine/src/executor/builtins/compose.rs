@@ -68,6 +68,7 @@ impl NodeExecutor for ComposeExecutor {
                 u32::try_from(next_depth).unwrap_or(u32::MAX),
                 Some(ctx.workspace.clone()),
                 "compose-",
+                Arc::clone(&ctx.run_snapshot),
             )
             .await
             .map_err(|e| NodeError::Other(format!("compose: child run: {e}")))?;

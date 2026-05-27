@@ -71,6 +71,12 @@ pub struct RunContext {
     /// a waiter here and parks until an external caller delivers
     /// the matching event via `Engine::deliver_event`.
     pub events: Arc<crate::events_registry::EventRegistry>,
+    /// Per-run frozen view of the env-runtime substrate (registry +
+    /// dispatchers + catalogs + specs). Built once at
+    /// `Engine::start_run` so a mid-run refresh of the engine's live
+    /// state cannot mutate the resources visible to in-flight nodes.
+    /// Cloned cheaply (Arc per field) into every executor call.
+    pub run_snapshot: Arc<crate::environment::runtime::RunSnapshot>,
     /// Weak handle back to the engine — built-ins that need to
     /// invoke sub-workflows (`compose`, `parallel`) upgrade and call
     /// `Engine::run_child_workflow`. Weak so the per-node context

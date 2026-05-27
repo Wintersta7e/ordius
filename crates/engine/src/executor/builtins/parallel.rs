@@ -112,6 +112,7 @@ impl NodeExecutor for ParallelExecutor {
                 &group_cancel,
                 next_depth,
                 &ctx.workspace,
+                &ctx.run_snapshot,
             );
             next_index += 1;
         }
@@ -175,6 +176,7 @@ impl NodeExecutor for ParallelExecutor {
                     &group_cancel,
                     next_depth,
                     &ctx.workspace,
+                    &ctx.run_snapshot,
                 );
                 next_index += 1;
             }
@@ -226,10 +228,12 @@ fn spawn_one(
     group_cancel: &CancellationToken,
     next_depth: u32,
     workspace: &std::path::Path,
+    parent_snapshot: &Arc<crate::environment::runtime::RunSnapshot>,
 ) {
     let item = items[index].clone();
     let engine = Arc::clone(engine);
     let workspace = workspace.to_path_buf();
+    let parent_snapshot = Arc::clone(parent_snapshot);
     let mut vars = base_vars.clone();
     let item_str = match &item {
         serde_json::Value::String(s) => s.clone(),
@@ -247,6 +251,7 @@ fn spawn_one(
                 next_depth,
                 Some(workspace),
                 "parallel-",
+                parent_snapshot,
             )
             .await;
         match res {

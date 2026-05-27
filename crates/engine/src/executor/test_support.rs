@@ -6,6 +6,7 @@
 use crate::checkpoints::CheckpointRegistry;
 use crate::db::open;
 use crate::emitter::Emitter;
+use crate::environment::runtime::{EnvId, ResourceRegistry, RunSnapshot, WorkflowId};
 use crate::events::RunEvent;
 use crate::executor::{RunContext, wrap_process_env};
 use crate::recorder::RunRecorder;
@@ -17,6 +18,22 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
+
+/// Build a minimal `Arc<RunSnapshot>` for tests that need a
+/// `RunContext` without booting a full `Engine`. The snapshot has
+/// no dispatchers, catalogs, or env specs — tests that exercise
+/// dispatcher selection should build via a real `Engine` instead.
+pub(super) fn test_run_snapshot(run_id: &str, workflow_id: &str) -> Arc<RunSnapshot> {
+    Arc::new(RunSnapshot {
+        run_id: run_id.to_string(),
+        workflow_id: WorkflowId(workflow_id.to_string()),
+        default_env: EnvId::local(),
+        registry: ResourceRegistry::new().snapshot(),
+        dispatchers: Arc::new(HashMap::new()),
+        catalogs: Arc::new(HashMap::new()),
+        specs: Arc::new(HashMap::new()),
+    })
+}
 
 /// Build a self-contained `RunContext` backed by a fresh `SQLite`
 /// database in a temporary directory. Returns the broadcast
@@ -43,6 +60,7 @@ pub(super) fn make_ctx() -> (RunContext, broadcast::Receiver<RunEvent>, TempDir)
     };
     let rec = Arc::new(RunRecorder::start(pool, &wf, "{}", &HashMap::new(), "test").unwrap());
     let (em, rx) = Emitter::new(rec.clone());
+    let run_snapshot = test_run_snapshot(&rec.run_id, "w");
     let ctx = RunContext {
         run_id: rec.run_id.clone(),
         workflow_id: "w".into(),
@@ -58,6 +76,7 @@ pub(super) fn make_ctx() -> (RunContext, broadcast::Receiver<RunEvent>, TempDir)
         upstream_outputs: HashMap::new(),
         checkpoints: Arc::new(CheckpointRegistry::new()),
         events: Arc::new(crate::events_registry::EventRegistry::new()),
+        run_snapshot,
         engine: std::sync::Weak::new(),
         compose_depth: 0,
         iteration: 1,

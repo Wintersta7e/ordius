@@ -59,6 +59,12 @@ impl RunRecorder {
     /// it via foreign key), then the run row itself with status
     /// `running`. Returns a recorder ready to accept events and
     /// per-node updates.
+    ///
+    /// Thin wrapper that mints a fresh `run_id` and delegates to
+    /// [`Self::start_with_run_id`]. Used by callers that don't need
+    /// to know the `run_id` before the recorder row exists (tests,
+    /// child workflows). `Engine::start_run` calls the split form so
+    /// it can build the per-run `RunSnapshot` before any DB write.
     pub fn start(
         pool: DbPool,
         wf: &Workflow,
@@ -66,7 +72,34 @@ impl RunRecorder {
         variables: &HashMap<String, String>,
         trigger_kind: &str,
     ) -> Result<Self> {
-        let run_id = Uuid::new_v4().to_string();
+        let run_id = Self::generate_run_id();
+        Self::start_with_run_id(pool, wf, node_specs_json, variables, trigger_kind, &run_id)
+    }
+
+    /// Generate a fresh run id without writing to the database.
+    ///
+    /// Paired with [`Self::start_with_run_id`] so `Engine::start_run`
+    /// can build the per-run `RunSnapshot` keyed on the run id
+    /// before the recorder row is created. Falls back to v4 (not
+    /// v7) to keep the run id shape stable across existing DBs.
+    #[must_use]
+    pub fn generate_run_id() -> String {
+        Uuid::new_v4().to_string()
+    }
+
+    /// Variant of [`Self::start`] that consumes a pre-generated
+    /// `run_id`. Used by the snapshot-before-recorder ordering in
+    /// `Engine::start_run`: the snapshot is built first so an
+    /// `EnvUnknown` (or any other snapshot construction failure)
+    /// leaves no orphan `running` row or held workflow lock.
+    pub fn start_with_run_id(
+        pool: DbPool,
+        wf: &Workflow,
+        node_specs_json: &str,
+        variables: &HashMap<String, String>,
+        trigger_kind: &str,
+        run_id: &str,
+    ) -> Result<Self> {
         let snapshot_id = Uuid::new_v4().to_string();
         let now = Utc::now().timestamp_millis();
         let wf_json = serde_json::to_string(wf).map_err(|e| EngineError::Db(e.to_string()))?;
@@ -90,7 +123,7 @@ impl RunRecorder {
              VALUES (?,?,?,?,?,?,?,?)",
         )?
         .execute(rusqlite::params![
-            &run_id,
+            run_id,
             &wf.id,
             &wf.name,
             "running",
@@ -101,7 +134,7 @@ impl RunRecorder {
         ])?;
         Ok(Self {
             pool,
-            run_id,
+            run_id: run_id.to_string(),
             workflow_id: wf.id.clone(),
             seq: AtomicU64::new(0),
         })

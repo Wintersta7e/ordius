@@ -428,6 +428,8 @@ mod tests {
         };
         let rec = Arc::new(RunRecorder::start(pool, &wf, "{}", &HashMap::new(), "test").unwrap());
         let (em, _rx) = Emitter::new(rec.clone());
+        let run_snapshot =
+            crate::executor::test_support::test_run_snapshot(&rec.run_id, workflow_id);
         let ctx = RunContext {
             run_id: rec.run_id.clone(),
             workflow_id: workflow_id.into(),
@@ -443,6 +445,7 @@ mod tests {
             upstream_outputs: HashMap::new(),
             checkpoints: Arc::new(CheckpointRegistry::new()),
             events: Arc::new(crate::events_registry::EventRegistry::new()),
+            run_snapshot,
             engine: Arc::downgrade(&engine),
             compose_depth: 0,
             iteration: 1,

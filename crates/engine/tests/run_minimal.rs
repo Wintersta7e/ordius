@@ -7,6 +7,7 @@
 use ordius_engine::checkpoints::CheckpointRegistry;
 use ordius_engine::db::open;
 use ordius_engine::emitter::Emitter;
+use ordius_engine::environment::runtime::{EnvId, ResourceRegistry, RunSnapshot, WorkflowId};
 use ordius_engine::events::EventType;
 use ordius_engine::executor::{InProcessExecutor, NodeExecutor, RunContext, wrap_process_env};
 use ordius_engine::recorder::{NodeRunRow, RunRecorder};
@@ -77,6 +78,15 @@ async fn two_delay_nodes_run_end_to_end() {
     let em = Arc::new(em);
     em.emit_workflow(EventType::WorkflowStarted, HashMap::new());
 
+    let run_snapshot = Arc::new(RunSnapshot {
+        run_id: rec.run_id.clone(),
+        workflow_id: WorkflowId(wf.id.clone()),
+        default_env: EnvId::local(),
+        registry: ResourceRegistry::new().snapshot(),
+        dispatchers: Arc::new(HashMap::new()),
+        catalogs: Arc::new(HashMap::new()),
+        specs: Arc::new(HashMap::new()),
+    });
     let ctx = RunContext {
         run_id: rec.run_id.clone(),
         workflow_id: wf.id.clone(),
@@ -92,6 +102,7 @@ async fn two_delay_nodes_run_end_to_end() {
         upstream_outputs: HashMap::new(),
         checkpoints: Arc::new(CheckpointRegistry::new()),
         events: Arc::new(ordius_engine::events_registry::EventRegistry::new()),
+        run_snapshot,
         engine: std::sync::Weak::new(),
         compose_depth: 0,
         iteration: 1,

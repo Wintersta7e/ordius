@@ -81,6 +81,94 @@ impl Engine {
         }
     }
 
+    /// Install the workflow scope, mint a run id, build the per-run
+    /// snapshot, and create the recorder row.
+    ///
+    /// Failures between the scope install and the recorder write
+    /// restore the prior scope so a snapshot construction error
+    /// (e.g. `EnvUnknown`) does not wipe a previously valid scope.
+    fn prepare_run_snapshot_and_recorder(
+        &self,
+        wf: &Workflow,
+        variables: &HashMap<String, String>,
+        trigger_kind: &str,
+    ) -> Result<(
+        Arc<RunRecorder>,
+        Arc<crate::environment::runtime::RunSnapshot>,
+    )> {
+        // Capture the prior workflow scope before re-installing so a
+        // failure between here and the recorder write can restore it.
+        let workflow_id = crate::environment::runtime::WorkflowId(wf.id.clone());
+        let prior_scope = crate::environment::runtime::snapshot_workflow_scope(
+            &workflow_id,
+            &self.resource_registry,
+        );
+
+        // Safety net: ensure the workflow's `resources:` block is installed
+        // under `ScopeKey::Workflow { id }` before any node executes.
+        // Production callers funnel through `load_workflow_for_run`, but
+        // programmatic `Workflow` construction (tests, future entry points)
+        // bypasses that path and would otherwise hit a "resource not in
+        // registry" failure at dispatch time. Replace-then-install keeps
+        // re-running an already-loaded workflow idempotent.
+        crate::environment::runtime::install_workflow_resources(
+            &workflow_id,
+            &wf.resources,
+            &self.resource_registry,
+        )?;
+
+        // Best-effort rollback when a subsequent step fails. The
+        // discarded result is fine — the rollback only matters when the
+        // underlying error has already been packaged into the EngineError
+        // we're about to return.
+        let restore_prior_scope = || {
+            drop(crate::environment::runtime::install_workflow_resources(
+                &workflow_id,
+                &prior_scope,
+                &self.resource_registry,
+            ));
+        };
+
+        // Mint the run id eagerly so the snapshot can be keyed on it
+        // before any DB write. No `runs` row exists yet.
+        let run_id = RunRecorder::generate_run_id();
+
+        let envs_in_scope = wf.envs_in_scope();
+        let default_env = wf
+            .default_env
+            .clone()
+            .unwrap_or_else(crate::environment::runtime::EnvId::local);
+        let run_snapshot = match self.build_run_snapshot(
+            &run_id,
+            workflow_id.clone(),
+            default_env,
+            &envs_in_scope,
+        ) {
+            Ok(snap) => snap,
+            Err(e) => {
+                restore_prior_scope();
+                return Err(e);
+            },
+        };
+
+        let rec = match RunRecorder::start_with_run_id(
+            self.pool(),
+            wf,
+            "{}",
+            variables,
+            trigger_kind,
+            &run_id,
+        ) {
+            Ok(r) => Arc::new(r),
+            Err(e) => {
+                restore_prior_scope();
+                return Err(e);
+            },
+        };
+
+        Ok((rec, run_snapshot))
+    }
+
     /// Start a workflow run. Returns immediately with a
     /// [`RunHandle`]; the run loop spawns on tokio.
     ///
@@ -98,27 +186,12 @@ impl Engine {
         workspace_override: Option<std::path::PathBuf>,
     ) -> Result<RunHandle> {
         crate::validation::validate(&wf)?;
-        // Safety net: ensure the workflow's `resources:` block is installed
-        // under `ScopeKey::Workflow { id }` before any node executes.
-        // Production callers should funnel through `load_workflow_for_run`,
-        // but programmatic `Workflow` construction (tests, future entry
-        // points) bypasses that path and would otherwise hit a
-        // "resource not in registry" failure at dispatch time. The install
-        // is replace-then-install so re-running an already-loaded workflow
-        // remains idempotent.
-        crate::environment::runtime::install_workflow_resources(
-            &crate::environment::runtime::WorkflowId(wf.id.clone()),
-            &wf.resources,
-            &self.resource_registry,
-        )?;
 
-        let rec = Arc::new(RunRecorder::start(
-            self.pool(),
-            &wf,
-            "{}",
-            &variables,
-            trigger_kind,
-        )?);
+        let (rec, run_snapshot) =
+            self.prepare_run_snapshot_and_recorder(&wf, &variables, trigger_kind)?;
+
+        // Lock acquisition failure means another run holds the workflow
+        // scope; don't restore — the holder's scope is the canonical one.
         if !rec.try_acquire_lock()? {
             return Err(EngineError::AlreadyRunning {
                 id: wf.id.clone(),
@@ -167,6 +240,7 @@ impl Engine {
                     cancel,
                     auto_resume_checkpoints,
                     0,
+                    run_snapshot,
                 )
                 .await
                 .map(|(summary, _outputs)| summary);
@@ -230,6 +304,12 @@ impl Engine {
     /// secrets store, checkpoint registry, and event registry. The
     /// workflow lock is intentionally not acquired so the same
     /// child workflow can be composed in parallel from a parent.
+    ///
+    /// `parent_snapshot` is inherited rather than rebuilt so the
+    /// dispatchers + catalogs visible to the child match what the
+    /// parent run started with. Per-env validation against the
+    /// child workflow's `target_env`s lands in a later task.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_child_workflow(
         self: &Arc<Self>,
         child_wf: Arc<Workflow>,
@@ -238,6 +318,7 @@ impl Engine {
         compose_depth: u32,
         workspace_override: Option<PathBuf>,
         scratch_prefix: &str,
+        parent_snapshot: Arc<crate::environment::runtime::RunSnapshot>,
     ) -> Result<(RunSummary, HashMap<(String, String), PortValue>)> {
         crate::validation::validate(&child_wf)?;
         let rec = Arc::new(RunRecorder::start(
@@ -276,6 +357,7 @@ impl Engine {
             child_cancel,
             false,
             compose_depth,
+            parent_snapshot,
         )
         .await
     }
@@ -306,6 +388,7 @@ impl Engine {
         cancel: CancellationToken,
         auto_resume: bool,
         compose_depth: u32,
+        run_snapshot: Arc<crate::environment::runtime::RunSnapshot>,
     ) -> Result<(RunSummary, HashMap<(String, String), PortValue>)> {
         let mut upstream_outputs: HashMap<(String, String), PortValue> = HashMap::new();
         let mut iterations: HashMap<String, u32> = HashMap::new();
@@ -421,6 +504,7 @@ impl Engine {
                     upstream_outputs: upstream_outputs.clone(),
                     checkpoints: self.checkpoints(),
                     events: self.events(),
+                    run_snapshot: Arc::clone(&run_snapshot),
                     engine: Arc::downgrade(self),
                     compose_depth,
                     iteration,
