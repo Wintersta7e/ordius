@@ -76,12 +76,31 @@ pub enum HttpError {
     },
 }
 
+/// Disposition for a child process's stdout/stderr stream.
+///
+/// `Inherit` (the default) sends the stream to the parent process — used by
+/// fire-and-forget spawns like the boot probe helpers. `Piped` opens a pipe
+/// the supervisor reads line-by-line, used by the `shell` / `docker-run`
+/// nodes that forward output to the run emitter. `Null` discards the
+/// stream entirely.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stdio {
+    /// Inherit the parent's handle.
+    #[default]
+    Inherit,
+    /// Open a pipe the caller can read.
+    Piped,
+    /// Discard the stream (`/dev/null` / `nul:`).
+    Null,
+}
+
 /// argv-only process command. The [`crate::environment::runtime::dispatcher::Dispatcher`]
 /// wraps it per env type (e.g. prefixes `wsl.exe -d <name> --exec` for WSL).
 ///
 /// Constructed without shell escaping — individual tokens are kept separate to
 /// avoid double-escaping when the dispatcher builds the final invocation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessCmd {
     /// Executable name or absolute path (no shell metacharacters).
     pub program: String,
@@ -93,6 +112,13 @@ pub struct ProcessCmd {
     pub cwd: Option<EnvPath>,
     /// Optional data piped to the process's stdin.
     pub stdin: Option<Bytes>,
+    /// stdout disposition. Defaults to `Inherit` for back-compat with Phase
+    /// A/B call sites that don't set the field.
+    #[serde(default)]
+    pub stdout: Stdio,
+    /// stderr disposition. Same default as `stdout`.
+    #[serde(default)]
+    pub stderr: Stdio,
 }
 
 /// An env-side path. Distinct newtype from `std::path::PathBuf` / host paths so
@@ -260,8 +286,28 @@ mod tests {
             env: HashMap::default(),
             cwd: None,
             stdin: None,
+            stdout: Stdio::default(),
+            stderr: Stdio::default(),
         };
         assert_eq!(cmd.args, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn process_cmd_serde_defaults_stdout_stderr_to_inherit() {
+        // Wire shape from an older caller (no stdout/stderr fields) must
+        // still deserialize, with the new fields defaulting to Inherit.
+        let json = r#"{"program":"echo","args":[],"env":{},"cwd":null,"stdin":null}"#;
+        let cmd: ProcessCmd = serde_json::from_str(json).unwrap();
+        assert_eq!(cmd.stdout, Stdio::Inherit);
+        assert_eq!(cmd.stderr, Stdio::Inherit);
+    }
+
+    #[test]
+    fn stdio_round_trips_through_serde() {
+        let s = serde_json::to_string(&Stdio::Piped).unwrap();
+        assert_eq!(s, "\"piped\"");
+        let back: Stdio = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, Stdio::Piped);
     }
 
     #[test]

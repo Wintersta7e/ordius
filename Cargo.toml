@@ -55,7 +55,7 @@ r2d2_sqlite = "0.34"
 
 # HTTP / external
 base64 = "0.22"
-bytes = "1"
+bytes = { version = "1", features = ["serde"] }
 reqwest = { version = "0.13", features = ["json", "stream", "query"] }
 ureq = { version = "2", default-features = false, features = ["rustls", "json"] }
 jsonpath-rust = "1"

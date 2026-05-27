@@ -20,17 +20,17 @@
 //! onto the node's declared output ports.
 
 use crate::emitter::Emitter;
+use crate::environment::runtime::transport::{ProcessCmd, Stdio as ProcessStdio};
 use crate::events::EventType;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::template::{SubstitutionContext, default_env_allowlist, substitute};
 use crate::types::{ExecutionBackend, Node, NodeType, OutputParse, PortValue};
 use async_trait::async_trait;
+use bytes::Bytes;
 use jsonpath_rust::JsonPath;
 use std::collections::HashMap;
-use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -92,31 +92,45 @@ impl NodeExecutor for SubprocessExecutor {
             .split_first()
             .ok_or_else(|| NodeError::Config("execution.command is empty".into()))?;
 
-        let mut cmd = Command::new(program);
-        cmd.args(argv_rest);
-        cmd.current_dir(&ctx.workspace);
-        for (k, v) in &env_pairs {
-            cmd.env(k, v);
-        }
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        if stdin_body.is_some() {
-            cmd.stdin(Stdio::piped());
-        }
+        // Select the dispatcher for the node's target_env (default = run's
+        // default_env) and translate the host workspace into an env-side
+        // path. Failures propagate loudly — no silent fallback to the host
+        // namespace.
+        let effective_env = node
+            .target_env
+            .clone()
+            .unwrap_or_else(|| ctx.run_snapshot.default_env.clone());
+        let dispatcher = ctx
+            .run_snapshot
+            .dispatcher(&effective_env)
+            .ok_or_else(|| {
+                NodeError::Config(format!(
+                    "shell: env '{}' not in run snapshot scope",
+                    effective_env.as_str()
+                ))
+            })?
+            .clone();
+        let cwd = dispatcher.translate_path(&ctx.workspace).map_err(|e| {
+            NodeError::Config(format!(
+                "shell: env '{}' cannot translate workspace path '{}': {e}",
+                effective_env.as_str(),
+                ctx.workspace.display(),
+            ))
+        })?;
 
-        let mut sup: Supervised =
-            supervisor::spawn(cmd).map_err(|e| NodeError::Subprocess(format!("spawn: {e}")))?;
+        let process_cmd = ProcessCmd {
+            program: program.clone(),
+            args: argv_rest.to_vec(),
+            env: env_pairs.into_iter().collect(),
+            cwd: Some(cwd),
+            stdin: stdin_body.map(|s| Bytes::from(s.into_bytes())),
+            stdout: ProcessStdio::Piped,
+            stderr: ProcessStdio::Piped,
+        };
 
-        if let (Some(body), Some(mut stdin)) = (stdin_body, sup.child_mut().stdin.take()) {
-            // Writer runs on its own task so a child that reads stdin
-            // fully before producing stdout can't deadlock us (we
-            // hold the stdout read loop below).
-            tokio::spawn(async move {
-                let write_res = stdin.write_all(body.as_bytes()).await;
-                drop(write_res);
-                let shutdown_res = stdin.shutdown().await;
-                drop(shutdown_res);
-            });
-        }
+        let mut sup: Supervised = dispatcher
+            .spawn(process_cmd)
+            .map_err(|e| NodeError::Subprocess(format!("spawn: {e}")))?;
 
         let emitter = ctx.emitter.clone();
         // Snapshot iteration + attempt at spawn time so every line

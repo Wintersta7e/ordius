@@ -14,7 +14,7 @@
 
 use crate::events::EventType;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
-use crate::types::{Node, NodeType, PortValue};
+use crate::types::{EnvId, Node, NodeType, PortValue};
 use async_trait::async_trait;
 use bollard::Docker;
 use bollard::container::{
@@ -50,6 +50,24 @@ impl NodeExecutor for ContainerExecutor {
         ctx: &RunContext,
         cancel: CancellationToken,
     ) -> Result<NodeOutputs, NodeError> {
+        // Phase E policy: docker-run only supports `target_env = local`.
+        // The bollard client talks to the host's local Docker daemon;
+        // routing the call to a non-local env would require a separate
+        // ContainerDispatcher (Phase H). Until then, reject non-local
+        // target_env loudly rather than silently running against the host
+        // daemon.
+        let effective_env = node
+            .target_env
+            .clone()
+            .unwrap_or_else(|| ctx.run_snapshot.default_env.clone());
+        if effective_env != EnvId::local() {
+            return Err(NodeError::Config(format!(
+                "docker-run: target_env '{}' is not supported in Phase E; \
+                 only target_env=local works until Phase H ships ContainerDispatcher.",
+                effective_env.as_str(),
+            )));
+        }
+
         let image = node
             .config
             .get("image")
@@ -362,4 +380,58 @@ fn sanitise_for_docker(input: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::test_support::{make_ctx, trivial_subprocess_node};
+    use crate::types::{Category, EnvId, ExecutionBackend, ExecutionSpec, OutputParse};
+
+    fn container_node_type() -> NodeType {
+        NodeType {
+            id: "docker-run".into(),
+            name: String::new(),
+            category: Category::Execution,
+            tags: vec![],
+            icon: String::new(),
+            description: String::new(),
+            inputs: vec![],
+            outputs: vec![],
+            config: vec![],
+            execution: ExecutionSpec {
+                backend: ExecutionBackend::Container,
+                command: vec![],
+                stdin_template: None,
+                env: HashMap::new(),
+                timeout_ms: None,
+                output_parse: OutputParse::Text,
+                output_map: HashMap::new(),
+            },
+            skip_config_templates: false,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn docker_run_with_non_local_target_env_errors_with_phase_h_pointer() {
+        let (ctx, _rx, _dir) = make_ctx();
+        let mut node = trivial_subprocess_node();
+        node.target_env = Some(EnvId::new("wsl:Ubuntu"));
+        node.config
+            .insert("image".into(), serde_json::Value::String("alpine".into()));
+        let nt = container_node_type();
+
+        let err = ContainerExecutor
+            .run(&node, &nt, &ctx, tokio_util::sync::CancellationToken::new())
+            .await
+            .expect_err("non-local target_env must error in Phase E");
+
+        match err {
+            NodeError::Config(msg) => {
+                assert!(msg.contains("Phase H"), "msg = {msg}");
+                assert!(msg.contains("wsl:Ubuntu"), "msg = {msg}");
+            },
+            other => panic!("expected NodeError::Config, got {other:?}"),
+        }
+    }
 }

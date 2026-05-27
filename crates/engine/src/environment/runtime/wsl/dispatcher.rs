@@ -26,7 +26,9 @@ use crate::environment::runtime::plan::{ProbePlan, ProbeSummary};
 use crate::environment::runtime::resource::{
     Capability, HttpProbeMethod, ProbeSpec, ResourceDefinition, ResourceId, ResourceKind,
 };
-use crate::environment::runtime::transport::{EnvPath, ProcessCmd, WorkspaceHandle};
+use crate::environment::runtime::transport::{
+    EnvPath, ProcessCmd, Stdio as ProcessStdio, WorkspaceHandle,
+};
 use crate::executor::supervisor::Supervised;
 
 use super::bootstrap::BootstrappedHelper;
@@ -630,15 +632,18 @@ impl Dispatcher for WslDispatcher {
     }
 
     fn spawn(&self, cmd: ProcessCmd) -> std::io::Result<Supervised> {
+        use std::process::Stdio as StdStdio;
         let mut tokio_cmd = build_wsl_command(&self.distro_name, &cmd);
         // Only pipe stdin when bytes are actually queued; otherwise the
         // in-distro process would block on EOF (e.g. `cat` with no input).
         // Mirrors LocalDispatcher::spawn.
-        if cmd.stdin.is_some() {
-            tokio_cmd.stdin(std::process::Stdio::piped());
-        }
-        tokio_cmd.stdout(std::process::Stdio::piped());
-        tokio_cmd.stderr(std::process::Stdio::piped());
+        tokio_cmd.stdin(if cmd.stdin.is_some() {
+            StdStdio::piped()
+        } else {
+            StdStdio::null()
+        });
+        tokio_cmd.stdout(map_stdio(cmd.stdout));
+        tokio_cmd.stderr(map_stdio(cmd.stderr));
         let mut sup = crate::executor::supervisor::spawn(tokio_cmd)?;
         if let Some(bytes) = cmd.stdin
             && let Some(mut child_stdin) = sup.child_mut().stdin.take()
@@ -706,6 +711,15 @@ fn helper_wait_timeout(timeout_ms: u64) -> Duration {
         DEFAULT_PROBE_TIMEOUT + HELPER_PROBE_GRACE
     } else {
         Duration::from_millis(timeout_ms).saturating_add(HELPER_PROBE_GRACE)
+    }
+}
+
+/// Translate the runtime's `Stdio` enum to a `std::process::Stdio`.
+fn map_stdio(s: ProcessStdio) -> std::process::Stdio {
+    match s {
+        ProcessStdio::Inherit => std::process::Stdio::inherit(),
+        ProcessStdio::Piped => std::process::Stdio::piped(),
+        ProcessStdio::Null => std::process::Stdio::null(),
     }
 }
 
@@ -998,6 +1012,8 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
             stdin: None,
+            stdout: ProcessStdio::default(),
+            stderr: ProcessStdio::default(),
         };
         let built = build_wsl_command("Ubuntu", &cmd);
         let dbg = format!("{built:?}");
@@ -1018,6 +1034,8 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
             stdin: None,
+            stdout: ProcessStdio::default(),
+            stderr: ProcessStdio::default(),
         };
         let built = build_wsl_command("Ubuntu", &cmd);
         let dbg = format!("{built:?}");
@@ -1035,6 +1053,8 @@ mod tests {
             env: HashMap::new(),
             cwd: Some(EnvPath::new("/home/me/work")),
             stdin: None,
+            stdout: ProcessStdio::default(),
+            stderr: ProcessStdio::default(),
         };
         let built = build_wsl_command("Ubuntu", &cmd);
         let dbg = format!("{built:?}");

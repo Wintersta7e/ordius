@@ -17,7 +17,8 @@ use super::error::DispatchError;
 use super::plan::{ProbePlan, ProbeSummary};
 use super::resource::{HttpProbeMethod, HttpProbeRoute, ProbeSpec, ResourceDefinition};
 use super::transport::{
-    EnvPath, HttpError, HttpMethod, HttpRequest, HttpResponse, ProcessCmd, WorkspaceHandle,
+    EnvPath, HttpError, HttpMethod, HttpRequest, HttpResponse, ProcessCmd, Stdio as ProcessStdio,
+    WorkspaceHandle,
 };
 
 const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -199,8 +200,11 @@ impl Dispatcher for LocalDispatcher {
     ///
     /// Builds a `tokio::process::Command` from the argv-only `ProcessCmd` and
     /// delegates to `executor::supervisor::spawn`, which sets up a process group
-    /// (Unix) or Job Object (Windows) for correct tree teardown.
+    /// (Unix) or Job Object (Windows) for correct tree teardown. The stdout /
+    /// stderr disposition follows `cmd.stdout` / `cmd.stderr`; callers that
+    /// want line-by-line streaming pass `Stdio::Piped`.
     fn spawn(&self, cmd: ProcessCmd) -> std::io::Result<crate::executor::supervisor::Supervised> {
+        use std::process::Stdio as StdStdio;
         let mut command = tokio::process::Command::new(&cmd.program);
         command.args(&cmd.args);
         for (k, v) in &cmd.env {
@@ -209,9 +213,13 @@ impl Dispatcher for LocalDispatcher {
         if let Some(cwd) = &cmd.cwd {
             command.current_dir(cwd.as_str());
         }
-        if cmd.stdin.is_some() {
-            command.stdin(std::process::Stdio::piped());
-        }
+        command.stdin(if cmd.stdin.is_some() {
+            StdStdio::piped()
+        } else {
+            StdStdio::null()
+        });
+        command.stdout(map_stdio(cmd.stdout));
+        command.stderr(map_stdio(cmd.stderr));
         let mut sup = crate::executor::supervisor::spawn(command)?;
         if let Some(bytes) = cmd.stdin
             && let Some(mut child_stdin) = sup.child_mut().stdin.take()
@@ -491,6 +499,15 @@ fn cancelled_probe_outcome() -> ResourceProbeOutcome {
     }
 }
 
+/// Translate the runtime's `Stdio` enum to a `std::process::Stdio`.
+fn map_stdio(s: ProcessStdio) -> std::process::Stdio {
+    match s {
+        ProcessStdio::Inherit => std::process::Stdio::inherit(),
+        ProcessStdio::Piped => std::process::Stdio::piped(),
+        ProcessStdio::Null => std::process::Stdio::null(),
+    }
+}
+
 /// Resolve `bin` to an absolute path.
 ///
 /// Tries `which::which` first (honours `PATH`), then expands `extras`
@@ -626,9 +643,52 @@ mod tests {
             env: std::collections::HashMap::new(),
             cwd: None,
             stdin: None,
+            stdout: ProcessStdio::default(),
+            stderr: ProcessStdio::default(),
         };
         let mut sup = d.spawn(cmd).expect("spawn");
         let _exit = crate::executor::supervisor::cancel(&mut sup).await;
+    }
+
+    #[tokio::test]
+    async fn local_spawn_pipes_stdout_when_requested() {
+        // Phase E contract: ProcessCmd::stdout = Piped means the supervisor
+        // can read the child's stdout. Without this fix shell node output
+        // would silently drop.
+        use tokio::io::AsyncReadExt;
+        let d = LocalDispatcher::new(local_info());
+        let cmd = if cfg!(windows) {
+            ProcessCmd {
+                program: "cmd".into(),
+                args: vec!["/C".into(), "echo pipe-ok".into()],
+                env: std::collections::HashMap::new(),
+                cwd: None,
+                stdin: None,
+                stdout: ProcessStdio::Piped,
+                stderr: ProcessStdio::Inherit,
+            }
+        } else {
+            ProcessCmd {
+                program: "/bin/echo".into(),
+                args: vec!["pipe-ok".into()],
+                env: std::collections::HashMap::new(),
+                cwd: None,
+                stdin: None,
+                stdout: ProcessStdio::Piped,
+                stderr: ProcessStdio::Inherit,
+            }
+        };
+        let mut sup = d.spawn(cmd).expect("spawn");
+        let mut buf = String::new();
+        sup.child_mut()
+            .stdout
+            .as_mut()
+            .expect("Stdio::Piped should open the stdout pipe")
+            .read_to_string(&mut buf)
+            .await
+            .expect("read stdout");
+        let _exit = sup.child_mut().wait().await.expect("wait");
+        assert!(buf.contains("pipe-ok"), "got {buf:?}");
     }
 
     #[tokio::test]
