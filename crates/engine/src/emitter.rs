@@ -95,6 +95,32 @@ impl Emitter {
         self.emit(ty, None, None, None, payload);
     }
 
+    /// Emit a `stream:fallback` event signalling that an `llm` (or
+    /// similar) executor requested streaming under `StreamMode::Auto`
+    /// but the resolved route could not stream, so the run silently
+    /// downgraded to a non-streaming request. Payload carries `url`
+    /// and `reason` so consumers can surface the decision in the UI
+    /// without reconstructing dispatch state.
+    pub fn emit_stream_fallback(
+        &self,
+        node_id: impl Into<String>,
+        iteration: u32,
+        attempt: u32,
+        url: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        let mut payload: HashMap<String, serde_json::Value> = HashMap::with_capacity(2);
+        payload.insert("url".into(), serde_json::Value::String(url.into()));
+        payload.insert("reason".into(), serde_json::Value::String(reason.into()));
+        self.emit_node(
+            EventType::StreamFallback,
+            node_id,
+            iteration,
+            attempt,
+            payload,
+        );
+    }
+
     /// Emit a node-scoped event. Convenience wrapper around
     /// [`Self::emit`] that takes the node id by `impl Into<String>`
     /// and requires both `iteration` and `attempt` — these are

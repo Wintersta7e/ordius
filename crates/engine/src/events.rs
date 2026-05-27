@@ -82,6 +82,11 @@ pub enum EventType {
     /// Paused node resumed execution.
     #[serde(rename = "node:resumed")]
     NodeResumed,
+    /// Streaming was requested under `StreamMode::Auto` but the resolved
+    /// route cannot stream; the executor fell back to a non-streaming
+    /// request. Payload carries `url` and `reason`.
+    #[serde(rename = "stream:fallback")]
+    StreamFallback,
 }
 
 impl EventType {
@@ -105,6 +110,7 @@ impl EventType {
             Self::NodeLoop => "node:loop",
             Self::NodePaused => "node:paused",
             Self::NodeResumed => "node:resumed",
+            Self::StreamFallback => "stream:fallback",
         }
     }
 }

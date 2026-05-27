@@ -16,7 +16,9 @@
 
 use super::util::{config_f64_or, config_str, config_str_opt, config_str_or, config_u64_or};
 use crate::environment::runtime::ResourceProbeOutcome;
-use crate::environment::runtime::catalog::{ResourceDetail, route_for_capability_from_detail};
+use crate::environment::runtime::catalog::{
+    ResourceDetail, RouteOrigin, route_for_capability_from_detail,
+};
 use crate::environment::runtime::dispatcher::HttpTransport;
 use crate::environment::runtime::env::EnvId;
 use crate::environment::runtime::resource::{Capability, ResourceRef};
@@ -418,8 +420,14 @@ async fn run_single_turn(
     let temperature = config_f64_or(&node.config, "temperature", DEFAULT_MODEL_TEMP);
     let max_tokens = node.config.get("max_tokens").cloned();
     let stream_mode = read_stream_mode(node)?;
-    warn_if_force_stream(node, stream_mode);
-    let stream = !matches!(stream_mode, StreamMode::Off);
+    let stream = resolve_effective_stream(
+        node,
+        ctx,
+        stream_mode,
+        detail.as_ref(),
+        transport.as_ref(),
+        &url_string,
+    )?;
     let api_key = config_str_opt(&node.config, "api_key").map(str::to_string);
     let timeout_ms = config_u64_or(&node.config, "timeout_ms", DEFAULT_TIMEOUT_MS);
 
@@ -537,8 +545,14 @@ async fn run_tool_loop(
         .map(str::to_string);
     let timeout_ms = config_u64_or(&node.config, "timeout_ms", DEFAULT_TIMEOUT_MS);
     let stream_mode = read_stream_mode(node)?;
-    warn_if_force_stream(node, stream_mode);
-    let stream = !matches!(stream_mode, StreamMode::Off);
+    let stream = resolve_effective_stream(
+        node,
+        ctx,
+        stream_mode,
+        detail.as_ref(),
+        transport.as_ref(),
+        &url_string,
+    )?;
 
     let initial_messages = node
         .config
@@ -708,19 +722,67 @@ fn read_stream_mode(node: &Node) -> Result<StreamMode, NodeError> {
     )
 }
 
-/// Phase D treats `StreamMode::Force` identically to `Auto` (both attempt
-/// SSE without a capability check). The docstring on `StreamMode::Force`
-/// promises an error when streaming is unavailable — that promise is
-/// kept only after Phase E's dispatcher layer adds the route-capability
-/// gate. Until then, emit a warning when Force is selected so the
-/// surprising no-op is visible under `RUST_LOG=warn`.
-fn warn_if_force_stream(node: &Node, stream_mode: StreamMode) {
-    if matches!(stream_mode, StreamMode::Force) {
-        tracing::warn!(
-            node_id = %node.id,
-            "llm: StreamMode::Force is selected but Phase D treats it as Auto; \
-             Phase E adds the route-capability check that makes Force errorable"
-        );
+/// True iff the resolved route is allowed to stream under the Phase E
+/// rule:
+///
+/// `route_origin != RouteOrigin::EnvLoopback AND transport.can_stream(url)`
+///
+/// `streaming_supported_natively` on the detail stays advisory in Phase
+/// E — no probe yet populates it from real upstream introspection.
+/// When that changes, fold it in as an additional AND clause.
+///
+/// `detail` is `Some` when the executor reached the route through the
+/// resource catalog and `None` when it fell back to a literal `url`
+/// node-config. In the literal-URL case the rule degrades to
+/// `transport.can_stream(url)` only — the user explicitly typed a URL,
+/// so we defer to the transport's own gate.
+fn streaming_supported_for(
+    detail: Option<&ResourceDetail>,
+    transport: &dyn HttpTransport,
+    url: &url::Url,
+) -> bool {
+    match detail {
+        None => transport.can_stream(url),
+        Some(ResourceDetail::HttpEndpoint { route_origin, .. }) => {
+            *route_origin != RouteOrigin::EnvLoopback && transport.can_stream(url)
+        },
+        Some(_) => false,
+    }
+}
+
+/// Apply the `StreamMode` rule against the resolved route. Returns
+/// `Ok(true)` when the executor should stream, `Ok(false)` when it
+/// should send a one-shot request (emitting a `StreamFallback` event
+/// when `Auto` downgrades), and `Err(NodeError::Config)` when `Force`
+/// is selected against a route that cannot stream.
+fn resolve_effective_stream(
+    node: &Node,
+    ctx: &RunContext,
+    stream_mode: StreamMode,
+    detail: Option<&ResourceDetail>,
+    transport: &dyn HttpTransport,
+    url_str: &str,
+) -> Result<bool, NodeError> {
+    let parsed = url::Url::parse(url_str).map_err(|e| {
+        NodeError::Config(format!("llm: cannot parse dispatch URL '{url_str}': {e}"))
+    })?;
+    let can_stream = streaming_supported_for(detail, transport, &parsed);
+    match (stream_mode, can_stream) {
+        (StreamMode::Off, _) => Ok(false),
+        (StreamMode::Force | StreamMode::Auto, true) => Ok(true),
+        (StreamMode::Force, false) => Err(NodeError::Config(format!(
+            "llm: stream=force but route '{url_str}' does not support streaming"
+        ))),
+        (StreamMode::Auto, false) => {
+            ctx.emitter.emit_stream_fallback(
+                node.id.clone(),
+                ctx.iteration,
+                ctx.attempt.load(std::sync::atomic::Ordering::Relaxed),
+                url_str.to_string(),
+                "route does not support streaming".to_string(),
+            );
+            Ok(false)
+        },
     }
 }
 
@@ -1784,5 +1846,175 @@ mod tests {
             matches!(err, NodeError::Config(_)),
             "expected Config error, got {err:?}"
         );
+    }
+
+    // ── Task 12: StreamMode enforcement ──────────────────────────────
+
+    use crate::environment::runtime::FakeHttpTransport;
+    use crate::environment::runtime::local::LocalHttpTransport;
+
+    fn http_endpoint(route_origin: RouteOrigin) -> ResourceDetail {
+        ResourceDetail::HttpEndpoint {
+            base_url: "http://127.0.0.1:11434".into(),
+            routes_by_capability: HashMap::new(),
+            version: None,
+            models_list: None,
+            auth_secret_ref: None,
+            streaming_supported_natively: false,
+            route_origin,
+        }
+    }
+
+    #[test]
+    fn streaming_supported_envloopback_blocks_even_when_transport_can_stream() {
+        // EnvLoopback + LocalHttpTransport (can_stream=true) → false.
+        let transport = LocalHttpTransport::new();
+        let url = url::Url::parse("http://127.0.0.1:11434/v1/chat/completions").unwrap();
+        let detail = http_endpoint(RouteOrigin::EnvLoopback);
+        assert!(!streaming_supported_for(Some(&detail), &transport, &url));
+    }
+
+    #[test]
+    fn streaming_supported_hostdirect_with_local_transport_streams() {
+        let transport = LocalHttpTransport::new();
+        let url = url::Url::parse("http://127.0.0.1:11434/v1/chat/completions").unwrap();
+        let detail = http_endpoint(RouteOrigin::HostDirect);
+        assert!(streaming_supported_for(Some(&detail), &transport, &url));
+    }
+
+    #[test]
+    fn streaming_supported_hostdirect_but_transport_cannot_stream_blocks() {
+        // HostDirect route but FakeHttpTransport reports can_stream=false → false.
+        let transport = FakeHttpTransport;
+        let url = url::Url::parse("http://127.0.0.1:11434/v1/chat/completions").unwrap();
+        let detail = http_endpoint(RouteOrigin::HostDirect);
+        assert!(!streaming_supported_for(Some(&detail), &transport, &url));
+    }
+
+    #[test]
+    fn streaming_supported_literal_url_defers_to_transport() {
+        // No detail (literal-URL fallback) → transport.can_stream alone.
+        let url = url::Url::parse("http://127.0.0.1:11434/v1/chat/completions").unwrap();
+        let local = LocalHttpTransport::new();
+        assert!(streaming_supported_for(None, &local, &url));
+        let fake = FakeHttpTransport;
+        assert!(!streaming_supported_for(None, &fake, &url));
+    }
+
+    #[test]
+    fn streaming_supported_binary_detail_is_never_streamable() {
+        // Non-HttpEndpoint detail (Binary, Toolchain) → false regardless.
+        let transport = LocalHttpTransport::new();
+        let url = url::Url::parse("http://127.0.0.1:11434/v1/chat/completions").unwrap();
+        let detail = ResourceDetail::Binary {
+            path: "/usr/bin/echo".into(),
+            version: None,
+            capabilities: vec![],
+        };
+        assert!(!streaming_supported_for(Some(&detail), &transport, &url));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_effective_stream_force_errors_on_envloopback() {
+        let (ctx, _rx, _dir) = make_ctx();
+        let node = llm_node("http://127.0.0.1:11434/v1/chat/completions", true);
+        let detail = http_endpoint(RouteOrigin::EnvLoopback);
+        let transport = LocalHttpTransport::new();
+        let err = resolve_effective_stream(
+            &node,
+            &ctx,
+            StreamMode::Force,
+            Some(&detail),
+            &transport,
+            "http://127.0.0.1:11434/v1/chat/completions",
+        )
+        .expect_err("Force on EnvLoopback must error");
+        match err {
+            NodeError::Config(msg) => {
+                assert!(
+                    msg.contains("stream=force") && msg.contains("does not support streaming"),
+                    "expected force-stream config error, got: {msg}",
+                );
+            },
+            other => panic!("expected NodeError::Config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_effective_stream_auto_falls_back_and_emits_event() {
+        let (ctx, mut rx, _dir) = make_ctx();
+        let node = llm_node("http://127.0.0.1:11434/v1/chat/completions", true);
+        let detail = http_endpoint(RouteOrigin::EnvLoopback);
+        let transport = LocalHttpTransport::new();
+        let stream = resolve_effective_stream(
+            &node,
+            &ctx,
+            StreamMode::Auto,
+            Some(&detail),
+            &transport,
+            "http://127.0.0.1:11434/v1/chat/completions",
+        )
+        .expect("Auto fallback is Ok");
+        assert!(
+            !stream,
+            "Auto on EnvLoopback must downgrade to non-streaming"
+        );
+
+        let mut saw_fallback = false;
+        while let Ok(ev) = rx.try_recv() {
+            if ev.ty == EventType::StreamFallback {
+                let url = ev
+                    .payload
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let reason = ev
+                    .payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                assert_eq!(url, "http://127.0.0.1:11434/v1/chat/completions");
+                assert!(reason.contains("does not support streaming"));
+                saw_fallback = true;
+                break;
+            }
+        }
+        assert!(saw_fallback, "expected a stream:fallback event");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_effective_stream_off_never_streams() {
+        let (ctx, _rx, _dir) = make_ctx();
+        let node = llm_node("http://127.0.0.1:11434/v1/chat/completions", false);
+        let detail = http_endpoint(RouteOrigin::HostDirect);
+        let transport = LocalHttpTransport::new();
+        let stream = resolve_effective_stream(
+            &node,
+            &ctx,
+            StreamMode::Off,
+            Some(&detail),
+            &transport,
+            "http://127.0.0.1:11434/v1/chat/completions",
+        )
+        .expect("Off is Ok");
+        assert!(!stream, "Off must never stream even when route supports it");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_effective_stream_force_passes_on_hostdirect() {
+        let (ctx, _rx, _dir) = make_ctx();
+        let node = llm_node("http://127.0.0.1:11434/v1/chat/completions", true);
+        let detail = http_endpoint(RouteOrigin::HostDirect);
+        let transport = LocalHttpTransport::new();
+        let stream = resolve_effective_stream(
+            &node,
+            &ctx,
+            StreamMode::Force,
+            Some(&detail),
+            &transport,
+            "http://127.0.0.1:11434/v1/chat/completions",
+        )
+        .expect("Force on streamable route is Ok");
+        assert!(stream, "Force on HostDirect must request streaming");
     }
 }

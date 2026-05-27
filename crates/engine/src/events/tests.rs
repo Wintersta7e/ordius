@@ -71,9 +71,9 @@ fn payload_fields_flatten_to_top_level() {
 }
 
 #[test]
-fn all_thirteen_variants_have_distinct_tags() {
+fn all_variants_have_distinct_tags() {
     let tags: std::collections::HashSet<&str> = ALL_VARIANTS.iter().map(|v| v.wire_tag()).collect();
-    assert_eq!(tags.len(), 13);
+    assert_eq!(tags.len(), ALL_VARIANTS.len());
 }
 
 const ALL_VARIANTS: &[EventType] = &[
@@ -90,6 +90,7 @@ const ALL_VARIANTS: &[EventType] = &[
     EventType::NodeLoop,
     EventType::NodePaused,
     EventType::NodeResumed,
+    EventType::StreamFallback,
 ];
 
 #[test]
