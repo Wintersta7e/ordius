@@ -9,6 +9,7 @@
 //! Coexists with the legacy `environment::{types, detect, local, wsl, custom}`
 //! modules until later phases wire this into IPC.
 
+pub mod boot_probe;
 pub mod builtin;
 pub mod catalog;
 pub mod dispatcher;

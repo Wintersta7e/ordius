@@ -1,8 +1,9 @@
 use super::open;
 
 const EXPECTED_TABLES: &[&str] = &[
+    "env_specs",
     "kv_store",
-    "namespace_overrides",
+    "migrated_custom_namespaces",
     "node_outputs",
     "node_runs",
     "run_events",
@@ -33,31 +34,46 @@ fn open_creates_schema() {
 }
 
 #[test]
-fn open_seeds_schema_version_to_two() {
+fn namespace_overrides_dropped_by_v3() {
+    let f = tempfile::NamedTempFile::new().unwrap();
+    let pool = open(f.path()).unwrap();
+    let conn = pool.get().unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='namespace_overrides'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "v3 must drop namespace_overrides");
+}
+
+#[test]
+fn open_seeds_schema_version_to_latest() {
     let f = tempfile::NamedTempFile::new().unwrap();
     let pool = open(f.path()).unwrap();
     let conn = pool.get().unwrap();
     let version: i64 = conn
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 }
 
 #[test]
 fn open_is_idempotent() {
     let f = tempfile::NamedTempFile::new().unwrap();
     drop(open(f.path()).unwrap());
-    // Re-open: schema is already at v2, migration should no-op.
+    // Re-open: schema is already at v3, migration should no-op.
     let pool = open(f.path()).unwrap();
     let conn = pool.get().unwrap();
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(count, 2);
+    assert_eq!(count, 3);
 }
 
 #[test]
-fn migration_v2_idempotent() {
+fn migration_v3_idempotent() {
     let f = tempfile::NamedTempFile::new().unwrap();
     drop(open(f.path()).unwrap());
     drop(open(f.path()).unwrap());
@@ -65,7 +81,7 @@ fn migration_v2_idempotent() {
     let conn = pool.get().unwrap();
     let count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name='namespace_overrides'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='env_specs'",
             [],
             |r| r.get(0),
         )

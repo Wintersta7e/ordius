@@ -101,9 +101,8 @@ pub struct Engine {
     /// (NOT inside `env_registry`) so disabled envs surface in IPC listings
     /// with an Enable affordance while workflow validation refuses them via
     /// `validate_nodes` checking that the `target_env` is in the active
-    /// `env_registry`. Consumed by the boot probe + IPC handlers in Task 4
-    /// / Task 5; declared here so the struct shape stays stable.
-    #[allow(dead_code)]
+    /// `env_registry`. Populated by the boot probe; Task 5's
+    /// `refresh_environment` swaps it atomically.
     env_disabled_specs:
         ArcSwap<HashMap<environment::runtime::EnvId, environment::runtime::EnvSpec>>,
     /// Serialises concurrent `refresh_environment` / inline-`EnvSpec`-write
@@ -130,7 +129,6 @@ impl Engine {
     ///
     /// The signature is async because future manifest loading may
     /// want to await disk IO; the body is sync today.
-    #[allow(clippy::unused_async)]
     pub async fn new(home: PathBuf) -> Result<Self> {
         let db_path = home.join("runs.db");
         if let Some(parent) = db_path.parent() {
@@ -169,10 +167,22 @@ impl Engine {
             user_resources = user_count,
             "seeded resource registry",
         );
-        // The env-runtime boot probe (Task 4) will populate env_registry +
-        // env_catalogs from `env_specs` rows. Until that lands the engine
-        // starts with no envs registered; workflows with a `target_env`
-        // will fail validation at load time.
+        // EnvSpec-driven boot probe. Loads `env_specs` rows, builds a
+        // Dispatcher per spec (Local + WSL today; SSH/Container land in
+        // later phases), probes each, and returns the entries/catalogs/
+        // disabled maps. An empty `env_specs` table synthesizes a default
+        // Local env so first-run installs always have one usable target.
+        let outcome =
+            environment::runtime::boot_probe::run(&pool, &resource_registry).await;
+        tracing::info!(
+            envs = outcome.entries.len(),
+            disabled = outcome.disabled_specs.len(),
+            "env-runtime boot probe",
+        );
+        let env_registry = Arc::new(environment::runtime::EnvRegistry::new());
+        env_registry.store(outcome.entries);
+        let env_catalogs = ArcSwap::new(Arc::new(outcome.catalogs));
+        let env_disabled_specs = ArcSwap::new(Arc::new(outcome.disabled_specs));
         Ok(Self {
             pool,
             registry: Arc::new(registry),
@@ -181,9 +191,9 @@ impl Engine {
             events: Arc::new(events_registry::EventRegistry::new()),
             home,
             secrets_store,
-            env_registry: Arc::new(environment::runtime::EnvRegistry::new()),
-            env_catalogs: ArcSwap::new(Arc::new(HashMap::new())),
-            env_disabled_specs: ArcSwap::new(Arc::new(HashMap::new())),
+            env_registry,
+            env_catalogs,
+            env_disabled_specs,
             env_refresh_lock: tokio::sync::Mutex::new(()),
             env_refresh_epoch: AtomicU64::new(0),
             run_senders: Arc::new(Mutex::new(HashMap::new())),
@@ -206,6 +216,16 @@ impl Engine {
         &self,
     ) -> Arc<HashMap<environment::runtime::EnvId, Arc<environment::runtime::ResourceCatalog>>> {
         self.env_catalogs.load_full()
+    }
+
+    /// Cloned snapshot of every env spec the user has flagged disabled.
+    /// Disabled envs are not paired with a dispatcher and do not probe;
+    /// IPC listings render them with an Enable affordance.
+    #[must_use]
+    pub fn env_disabled_specs(
+        &self,
+    ) -> Arc<HashMap<environment::runtime::EnvId, environment::runtime::EnvSpec>> {
+        self.env_disabled_specs.load_full()
     }
 
     /// Shared secrets store. Backed by `<home>/secrets-index.json`

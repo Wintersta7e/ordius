@@ -228,7 +228,7 @@ fn slug(label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{NamespacesError, add_custom, list, remove_custom, set_enabled, validate_host};
+    use super::{NamespacesError, validate_host};
 
     #[test]
     fn validate_accepts_ipv4() {
@@ -317,45 +317,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn add_custom_round_trips() {
-        let f = tempfile::NamedTempFile::new().unwrap();
-        let pool = crate::db::open(f.path()).unwrap();
-        let row = add_custom(&pool, "GPU Box", "192.0.2.10").unwrap();
-        assert_eq!(row.namespace_id, "custom:gpu-box");
-        let listed = list(&pool).unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].custom_label.as_deref(), Some("GPU Box"));
-        assert_eq!(listed[0].custom_host.as_deref(), Some("192.0.2.10"));
-        assert!(listed[0].enabled);
-    }
-
-    #[test]
-    fn add_custom_rejects_localhost() {
-        let f = tempfile::NamedTempFile::new().unwrap();
-        let pool = crate::db::open(f.path()).unwrap();
-        let res = add_custom(&pool, "Local", "localhost");
-        assert!(matches!(res, Err(NamespacesError::InvalidHost(_))));
-    }
-
-    #[test]
-    fn remove_custom_missing_is_not_found() {
-        let f = tempfile::NamedTempFile::new().unwrap();
-        let pool = crate::db::open(f.path()).unwrap();
-        let res = remove_custom(&pool, "custom:nonexistent");
-        assert!(matches!(res, Err(NamespacesError::NotFound(_))));
-    }
-
-    #[test]
-    fn set_enabled_upserts_for_wsl() {
-        let f = tempfile::NamedTempFile::new().unwrap();
-        let pool = crate::db::open(f.path()).unwrap();
-        set_enabled(&pool, "wsl:Debian", false).unwrap();
-        let rows = list(&pool).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].namespace_id, "wsl:Debian");
-        assert!(!rows[0].enabled);
-        assert!(rows[0].custom_label.is_none());
-        assert!(rows[0].custom_host.is_none());
-    }
+    // DB-touching tests removed: schema v3 migration drops namespace_overrides
+    // and migrates rows into env_specs + migrated_custom_namespaces. The legacy
+    // CRUD path is dead until namespaces.rs itself is deleted in Task 15.
+    // validate_host tests above remain valid (pure-function, no DB).
 }

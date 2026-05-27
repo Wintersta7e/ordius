@@ -119,12 +119,68 @@ CREATE TABLE IF NOT EXISTS namespace_overrides (
 INSERT OR IGNORE INTO schema_version (version) VALUES (2);
 ";
 
+/// Schema v3: persisted `EnvSpec` rows replace the session-C
+/// `namespace_overrides` table. Local + WSL rows port directly into
+/// `env_specs`; `custom:` rows land in `migrated_custom_namespaces`
+/// for the Phase F UI to re-surface once SSH/Container dispatchers
+/// ship. `namespace_overrides` is dropped at the end — Phase E owns
+/// the canonical env shape from this point on.
+const MIGRATION_V3: &str = r"
+CREATE TABLE IF NOT EXISTS env_specs (
+    id          TEXT PRIMARY KEY,
+    label       TEXT NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    spec_json   TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS migrated_custom_namespaces (
+    id           TEXT PRIMARY KEY,
+    host         TEXT NOT NULL,
+    label        TEXT NOT NULL,
+    enabled      INTEGER NOT NULL,
+    migrated_at  INTEGER NOT NULL
+);
+
+INSERT INTO env_specs (id, label, enabled, spec_json, created_at, updated_at)
+SELECT 'local', 'Local', enabled,
+       json_object('type','local','resources',json_array(),'host_direct_verifications',json_object()),
+       unixepoch()*1000, unixepoch()*1000
+FROM namespace_overrides
+WHERE namespace_id = 'local'
+LIMIT 1;
+
+INSERT INTO env_specs (id, label, enabled, spec_json, created_at, updated_at)
+SELECT 'wsl:' || substr(namespace_id, 5),
+       'WSL: ' || substr(namespace_id, 5),
+       enabled,
+       json_object(
+         'type', 'wsl_distro',
+         'name', substr(namespace_id, 5),
+         'resources', json_array(),
+         'host_direct_verifications', json_object()
+       ),
+       unixepoch()*1000, unixepoch()*1000
+FROM namespace_overrides
+WHERE namespace_id LIKE 'wsl:%';
+
+INSERT INTO migrated_custom_namespaces (id, host, label, enabled, migrated_at)
+SELECT namespace_id, custom_host, custom_label, enabled, unixepoch()*1000
+FROM namespace_overrides
+WHERE namespace_id LIKE 'custom:%' AND custom_host IS NOT NULL;
+
+DROP TABLE namespace_overrides;
+
+INSERT OR IGNORE INTO schema_version (version) VALUES (3);
+";
+
 /// Apply the bundled migration set to `conn`. Idempotent.
 ///
 /// V1 is unconditionally re-run because all of its statements are
 /// `IF NOT EXISTS` / `INSERT OR IGNORE`; this also guarantees the
 /// `schema_version` row exists before we read it. Then `MAX(version)`
-/// gates V2 so we don't run it twice on databases already at v2.
+/// gates later versions so they only run once.
 pub(super) fn apply(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     conn.execute_batch(MIGRATION_V1)?;
     let v: i64 = conn.query_row(
@@ -134,6 +190,9 @@ pub(super) fn apply(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     )?;
     if v < 2 {
         conn.execute_batch(MIGRATION_V2)?;
+    }
+    if v < 3 {
+        conn.execute_batch(MIGRATION_V3)?;
     }
     Ok(())
 }
