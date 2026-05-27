@@ -102,8 +102,9 @@ pub struct Engine {
     /// `validate_nodes` checking that the `target_env` is in the active
     /// `env_registry`. Populated by the boot probe; Task 5's
     /// `refresh_environment` swaps it atomically.
-    env_disabled_specs:
-        ArcSwap<HashMap<environment::runtime::EnvId, environment::runtime::EnvSpec>>,
+    env_disabled_specs: ArcSwap<
+        HashMap<environment::runtime::EnvId, environment::runtime::boot_probe::DisabledEnv>,
+    >,
     /// Serialises concurrent `refresh_environment` / inline-`EnvSpec`-write
     /// callers so the spec read + remove paths stay atomic. The lock is NOT
     /// held across the background probe — it covers only the synchronous
@@ -233,7 +234,8 @@ impl Engine {
     #[must_use]
     pub fn env_disabled_specs(
         &self,
-    ) -> Arc<HashMap<environment::runtime::EnvId, environment::runtime::EnvSpec>> {
+    ) -> Arc<HashMap<environment::runtime::EnvId, environment::runtime::boot_probe::DisabledEnv>>
+    {
         self.env_disabled_specs.load_full()
     }
 
@@ -279,9 +281,20 @@ impl Engine {
             None => RefreshPending::Full,
             Some(env) => {
                 match environment::runtime::boot_probe::load_spec_single(&self.pool, env) {
-                    Ok(Some(spec)) => RefreshPending::Single {
-                        env_id: env.clone(),
-                        spec: Box::new(spec),
+                    Ok(Some(row)) => {
+                        if row.enabled {
+                            RefreshPending::Single {
+                                env_id: env.clone(),
+                                label: row.label,
+                                spec: Box::new(row.spec),
+                            }
+                        } else {
+                            RefreshPending::Disabled {
+                                env_id: env.clone(),
+                                label: row.label,
+                                spec: Box::new(row.spec),
+                            }
+                        }
                     },
                     Ok(None) => RefreshPending::Remove {
                         env_id: env.clone(),
@@ -294,12 +307,24 @@ impl Engine {
         };
         let epoch_before = self.env_refresh_epoch.load(Ordering::Acquire);
 
-        // SECTION B — handle Remove inline. No probe required; CoW the maps
-        // under the lock, bump the epoch, swap. Concurrent background probes
-        // for this env then fail their CAS commit and drop stale results.
-        if let RefreshPending::Remove { env_id } = pending {
-            self.apply_remove(&env_id);
-            return Ok(());
+        // SECTION B — handle Remove + Disabled inline. No probe required;
+        // CoW the maps under the lock, bump the epoch, swap. Concurrent
+        // background probes for this env then fail their CAS commit and
+        // drop stale results.
+        match pending {
+            RefreshPending::Remove { env_id } => {
+                self.apply_remove(&env_id);
+                return Ok(());
+            },
+            RefreshPending::Disabled {
+                env_id,
+                label,
+                spec,
+            } => {
+                self.apply_disable(&env_id, label, *spec);
+                return Ok(());
+            },
+            _ => {},
         }
 
         // SECTION C — spawn the background probe. Returns immediately; the
@@ -308,13 +333,17 @@ impl Engine {
         tokio::spawn(async move {
             match pending {
                 RefreshPending::Full => run_full_refresh(&engine, epoch_before).await,
-                RefreshPending::Single { env_id, spec } => {
-                    run_single_refresh(&engine, epoch_before, env_id, *spec).await;
+                RefreshPending::Single {
+                    env_id,
+                    label,
+                    spec,
+                } => {
+                    run_single_refresh(&engine, epoch_before, env_id, label, *spec).await;
                 },
-                RefreshPending::Remove { .. } => {
-                    // SECTION B handles Remove inline; reaching here is a
+                RefreshPending::Remove { .. } | RefreshPending::Disabled { .. } => {
+                    // SECTION B handles both inline; reaching here is a
                     // programming error in this module.
-                    unreachable!("RefreshPending::Remove handled before spawn");
+                    unreachable!("Remove / Disabled handled before spawn");
                 },
             }
         });
@@ -336,6 +365,37 @@ impl Engine {
         let current_disabled = self.env_disabled_specs.load();
         let mut next_disabled = (**current_disabled).clone();
         next_disabled.remove(env_id);
+        self.env_refresh_epoch.fetch_add(1, Ordering::AcqRel);
+        self.env_registry.store(next_entries);
+        self.env_catalogs.store(Arc::new(next_catalogs));
+        self.env_disabled_specs.store(Arc::new(next_disabled));
+    }
+
+    /// Synchronous Disable: drops the env from `env_registry` +
+    /// `env_catalogs` (a disabled env can't dispatch) and inserts the spec
+    /// into `env_disabled_specs` so the IPC layer can list it under
+    /// "Disabled" with an Enable action. Bumps the epoch BEFORE the swap
+    /// so an in-flight background probe reads the bumped value on its CAS.
+    fn apply_disable(
+        &self,
+        env_id: &environment::runtime::EnvId,
+        label: String,
+        spec: environment::runtime::EnvSpec,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        let current_entries = self.env_registry.entries();
+        let mut next_entries = (*current_entries).clone();
+        next_entries.remove(env_id);
+        let current_catalogs = self.env_catalogs.load();
+        let mut next_catalogs = (**current_catalogs).clone();
+        next_catalogs.remove(env_id);
+        let current_disabled = self.env_disabled_specs.load();
+        let mut next_disabled = (**current_disabled).clone();
+        next_disabled.insert(
+            env_id.clone(),
+            environment::runtime::boot_probe::DisabledEnv { label, spec },
+        );
         self.env_refresh_epoch.fetch_add(1, Ordering::AcqRel);
         self.env_registry.store(next_entries);
         self.env_catalogs.store(Arc::new(next_catalogs));
@@ -715,12 +775,25 @@ enum RefreshPending {
     /// works against a frozen snapshot of the user's configuration.
     Single {
         env_id: environment::runtime::EnvId,
+        /// Persisted display label, propagated into the rebuilt `EnvInfo`.
+        label: String,
         /// `EnvSpec` is ~272 bytes; boxing keeps the enum variant size in
         /// line with the other cheap variants (clippy `large_enum_variant`).
         spec: Box<environment::runtime::EnvSpec>,
     },
-    /// Row absent or disabled at lock-read time. Handled inline (no probe);
-    /// the env's entry + catalog are dropped under the lock.
+    /// Row present but `enabled = 0` at lock-read time. Handled inline (no
+    /// probe); the env's entry + catalog are dropped from the active maps
+    /// and the spec is landed in `env_disabled_specs` so the IPC layer can
+    /// surface it under "Disabled" with an Enable action.
+    Disabled {
+        env_id: environment::runtime::EnvId,
+        /// Persisted display label, threaded through so the IPC entry shows
+        /// the user-customised name.
+        label: String,
+        spec: Box<environment::runtime::EnvSpec>,
+    },
+    /// Row absent at lock-read time. Handled inline (no probe); the env's
+    /// entry, catalog, and any prior disabled-spec are all dropped.
     Remove { env_id: environment::runtime::EnvId },
 }
 
@@ -809,11 +882,17 @@ async fn run_single_refresh(
     engine: &Arc<Engine>,
     epoch_before: u64,
     env_id: environment::runtime::EnvId,
+    label: String,
     spec: environment::runtime::EnvSpec,
 ) {
     use std::sync::atomic::Ordering;
-    match environment::runtime::boot_probe::run_single(&engine.resource_registry, &env_id, &spec)
-        .await
+    match environment::runtime::boot_probe::run_single(
+        &engine.resource_registry,
+        &env_id,
+        &label,
+        &spec,
+    )
+    .await
     {
         Ok(single) => {
             match engine.env_refresh_epoch.compare_exchange(

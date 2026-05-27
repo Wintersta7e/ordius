@@ -51,7 +51,18 @@ pub struct BootProbeOutcome {
     /// with a dispatcher; surfaced by IPC so the UI can render an
     /// Enable affordance. Workflow validation (Task 8) rejects target envs
     /// that resolve into this map.
-    pub disabled_specs: HashMap<EnvId, EnvSpec>,
+    pub disabled_specs: HashMap<EnvId, DisabledEnv>,
+}
+
+/// A disabled `env_specs` row preserved for IPC display. Carries the
+/// persisted label alongside the spec so the UI can render the row with
+/// its user-customised name instead of a synthesised fallback.
+#[derive(Debug, Clone)]
+pub struct DisabledEnv {
+    /// Persisted display label from the `env_specs` row.
+    pub label: String,
+    /// Decoded environment spec.
+    pub spec: EnvSpec,
 }
 
 /// Output of [`run_single`]: a probed `EnvEntry` ready to install into the
@@ -93,33 +104,44 @@ pub async fn run(pool: &DbPool, resource_registry: &ResourceRegistry) -> BootPro
     let mut specs = load_specs(pool);
     // Local is ALWAYS synthesized when absent so every workflow that
     // targets the default Local env can validate at load time even on
-    // first-run installs with no `env_specs` rows.
-    let has_local = specs.iter().any(|(id, _, _)| *id == EnvId::local());
-    if !has_local {
-        specs.push((
-            EnvId::local(),
-            EnvSpec::Local {
+    // first-run installs with no `env_specs` rows. A disabled Local row
+    // counts as "no Local" here — every workflow's default_env resolves
+    // to Local unless overridden, so the engine cannot run without one.
+    let has_enabled_local = specs
+        .iter()
+        .any(|row| row.id == EnvId::local() && row.enabled);
+    if !has_enabled_local {
+        specs.push(EnvSpecRow {
+            id: EnvId::local(),
+            label: "Local".to_string(),
+            spec: EnvSpec::Local {
                 resources: Vec::new(),
                 host_direct_verifications: HashMap::new(),
             },
-            true,
-        ));
+            enabled: true,
+        });
     }
 
     let cancel = CancellationToken::new();
     let mut tasks: JoinSet<(EnvId, Arc<EnvEntry>, Arc<ResourceCatalog>)> = JoinSet::new();
-    let mut disabled_specs: HashMap<EnvId, EnvSpec> = HashMap::new();
+    let mut disabled_specs: HashMap<EnvId, DisabledEnv> = HashMap::new();
 
-    for (env_id, spec, enabled) in specs {
+    for EnvSpecRow {
+        id: env_id,
+        label,
+        spec,
+        enabled,
+    } in specs
+    {
         if !enabled {
             tracing::info!(env_id = %env_id, "env disabled; staged for disabled_specs");
-            disabled_specs.insert(env_id, spec);
+            disabled_specs.insert(env_id, DisabledEnv { label, spec });
             continue;
         }
         // Probing-state info; rebuilt with the resolved state after probe.
         let probing_info = Arc::new(EnvInfo {
             id: env_id.clone(),
-            label: human_label(&spec),
+            label,
             spec: spec.clone(),
             state: EnvState::Probing,
             enabled: true,
@@ -290,18 +312,26 @@ fn build_plan(env_id: &EnvId, spec: &EnvSpec, resource_registry: &ResourceRegist
     }
 }
 
-fn human_label(spec: &EnvSpec) -> String {
-    match spec {
-        EnvSpec::Local { .. } => "Local".to_string(),
-        EnvSpec::WslDistro { name, .. } => format!("WSL: {name}"),
-        EnvSpec::Ssh { user, host, .. } => format!("SSH: {user}@{host}"),
-        EnvSpec::Container { image, .. } => format!("Container: {image}"),
-    }
+/// One persisted row from the `env_specs` table.
+///
+/// Carries id, persisted label, decoded spec, and the enabled flag.
+/// Returned by [`load_specs`] and [`load_spec_single`] so callers can
+/// route active vs disabled rows without re-reading the DB.
+pub struct EnvSpecRow {
+    /// Environment identifier.
+    pub id: EnvId,
+    /// Persisted display label (user-customised; never re-synthesised from
+    /// the spec at load time).
+    pub label: String,
+    /// Decoded environment spec.
+    pub spec: EnvSpec,
+    /// `true` when the row is enabled for scheduling.
+    pub enabled: bool,
 }
 
 /// Load every row from `env_specs`. Bad rows (unparseable `spec_json`) are
 /// logged + skipped — the boot probe must not panic on a corrupted file.
-fn load_specs(pool: &DbPool) -> Vec<(EnvId, EnvSpec, bool)> {
+fn load_specs(pool: &DbPool) -> Vec<EnvSpecRow> {
     let conn = match pool.get() {
         Ok(c) => c,
         Err(e) => {
@@ -309,7 +339,7 @@ fn load_specs(pool: &DbPool) -> Vec<(EnvId, EnvSpec, bool)> {
             return Vec::new();
         },
     };
-    let mut stmt = match conn.prepare("SELECT id, spec_json, enabled FROM env_specs") {
+    let mut stmt = match conn.prepare("SELECT id, label, spec_json, enabled FROM env_specs") {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "env_specs: prepare failed");
@@ -318,9 +348,10 @@ fn load_specs(pool: &DbPool) -> Vec<(EnvId, EnvSpec, bool)> {
     };
     let row_iter = match stmt.query_map([], |row| {
         let id_s: String = row.get(0)?;
-        let json: String = row.get(1)?;
-        let enabled: i64 = row.get(2)?;
-        Ok((id_s, json, enabled != 0))
+        let label: String = row.get(1)?;
+        let json: String = row.get(2)?;
+        let enabled: i64 = row.get(3)?;
+        Ok((id_s, label, json, enabled != 0))
     }) {
         Ok(it) => it,
         Err(e) => {
@@ -330,9 +361,14 @@ fn load_specs(pool: &DbPool) -> Vec<(EnvId, EnvSpec, bool)> {
     };
     row_iter
         .filter_map(|r| {
-            let (id_s, json, enabled) = r.ok()?;
+            let (id_s, label, json, enabled) = r.ok()?;
             match serde_json::from_str::<EnvSpec>(&json) {
-                Ok(spec) => Some((EnvId::new(id_s), spec, enabled)),
+                Ok(spec) => Some(EnvSpecRow {
+                    id: EnvId::new(id_s),
+                    label,
+                    spec,
+                    enabled,
+                }),
                 Err(e) => {
                     tracing::warn!(env_id = %id_s, error = %e, "env_specs: bad spec_json; skipping");
                     None
@@ -344,13 +380,13 @@ fn load_specs(pool: &DbPool) -> Vec<(EnvId, EnvSpec, bool)> {
 
 /// Load a single `env_specs` row by id.
 ///
-/// Returns `Ok(Some(spec))` only when the row exists AND `enabled = 1`;
-/// `Ok(None)` covers the absent-or-disabled case so the refresh API can
-/// treat both identically (remove the env from the registry without probing).
-pub fn load_spec_single(pool: &DbPool, env_id: &EnvId) -> Result<Option<EnvSpec>, BootError> {
+/// Returns the full row (label + spec + enabled flag) when present so the
+/// refresh API can distinguish disabled rows (insert into
+/// `env_disabled_specs`, no probe) from absent rows (drop from all maps).
+pub fn load_spec_single(pool: &DbPool, env_id: &EnvId) -> Result<Option<EnvSpecRow>, BootError> {
     let conn = pool.get().map_err(|e| BootError::Db(e.to_string()))?;
     let mut stmt = conn
-        .prepare("SELECT spec_json FROM env_specs WHERE id = ?1 AND enabled = 1")
+        .prepare("SELECT label, spec_json, enabled FROM env_specs WHERE id = ?1")
         .map_err(|e| BootError::Db(e.to_string()))?;
     let mut rows = stmt
         .query(rusqlite::params![env_id.as_str()])
@@ -358,10 +394,17 @@ pub fn load_spec_single(pool: &DbPool, env_id: &EnvId) -> Result<Option<EnvSpec>
     let Some(row) = rows.next().map_err(|e| BootError::Db(e.to_string()))? else {
         return Ok(None);
     };
-    let json: String = row.get(0).map_err(|e| BootError::Db(e.to_string()))?;
+    let label: String = row.get(0).map_err(|e| BootError::Db(e.to_string()))?;
+    let json: String = row.get(1).map_err(|e| BootError::Db(e.to_string()))?;
+    let enabled: i64 = row.get(2).map_err(|e| BootError::Db(e.to_string()))?;
     let spec: EnvSpec =
         serde_json::from_str(&json).map_err(|e| BootError::Db(format!("EnvSpec parse: {e}")))?;
-    Ok(Some(spec))
+    Ok(Some(EnvSpecRow {
+        id: env_id.clone(),
+        label,
+        spec,
+        enabled: enabled != 0,
+    }))
 }
 
 /// Construct + probe one env.
@@ -373,11 +416,12 @@ pub fn load_spec_single(pool: &DbPool, env_id: &EnvId) -> Result<Option<EnvSpec>
 pub async fn run_single(
     resource_registry: &ResourceRegistry,
     env_id: &EnvId,
+    label: &str,
     spec: &EnvSpec,
 ) -> Result<SingleRefresh, BootError> {
     let probing_info = Arc::new(EnvInfo {
         id: env_id.clone(),
-        label: human_label(spec),
+        label: label.to_string(),
         spec: spec.clone(),
         state: EnvState::Probing,
         enabled: true,

@@ -6,8 +6,9 @@
 //! GUI need the additional listing / saving / id-keyed lookup
 //! helpers exposed here so the surface doesn't drift between them.
 
+use crate::environment::runtime::boot_probe::DisabledEnv;
 use crate::environment::runtime::{
-    EnvId, EnvRegistry, EnvSpec, ResourceRef, ResourceRegistry, WorkflowId, WorkflowScopeError,
+    EnvId, EnvRegistry, ResourceRef, ResourceRegistry, WorkflowId, WorkflowScopeError,
     install_workflow_resources, remove_workflow_scope, snapshot_workflow_scope,
 };
 use crate::loader::{LoadError, load_workflow};
@@ -363,7 +364,7 @@ fn validate_nodes<S: std::hash::BuildHasher>(
     workflow: &Workflow,
     registry: &ResourceRegistry,
     env_registry: &EnvRegistry,
-    env_disabled: &HashMap<EnvId, EnvSpec, S>,
+    env_disabled: &HashMap<EnvId, DisabledEnv, S>,
 ) -> Result<Vec<WorkflowWarning>, WorkflowsError> {
     let snap = registry.snapshot();
     let env = EnvId::local();
@@ -496,7 +497,7 @@ pub fn load_in_registry<S: std::hash::BuildHasher>(
     id: &str,
     registry: &ResourceRegistry,
     env_registry: &EnvRegistry,
-    env_disabled: &HashMap<EnvId, EnvSpec, S>,
+    env_disabled: &HashMap<EnvId, DisabledEnv, S>,
 ) -> Result<(Workflow, Vec<WorkflowWarning>), WorkflowsError> {
     let wf = load(home, id)?;
     let wf_id = WorkflowId(wf.id.clone());

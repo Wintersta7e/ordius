@@ -590,8 +590,8 @@ fn build_env_snapshot(engine: &ordius_engine::Engine) -> crate::dto::EnvSnapshot
         envs.push(build_active_env_entry(id, &entry.info, catalog));
     }
 
-    for (id, spec) in disabled.iter() {
-        envs.push(build_disabled_env_entry(id, spec));
+    for (id, entry) in disabled.iter() {
+        envs.push(build_disabled_env_entry(id, &entry.label));
     }
 
     envs.sort_by(|a, b| a.id.cmp(&b.id));
@@ -616,11 +616,11 @@ fn build_active_env_entry(
 
 fn build_disabled_env_entry(
     id: &ordius_engine::environment::runtime::EnvId,
-    spec: &ordius_engine::environment::runtime::EnvSpec,
+    label: &str,
 ) -> crate::dto::EnvEntryIpc {
     crate::dto::EnvEntryIpc {
         id: id.as_str().to_string(),
-        label: env_spec_label(spec, id),
+        label: label.to_string(),
         kind: env_kind_ipc(id.kind()),
         enabled: false,
         state: crate::dto::EnvStateIpc::Disabled,
@@ -653,19 +653,6 @@ fn env_state_ipc(state: &ordius_engine::environment::runtime::EnvState) -> crate
             reason: reason.clone(),
         },
         EnvState::Disabled => crate::dto::EnvStateIpc::Disabled,
-    }
-}
-
-fn env_spec_label(
-    spec: &ordius_engine::environment::runtime::EnvSpec,
-    _fallback_id: &ordius_engine::environment::runtime::EnvId,
-) -> String {
-    use ordius_engine::environment::runtime::EnvSpec;
-    match spec {
-        EnvSpec::Local { .. } => "Local".to_string(),
-        EnvSpec::WslDistro { name, .. } => format!("WSL: {name}"),
-        EnvSpec::Ssh { user, host, .. } => format!("SSH: {user}@{host}"),
-        EnvSpec::Container { image, .. } => format!("Container: {image}"),
     }
 }
 
