@@ -442,6 +442,10 @@ impl Engine {
                 let template_result = if skip {
                     Ok(node.config.clone())
                 } else {
+                    let effective_env = node
+                        .target_env
+                        .clone()
+                        .unwrap_or_else(|| run_snapshot.default_env.clone());
                     substitute_node_config(
                         &node.config,
                         &variables,
@@ -449,7 +453,8 @@ impl Engine {
                         &current_inputs,
                         &self.secrets_store(),
                         &emitter,
-                        &self.resource_registry(),
+                        &run_snapshot,
+                        &effective_env,
                         &recorder.run_id,
                         &workspace,
                         &wf.id,
@@ -1071,7 +1076,8 @@ fn substitute_node_config(
     current_inputs: &HashMap<String, PortValue>,
     secrets_store: &Arc<crate::secrets::Store>,
     emitter: &Arc<crate::emitter::Emitter>,
-    resource_registry: &Arc<crate::environment::runtime::ResourceRegistry>,
+    run_snapshot: &Arc<crate::environment::runtime::RunSnapshot>,
+    effective_env: &crate::environment::runtime::EnvId,
     run_id: &str,
     workspace: &std::path::Path,
     workflow_id: &str,
@@ -1085,9 +1091,11 @@ fn substitute_node_config(
     let kv_resolver = |_: &str| None;
     let env_resolver = wrap_process_env();
     let env_allow = crate::template::default_env_allowlist();
-    let resources_resolver = crate::template::build_resources_resolver(
-        Arc::clone(resource_registry),
-        workflow_id.to_string(),
+    let resources_resolver = crate::template::build_run_snapshot_resources_resolver(
+        Arc::clone(&run_snapshot.registry),
+        run_snapshot.workflow_id.clone(),
+        effective_env.clone(),
+        Arc::clone(&run_snapshot.catalogs),
     );
     let original_config = config.clone();
     let sub_ctx = crate::template::SubstitutionContext {

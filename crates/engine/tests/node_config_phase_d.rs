@@ -230,79 +230,19 @@ async fn http_resource_path_form_concatenates_url() {
     assert_eq!(summary.status, "done");
 }
 
-// ── test 3: shell `{{resource.<id>.base_url}}` template substitutes ────────
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shell_template_substitutes_resource_base_url() {
-    let api = MockServer::start().await;
-    let dir = TempDir::new().unwrap();
-    let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
-
-    let port = mock_port(&api);
-    let expected_base = format!("http://127.0.0.1:{port}");
-    let resource = http_resource("wf-api", port, vec![]);
-
-    // `shell` keeps its own template pass; the universal dispatch pass
-    // is skipped. The per-spawn substitution wires the same resources
-    // resolver, so `{{resource.<id>.base_url}}` resolves to the same
-    // `http://127.0.0.1:<port>` the http/llm builtins synthesise.
-    let mut cfg: HashMap<String, serde_json::Value> = HashMap::new();
-    cfg.insert(
-        "command".into(),
-        serde_json::json!("echo {{resource.wf-api.base_url}}"),
-    );
-    let node = Node {
-        id: "echo".into(),
-        ty: "shell".into(),
-        name: String::new(),
-        config: cfg,
-        pos: Pos::default(),
-        timeout_ms: None,
-        retry: None,
-        continue_on_error: false,
-        target_env: None,
-    };
-
-    let wf = workflow_with_resource("wf-shell-res", vec![node], vec![resource]);
-    install_workflow_resources(
-        &WorkflowId(wf.id.clone()),
-        &wf.resources,
-        &engine.resource_registry(),
-    )
-    .expect("install workflow scope");
-
-    let summary = engine
-        .run_workflow(Arc::new(wf), HashMap::new(), "test", false, None)
-        .await
-        .expect("run");
-    assert_eq!(summary.status, "done");
-
-    // Verify the recorded stdout actually carries the synthesized base
-    // URL — proves the template was substituted by the per-spawn pass
-    // (not silently passed through as a literal).
-    let conn = engine.pool().get().unwrap();
-    let mut stmt = conn
-        .prepare(
-            "SELECT payload_json FROM run_events \
-             WHERE run_id = ? AND type = 'node:output' AND channel = 'stdout' \
-             ORDER BY seq",
-        )
-        .unwrap();
-    let payloads: Vec<String> = stmt
-        .query_map([&summary.run_id], |r| r.get::<_, String>(0))
-        .unwrap()
-        .filter_map(Result::ok)
-        .collect();
-    assert!(
-        !payloads.is_empty(),
-        "shell node should have emitted at least one stdout line, got none",
-    );
-    let joined = payloads.join("\n");
-    assert!(
-        joined.contains(&expected_base),
-        "expected stdout to contain {expected_base}, got {joined}",
-    );
-}
+// ── test 3 (removed): shell `{{resource.<id>.base_url}}` port synthesis ────
+//
+// Phase D synthesised `http://127.0.0.1:<first-probe-port>` for any
+// `{{resource.<id>.base_url}}` reference. Phase E (Task 18) moves
+// resolution to the per-env `RunCatalog`: `base_url` reads the proven
+// `RouteAddress` from a successful probe — there is no port-synthesis
+// fallback. A workflow with a registered-but-unprobed resource now
+// surfaces `TemplateError::Undefined`, which is the intended contract
+// (the workflow editor in Phase F gets a probe-button UX so the user
+// sees the route before the run).
+//
+// Inline coverage for the new resolver lives in
+// `crates/engine/src/template/tests.rs::run_snapshot_resolver`.
 
 // ── test 4: reserved `agent` → llm rename hint ─────────────────────────────
 

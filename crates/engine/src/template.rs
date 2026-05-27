@@ -35,10 +35,11 @@ pub fn default_env_allowlist() -> HashSet<String> {
 
 /// Boxed resolver for `{{resource.<id>.<field>}}` references.
 ///
-/// Call sites that build a closure conditionally (`Some(engine) ⇒
-/// build_resources_resolver(...)` vs noop on `Weak::upgrade` failure)
-/// store the result in this type to satisfy `clippy::type_complexity`.
-pub type BoxedResourceResolver = Box<dyn Fn(&str, &str) -> Option<String>>;
+/// Call sites that build a closure conditionally
+/// (`build_run_snapshot_resources_resolver(...)` on the run-loop path vs
+/// a noop fallback) store the result in this type to satisfy
+/// `clippy::type_complexity`.
+pub type BoxedResourceResolver = Box<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
 
 /// Per-substitution context.
 ///
@@ -349,40 +350,85 @@ pub fn substitute_in_config(
     Ok(out)
 }
 
-/// Build the standard `resources` closure for `SubstitutionContext`.
+/// Build a `resources` resolver for `SubstitutionContext` that consults
+/// the run-local frozen registry + per-env catalogs.
 ///
-/// Captures the registry handle + workflow id; resolves `base_url`
-/// on resources whose probe is `ProbeSpec::Http` by synthesizing
-/// `http://127.0.0.1:<first-port>` (the Phase D pattern — Phase E
-/// swaps to `ResourceCatalog::route_for_capability` once the per-env
-/// probed catalog is wired to the run loop).
+/// Used by the run loop so every node's `{{resource.<id>.<field>}}`
+/// substitution sees the same registry view the snapshot froze at run
+/// start, AT the node's effective env. The engine's live registry can
+/// refresh underneath an active run without affecting it.
+///
+/// Supported template fields:
+/// - `base_url` — from `RunCatalog::lookup` → `Found(HttpEndpoint::base_url)`.
+///   Catalog is authoritative; the proven `RouteAddress` `base_url` wins
+///   over any port-synthesis fallback.
+/// - `version` — from `Found(HttpEndpoint::version)`, `Binary::version`,
+///   or `Toolchain::version`. `None` until the resource is probed.
+/// - `id` — the resource id verbatim from the registry definition.
+/// - `kind` — `http_endpoint` / `binary` / `toolchain` via serde
+///   (`ResourceKind` carries `rename_all = "snake_case"`), so the
+///   spelling matches what shows in workflow JSON elsewhere — `{:?}`
+///   would render `HttpEndpoint` and `.to_lowercase()` would render
+///   `httpendpoint`, breaking round-trips.
 ///
 /// Unknown ids and unsupported fields return `None`; the template
-/// engine then surfaces the failure as `TemplateError::Undefined`.
-pub fn build_resources_resolver(
-    registry: std::sync::Arc<crate::environment::runtime::ResourceRegistry>,
-    workflow_id: String,
-) -> impl Fn(&str, &str) -> Option<String> + Send + Sync + 'static {
-    move |id: &str, field: &str| {
-        use crate::environment::runtime::env::{EnvId, WorkflowId};
-        use crate::environment::runtime::resource::{ProbeSpec, ResourceId};
+/// engine surfaces the failure as `TemplateError::Undefined`.
+#[must_use]
+pub fn build_run_snapshot_resources_resolver<S>(
+    registry: std::sync::Arc<crate::environment::runtime::RegistryInner>,
+    workflow_id: crate::environment::runtime::WorkflowId,
+    effective_env: crate::environment::runtime::EnvId,
+    catalogs: std::sync::Arc<
+        HashMap<
+            crate::environment::runtime::EnvId,
+            std::sync::Arc<crate::environment::runtime::RunCatalog>,
+            S,
+        >,
+    >,
+) -> BoxedResourceResolver
+where
+    S: std::hash::BuildHasher + Send + Sync + 'static,
+{
+    use crate::environment::runtime::{ResourceDetail, ResourceId, ResourceProbeOutcome};
 
-        let snap = registry.snapshot();
-        let wf = WorkflowId(workflow_id.clone());
-        let env = EnvId::local();
-        let (def, _scope) = snap.resolve(&ResourceId(id.to_string()), &env, Some(&wf))?;
+    Box::new(move |id_part: &str, field: &str| -> Option<String> {
+        let id = ResourceId(id_part.to_string());
 
+        // base_url and version come from the per-env run-local catalog —
+        // the proven RouteAddress base_url is authoritative.
+        if field == "base_url" {
+            let outcome = catalogs.get(&effective_env)?.lookup(&id)?;
+            let ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint { base_url, .. }) =
+                outcome
+            else {
+                return None;
+            };
+            return Some(base_url);
+        }
+        if field == "version" {
+            let outcome = catalogs.get(&effective_env)?.lookup(&id)?;
+            let ResourceProbeOutcome::Found(detail) = outcome else {
+                return None;
+            };
+            return match detail {
+                ResourceDetail::HttpEndpoint { version, .. }
+                | ResourceDetail::Binary { version, .. }
+                | ResourceDetail::Toolchain { version, .. } => version,
+            };
+        }
+
+        // Registry-derived fields walk the per-run frozen registry at
+        // the node's effective env; the snapshot installs `EnvLocal`
+        // overlays per Task 14 so env-local resources resolve.
+        let (def, _scope) = registry.resolve(&id, &effective_env, Some(&workflow_id))?;
         match field {
-            "base_url" => match &def.probe {
-                ProbeSpec::Http { ports, .. } => {
-                    let port = ports.first()?;
-                    Some(format!("http://127.0.0.1:{port}"))
-                },
-                _ => None,
-            },
+            "id" => Some(def.id.0.clone()),
+            "kind" => serde_json::to_value(def.kind)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string)),
             _ => None,
         }
-    }
+    })
 }
 
 #[cfg(test)]

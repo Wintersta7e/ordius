@@ -26,8 +26,8 @@ use crate::environment::runtime::transport::{HttpMethod, HttpRequest, HttpRespon
 use crate::events::EventType;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::template::{
-    BoxedResourceResolver, SubstitutionContext, build_resources_resolver, default_env_allowlist,
-    substitute_in_config,
+    BoxedResourceResolver, SubstitutionContext, build_run_snapshot_resources_resolver,
+    default_env_allowlist, substitute_in_config,
 };
 use crate::types::{Node, NodeType, PortValue, StreamMode};
 use async_trait::async_trait;
@@ -136,14 +136,16 @@ fn substitute_llm_config(
     let secrets_resolver = crate::executor::context::make_secrets_resolver(ctx);
     let kv_resolver = |_: &str| -> Option<String> { None };
     let env_allowlist = default_env_allowlist();
-    let resources_resolver: BoxedResourceResolver = if let Some(engine) = ctx.engine.upgrade() {
-        Box::new(build_resources_resolver(
-            engine.resource_registry(),
-            ctx.workflow_id.clone(),
-        ))
-    } else {
-        Box::new(|_, _| None)
-    };
+    let effective_env = node
+        .target_env
+        .clone()
+        .unwrap_or_else(|| ctx.run_snapshot.default_env.clone());
+    let resources_resolver: BoxedResourceResolver = build_run_snapshot_resources_resolver(
+        std::sync::Arc::clone(&ctx.run_snapshot.registry),
+        ctx.run_snapshot.workflow_id.clone(),
+        effective_env,
+        std::sync::Arc::clone(&ctx.run_snapshot.catalogs),
+    );
 
     // Detach `tools` so the substitution pass never touches it; reattach
     // afterwards so downstream code sees the same map shape it would

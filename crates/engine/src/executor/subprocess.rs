@@ -224,15 +224,17 @@ fn resolve_templated_inputs(
     // returns None so `{{kv.X}}` fails loud via TemplateError::Undefined.
     let kv_resolver = |_: &str| -> Option<String> { None };
     let env_allowlist = default_env_allowlist();
+    let effective_env = node
+        .target_env
+        .clone()
+        .unwrap_or_else(|| ctx.run_snapshot.default_env.clone());
     let resources_resolver: crate::template::BoxedResourceResolver =
-        if let Some(engine) = ctx.engine.upgrade() {
-            Box::new(crate::template::build_resources_resolver(
-                engine.resource_registry(),
-                ctx.workflow_id.clone(),
-            ))
-        } else {
-            Box::new(|_, _| None)
-        };
+        crate::template::build_run_snapshot_resources_resolver(
+            std::sync::Arc::clone(&ctx.run_snapshot.registry),
+            ctx.run_snapshot.workflow_id.clone(),
+            effective_env,
+            std::sync::Arc::clone(&ctx.run_snapshot.catalogs),
+        );
 
     let subctx = SubstitutionContext {
         vars: &ctx.variables,

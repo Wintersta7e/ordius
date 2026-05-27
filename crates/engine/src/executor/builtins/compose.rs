@@ -51,7 +51,7 @@ impl NodeExecutor for ComposeExecutor {
             )));
         }
 
-        let vars = vars_from_config(&node.config, ctx)?;
+        let vars = vars_from_config(node, ctx)?;
 
         let engine = ctx.engine.upgrade().ok_or_else(|| {
             NodeError::Other("compose: engine handle gone (shutdown in progress)".into())
@@ -112,11 +112,8 @@ impl NodeExecutor for ComposeExecutor {
 /// Build the child's variable map. Each value is a string; templates
 /// are substituted using the parent's context so callers can pass
 /// `{{inputs.x}}` / `{{vars.y}}` / `{{nodes.N.outputs.P}}`.
-fn vars_from_config(
-    config: &HashMap<String, serde_json::Value>,
-    ctx: &RunContext,
-) -> Result<HashMap<String, String>, NodeError> {
-    let raw = match config.get("vars") {
+fn vars_from_config(node: &Node, ctx: &RunContext) -> Result<HashMap<String, String>, NodeError> {
+    let raw = match node.config.get("vars") {
         None => return Ok(HashMap::new()),
         Some(serde_json::Value::Object(map)) => map,
         Some(_) => {
@@ -128,15 +125,17 @@ fn vars_from_config(
     let secrets_resolver = crate::executor::context::make_secrets_resolver(ctx);
     let kv_resolver = |_: &str| None;
     let env_allow = crate::template::default_env_allowlist();
+    let effective_env = node
+        .target_env
+        .clone()
+        .unwrap_or_else(|| ctx.run_snapshot.default_env.clone());
     let resources_resolver: crate::template::BoxedResourceResolver =
-        if let Some(engine) = ctx.engine.upgrade() {
-            Box::new(crate::template::build_resources_resolver(
-                engine.resource_registry(),
-                ctx.workflow_id.clone(),
-            ))
-        } else {
-            Box::new(|_, _| None)
-        };
+        crate::template::build_run_snapshot_resources_resolver(
+            std::sync::Arc::clone(&ctx.run_snapshot.registry),
+            ctx.run_snapshot.workflow_id.clone(),
+            effective_env,
+            std::sync::Arc::clone(&ctx.run_snapshot.catalogs),
+        );
     let empty_config: HashMap<String, serde_json::Value> = HashMap::new();
     let sub_ctx = crate::template::SubstitutionContext {
         vars: &ctx.variables,

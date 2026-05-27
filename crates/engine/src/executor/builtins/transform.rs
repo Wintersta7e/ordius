@@ -72,15 +72,17 @@ fn apply_template(node: &Node, ctx: &RunContext) -> Result<String, NodeError> {
     let secrets_resolver = crate::executor::context::make_secrets_resolver(ctx);
     let kv_resolver = |_: &str| None;
     let env_allow = crate::template::default_env_allowlist();
+    let effective_env = node
+        .target_env
+        .clone()
+        .unwrap_or_else(|| ctx.run_snapshot.default_env.clone());
     let resources_resolver: crate::template::BoxedResourceResolver =
-        if let Some(engine) = ctx.engine.upgrade() {
-            Box::new(crate::template::build_resources_resolver(
-                engine.resource_registry(),
-                ctx.workflow_id.clone(),
-            ))
-        } else {
-            Box::new(|_, _| None)
-        };
+        crate::template::build_run_snapshot_resources_resolver(
+            std::sync::Arc::clone(&ctx.run_snapshot.registry),
+            ctx.run_snapshot.workflow_id.clone(),
+            effective_env,
+            std::sync::Arc::clone(&ctx.run_snapshot.catalogs),
+        );
     let sub_ctx = crate::template::SubstitutionContext {
         vars: &ctx.variables,
         secrets: &secrets_resolver,

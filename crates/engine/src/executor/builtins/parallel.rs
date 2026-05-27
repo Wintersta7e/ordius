@@ -88,7 +88,7 @@ impl NodeExecutor for ParallelExecutor {
             .map_err(|e| NodeError::Config(format!("parallel: load workflow: {e}")))?;
         let child_wf = Arc::new(child_wf);
 
-        let base_vars = base_vars_from_config(&node.config, ctx)?;
+        let base_vars = base_vars_from_config(node, ctx)?;
         let next_depth = ctx.compose_depth.saturating_add(1);
         // Cancellation that covers the whole fan-out: any child error
         // fires this to drop siblings.
@@ -312,10 +312,10 @@ fn resolve_items(node: &Node, ctx: &RunContext) -> Result<Vec<serde_json::Value>
 }
 
 fn base_vars_from_config(
-    config: &HashMap<String, serde_json::Value>,
+    node: &Node,
     ctx: &RunContext,
 ) -> Result<HashMap<String, String>, NodeError> {
-    let raw = match config.get("vars") {
+    let raw = match node.config.get("vars") {
         None => return Ok(HashMap::new()),
         Some(serde_json::Value::Object(map)) => map,
         Some(_) => {
@@ -327,15 +327,17 @@ fn base_vars_from_config(
     let secrets_resolver = crate::executor::context::make_secrets_resolver(ctx);
     let kv_resolver = |_: &str| None;
     let env_allow = crate::template::default_env_allowlist();
+    let effective_env = node
+        .target_env
+        .clone()
+        .unwrap_or_else(|| ctx.run_snapshot.default_env.clone());
     let resources_resolver: crate::template::BoxedResourceResolver =
-        if let Some(engine) = ctx.engine.upgrade() {
-            Box::new(crate::template::build_resources_resolver(
-                engine.resource_registry(),
-                ctx.workflow_id.clone(),
-            ))
-        } else {
-            Box::new(|_, _| None)
-        };
+        crate::template::build_run_snapshot_resources_resolver(
+            std::sync::Arc::clone(&ctx.run_snapshot.registry),
+            ctx.run_snapshot.workflow_id.clone(),
+            effective_env,
+            std::sync::Arc::clone(&ctx.run_snapshot.catalogs),
+        );
     let empty_config: HashMap<String, serde_json::Value> = HashMap::new();
     let sub_ctx = crate::template::SubstitutionContext {
         vars: &ctx.variables,

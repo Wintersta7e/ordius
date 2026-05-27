@@ -477,3 +477,205 @@ fn resource_namespace_rejects_empty_id_with_trailing_field() {
     .unwrap_err();
     assert!(matches!(err, TemplateError::Syntax(_)));
 }
+
+mod run_snapshot_resolver {
+    //! Unit coverage for [`super::build_run_snapshot_resources_resolver`]:
+    //! `base_url` and `version` come from the per-env `RunCatalog`; `id`
+    //! and `kind` come from the per-run frozen `RegistryInner`; the `kind`
+    //! spelling matches the serde wire form (`http_endpoint`, not
+    //! `httpendpoint`).
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use chrono::Utc;
+
+    use crate::environment::runtime::ResourceCatalog;
+    use crate::environment::runtime::catalog::{ResourceDetail, ResourceProbeOutcome};
+    use crate::environment::runtime::env::{EnvId, WorkflowId};
+    use crate::environment::runtime::registry::{RegistryInner, ScopeKey};
+    use crate::environment::runtime::resource::{
+        ProbeSpec, ResourceDefinition, ResourceId, ResourceKind,
+    };
+    use crate::environment::runtime::run_catalog::RunCatalog;
+    use crate::template::build_run_snapshot_resources_resolver;
+
+    /// Build a registry whose `Workflow` scope holds one definition keyed
+    /// to the given `kind`.
+    fn registry_with_def(id: &str, kind: ResourceKind, wf: &WorkflowId) -> Arc<RegistryInner> {
+        let def = ResourceDefinition {
+            id: ResourceId(id.to_string()),
+            kind,
+            advertised_capabilities: Vec::new(),
+            probe: ProbeSpec::Http {
+                ports: vec![1234],
+                routes: Vec::new(),
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        };
+        let mut layers = HashMap::new();
+        layers.insert(
+            ScopeKey::Workflow { id: wf.clone() },
+            HashMap::from([(def.id.clone(), def)]),
+        );
+        Arc::new(RegistryInner {
+            revision: 1,
+            layers,
+        })
+    }
+
+    /// Build a `RunCatalog` whose frozen view holds one resource outcome.
+    fn catalog_with_outcome(
+        env: EnvId,
+        id: ResourceId,
+        outcome: ResourceProbeOutcome,
+    ) -> Arc<RunCatalog> {
+        let mut resources = HashMap::new();
+        resources.insert(id, outcome);
+        let frozen = Arc::new(ResourceCatalog {
+            env_id: env.clone(),
+            registry_revision: 1,
+            probed_at: Utc::now(),
+            resources,
+        });
+        Arc::new(RunCatalog::new(env, frozen))
+    }
+
+    fn http_endpoint_outcome(base_url: &str, version: Option<&str>) -> ResourceProbeOutcome {
+        ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
+            base_url: base_url.to_string(),
+            routes_by_capability: HashMap::new(),
+            version: version.map(str::to_string),
+            models_list: None,
+            auth_secret_ref: None,
+            streaming_supported_natively: false,
+            route_origin: crate::environment::runtime::catalog::RouteOrigin::EnvLoopback,
+        })
+    }
+
+    #[test]
+    fn base_url_reads_from_catalog_not_registry() {
+        let wf = WorkflowId("wf".to_string());
+        let env = EnvId::local();
+        let id = ResourceId("ollama".to_string());
+
+        // Registry advertises probe port 1234, but catalog says the
+        // proven base_url is :1111 — the resolver must take the
+        // catalog's view, not synthesize `http://127.0.0.1:1234`.
+        let registry = registry_with_def("ollama", ResourceKind::HttpEndpoint, &wf);
+        let catalog = catalog_with_outcome(
+            env.clone(),
+            id,
+            http_endpoint_outcome("http://x:1111", None),
+        );
+        let catalogs = Arc::new(HashMap::from([(env.clone(), catalog)]));
+
+        let resolver = build_run_snapshot_resources_resolver(registry, wf, env, catalogs);
+        assert_eq!(
+            resolver("ollama", "base_url").as_deref(),
+            Some("http://x:1111")
+        );
+    }
+
+    #[test]
+    fn base_url_returns_none_for_unprobed_resource() {
+        let wf = WorkflowId("wf".to_string());
+        let env = EnvId::local();
+        let registry = registry_with_def("ollama", ResourceKind::HttpEndpoint, &wf);
+        // Empty catalog map for this env — no probe outcome at all.
+        let catalogs = Arc::new(HashMap::new());
+
+        let resolver = build_run_snapshot_resources_resolver(registry, wf, env, catalogs);
+        assert_eq!(resolver("ollama", "base_url"), None);
+    }
+
+    #[test]
+    fn version_reads_from_catalog_http_endpoint() {
+        let wf = WorkflowId("wf".to_string());
+        let env = EnvId::local();
+        let id = ResourceId("ollama".to_string());
+
+        let registry = registry_with_def("ollama", ResourceKind::HttpEndpoint, &wf);
+        let catalog = catalog_with_outcome(
+            env.clone(),
+            id,
+            http_endpoint_outcome("http://x:1111", Some("0.4.3")),
+        );
+        let catalogs = Arc::new(HashMap::from([(env.clone(), catalog)]));
+
+        let resolver = build_run_snapshot_resources_resolver(registry, wf, env, catalogs);
+        assert_eq!(resolver("ollama", "version").as_deref(), Some("0.4.3"));
+    }
+
+    #[test]
+    fn id_reads_from_registry_definition() {
+        let wf = WorkflowId("wf".to_string());
+        let env = EnvId::local();
+        let registry = registry_with_def("my-llm", ResourceKind::HttpEndpoint, &wf);
+        let catalogs = Arc::new(HashMap::new());
+
+        let resolver = build_run_snapshot_resources_resolver(registry, wf, env, catalogs);
+        assert_eq!(resolver("my-llm", "id").as_deref(), Some("my-llm"));
+    }
+
+    #[test]
+    fn kind_uses_serde_snake_case_spelling() {
+        // Regression for the preamble item 16 + plan note: `{:?}.lowercase()`
+        // would render `httpendpoint`, breaking workflow-JSON round-trips.
+        // Serde's `rename_all = "snake_case"` on `ResourceKind` is the
+        // authoritative spelling.
+        let wf = WorkflowId("wf".to_string());
+        let env = EnvId::local();
+        let registry = registry_with_def("foo", ResourceKind::HttpEndpoint, &wf);
+        let catalogs = Arc::new(HashMap::new());
+
+        let resolver = build_run_snapshot_resources_resolver(registry, wf, env, catalogs);
+        assert_eq!(resolver("foo", "kind").as_deref(), Some("http_endpoint"));
+    }
+
+    #[test]
+    fn kind_for_binary_and_toolchain() {
+        let wf = WorkflowId("wf".to_string());
+        let env = EnvId::local();
+        let catalogs = Arc::new(HashMap::new());
+
+        let bin_registry = registry_with_def("rg", ResourceKind::Binary, &wf);
+        let resolver_bin = build_run_snapshot_resources_resolver(
+            bin_registry,
+            wf.clone(),
+            env.clone(),
+            Arc::clone(&catalogs),
+        );
+        assert_eq!(resolver_bin("rg", "kind").as_deref(), Some("binary"));
+
+        let tc_registry = registry_with_def("rustc", ResourceKind::Toolchain, &wf);
+        let resolver_tc = build_run_snapshot_resources_resolver(tc_registry, wf, env, catalogs);
+        assert_eq!(resolver_tc("rustc", "kind").as_deref(), Some("toolchain"));
+    }
+
+    #[test]
+    fn unknown_field_returns_none() {
+        let wf = WorkflowId("wf".to_string());
+        let env = EnvId::local();
+        let registry = registry_with_def("ollama", ResourceKind::HttpEndpoint, &wf);
+        let catalogs = Arc::new(HashMap::new());
+
+        let resolver = build_run_snapshot_resources_resolver(registry, wf, env, catalogs);
+        assert_eq!(resolver("ollama", "no_such_field"), None);
+    }
+
+    #[test]
+    fn unknown_resource_id_returns_none() {
+        let wf = WorkflowId("wf".to_string());
+        let env = EnvId::local();
+        let registry = registry_with_def("ollama", ResourceKind::HttpEndpoint, &wf);
+        let catalogs = Arc::new(HashMap::new());
+
+        let resolver = build_run_snapshot_resources_resolver(registry, wf, env, catalogs);
+        assert_eq!(resolver("nope", "id"), None);
+        assert_eq!(resolver("nope", "kind"), None);
+        assert_eq!(resolver("nope", "base_url"), None);
+        assert_eq!(resolver("nope", "version"), None);
+    }
+}
