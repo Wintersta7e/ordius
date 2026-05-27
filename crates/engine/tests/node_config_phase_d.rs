@@ -183,6 +183,15 @@ async fn http_resource_path_form_concatenates_url() {
         .expect(1)
         .mount(&api)
         .await;
+    // Phase E's resource form runs an opportunistic probe against the
+    // resource's declared route (`/`) when the catalog is cold; without
+    // this mock, the probe would return `NotFound` and the executor
+    // would refuse to dispatch.
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&api)
+        .await;
 
     let dir = TempDir::new().unwrap();
     let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());

@@ -17,6 +17,7 @@ workspace = true
 arc-swap = { workspace = true }
 parking_lot = { workspace = true }
 url = { workspace = true }
+urlencoding = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }
