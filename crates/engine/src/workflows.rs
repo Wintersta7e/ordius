@@ -7,11 +7,12 @@
 //! helpers exposed here so the surface doesn't drift between them.
 
 use crate::environment::runtime::{
-    EnvId, ResourceRef, ResourceRegistry, WorkflowId, WorkflowScopeError,
+    EnvId, EnvRegistry, EnvSpec, ResourceRef, ResourceRegistry, WorkflowId, WorkflowScopeError,
     install_workflow_resources, remove_workflow_scope, snapshot_workflow_scope,
 };
 use crate::loader::{LoadError, load_workflow};
 use crate::types::Workflow;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -119,6 +120,44 @@ pub enum WorkflowsError {
         node_id: String,
         /// Underlying parse failure (already display-formatted).
         reason: String,
+    },
+    /// A node names a `target_env` that is not registered with the engine.
+    /// Emitted at load so users get the error before run start.
+    #[error("node '{node_id}': target_env '{env_id}' is not in the engine's env registry")]
+    TargetEnvUnknown {
+        /// Env id named by the offending node.
+        env_id: String,
+        /// Id of the offending node inside the workflow.
+        node_id: String,
+    },
+    /// A node names a `target_env` that is registered but currently
+    /// disabled. Distinct from `TargetEnvUnknown` so the UI can render
+    /// "Re-enable in Settings" guidance.
+    #[error(
+        "node '{node_id}': target_env '{env_id}' is registered but disabled. \
+         Re-enable it in Settings"
+    )]
+    TargetEnvDisabled {
+        /// Disabled env id named by the offending node.
+        env_id: String,
+        /// Id of the offending node inside the workflow.
+        node_id: String,
+    },
+    /// The workflow's top-level `default_env` is not registered with
+    /// the engine.
+    #[error("workflow default_env '{env_id}' is not in the engine's env registry")]
+    DefaultEnvUnknown {
+        /// Env id named by `workflow.default_env`.
+        env_id: String,
+    },
+    /// The workflow's top-level `default_env` is registered but disabled.
+    #[error(
+        "workflow default_env '{env_id}' is registered but disabled. \
+         Re-enable it in Settings"
+    )]
+    DefaultEnvDisabled {
+        /// Disabled env id named by `workflow.default_env`.
+        env_id: String,
     },
 }
 
@@ -311,19 +350,58 @@ pub fn install_resources_into_registry(
 ///   URLs and a non-local `target_env` (`LoopbackUrlInRemoteEnv`
 ///   warning)
 ///
-/// `target_env` existence validation is deferred to Phase E (no env
-/// registry exists yet). Similarly, `resource known but probe
-/// NotFound in resolved env` is Phase E (no env-scoped catalog yet).
-fn validate_nodes(
+/// Phase E adds `target_env` and `default_env` existence checks against
+/// the engine's `EnvRegistry`. `EnvId::local()` is always treated as
+/// valid (the boot probe always synthesises it). Envs that exist but
+/// are flagged disabled in `env_disabled` surface as
+/// [`WorkflowsError::TargetEnvDisabled`] / [`WorkflowsError::DefaultEnvDisabled`]
+/// so the IPC layer can render "Re-enable in Settings" guidance.
+///
+/// `resource known but probe NotFound in resolved env` is still deferred
+/// to later Phase E tasks (no env-scoped catalog probe at load time).
+fn validate_nodes<S: std::hash::BuildHasher>(
     workflow: &Workflow,
     registry: &ResourceRegistry,
+    env_registry: &EnvRegistry,
+    env_disabled: &HashMap<EnvId, EnvSpec, S>,
 ) -> Result<Vec<WorkflowWarning>, WorkflowsError> {
     let snap = registry.snapshot();
     let env = EnvId::local();
     let wf = WorkflowId(workflow.id.clone());
     let mut warnings: Vec<WorkflowWarning> = Vec::new();
 
+    // Workflow-level default_env check.
+    if let Some(default_env) = &workflow.default_env
+        && *default_env != EnvId::local()
+        && env_registry.get(default_env).is_none()
+    {
+        if env_disabled.contains_key(default_env) {
+            return Err(WorkflowsError::DefaultEnvDisabled {
+                env_id: default_env.as_str().to_string(),
+            });
+        }
+        return Err(WorkflowsError::DefaultEnvUnknown {
+            env_id: default_env.as_str().to_string(),
+        });
+    }
+
     for node in &workflow.nodes {
+        // Per-node target_env check.
+        if let Some(target_env) = &node.target_env
+            && *target_env != EnvId::local()
+            && env_registry.get(target_env).is_none()
+        {
+            if env_disabled.contains_key(target_env) {
+                return Err(WorkflowsError::TargetEnvDisabled {
+                    env_id: target_env.as_str().to_string(),
+                    node_id: node.id.clone(),
+                });
+            }
+            return Err(WorkflowsError::TargetEnvUnknown {
+                env_id: target_env.as_str().to_string(),
+                node_id: node.id.clone(),
+            });
+        }
         // 1. `resource` ref resolution + capability assertion.
         if let Some(rref_val) = node.config.get("resource") {
             let rref: ResourceRef = serde_json::from_value(rref_val.clone()).map_err(|e| {
@@ -413,10 +491,12 @@ fn validate_nodes(
 /// previously-valid scope entirely. Instead, snapshot the prior scope
 /// before mutating and restore it on validation failure: callers that
 /// fail to reload keep the last-known-good resources visible.
-pub fn load_in_registry(
+pub fn load_in_registry<S: std::hash::BuildHasher>(
     home: &Path,
     id: &str,
     registry: &ResourceRegistry,
+    env_registry: &EnvRegistry,
+    env_disabled: &HashMap<EnvId, EnvSpec, S>,
 ) -> Result<(Workflow, Vec<WorkflowWarning>), WorkflowsError> {
     let wf = load(home, id)?;
     let wf_id = WorkflowId(wf.id.clone());
@@ -426,7 +506,7 @@ pub fn load_in_registry(
 
     install_resources_into_registry(&wf, registry)?;
 
-    let warnings = match validate_nodes(&wf, registry) {
+    let warnings = match validate_nodes(&wf, registry, env_registry, env_disabled) {
         Ok(w) => w,
         Err(e) => {
             // Restore the prior scope. If prior was empty this collapses

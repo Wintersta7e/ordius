@@ -240,7 +240,9 @@ fn load_rejects_container_node_type_with_rename_hint() {
 
 #[cfg(test)]
 mod scope_tests {
-    use crate::environment::runtime::{EnvId, ResourceId, ResourceRegistry, ScopeKey, WorkflowId};
+    use crate::environment::runtime::{
+        EnvId, EnvRegistry, ResourceId, ResourceRegistry, ScopeKey, WorkflowId,
+    };
     use crate::types::Workflow;
     use std::collections::HashMap;
     use tempfile::TempDir;
@@ -277,8 +279,14 @@ mod scope_tests {
         let reg = ResourceRegistry::new();
         let wf = wf_with_resources("my-wf");
         super::save(home.path(), &wf).expect("save");
-        let (_loaded, _warnings) =
-            super::load_in_registry(home.path(), "my-wf", &reg).expect("load");
+        let (_loaded, _warnings) = super::load_in_registry(
+            home.path(),
+            "my-wf",
+            &reg,
+            &EnvRegistry::new(),
+            &HashMap::new(),
+        )
+        .expect("load");
 
         let snap = reg.snapshot();
         let layer = snap
@@ -305,8 +313,14 @@ mod scope_tests {
         let reg = ResourceRegistry::new();
         let wf = wf_with_resources("doomed");
         super::save(home.path(), &wf).expect("save");
-        let (_loaded, _warnings) =
-            super::load_in_registry(home.path(), "doomed", &reg).expect("load");
+        let (_loaded, _warnings) = super::load_in_registry(
+            home.path(),
+            "doomed",
+            &reg,
+            &EnvRegistry::new(),
+            &HashMap::new(),
+        )
+        .expect("load");
 
         let removed = super::delete_in_registry(home.path(), "doomed", &reg).expect("delete");
         assert!(removed);
@@ -361,8 +375,47 @@ mod scope_tests {
 
 #[cfg(test)]
 mod validation_tests {
-    use crate::environment::runtime::ResourceRegistry;
+    use crate::environment::runtime::{
+        EnvEntry, EnvId, EnvInfo, EnvRegistry, EnvSpec, EnvState, FakeRemoteDispatcher,
+        ResourceRegistry,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use tempfile::TempDir;
+
+    /// Construct an [`EnvRegistry`] pre-populated with the listed envs.
+    /// Each entry carries a [`FakeRemoteDispatcher`] so call sites that
+    /// need the env to exist (but don't exercise dispatch) can pass it
+    /// to [`super::load_in_registry`] without standing up the full boot
+    /// probe.
+    fn env_registry_with(envs: &[(&str, bool)]) -> EnvRegistry {
+        let mut entries: HashMap<EnvId, Arc<EnvEntry>> = HashMap::new();
+        for (id, enabled) in envs {
+            let env_id = EnvId::new(*id);
+            let info = EnvInfo {
+                id: env_id.clone(),
+                label: (*id).to_string(),
+                spec: EnvSpec::Local {
+                    resources: vec![],
+                    host_direct_verifications: HashMap::new(),
+                },
+                state: EnvState::Reachable,
+                enabled: *enabled,
+            };
+            let dispatcher: Arc<dyn crate::environment::runtime::Dispatcher> =
+                Arc::new(FakeRemoteDispatcher::new(info.clone()));
+            entries.insert(
+                env_id,
+                Arc::new(EnvEntry {
+                    info: Arc::new(info),
+                    dispatcher,
+                }),
+            );
+        }
+        let registry = EnvRegistry::new();
+        registry.store(entries);
+        registry
+    }
 
     #[test]
     fn load_in_registry_rejects_unknown_resource_id() {
@@ -381,7 +434,14 @@ mod validation_tests {
         )
         .unwrap();
         let registry = ResourceRegistry::new();
-        let err = super::load_in_registry(tmp.path(), id, &registry).unwrap_err();
+        let err = super::load_in_registry(
+            tmp.path(),
+            id,
+            &registry,
+            &EnvRegistry::new(),
+            &HashMap::new(),
+        )
+        .unwrap_err();
         match err {
             super::WorkflowsError::ResourceNotInRegistry {
                 node_id,
@@ -425,7 +485,14 @@ mod validation_tests {
         )
         .unwrap();
         let registry = ResourceRegistry::new();
-        let err = super::load_in_registry(tmp.path(), id, &registry).unwrap_err();
+        let err = super::load_in_registry(
+            tmp.path(),
+            id,
+            &registry,
+            &EnvRegistry::new(),
+            &HashMap::new(),
+        )
+        .unwrap_err();
         match err {
             super::WorkflowsError::CapabilityNotAdvertised {
                 node_id,
@@ -471,7 +538,14 @@ mod validation_tests {
         )
         .unwrap();
         let registry = ResourceRegistry::new();
-        let err = super::load_in_registry(tmp.path(), id, &registry).unwrap_err();
+        let err = super::load_in_registry(
+            tmp.path(),
+            id,
+            &registry,
+            &EnvRegistry::new(),
+            &HashMap::new(),
+        )
+        .unwrap_err();
         match err {
             super::WorkflowsError::CapabilityNotAdvertised {
                 node_id,
@@ -513,7 +587,14 @@ mod validation_tests {
         )
         .unwrap();
         let registry = ResourceRegistry::new();
-        let (_wf, warnings) = super::load_in_registry(tmp.path(), id, &registry).unwrap();
+        let (_wf, warnings) = super::load_in_registry(
+            tmp.path(),
+            id,
+            &registry,
+            &EnvRegistry::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
     }
 
@@ -536,7 +617,14 @@ mod validation_tests {
         )
         .unwrap();
         let registry = ResourceRegistry::new();
-        let err = super::load_in_registry(tmp.path(), id, &registry).unwrap_err();
+        let err = super::load_in_registry(
+            tmp.path(),
+            id,
+            &registry,
+            &EnvRegistry::new(),
+            &HashMap::new(),
+        )
+        .unwrap_err();
         match err {
             super::WorkflowsError::InvalidNodeConfig { node_id, reason } => {
                 assert_eq!(node_id, "n1");
@@ -567,7 +655,10 @@ mod validation_tests {
         )
         .unwrap();
         let registry = ResourceRegistry::new();
-        let (_wf, warnings) = super::load_in_registry(tmp.path(), id, &registry).unwrap();
+        let env_registry = env_registry_with(&[("wsl:Ubuntu", false)]);
+        let (_wf, warnings) =
+            super::load_in_registry(tmp.path(), id, &registry, &env_registry, &HashMap::new())
+                .unwrap();
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].node_id, "h1");
         assert!(matches!(
@@ -597,7 +688,14 @@ mod validation_tests {
         )
         .unwrap();
         let registry = ResourceRegistry::new();
-        let (_wf, warnings) = super::load_in_registry(tmp.path(), id, &registry).unwrap();
+        let (_wf, warnings) = super::load_in_registry(
+            tmp.path(),
+            id,
+            &registry,
+            &EnvRegistry::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert!(warnings.is_empty(), "got warnings: {warnings:?}");
     }
 
@@ -621,7 +719,14 @@ mod validation_tests {
         )
         .unwrap();
         let registry = ResourceRegistry::new();
-        let (_wf, warnings) = super::load_in_registry(tmp.path(), id, &registry).unwrap();
+        let (_wf, warnings) = super::load_in_registry(
+            tmp.path(),
+            id,
+            &registry,
+            &EnvRegistry::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
         assert!(warnings.is_empty(), "got warnings: {warnings:?}");
     }
 
@@ -652,7 +757,14 @@ mod validation_tests {
         )
         .unwrap();
         let registry = ResourceRegistry::new();
-        let err = super::load_in_registry(tmp.path(), id, &registry).unwrap_err();
+        let err = super::load_in_registry(
+            tmp.path(),
+            id,
+            &registry,
+            &EnvRegistry::new(),
+            &HashMap::new(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             super::WorkflowsError::ResourceNotInRegistry { .. }
@@ -697,7 +809,14 @@ mod validation_tests {
         std::fs::write(&path, good_body).unwrap();
 
         let registry = ResourceRegistry::new();
-        super::load_in_registry(tmp.path(), id, &registry).expect("initial load ok");
+        super::load_in_registry(
+            tmp.path(),
+            id,
+            &registry,
+            &EnvRegistry::new(),
+            &HashMap::new(),
+        )
+        .expect("initial load ok");
 
         // Sanity: the prior scope resolves `keep`.
         let wf_id = crate::environment::runtime::WorkflowId(id.into());
@@ -727,7 +846,14 @@ mod validation_tests {
         }"#;
         std::fs::write(&path, bad_body).unwrap();
 
-        let err = super::load_in_registry(tmp.path(), id, &registry).unwrap_err();
+        let err = super::load_in_registry(
+            tmp.path(),
+            id,
+            &registry,
+            &EnvRegistry::new(),
+            &HashMap::new(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             super::WorkflowsError::ResourceNotInRegistry { .. }
@@ -776,7 +902,14 @@ mod validation_tests {
         )
         .unwrap();
         let registry = ResourceRegistry::new();
-        let err = super::load_in_registry(tmp.path(), id, &registry).unwrap_err();
+        let err = super::load_in_registry(
+            tmp.path(),
+            id,
+            &registry,
+            &EnvRegistry::new(),
+            &HashMap::new(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             super::WorkflowsError::ResourceNotInRegistry { .. }

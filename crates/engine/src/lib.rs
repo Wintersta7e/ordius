@@ -414,7 +414,14 @@ impl Engine {
         id: &str,
     ) -> std::result::Result<(Arc<types::Workflow>, Vec<workflows::WorkflowWarning>), EngineError>
     {
-        let (wf, warnings) = workflows::load_in_registry(home, id, &self.resource_registry)?;
+        let env_disabled = self.env_disabled_specs.load_full();
+        let (wf, warnings) = workflows::load_in_registry(
+            home,
+            id,
+            &self.resource_registry,
+            &self.env_registry,
+            &env_disabled,
+        )?;
         Ok((Arc::new(wf), warnings))
     }
 

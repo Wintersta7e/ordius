@@ -308,8 +308,14 @@ async fn workflow_with_agent_type_is_rejected_with_hint() {
     let engine = Engine::new(dir.path().to_path_buf()).await.expect("new");
     let registry = engine.resource_registry();
 
-    let err = ordius_engine::workflows::load_in_registry(dir.path(), "retired-agent", &registry)
-        .expect_err("agent type must be rejected");
+    let err = ordius_engine::workflows::load_in_registry(
+        dir.path(),
+        "retired-agent",
+        &registry,
+        &ordius_engine::environment::runtime::EnvRegistry::new(),
+        &std::collections::HashMap::new(),
+    )
+    .expect_err("agent type must be rejected");
     match err {
         WorkflowsError::ReservedNodeType {
             id,
@@ -347,9 +353,14 @@ async fn workflow_with_container_type_is_rejected_with_hint() {
     let engine = Engine::new(dir.path().to_path_buf()).await.expect("new");
     let registry = engine.resource_registry();
 
-    let err =
-        ordius_engine::workflows::load_in_registry(dir.path(), "retired-container", &registry)
-            .expect_err("container type must be rejected");
+    let err = ordius_engine::workflows::load_in_registry(
+        dir.path(),
+        "retired-container",
+        &registry,
+        &ordius_engine::environment::runtime::EnvRegistry::new(),
+        &std::collections::HashMap::new(),
+    )
+    .expect_err("container type must be rejected");
     match err {
         WorkflowsError::ReservedNodeType {
             id,
@@ -393,12 +404,36 @@ async fn loopback_url_with_remote_target_env_warns() {
     )
     .unwrap();
 
+    // Pre-seed `wsl:Ubuntu` so the boot probe registers it as a known env;
+    // the loopback lint then fires because the literal URL is local but the
+    // node targets a remote env. Without this row, `target_env` validation
+    // (Task 8) rejects the workflow before the lint runs.
+    {
+        let pool = ordius_engine::db::open(dir.path().join("runs.db")).unwrap();
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO env_specs (id, label, enabled, spec_json, created_at, updated_at)
+             VALUES ('wsl:Ubuntu', 'WSL: Ubuntu', 1,
+                     '{\"type\":\"wsl_distro\",\"name\":\"Ubuntu\",\"resources\":[],\"host_direct_verifications\":{}}',
+                     0, 0)",
+            [],
+        )
+        .unwrap();
+    }
+
     let engine = Engine::new(dir.path().to_path_buf()).await.expect("new");
     let registry = engine.resource_registry();
+    let env_registry = engine.env_registry();
+    let env_disabled = engine.env_disabled_specs();
 
-    let (_wf, warnings) =
-        ordius_engine::workflows::load_in_registry(dir.path(), "looped", &registry)
-            .expect("load with loopback warning, not error");
+    let (_wf, warnings) = ordius_engine::workflows::load_in_registry(
+        dir.path(),
+        "looped",
+        &registry,
+        &env_registry,
+        &env_disabled,
+    )
+    .expect("load with loopback warning, not error");
     assert_eq!(
         warnings.len(),
         1,
