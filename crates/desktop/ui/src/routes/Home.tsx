@@ -17,19 +17,19 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { JSX } from "react";
 
 import {
+  type EnvSnapshotIpc,
   type RunRow,
   type SavedWorkflow,
-  type EnvironmentReport,
   type SystemStatus,
   type Workflow,
   type Workspace,
   deleteWorkflow,
   duplicateWorkflow,
+  listEnvironments,
   listRuns,
   listWorkflows,
   listWorkspaces,
   saveWorkflow,
-  systemEnvironment,
   systemStatus,
   validateWorkflow,
 } from "../engine";
@@ -78,9 +78,7 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
   const [runs, setRuns] = useState<RunRow[]>([]);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [status, setStatus] = useState<SystemStatus | null>(null);
-  const [environment, setEnvironment] = useState<EnvironmentReport | null>(
-    null,
-  );
+  const [environment, setEnvironment] = useState<EnvSnapshotIpc | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [sort, setSort] = useState<SortKey>("recent");
 
@@ -101,29 +99,25 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
       setWorkspaces(demo.workspaces);
       setStatus(demo.status);
       setEnvironment({
-        platform: "wsl",
-        wslDistro: "Ubuntu-24.04",
-        namespaces: [
+        envs: [
           {
             id: "local",
             label: "Local (this machine)",
-            kind: { kind: "local" },
+            kind: "local",
             enabled: true,
-            reachable: { state: "reachable" },
+            state: { state: "reachable" },
+            resources: [
+              {
+                id: "ollama",
+                kind: "http_endpoint",
+                state: { state: "found" },
+                baseUrl: "http://127.0.0.1:11434",
+                version: null,
+                routeOrigin: "env_loopback",
+              },
+            ],
           },
         ],
-        endpoints: [
-          {
-            type: "direct",
-            kind: "ollama",
-            name: "Ollama (127.0.0.1:11434)",
-            namespaceId: "local",
-            callableUrl: "http://127.0.0.1:11434",
-            observedUrl: "http://127.0.0.1:11434",
-            coVisibleIn: [],
-          },
-        ],
-        timedOut: false,
       });
       return;
     }
@@ -133,7 +127,7 @@ export function Home({ theme, onThemeToggle }: Props): JSX.Element {
         listRuns({ limit: 100 }),
         listWorkspaces(),
         systemStatus(),
-        systemEnvironment(),
+        listEnvironments(),
       ]);
       setWorkflows(wfs);
       setRuns(allRuns);

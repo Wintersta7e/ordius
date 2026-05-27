@@ -217,62 +217,79 @@ export interface SystemStatus {
   endpoints: EndpointStatus[];
 }
 
-export type HostPlatform = "windows" | "wsl" | "linux" | "mac-os" | "other";
+// ─── Environment / EnvSpec IPC ───────────────────────────────────
+//
+// Mirrors `crates/desktop/src/dto.rs` (`EnvSnapshotIpc` family). The
+// engine's `env_registry` + per-env `ResourceCatalog`s are summarised
+// into a flat env list; each row carries its kind, lifecycle state,
+// and the resources the latest probe observed.
 
-export type WslState = "running" | "stopped";
+/** Broad env category — matches `EnvKindIpc` (snake_case on the wire). */
+export type EnvKindIpc = "local" | "wsl_distro" | "ssh" | "container";
 
-export type NamespaceKind =
-  | { kind: "local" }
-  | { kind: "wsl-distro"; name: string; state: WslState }
-  | { kind: "windows-host"; gatewayIp: string }
-  | { kind: "custom"; host: string };
-
-export type NamespaceState =
+/** Reachability / lifecycle state for the IPC envelope. */
+export type EnvStateIpc =
   | { state: "reachable" }
+  | { state: "probing" }
   | { state: "unreachable"; reason: string }
-  | { state: "disabled" }
-  | { state: "stopped" }
-  | { state: "not-probeable"; reason: string };
+  | { state: "disabled" };
 
-export interface NamespaceInfo {
+/** Outcome of a single resource probe. */
+export type ResourceStateIpc =
+  | { state: "found" }
+  | { state: "not_found" }
+  | { state: "skipped"; reason: string }
+  | { state: "timed_out" }
+  | { state: "probe_failed"; reason: string };
+
+/** How the route was reached. Snake-case enum on the wire. */
+export type RouteOriginIpc =
+  | "env_loopback"
+  | "host_direct"
+  | "forwarded_tunnel"
+  | "container_bridge";
+
+/** One probed resource as the GUI consumes it. */
+export interface EnvResourceIpc {
   id: string;
-  label: string;
-  kind: NamespaceKind;
-  enabled: boolean;
-  reachable: NamespaceState;
+  /**
+   * Probe kind serialised by the engine as a free-form string (e.g.
+   * `"http_endpoint"`, `"binary"`, `"toolchain"`). Treated as opaque
+   * by the UI — surface the value verbatim where helpful.
+   */
+  kind: string;
+  state: ResourceStateIpc;
+  baseUrl: string | null;
+  version: string | null;
+  routeOrigin: RouteOriginIpc | null;
 }
 
-export type ReachHint =
-  | "wsl-loopback-bound"
-  | "windows-host-bound"
-  | "custom-unreachable";
+/** One env's view as the GUI consumes it. */
+export interface EnvEntryIpc {
+  /** Stable env id (`local`, `wsl:Ubuntu`, `custom:dev`, …). */
+  id: string;
+  label: string;
+  kind: EnvKindIpc;
+  enabled: boolean;
+  state: EnvStateIpc;
+  resources: EnvResourceIpc[];
+}
 
-export type DiscoveredEndpoint =
-  | {
-      type: "direct";
-      kind: string;
-      name: string;
-      namespaceId: string;
-      callableUrl: string;
-      observedUrl: string;
-      coVisibleIn: string[];
-    }
-  | {
-      type: "only-via-namespace";
-      kind: string;
-      name: string;
-      namespaceId: string;
-      observedUrl: string;
-      hint: ReachHint;
-      coVisibleIn: string[];
-    };
+/** Snapshot returned by every `environment_*` command. */
+export interface EnvSnapshotIpc {
+  envs: EnvEntryIpc[];
+}
 
-export interface EnvironmentReport {
-  platform: HostPlatform;
-  wslDistro: string | null;
-  namespaces: NamespaceInfo[];
-  endpoints: DiscoveredEndpoint[];
-  timedOut: boolean;
+/**
+ * Payload accepted by `environment_add`. `spec` is the raw JSON form
+ * of `ordius_engine::environment::runtime::EnvSpec` — the desktop
+ * crate parses it server-side so the wire shape stays opaque here.
+ */
+export interface EnvAddIpc {
+  id: string;
+  label: string;
+  enabled: boolean;
+  spec: unknown;
 }
 
 export interface RunWorkflowArgs {

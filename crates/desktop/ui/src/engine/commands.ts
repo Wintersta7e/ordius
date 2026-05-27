@@ -6,7 +6,8 @@
 
 import { invoke, Channel } from "@tauri-apps/api/core";
 import type {
-  EnvironmentReport,
+  EnvAddIpc,
+  EnvSnapshotIpc,
   NodeType,
   RunDetail,
   RunEvent,
@@ -157,28 +158,38 @@ export function systemStatus(): Promise<SystemStatus> {
   return invoke("system_status");
 }
 
-export function systemEnvironment(): Promise<EnvironmentReport> {
-  return invoke("system_environment");
+// ─── Environment ─────────────────────────────────────────────────
+
+/** List every registered env (active + disabled) with its latest probe. */
+export function listEnvironments(): Promise<EnvSnapshotIpc> {
+  return invoke("environment_list");
 }
 
-export function refreshEnvironment(): Promise<EnvironmentReport> {
-  return invoke("refresh_environment");
+/**
+ * Re-probe one env (`envId = "..."`) or every enabled env
+ * (`envId` omitted). Returns the pre-probe snapshot; the probe runs in
+ * the background and lands on a subsequent `listEnvironments()`.
+ */
+export function refreshEnvironment(
+  envId?: string,
+): Promise<EnvSnapshotIpc> {
+  return invoke("environment_refresh", { envId });
 }
 
-export function addCustomNamespace(
-  label: string,
-  host: string,
-): Promise<EnvironmentReport> {
-  return invoke("add_custom_namespace", { label, host });
+/** Insert a new env spec and schedule its initial probe. */
+export function addEnvironment(spec: EnvAddIpc): Promise<EnvSnapshotIpc> {
+  return invoke("environment_add", { spec });
 }
 
-export function removeCustomNamespace(id: string): Promise<EnvironmentReport> {
-  return invoke("remove_custom_namespace", { id });
+/** Delete an env spec and tear down its registry + catalog entry. */
+export function removeEnvironment(envId: string): Promise<EnvSnapshotIpc> {
+  return invoke("environment_remove", { envId });
 }
 
-export function setNamespaceEnabled(
-  id: string,
+/** Toggle the `enabled` flag on an env spec. */
+export function setEnvironmentEnabled(
+  envId: string,
   enabled: boolean,
-): Promise<EnvironmentReport> {
-  return invoke("set_namespace_enabled", { id, enabled });
+): Promise<EnvSnapshotIpc> {
+  return invoke("environment_set_enabled", { envId, enabled });
 }

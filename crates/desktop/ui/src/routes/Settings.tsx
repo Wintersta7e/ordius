@@ -7,24 +7,25 @@ import type { JSX } from "react";
 
 import {
   type SecretMeta,
-  type EnvironmentReport,
+  type EnvEntryIpc,
+  type EnvSnapshotIpc,
+  type EnvResourceIpc,
   type Settings as SettingsShape,
   type SystemStatus,
   type Workspace,
-  addCustomNamespace,
   addSecret,
   addWorkspace,
   getSettings,
+  listEnvironments,
   listSecrets,
   listWorkspaces,
   refreshEnvironment,
-  removeCustomNamespace,
+  removeEnvironment,
   renameWorkspace,
   removeSecret,
   removeWorkspace,
-  setNamespaceEnabled,
+  setEnvironmentEnabled,
   setSettings,
-  systemEnvironment,
   systemStatus,
 } from "../engine";
 import { TopBar } from "../components/chrome/TopBar";
@@ -83,9 +84,7 @@ export function Settings({
   const [secrets, setSecretsState] = useState<SecretMeta[]>([]);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [status, setStatus] = useState<SystemStatus | null>(null);
-  const [environment, setEnvironment] = useState<EnvironmentReport | null>(
-    null,
-  );
+  const [environment, setEnvironment] = useState<EnvSnapshotIpc | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const activeIndex = SECTIONS.findIndex((s) => s.id === active);
@@ -115,29 +114,25 @@ export function Settings({
         endpoints: [],
       });
       setEnvironment({
-        platform: "wsl",
-        wslDistro: "Ubuntu-24.04",
-        namespaces: [
+        envs: [
           {
             id: "local",
             label: "Local (this machine)",
-            kind: { kind: "local" },
+            kind: "local",
             enabled: true,
-            reachable: { state: "reachable" },
+            state: { state: "reachable" },
+            resources: [
+              {
+                id: "ollama",
+                kind: "http_endpoint",
+                state: { state: "found" },
+                baseUrl: "http://127.0.0.1:11434",
+                version: null,
+                routeOrigin: "env_loopback",
+              },
+            ],
           },
         ],
-        endpoints: [
-          {
-            type: "direct",
-            kind: "ollama",
-            name: "Ollama (127.0.0.1:11434)",
-            namespaceId: "local",
-            callableUrl: "http://127.0.0.1:11434",
-            observedUrl: "http://127.0.0.1:11434",
-            coVisibleIn: [],
-          },
-        ],
-        timedOut: false,
       });
       setWorkspaces([
         {
@@ -159,7 +154,7 @@ export function Settings({
         listSecrets(),
         listWorkspaces(),
         systemStatus(),
-        systemEnvironment(),
+        listEnvironments(),
       ]);
       setSettingsState(s);
       setSecretsState(sec);
@@ -608,51 +603,22 @@ function EnvironmentsSection({
   environment,
   onEnvironmentChange,
 }: {
-  environment: EnvironmentReport | null;
-  onEnvironmentChange: (env: EnvironmentReport) => void;
+  environment: EnvSnapshotIpc | null;
+  onEnvironmentChange: (env: EnvSnapshotIpc) => void;
 }): JSX.Element | null {
   const [busy, setBusy] = useState(false);
-  const [newLabel, setNewLabel] = useState("");
-  const [newHost, setNewHost] = useState("");
-  const [hostError, setHostError] = useState<string | null>(null);
+  const [opError, setOpError] = useState<string | null>(null);
 
   if (!environment) return null;
 
   const handleToggle = async (id: string, enabled: boolean) => {
     setBusy(true);
+    setOpError(null);
     try {
-      const env = await setNamespaceEnabled(id, enabled);
+      const env = await setEnvironmentEnabled(id, enabled);
       onEnvironmentChange(env);
     } catch (e) {
-      console.error("toggle failed:", e);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const validateClientSide = (host: string): string | null => {
-    if (!host) return "host required";
-    if (host.includes("://") || host.includes("/") || host.includes("@"))
-      return "no scheme, path, or credentials";
-    if (host.toLowerCase() === "localhost") return "use Local namespace";
-    return null;
-  };
-
-  const handleAdd = async () => {
-    const err = validateClientSide(newHost);
-    if (err) {
-      setHostError(err);
-      return;
-    }
-    setHostError(null);
-    setBusy(true);
-    try {
-      const env = await addCustomNamespace(newLabel, newHost);
-      onEnvironmentChange(env);
-      setNewLabel("");
-      setNewHost("");
-    } catch (e) {
-      setHostError(String(e));
+      setOpError(String(e));
     } finally {
       setBusy(false);
     }
@@ -661,21 +627,25 @@ function EnvironmentsSection({
   const handleRemove = async (id: string) => {
     if (!window.confirm(`Remove ${id}?`)) return;
     setBusy(true);
+    setOpError(null);
     try {
-      const env = await removeCustomNamespace(id);
+      const env = await removeEnvironment(id);
       onEnvironmentChange(env);
     } catch (e) {
-      console.error("remove failed:", e);
+      setOpError(String(e));
     } finally {
       setBusy(false);
     }
   };
 
-  const handleRefresh = async () => {
+  const handleRefresh = async (id?: string) => {
     setBusy(true);
+    setOpError(null);
     try {
-      const env = await refreshEnvironment();
+      const env = await refreshEnvironment(id);
       onEnvironmentChange(env);
+    } catch (e) {
+      setOpError(String(e));
     } finally {
       setBusy(false);
     }
@@ -685,107 +655,50 @@ function EnvironmentsSection({
     <div>
       <Heading
         text="Environments"
-        sub="namespaces probed for LLM services"
+        sub="environments probed for LLM endpoints, binaries, and toolchains"
       />
       <Card>
-        {environment.namespaces.map((ns) => (
-          <div
-            key={ns.id}
-            style={{
-              display: "grid",
-              gridTemplateColumns: "auto 1fr auto auto",
-              gap: 10,
-              alignItems: "center",
-              padding: "10px 14px",
-              borderBottom: "1px solid var(--line-soft)",
-              fontFamily: "var(--mono)",
-              fontSize: 12,
-              color: "var(--txt)",
-            }}
-          >
-            <input
-              type="checkbox"
-              checked={ns.enabled}
-              onChange={(e) => void handleToggle(ns.id, e.target.checked)}
-              disabled={busy || ns.id === "local"}
-            />
-            <span>{ns.label}</span>
-            <span style={{ color: "var(--txt-dim)" }}>
-              {ns.reachable.state}
-            </span>
-            {ns.id.startsWith("custom:") ? (
-              <button
-                type="button"
-                className="btn"
-                onClick={() => void handleRemove(ns.id)}
-                disabled={busy}
-                style={{ height: 22, padding: "0 10px" }}
-              >
-                ✕
-              </button>
-            ) : (
-              <span />
-            )}
-          </div>
+        {environment.envs.map((env) => (
+          <EnvRow
+            key={env.id}
+            env={env}
+            busy={busy}
+            onToggle={(enabled) => void handleToggle(env.id, enabled)}
+            onRemove={() => void handleRemove(env.id)}
+            onRefresh={() => void handleRefresh(env.id)}
+          />
         ))}
-        <div style={{ padding: "10px 14px", display: "flex", gap: 8 }}>
-          <input
-            placeholder="Label"
-            value={newLabel}
-            onChange={(e) => setNewLabel(e.target.value)}
-            disabled={busy}
-            style={{
-              flex: 1,
-              background: "var(--bg-input)",
-              border: "1px solid var(--line)",
-              color: "var(--txt)",
-              fontFamily: "var(--mono)",
-              fontSize: 12,
-              padding: "5px 8px",
-              borderRadius: 2,
-              outline: "none",
-            }}
-          />
-          <input
-            placeholder="Host (e.g. 192.0.2.10)"
-            value={newHost}
-            onChange={(e) => setNewHost(e.target.value)}
-            disabled={busy}
-            style={{
-              flex: 1,
-              background: "var(--bg-input)",
-              border: "1px solid var(--line)",
-              color: "var(--txt)",
-              fontFamily: "var(--mono)",
-              fontSize: 12,
-              padding: "5px 8px",
-              borderRadius: 2,
-              outline: "none",
-            }}
-          />
-          <button
-            type="button"
-            className="btn"
-            onClick={() => void handleAdd()}
-            disabled={busy || !newLabel || !newHost}
-            style={{ height: 28, padding: "0 12px" }}
-          >
-            + Add
-          </button>
-        </div>
-        {hostError ? (
+        {opError ? (
           <div
             style={{
-              padding: "4px 14px",
+              padding: "8px 14px",
               color: "var(--warn)",
               fontSize: 11,
               fontFamily: "var(--mono)",
+              borderTop: "1px solid var(--line-soft)",
             }}
           >
-            {hostError}
+            {opError}
           </div>
         ) : null}
-        <div style={{ padding: "10px 14px" }}>
+        <div
+          style={{
+            padding: "10px 14px",
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: 10,
+          }}
+        >
+          <span
+            style={{
+              fontSize: 10.5,
+              color: "var(--txt-faint)",
+              fontFamily: "var(--mono)",
+            }}
+          >
+            adding remote envs (SSH · container) lands with v1.3 dispatchers.
+          </span>
           <button
             type="button"
             className="btn"
@@ -793,12 +706,231 @@ function EnvironmentsSection({
             disabled={busy}
             style={{ height: 22, padding: "0 10px" }}
           >
-            ↻ Refresh
+            ↻ Refresh all
           </button>
         </div>
       </Card>
     </div>
   );
+}
+
+function EnvRow({
+  env,
+  busy,
+  onToggle,
+  onRemove,
+  onRefresh,
+}: {
+  env: EnvEntryIpc;
+  busy: boolean;
+  onToggle: (enabled: boolean) => void;
+  onRemove: () => void;
+  onRefresh: () => void;
+}): JSX.Element {
+  const isLocal = env.id === "local";
+  return (
+    <div
+      style={{
+        padding: "10px 14px",
+        borderBottom: "1px solid var(--line-soft)",
+        fontFamily: "var(--mono)",
+        fontSize: 12,
+        color: "var(--txt)",
+      }}
+    >
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "auto 1fr auto auto auto",
+          gap: 10,
+          alignItems: "center",
+        }}
+      >
+        <input
+          type="checkbox"
+          checked={env.enabled}
+          onChange={(e) => onToggle(e.target.checked)}
+          disabled={busy || isLocal}
+          aria-label={`enable ${env.label}`}
+        />
+        <div style={{ minWidth: 0 }}>
+          <span style={{ marginRight: 8 }}>{env.label}</span>
+          <span
+            style={{
+              fontSize: 10,
+              color: "var(--txt-faint)",
+              letterSpacing: "0.06em",
+              textTransform: "uppercase",
+            }}
+          >
+            {formatEnvKind(env.kind)}
+          </span>
+        </div>
+        <EnvStatePill state={env.state} />
+        <button
+          type="button"
+          className="btn"
+          onClick={onRefresh}
+          disabled={busy || !env.enabled}
+          style={{ height: 22, padding: "0 10px" }}
+          title="re-probe this environment"
+        >
+          ↻
+        </button>
+        {isLocal ? (
+          <span />
+        ) : (
+          <button
+            type="button"
+            className="btn"
+            onClick={onRemove}
+            disabled={busy}
+            style={{ height: 22, padding: "0 10px" }}
+            aria-label={`remove ${env.label}`}
+          >
+            ✕
+          </button>
+        )}
+      </div>
+      {env.resources.length > 0 ? (
+        <div
+          style={{
+            marginTop: 6,
+            display: "flex",
+            flexDirection: "column",
+            gap: 2,
+          }}
+        >
+          {env.resources.map((res) => (
+            <EnvResourceRow key={res.id} resource={res} />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function EnvStatePill({ state }: { state: EnvEntryIpc["state"] }): JSX.Element {
+  const palette: Record<
+    string,
+    { color: string; bg: string; label: string }
+  > = {
+    reachable: {
+      color: "var(--ok)",
+      bg: "var(--ok-soft)",
+      label: "reachable",
+    },
+    probing: {
+      color: "var(--info)",
+      bg: "var(--info-soft)",
+      label: "probing…",
+    },
+    unreachable: {
+      color: "var(--err)",
+      bg: "var(--err-soft)",
+      label: "unreachable",
+    },
+    disabled: {
+      color: "var(--txt-faint)",
+      bg: "transparent",
+      label: "disabled",
+    },
+  };
+  const skin = palette[state.state] ?? palette.disabled!;
+  const tooltip = state.state === "unreachable" ? state.reason : undefined;
+  return (
+    <span
+      title={tooltip}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 6,
+        fontSize: 10.5,
+        color: skin.color,
+        background: skin.bg,
+        padding: "2px 8px",
+        borderRadius: 999,
+        fontFamily: "var(--mono)",
+        whiteSpace: "nowrap",
+      }}
+    >
+      <span
+        style={{
+          width: 6,
+          height: 6,
+          borderRadius: 6,
+          background: skin.color,
+        }}
+      />
+      {skin.label}
+    </span>
+  );
+}
+
+function EnvResourceRow({ resource }: { resource: EnvResourceIpc }): JSX.Element {
+  const stateLabel = resource.state.state;
+  const stateReason =
+    resource.state.state === "skipped" || resource.state.state === "probe_failed"
+      ? resource.state.reason
+      : null;
+  const color =
+    stateLabel === "found"
+      ? "var(--ok)"
+      : stateLabel === "timed_out" || stateLabel === "probe_failed"
+        ? "var(--warn)"
+        : "var(--txt-faint)";
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: "auto 1fr auto",
+        gap: 8,
+        alignItems: "center",
+        paddingLeft: 26,
+        fontSize: 10.5,
+        color: "var(--txt-faint)",
+      }}
+    >
+      <span style={{ color: "var(--txt-soft)" }}>·</span>
+      <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
+        <span style={{ color: "var(--txt)" }}>{resource.id}</span>
+        <span style={{ color: "var(--txt-faint)", margin: "0 6px" }}>·</span>
+        <span>{resource.kind.replace(/_/g, " ")}</span>
+        {resource.baseUrl ? (
+          <>
+            <span style={{ color: "var(--txt-faint)", margin: "0 6px" }}>·</span>
+            <span style={{ color: "var(--txt-dim)" }}>
+              {resource.baseUrl.replace(/^https?:\/\//, "")}
+            </span>
+          </>
+        ) : null}
+        {resource.version ? (
+          <>
+            <span style={{ color: "var(--txt-faint)", margin: "0 6px" }}>·</span>
+            <span>v{resource.version}</span>
+          </>
+        ) : null}
+      </span>
+      <span style={{ color, whiteSpace: "nowrap" }} title={stateReason ?? undefined}>
+        {stateLabel.replace(/_/g, " ")}
+      </span>
+    </div>
+  );
+}
+
+function formatEnvKind(kind: EnvEntryIpc["kind"]): string {
+  switch (kind) {
+    case "local":
+      return "host";
+    case "wsl_distro":
+      return "wsl";
+    case "ssh":
+      return "ssh";
+    case "container":
+      return "container";
+    default:
+      return kind;
+  }
 }
 
 // ─── Workspaces ──────────────────────────────────────────────────
@@ -1102,6 +1234,55 @@ function RetentionSection({
 
 // ─── Models ──────────────────────────────────────────────────────
 
+/**
+ * Walk the env snapshot and lift every found HTTP resource into a flat
+ * list the Models view can render. Non-reachable envs and non-http-endpoint
+ * resources are excluded; loopback routes surface with `hostReachable: false`
+ * so the UI can suppress the save button + show the warning chip.
+ */
+function collectDetectedRoutes(env: EnvSnapshotIpc | null): DetectedRoute[] {
+  if (!env) return [];
+  const out: DetectedRoute[] = [];
+  for (const e of env.envs) {
+    if (e.state.state !== "reachable") continue;
+    for (const r of e.resources) {
+      if (r.kind !== "http_endpoint") continue;
+      if (r.state.state !== "found") continue;
+      if (!r.baseUrl) continue;
+      out.push({
+        envId: e.id,
+        envLabel: e.label,
+        resourceId: r.id,
+        baseUrl: r.baseUrl,
+        routeOrigin: r.routeOrigin ?? "unknown",
+        // Only loopback routes inside a non-local env hide behind a
+        // dispatcher. Everything else (host_direct, forwarded_tunnel,
+        // container_bridge, or env_loopback on the local env itself) is
+        // already reachable from the GUI process.
+        hostReachable:
+          e.id === "local" || r.routeOrigin !== "env_loopback",
+      });
+    }
+  }
+  return out;
+}
+
+interface DetectedRoute {
+  envId: string;
+  envLabel: string;
+  resourceId: string;
+  baseUrl: string;
+  /**
+   * Routes whose `routeOrigin` is anything other than `env_loopback` are
+   * directly reachable from the host process — the `Save` button writes
+   * them straight into the model endpoints list. Loopback-only routes
+   * surface a warning chip instead (they're reachable from the env-side
+   * dispatcher but not from the GUI process).
+   */
+  hostReachable: boolean;
+  routeOrigin: string;
+}
+
 function ModelsSection({
   settings,
   secrets,
@@ -1110,7 +1291,7 @@ function ModelsSection({
 }: {
   settings: SettingsShape | null;
   secrets: SecretMeta[];
-  environment: EnvironmentReport | null;
+  environment: EnvSnapshotIpc | null;
   onPatch: (patch: Partial<SettingsShape>) => Promise<void>;
 }): JSX.Element {
   const [name, setName] = useState("");
@@ -1158,10 +1339,9 @@ function ModelsSection({
   };
 
   const registeredUrls = new Set(endpoints.map((e) => e.baseUrl));
-  const handleSaveDiscovered = async (
-    kind: string,
-    baseUrl: string,
-  ) => {
+  const detected = collectDetectedRoutes(environment);
+
+  const handleSaveDiscovered = async (kind: string, baseUrl: string) => {
     if (busy) return;
     setBusy(true);
     try {
@@ -1182,21 +1362,18 @@ function ModelsSection({
 
   return (
     <div>
-      {environment && environment.endpoints.length > 0 ? (
+      {detected.length > 0 ? (
         <>
           <Heading
             text="Detected on this host"
-            sub={`probed at boot · platform: ${environment.platform}${environment.wslDistro ? ` (${environment.wslDistro})` : ""}`}
+            sub="probed at boot · one row per resolved http endpoint"
           />
           <Card>
-            {environment.endpoints.map((ep) => {
-              const url =
-                ep.type === "direct" ? ep.callableUrl : ep.observedUrl;
-              const saved =
-                ep.type === "direct" && registeredUrls.has(ep.callableUrl);
+            {detected.map((route) => {
+              const saved = registeredUrls.has(route.baseUrl);
               return (
                 <div
-                  key={`${ep.namespaceId}::${ep.kind}::${ep.observedUrl}`}
+                  key={`${route.envId}::${route.resourceId}::${route.baseUrl}`}
                   style={{
                     display: "grid",
                     gridTemplateColumns: "1fr 1fr 110px",
@@ -1209,9 +1386,14 @@ function ModelsSection({
                     color: "var(--txt)",
                   }}
                 >
-                  <span>{ep.name}</span>
-                  <span style={{ color: "var(--txt-dim)" }}>{url}</span>
-                  {ep.type === "direct" ? (
+                  <span>
+                    {route.resourceId}
+                    <span style={{ color: "var(--txt-faint)", marginLeft: 8 }}>
+                      ({route.envLabel})
+                    </span>
+                  </span>
+                  <span style={{ color: "var(--txt-dim)" }}>{route.baseUrl}</span>
+                  {route.hostReachable ? (
                     saved ? (
                       <span style={{ color: "var(--accent)", fontSize: 11 }}>
                         ✓ saved
@@ -1221,7 +1403,7 @@ function ModelsSection({
                         type="button"
                         className="btn"
                         onClick={() =>
-                          void handleSaveDiscovered(ep.kind, ep.callableUrl)
+                          void handleSaveDiscovered(route.resourceId, route.baseUrl)
                         }
                         disabled={busy}
                         style={{ height: 22, padding: "0 10px" }}
@@ -1229,21 +1411,21 @@ function ModelsSection({
                         save endpoint
                       </button>
                     )
-                  ) : ep.type === "only-via-namespace" ? (
+                  ) : (
                     <span
                       title={
-                        `This service is bound inside ${ep.namespaceId} and is not ` +
-                        `directly reachable from the host. Bind it to 0.0.0.0 to ` +
-                        `expose it to the agent.\n\n` +
-                        `Note: 0.0.0.0 also exposes the service to your LAN. Set a ` +
-                        `Windows Firewall rule, or use WSL networkingMode = mirrored ` +
-                        `in your .wslconfig, if untrusted devices share your network.`
+                        `This resource is reachable from ${route.envLabel} but is bound ` +
+                        `to a loopback interface (${route.routeOrigin}), so the GUI process ` +
+                        `cannot reach it directly. Workflows targeting this env still work ` +
+                        `via the env-side dispatcher.\n\n` +
+                        `To expose it to the host, bind the service to 0.0.0.0 or set ` +
+                        `WSL networkingMode = mirrored in your .wslconfig.`
                       }
                       style={{ color: "var(--warn)", fontSize: 11 }}
                     >
-                      ⚠ via {ep.namespaceId}
+                      ⚠ via {route.envLabel}
                     </span>
-                  ) : null}
+                  )}
                 </div>
               );
             })}

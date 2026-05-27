@@ -6,8 +6,9 @@
 import type { JSX, ReactNode } from "react";
 
 import type {
-  EnvironmentReport,
-  HostPlatform,
+  EnvEntryIpc,
+  EnvResourceIpc,
+  EnvSnapshotIpc,
   SystemStatus,
   Workspace,
 } from "../../engine/types";
@@ -26,7 +27,7 @@ interface Props {
   running: RunningWorkflow[];
   workspace: Workspace | null;
   status: SystemStatus | null;
-  environment: EnvironmentReport | null;
+  environment: EnvSnapshotIpc | null;
   now: number;
 }
 
@@ -153,54 +154,28 @@ export function LeftRail({
                 detail={`v${status.engineVersion}`}
                 state="ok"
               />
-              {environment ? (
+              {environment
+                ? environment.envs.map((env) => (
+                    <EnvSysRow key={env.id} env={env} />
+                  ))
+                : null}
+              {environment && envHasResources(environment) === false ? (
                 <SysRow
-                  label="host"
-                  detail={formatPlatform(environment.platform, environment.wslDistro)}
-                  state="ok"
+                  label="endpoints"
+                  detail="none detected — install Ollama or LM Studio"
+                  state="unknown"
                 />
               ) : null}
-              {environment && environment.endpoints.length > 0
-                ? environment.endpoints.map((ep) => {
-                    const url =
-                      ep.type === "direct" ? ep.callableUrl : ep.observedUrl;
-                    const namespaceLabel =
-                      environment.namespaces.find((n) => n.id === ep.namespaceId)
-                        ?.label ?? ep.namespaceId;
-                    const rowState: SysRowState =
-                      ep.type === "direct"
-                        ? "ok"
-                        : ep.type === "only-via-namespace"
-                          ? "warn"
-                          : "unknown";
-                    return (
-                      <SysRow
-                        key={`${ep.namespaceId}::${ep.kind}::${ep.observedUrl}`}
-                        label={`${ep.kind} (${namespaceLabel})`}
-                        detail={url.replace(/^https?:\/\//, "")}
-                        state={rowState}
-                      />
-                    );
-                  })
+              {!environment && status.endpoints.length > 0
+                ? status.endpoints.map((endpoint) => (
+                    <SysRow
+                      key={endpoint.id}
+                      label={endpoint.name}
+                      detail={endpoint.state}
+                      state={endpoint.state}
+                    />
+                  ))
                 : null}
-              {status.endpoints.length === 0 ? (
-                environment && environment.endpoints.length === 0 ? (
-                  <SysRow
-                    label="endpoints"
-                    detail="none detected — install Ollama or LM Studio"
-                    state="unknown"
-                  />
-                ) : null
-              ) : (
-                status.endpoints.map((endpoint) => (
-                  <SysRow
-                    key={endpoint.id}
-                    label={endpoint.name}
-                    detail={endpoint.state}
-                    state={endpoint.state}
-                  />
-                ))
-              )}
               <SysRow
                 label="runs db"
                 detail={fmtBytes(status.runsDbBytes)}
@@ -425,20 +400,55 @@ function SysRow({
   );
 }
 
-function formatPlatform(
-  platform: HostPlatform,
-  wslDistro: string | null,
-): string {
-  switch (platform) {
-    case "windows":
-      return "Windows";
-    case "wsl":
-      return wslDistro ? `WSL · ${wslDistro}` : "WSL";
-    case "linux":
-      return "Linux";
-    case "mac-os":
-      return "macOS";
+function envHasResources(env: EnvSnapshotIpc): boolean {
+  return env.envs.some((e) => e.resources.length > 0);
+}
+
+function envSysRowState(env: EnvEntryIpc): SysRowState {
+  switch (env.state.state) {
+    case "reachable":
+      return env.resources.some((r) => r.state.state === "found")
+        ? "ok"
+        : "unknown";
+    case "probing":
+      return "unknown";
+    case "unreachable":
+      return "down";
+    case "disabled":
+      return "unknown";
     default:
-      return "Other";
+      return "unknown";
   }
+}
+
+function summariseResources(resources: EnvResourceIpc[]): string {
+  if (resources.length === 0) return "no resources probed";
+  const found = resources.filter((r) => r.state.state === "found");
+  if (found.length === 0) {
+    return `${resources.length} resource${resources.length === 1 ? "" : "s"} · none reachable`;
+  }
+  // Surface the first found resource's URL (sans scheme) for the detail
+  // line; the full list is visible from Settings → Environments.
+  const first = found[0]!;
+  if (first.baseUrl) {
+    const trimmed = first.baseUrl.replace(/^https?:\/\//, "");
+    return found.length === 1
+      ? `${first.id} · ${trimmed}`
+      : `${first.id} · ${trimmed} (+${found.length - 1})`;
+  }
+  return `${found.length} of ${resources.length} found`;
+}
+
+function EnvSysRow({ env }: { env: EnvEntryIpc }): JSX.Element {
+  const detail =
+    env.state.state === "unreachable"
+      ? env.state.reason
+      : env.state.state === "probing"
+        ? "probing…"
+        : env.state.state === "disabled"
+          ? "disabled"
+          : summariseResources(env.resources);
+  return (
+    <SysRow label={env.label} detail={detail} state={envSysRowState(env)} />
+  );
 }
