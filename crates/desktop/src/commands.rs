@@ -458,86 +458,295 @@ pub fn set_settings(
     ordius_engine::settings::save(state.engine.home(), &engine_settings).map_err(|e| e.to_string())
 }
 
-// ─── System status ───────────────────────────────────────────────
+// ─── Environment ─────────────────────────────────────────────────
 
-/// Host platform + endpoints discovered at boot. Cached on the
-/// engine, so this is a pure data fetch — no extra probing.
+/// Return the current env registry + per-env catalog state, packaged for
+/// the GUI's env picker / Settings page. Pure data fetch — no probing.
 #[tauri::command]
-pub fn system_environment(
+pub fn environment_list(
     state: tauri::State<'_, AppState>,
-) -> crate::dto::JsonCamel<ordius_engine::environment::EnvironmentReport> {
-    crate::dto::JsonCamel((*state.engine.environment()).clone())
+) -> Result<crate::dto::EnvSnapshotIpc, String> {
+    Ok(build_env_snapshot(&state.engine))
 }
 
-/// Re-run namespace + endpoint discovery and return the refreshed
-/// report. Used by the GUI's environment picker after the user
-/// edits namespace overrides or asks for a manual rescan.
+/// Re-probe one env (`env_id = Some`) or every enabled env (`env_id = None`)
+/// and return the refreshed snapshot.
+///
+/// The probe itself runs in a background task; this command returns as
+/// soon as the spec read + probe spawn completes. The snapshot returned
+/// is the *pre-probe* state — callers that need post-probe data should
+/// call `environment_list` again after the next event arrives.
 #[tauri::command]
-pub async fn refresh_environment(
+pub async fn environment_refresh(
     state: tauri::State<'_, AppState>,
-) -> Result<crate::dto::JsonCamel<ordius_engine::environment::EnvironmentReport>, String> {
-    let report = state
+    env_id: Option<String>,
+) -> Result<crate::dto::EnvSnapshotIpc, String> {
+    let env_id_typed = env_id.map(ordius_engine::environment::runtime::EnvId::new);
+    state
         .engine
-        .refresh_environment()
+        .refresh_environment(env_id_typed.as_ref())
         .await
         .map_err(|e| e.to_string())?;
-    Ok(crate::dto::JsonCamel((*report).clone()))
+    Ok(build_env_snapshot(&state.engine))
 }
 
-/// Insert a `custom:*` namespace override (validated host) and
-/// return the refreshed environment so the GUI sees the new row
-/// + its probe result in a single round-trip.
+/// Insert a new env spec and schedule its initial probe. Returns the
+/// snapshot reflecting the new row (state will be `Probing` until the
+/// background probe lands).
 #[tauri::command]
-pub async fn add_custom_namespace(
+pub async fn environment_add(
     state: tauri::State<'_, AppState>,
-    label: String,
-    host: String,
-) -> Result<crate::dto::JsonCamel<ordius_engine::environment::EnvironmentReport>, String> {
-    ordius_engine::namespaces::add_custom(&state.engine.pool(), &label, &host)
-        .map_err(|e| e.to_string())?;
-    let report = state
+    spec: crate::dto::EnvAddIpc,
+) -> Result<crate::dto::EnvSnapshotIpc, String> {
+    let env_spec: ordius_engine::environment::runtime::EnvSpec =
+        serde_json::from_value(spec.spec).map_err(|e| format!("invalid EnvSpec: {e}"))?;
+    let env_id = ordius_engine::environment::runtime::EnvId::new(spec.id);
+    state
         .engine
-        .refresh_environment()
+        .add_env(env_id, spec.label, spec.enabled, env_spec)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(crate::dto::JsonCamel((*report).clone()))
+    Ok(build_env_snapshot(&state.engine))
 }
 
-/// Delete a `custom:*` namespace override and return the refreshed
-/// environment. WSL/local ids are rejected by the engine layer.
+/// Delete an env spec and tear down its registry + catalog entry.
 #[tauri::command]
-pub async fn remove_custom_namespace(
+pub async fn environment_remove(
     state: tauri::State<'_, AppState>,
-    id: String,
-) -> Result<crate::dto::JsonCamel<ordius_engine::environment::EnvironmentReport>, String> {
-    ordius_engine::namespaces::remove_custom(&state.engine.pool(), &id)
-        .map_err(|e| e.to_string())?;
-    let report = state
+    env_id: String,
+) -> Result<crate::dto::EnvSnapshotIpc, String> {
+    let env_id_typed = ordius_engine::environment::runtime::EnvId::new(env_id);
+    state
         .engine
-        .refresh_environment()
+        .remove_env(&env_id_typed)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(crate::dto::JsonCamel((*report).clone()))
+    Ok(build_env_snapshot(&state.engine))
 }
 
-/// Toggle the enabled flag for any namespace (custom, WSL, or local)
-/// and return the refreshed environment. Disabled namespaces are
-/// skipped by the probe orchestrator and surface as `Disabled`.
+/// Toggle the enabled flag on an env spec. Disabling causes the next
+/// refresh to drop the env from the registry; enabling triggers a probe.
 #[tauri::command]
-pub async fn set_namespace_enabled(
+pub async fn environment_set_enabled(
     state: tauri::State<'_, AppState>,
-    id: String,
+    env_id: String,
     enabled: bool,
-) -> Result<crate::dto::JsonCamel<ordius_engine::environment::EnvironmentReport>, String> {
-    ordius_engine::namespaces::set_enabled(&state.engine.pool(), &id, enabled)
-        .map_err(|e| e.to_string())?;
-    let report = state
+) -> Result<crate::dto::EnvSnapshotIpc, String> {
+    let env_id_typed = ordius_engine::environment::runtime::EnvId::new(env_id);
+    state
         .engine
-        .refresh_environment()
+        .set_env_enabled(&env_id_typed, enabled)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(crate::dto::JsonCamel((*report).clone()))
+    Ok(build_env_snapshot(&state.engine))
 }
+
+/// Loud-failure shim for the session-C `system_environment` command.
+///
+/// Frontends that still call this see a clear rename message rather than
+/// the silent "command not found" Tauri returns for unknown invocations.
+#[tauri::command]
+pub fn system_environment(_state: tauri::State<'_, AppState>) -> Result<(), String> {
+    Err("command renamed: use environment_list".into())
+}
+
+/// Loud-failure shim for the session-C `refresh_environment` command.
+#[tauri::command]
+pub fn refresh_environment(_state: tauri::State<'_, AppState>) -> Result<(), String> {
+    Err("command renamed: use environment_refresh".into())
+}
+
+/// Loud-failure shim for the session-C `add_custom_namespace` command.
+#[tauri::command]
+pub fn add_custom_namespace(_state: tauri::State<'_, AppState>) -> Result<(), String> {
+    Err("command renamed: use environment_add with a Custom EnvSpec".into())
+}
+
+/// Loud-failure shim for the session-C `remove_custom_namespace` command.
+#[tauri::command]
+pub fn remove_custom_namespace(_state: tauri::State<'_, AppState>) -> Result<(), String> {
+    Err("command renamed: use environment_remove".into())
+}
+
+/// Loud-failure shim for the session-C `set_namespace_enabled` command.
+#[tauri::command]
+pub fn set_namespace_enabled(_state: tauri::State<'_, AppState>) -> Result<(), String> {
+    Err("command renamed: use environment_set_enabled".into())
+}
+
+/// Assemble an [`crate::dto::EnvSnapshotIpc`] from the engine's
+/// `env_registry`, `env_catalogs`, and `env_disabled_specs`. Disabled
+/// specs surface as entries with `state: Disabled`; active entries
+/// surface with the state the engine recorded after the last probe.
+fn build_env_snapshot(engine: &ordius_engine::Engine) -> crate::dto::EnvSnapshotIpc {
+    let entries = engine.env_registry().entries();
+    let catalogs = engine.env_catalogs();
+    let disabled = engine.env_disabled_specs();
+
+    let mut envs: Vec<crate::dto::EnvEntryIpc> = Vec::with_capacity(entries.len() + disabled.len());
+
+    for (id, entry) in entries.iter() {
+        let catalog = catalogs.get(id).map(std::sync::Arc::as_ref);
+        envs.push(build_active_env_entry(id, &entry.info, catalog));
+    }
+
+    for (id, spec) in disabled.iter() {
+        envs.push(build_disabled_env_entry(id, spec));
+    }
+
+    envs.sort_by(|a, b| a.id.cmp(&b.id));
+
+    crate::dto::EnvSnapshotIpc { envs }
+}
+
+fn build_active_env_entry(
+    id: &ordius_engine::environment::runtime::EnvId,
+    info: &ordius_engine::environment::runtime::EnvInfo,
+    catalog: Option<&ordius_engine::environment::runtime::ResourceCatalog>,
+) -> crate::dto::EnvEntryIpc {
+    crate::dto::EnvEntryIpc {
+        id: id.as_str().to_string(),
+        label: info.label.clone(),
+        kind: env_kind_ipc(id.kind()),
+        enabled: info.enabled,
+        state: env_state_ipc(&info.state),
+        resources: catalog.map(catalog_resources_ipc).unwrap_or_default(),
+    }
+}
+
+fn build_disabled_env_entry(
+    id: &ordius_engine::environment::runtime::EnvId,
+    spec: &ordius_engine::environment::runtime::EnvSpec,
+) -> crate::dto::EnvEntryIpc {
+    crate::dto::EnvEntryIpc {
+        id: id.as_str().to_string(),
+        label: env_spec_label(spec, id),
+        kind: env_kind_ipc(id.kind()),
+        enabled: false,
+        state: crate::dto::EnvStateIpc::Disabled,
+        resources: Vec::new(),
+    }
+}
+
+const fn env_kind_ipc(
+    kind: ordius_engine::environment::runtime::EnvKind,
+) -> crate::dto::EnvKindIpc {
+    use ordius_engine::environment::runtime::EnvKind;
+    match kind {
+        // `Unknown` is reserved for ids the engine couldn't classify; the
+        // GUI shouldn't see this in practice. Fold it into `Local` so the
+        // picker still renders something rather than throwing a schema
+        // error.
+        EnvKind::Local | EnvKind::Unknown => crate::dto::EnvKindIpc::Local,
+        EnvKind::Wsl => crate::dto::EnvKindIpc::WslDistro,
+        EnvKind::Ssh => crate::dto::EnvKindIpc::Ssh,
+        EnvKind::Container => crate::dto::EnvKindIpc::Container,
+    }
+}
+
+fn env_state_ipc(state: &ordius_engine::environment::runtime::EnvState) -> crate::dto::EnvStateIpc {
+    use ordius_engine::environment::runtime::EnvState;
+    match state {
+        EnvState::Reachable => crate::dto::EnvStateIpc::Reachable,
+        EnvState::Probing => crate::dto::EnvStateIpc::Probing,
+        EnvState::Unreachable { reason } => crate::dto::EnvStateIpc::Unreachable {
+            reason: reason.clone(),
+        },
+        EnvState::Disabled => crate::dto::EnvStateIpc::Disabled,
+    }
+}
+
+fn env_spec_label(
+    spec: &ordius_engine::environment::runtime::EnvSpec,
+    _fallback_id: &ordius_engine::environment::runtime::EnvId,
+) -> String {
+    use ordius_engine::environment::runtime::EnvSpec;
+    match spec {
+        EnvSpec::Local { .. } => "Local".to_string(),
+        EnvSpec::WslDistro { name, .. } => format!("WSL: {name}"),
+        EnvSpec::Ssh { user, host, .. } => format!("SSH: {user}@{host}"),
+        EnvSpec::Container { image, .. } => format!("Container: {image}"),
+    }
+}
+
+fn catalog_resources_ipc(
+    catalog: &ordius_engine::environment::runtime::ResourceCatalog,
+) -> Vec<crate::dto::EnvResourceIpc> {
+    use ordius_engine::environment::runtime::{ResourceDetail, ResourceProbeOutcome};
+
+    let mut out: Vec<crate::dto::EnvResourceIpc> = catalog
+        .resources
+        .iter()
+        .map(|(rid, outcome)| {
+            let (kind, base_url, version, route_origin) = match outcome {
+                ResourceProbeOutcome::Found(detail) => match detail {
+                    ResourceDetail::HttpEndpoint {
+                        base_url,
+                        version,
+                        route_origin,
+                        ..
+                    } => (
+                        "http_endpoint",
+                        Some(base_url.clone()),
+                        version.clone(),
+                        Some(route_origin_str(*route_origin).to_string()),
+                    ),
+                    ResourceDetail::Binary { version, .. } => {
+                        ("binary", None, version.clone(), None)
+                    },
+                    ResourceDetail::Toolchain { version, .. } => {
+                        ("toolchain", None, version.clone(), None)
+                    },
+                },
+                ResourceProbeOutcome::NotFound
+                | ResourceProbeOutcome::Skipped { .. }
+                | ResourceProbeOutcome::TimedOut
+                | ResourceProbeOutcome::ProbeFailed { .. } => ("unknown", None, None, None),
+            };
+            crate::dto::EnvResourceIpc {
+                id: rid.0.clone(),
+                kind: kind.to_string(),
+                state: resource_state_ipc(outcome),
+                base_url,
+                version,
+                route_origin,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+fn resource_state_ipc(
+    outcome: &ordius_engine::environment::runtime::ResourceProbeOutcome,
+) -> crate::dto::ResourceStateIpc {
+    use ordius_engine::environment::runtime::ResourceProbeOutcome;
+    match outcome {
+        ResourceProbeOutcome::Found(_) => crate::dto::ResourceStateIpc::Found,
+        ResourceProbeOutcome::NotFound => crate::dto::ResourceStateIpc::NotFound,
+        ResourceProbeOutcome::Skipped { reason } => crate::dto::ResourceStateIpc::Skipped {
+            reason: reason.clone(),
+        },
+        ResourceProbeOutcome::TimedOut => crate::dto::ResourceStateIpc::TimedOut,
+        ResourceProbeOutcome::ProbeFailed { reason } => crate::dto::ResourceStateIpc::ProbeFailed {
+            reason: reason.clone(),
+        },
+    }
+}
+
+const fn route_origin_str(
+    origin: ordius_engine::environment::runtime::RouteOrigin,
+) -> &'static str {
+    use ordius_engine::environment::runtime::RouteOrigin;
+    match origin {
+        RouteOrigin::EnvLoopback => "env_loopback",
+        RouteOrigin::HostDirect => "host_direct",
+        RouteOrigin::ForwardedTunnel => "forwarded_tunnel",
+        RouteOrigin::ContainerBridge => "container_bridge",
+    }
+}
+
+// ─── System status ───────────────────────────────────────────────
 
 /// Snapshot of engine-side state the GUI surfaces on Home + About.
 #[tauri::command]

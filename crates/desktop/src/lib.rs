@@ -51,6 +51,14 @@ pub fn run() {
             commands::get_settings,
             commands::set_settings,
             commands::system_status,
+            commands::environment_list,
+            commands::environment_refresh,
+            commands::environment_add,
+            commands::environment_remove,
+            commands::environment_set_enabled,
+            // Loud-failure shims for the session-C names. Phase F deletes
+            // these once the frontend has migrated to the `environment_*`
+            // family.
             commands::system_environment,
             commands::refresh_environment,
             commands::add_custom_namespace,

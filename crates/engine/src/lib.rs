@@ -342,6 +342,78 @@ impl Engine {
         self.env_disabled_specs.store(Arc::new(next_disabled));
     }
 
+    /// Insert a new `EnvSpec` row and schedule a probe for it.
+    ///
+    /// Holds `env_refresh_lock` across the SQL write + the call to
+    /// [`Self::refresh_environment_locked`] so concurrent refreshers see
+    /// either the pre-insert or the post-insert spec table — never a
+    /// partially-applied state.
+    ///
+    /// Errors when the id collides with an existing row or the spec fails
+    /// to serialize.
+    pub async fn add_env(
+        self: &Arc<Self>,
+        id: environment::runtime::EnvId,
+        label: String,
+        enabled: bool,
+        spec: environment::runtime::EnvSpec,
+    ) -> Result<()> {
+        let _guard = self.env_refresh_lock.lock().await;
+        let spec_json =
+            serde_json::to_string(&spec).map_err(|e| EngineError::Db(format!("EnvSpec: {e}")))?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let conn = self.pool.get()?;
+        conn.execute(
+            "INSERT INTO env_specs (id, label, enabled, spec_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            rusqlite::params![id.as_str(), label, i64::from(enabled), spec_json, now],
+        )?;
+        drop(conn);
+        self.refresh_environment_locked(Some(&id))
+    }
+
+    /// Delete an `EnvSpec` row and tear down its registry + catalog entry.
+    ///
+    /// Holds `env_refresh_lock` across the SQL delete + the call to
+    /// [`Self::refresh_environment_locked`]. With the row gone,
+    /// [`environment::runtime::boot_probe::load_spec_single`] returns
+    /// `None` and the refresh helper takes the synchronous Remove path
+    /// (no background probe).
+    pub async fn remove_env(self: &Arc<Self>, id: &environment::runtime::EnvId) -> Result<()> {
+        let _guard = self.env_refresh_lock.lock().await;
+        let conn = self.pool.get()?;
+        conn.execute(
+            "DELETE FROM env_specs WHERE id = ?1",
+            rusqlite::params![id.as_str()],
+        )?;
+        drop(conn);
+        self.refresh_environment_locked(Some(id))
+    }
+
+    /// Toggle the `enabled` flag on an existing `EnvSpec` row.
+    ///
+    /// Holds `env_refresh_lock` across the SQL update + the call to
+    /// [`Self::refresh_environment_locked`]. Disabling a row causes the
+    /// next refresh to drop it via the same Remove path as a delete; the
+    /// `env_disabled_specs` map is populated by the boot probe path on
+    /// subsequent reloads. A no-op (matching `enabled` flag) still
+    /// triggers the refresh so callers can use this as a forced re-probe.
+    pub async fn set_env_enabled(
+        self: &Arc<Self>,
+        id: &environment::runtime::EnvId,
+        enabled: bool,
+    ) -> Result<()> {
+        let _guard = self.env_refresh_lock.lock().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE env_specs SET enabled = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![i64::from(enabled), now, id.as_str()],
+        )?;
+        drop(conn);
+        self.refresh_environment_locked(Some(id))
+    }
+
     /// Shared secrets store. Backed by `<home>/secrets-index.json`
     /// plus whatever credential builder the host has installed for
     /// `keyring_core` (libsecret / Credential Manager / Keychain /

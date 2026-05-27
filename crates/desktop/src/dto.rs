@@ -484,6 +484,140 @@ impl From<RunEvent> for RunEventDto {
     }
 }
 
+// ─── Environment / EnvSpec IPC ─────────────────────────────────────
+
+/// Snapshot returned by every `environment_*` command. One row per env
+/// (active + disabled), each with its resolved state + the resources the
+/// boot probe / refresh observed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvSnapshotIpc {
+    /// One entry per env id in the engine's `env_registry` and
+    /// `env_disabled_specs`.
+    pub envs: Vec<EnvEntryIpc>,
+}
+
+/// One env's view as the GUI consumes it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvEntryIpc {
+    /// `EnvId::as_str()` form (`local`, `wsl:Ubuntu`, `custom:dev`, …).
+    pub id: String,
+    /// Display label.
+    pub label: String,
+    /// Broad category derived from the id prefix.
+    pub kind: EnvKindIpc,
+    /// Whether the env is enabled for scheduling.
+    pub enabled: bool,
+    /// Reachability / lifecycle state.
+    pub state: EnvStateIpc,
+    /// Resources the latest probe observed. Empty for `Disabled` envs and
+    /// for envs whose catalog hasn't populated yet.
+    pub resources: Vec<EnvResourceIpc>,
+}
+
+/// Broad env category — mirrors `ordius_engine::environment::runtime::EnvKind`
+/// minus the `Unknown` variant (callers should never see that on the wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvKindIpc {
+    /// The local host environment.
+    Local,
+    /// A Windows Subsystem for Linux distribution.
+    WslDistro,
+    /// A remote host reached over SSH.
+    Ssh,
+    /// A container-backed environment.
+    Container,
+}
+
+/// Reachability / lifecycle state for the IPC envelope. Disabled is
+/// surfaced for `env_specs` rows whose `enabled` flag is `false`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum EnvStateIpc {
+    /// The env was reached on the last refresh.
+    Reachable,
+    /// A refresh is in flight for this env.
+    Probing,
+    /// The env was unreachable; carries the human-readable reason.
+    Unreachable {
+        /// Why the probe failed (transport error, timeout, missing dispatcher, …).
+        reason: String,
+    },
+    /// The env's `env_specs` row has `enabled = 0`.
+    Disabled,
+}
+
+/// One probed resource as the GUI consumes it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvResourceIpc {
+    /// Resource id (matches the `EnvSpec`'s inline definition).
+    pub id: String,
+    /// Probe kind: `http_endpoint`, `binary`, or `toolchain`.
+    pub kind: String,
+    /// Outcome of the most recent probe.
+    pub state: ResourceStateIpc,
+    /// Base URL the resource is reachable at — `Some` only for HTTP routes
+    /// that resolved successfully.
+    pub base_url: Option<String>,
+    /// Probe-reported version string, when available.
+    pub version: Option<String>,
+    /// How the route was reached (`env_loopback`, `host_direct`, …) —
+    /// `Some` only for HTTP routes that resolved successfully.
+    pub route_origin: Option<String>,
+}
+
+/// Outcome of a resource probe. Mirrors
+/// `ordius_engine::environment::runtime::catalog::ResourceProbeOutcome` for
+/// the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ResourceStateIpc {
+    /// The resource was reachable.
+    Found,
+    /// No process / binary was discovered for this resource.
+    NotFound,
+    /// The probe was deliberately skipped.
+    Skipped {
+        /// Human-readable reason the probe was skipped.
+        reason: String,
+    },
+    /// The per-resource deadline elapsed.
+    TimedOut,
+    /// The resource was reachable but the probe request failed.
+    ProbeFailed {
+        /// Human-readable failure description.
+        reason: String,
+    },
+}
+
+/// Payload accepted by `environment_add`.
+///
+/// `spec` is the raw JSON form of
+/// `ordius_engine::environment::runtime::EnvSpec`; parsing happens
+/// engine-side so the desktop crate stays decoupled from the spec's
+/// internal `serde(tag)` shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvAddIpc {
+    /// Stable env id (e.g. `wsl:Ubuntu`, `custom:dev`).
+    pub id: String,
+    /// Display label shown in the env picker.
+    pub label: String,
+    /// Whether the env starts enabled (default `true` on the GUI form).
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// Raw `EnvSpec` JSON. The command parses this into `EnvSpec` before
+    /// inserting; malformed payloads surface as a typed error.
+    pub spec: serde_json::Value,
+}
+
+const fn default_enabled() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +709,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             resources: vec![],
+            default_env: None,
         };
         let dto = JsonCamel(wf);
         let json = serde_json::to_string(&dto).unwrap();
