@@ -472,12 +472,30 @@ impl Engine {
         let mut specs: StdHashMap<environment::runtime::EnvId, environment::runtime::EnvSpec> =
             StdHashMap::with_capacity(scope.len());
 
+        // Per-env env-local resource definitions, harvested from each
+        // in-scope EnvSpec. These land at `ScopeKey::EnvLocal { id: env }`
+        // in the per-run registry snapshot below — NOT the engine-level
+        // registry. Workflows referencing a resource from another env's
+        // scope chain see `None` at resolve time.
+        let mut env_locals: Vec<(
+            environment::runtime::EnvId,
+            Vec<environment::runtime::resource::ResourceDefinition>,
+        )> = Vec::with_capacity(scope.len());
+
         for env in &scope {
             let entry = entries
                 .get(env)
                 .ok_or_else(|| EngineError::EnvUnknown(env.clone()))?;
             dispatchers.insert(env.clone(), Arc::clone(&entry.dispatcher));
             specs.insert(env.clone(), entry.info.spec.clone());
+
+            let env_local = match &entry.info.spec {
+                environment::runtime::EnvSpec::Local { resources, .. }
+                | environment::runtime::EnvSpec::WslDistro { resources, .. }
+                | environment::runtime::EnvSpec::Ssh { resources, .. }
+                | environment::runtime::EnvSpec::Container { resources, .. } => resources.clone(),
+            };
+            env_locals.push((env.clone(), env_local));
 
             // Last-probed catalog Arc, cloned out of the engine's
             // ArcSwap. Envs without a probed catalog yet (newly added /
@@ -501,11 +519,18 @@ impl Engine {
             );
         }
 
+        let engine_registry_snap = self.resource_registry.snapshot();
+        let run_registry = engine_registry_snap
+            .with_env_local_overlay(&env_locals)
+            .map_err(|e| {
+                EngineError::Workflows(crate::workflows::WorkflowsError::Other(e.to_string()))
+            })?;
+
         Ok(Arc::new(environment::runtime::run_snapshot::RunSnapshot {
             run_id: run_id.to_string(),
             workflow_id,
             default_env,
-            registry: self.resource_registry.snapshot(),
+            registry: run_registry,
             dispatchers: Arc::new(dispatchers),
             catalogs: Arc::new(catalogs),
             specs: Arc::new(specs),

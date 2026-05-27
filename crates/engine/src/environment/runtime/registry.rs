@@ -91,6 +91,54 @@ impl RegistryInner {
         None
     }
 
+    /// Clone `self` with `ScopeKey::EnvLocal { id }` layers populated from
+    /// `envs`. Used by [`crate::Engine::build_run_snapshot`] to materialize
+    /// per-run env-scoped resources without mutating the engine-level
+    /// registry.
+    ///
+    /// Existing `EnvLocal` layers for the same env id are replaced (not
+    /// merged) — the caller passes the canonical per-env resource list and
+    /// every layer is rebuilt from scratch.
+    ///
+    /// Honors [`ResourceDefinition::override_lower_scope`]: an env-local def
+    /// whose id already lives at `Builtin` or `UserGlobal` AND has
+    /// `override_lower_scope == false` is rejected with
+    /// [`RegistryError::OverrideRequired`]. The precedence chain is
+    /// `Workflow > EnvLocal > UserGlobal > Builtin`, so colliding with a
+    /// `Workflow` scope entry is allowed (workflow wins at resolve time);
+    /// EnvLocal-vs-EnvLocal collisions across different envs are also fine
+    /// because each env has its own scope key.
+    ///
+    /// On success returns a new `Arc<RegistryInner>` with `revision`
+    /// incremented by one.
+    pub fn with_env_local_overlay(
+        self: &Arc<Self>,
+        envs: &[(EnvId, Vec<ResourceDefinition>)],
+    ) -> Result<Arc<Self>, RegistryError> {
+        let mut next_layers = self.layers.clone();
+        for (env_id, defs) in envs {
+            let scope = ScopeKey::EnvLocal { id: env_id.clone() };
+            let mut layer = HashMap::with_capacity(defs.len());
+            for def in defs {
+                if !def.override_lower_scope
+                    && let Some(existing_scope) =
+                        find_lower_scope_with_id_for_env_local(&self.layers, &def.id)
+                {
+                    return Err(RegistryError::OverrideRequired {
+                        id: def.id.0.clone(),
+                        existing_scope: format!("{existing_scope:?}"),
+                    });
+                }
+                layer.insert(def.id.clone(), def.clone());
+            }
+            next_layers.insert(scope, layer);
+        }
+        Ok(Arc::new(Self {
+            revision: self.revision + 1,
+            layers: next_layers,
+        }))
+    }
+
     /// All resource definitions visible to `(env, workflow?)`, deduplicated
     /// by precedence: the first scope in the chain that declares an id wins;
     /// lower-precedence declarations of the same id are silently dropped.
@@ -231,6 +279,23 @@ fn find_lower_scope_with_id(
     for (existing_scope, layer) in &inner.layers {
         if layer.contains_key(id) && scope_rank(existing_scope) <= highest_lower_rank {
             return Some(existing_scope.clone());
+        }
+    }
+    None
+}
+
+/// Find an existing declaration for `id` at a scope strictly lower than
+/// `EnvLocal` (i.e. `Builtin` or `UserGlobal`). Used by
+/// [`RegistryInner::with_env_local_overlay`] to enforce
+/// `override_lower_scope` against lower-precedence layers without consulting
+/// `Workflow` (which is HIGHER than `EnvLocal` and therefore not a shadow).
+fn find_lower_scope_with_id_for_env_local(
+    layers: &HashMap<ScopeKey, HashMap<ResourceId, ResourceDefinition>>,
+    id: &ResourceId,
+) -> Option<ScopeKey> {
+    for (scope, layer) in layers {
+        if matches!(scope, ScopeKey::Builtin | ScopeKey::UserGlobal) && layer.contains_key(id) {
+            return Some(scope.clone());
         }
     }
     None
