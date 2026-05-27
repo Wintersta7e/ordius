@@ -82,6 +82,12 @@ pub enum EngineError {
     /// centralised loader.
     #[error("workflow scope: {0}")]
     Scope(#[from] crate::environment::runtime::WorkflowScopeError),
+    /// A node's `target_env` (or the workflow's `default_env`) refers to an
+    /// env id that is not present in the engine's env registry. Raised by
+    /// [`crate::Engine::build_run_snapshot`] when freezing the per-env
+    /// dispatchers + catalogs at run start.
+    #[error("env '{0}' not in the engine's env registry")]
+    EnvUnknown(crate::environment::runtime::EnvId),
     /// A code path that intentionally returns `NotImplemented` in this
     /// release. The static string identifies the missing capability
     /// (e.g. `"container backend"` for the v1.0 stub).

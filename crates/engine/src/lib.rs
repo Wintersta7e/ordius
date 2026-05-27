@@ -418,6 +418,93 @@ impl Engine {
         Ok((Arc::new(wf), warnings))
     }
 
+    /// Freeze the per-env substrate a run needs into an [`Arc<RunSnapshot>`].
+    ///
+    /// Resolves the effective scope from `default_env ∪ envs_in_scope`,
+    /// validates every entry against the engine's env registry, and clones
+    /// the matching dispatcher, last-probed catalog, and `EnvSpec` for each.
+    /// The result is immutable for the duration of the run — concurrent
+    /// `refresh_environment` calls cannot invalidate it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::EnvUnknown`] when any env in scope is missing
+    /// from [`Self::env_registry`]. Callers that surfaced the workflow
+    /// through [`Self::load_workflow_for_run`] should have failed validation
+    /// already; this is the defence-in-depth check at run start.
+    pub fn build_run_snapshot(
+        &self,
+        run_id: &str,
+        workflow_id: environment::runtime::WorkflowId,
+        default_env: environment::runtime::EnvId,
+        envs_in_scope: &[environment::runtime::EnvId],
+    ) -> Result<Arc<environment::runtime::run_snapshot::RunSnapshot>> {
+        use std::collections::HashMap as StdHashMap;
+
+        // Effective scope = default_env ∪ envs_in_scope (deduplicated).
+        let mut scope: Vec<environment::runtime::EnvId> =
+            Vec::with_capacity(envs_in_scope.len() + 1);
+        scope.push(default_env.clone());
+        for env in envs_in_scope {
+            if !scope.contains(env) {
+                scope.push(env.clone());
+            }
+        }
+
+        let entries = self.env_registry.entries();
+        let catalogs_map = self.env_catalogs.load_full();
+
+        let mut dispatchers: StdHashMap<
+            environment::runtime::EnvId,
+            Arc<dyn environment::runtime::dispatcher::Dispatcher>,
+        > = StdHashMap::with_capacity(scope.len());
+        let mut catalogs: StdHashMap<
+            environment::runtime::EnvId,
+            Arc<environment::runtime::run_catalog::RunCatalog>,
+        > = StdHashMap::with_capacity(scope.len());
+        let mut specs: StdHashMap<environment::runtime::EnvId, environment::runtime::EnvSpec> =
+            StdHashMap::with_capacity(scope.len());
+
+        for env in &scope {
+            let entry = entries
+                .get(env)
+                .ok_or_else(|| EngineError::EnvUnknown(env.clone()))?;
+            dispatchers.insert(env.clone(), Arc::clone(&entry.dispatcher));
+            specs.insert(env.clone(), entry.info.spec.clone());
+
+            // Last-probed catalog Arc, cloned out of the engine's
+            // ArcSwap. Envs without a probed catalog yet (newly added /
+            // mid-refresh) get an empty `ResourceCatalog` keyed to the env so
+            // `RunCatalog::new` still receives an `env_id`-consistent frozen
+            // view.
+            let catalog_arc = catalogs_map.get(env).cloned().unwrap_or_else(|| {
+                Arc::new(environment::runtime::catalog::ResourceCatalog {
+                    env_id: env.clone(),
+                    registry_revision: 0,
+                    probed_at: chrono::Utc::now(),
+                    resources: std::collections::HashMap::new(),
+                })
+            });
+            catalogs.insert(
+                env.clone(),
+                Arc::new(environment::runtime::run_catalog::RunCatalog::new(
+                    env.clone(),
+                    catalog_arc,
+                )),
+            );
+        }
+
+        Ok(Arc::new(environment::runtime::run_snapshot::RunSnapshot {
+            run_id: run_id.to_string(),
+            workflow_id,
+            default_env,
+            registry: self.resource_registry.snapshot(),
+            dispatchers: Arc::new(dispatchers),
+            catalogs: Arc::new(catalogs),
+            specs: Arc::new(specs),
+        }))
+    }
+
     /// Subscribe to a run's event stream. Returns `None` if the
     /// run isn't active in this process (already completed, or
     /// never started here).

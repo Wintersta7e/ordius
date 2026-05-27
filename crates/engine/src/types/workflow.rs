@@ -51,6 +51,57 @@ pub struct Workflow {
     pub default_env: Option<crate::types::EnvId>,
 }
 
+impl Workflow {
+    /// Compute the deduplicated, sorted list of envs the engine must wire
+    /// up before this workflow can run.
+    ///
+    /// The list always covers:
+    /// - every node's explicit `target_env`,
+    /// - the workflow-level `default_env` (if set),
+    /// - `local` whenever any `http` or `llm` node carries
+    ///   `config.origin == "host"` (`HostDirect` routes always reach via the
+    ///   host loopback dispatcher, regardless of where the node's
+    ///   `target_env` resolves).
+    ///
+    /// Used by [`crate::Engine::build_run_snapshot`] to freeze dispatchers,
+    /// catalogs, and `EnvSpec`s at run start.
+    #[must_use]
+    pub fn envs_in_scope(&self) -> Vec<crate::types::EnvId> {
+        use std::collections::HashSet;
+
+        let mut scope: HashSet<crate::types::EnvId> = HashSet::new();
+
+        if let Some(ref default_env) = self.default_env {
+            scope.insert(default_env.clone());
+        }
+
+        let mut host_origin_seen = false;
+        for node in &self.nodes {
+            if let Some(ref target) = node.target_env {
+                scope.insert(target.clone());
+            }
+            if !host_origin_seen
+                && (node.ty == "http" || node.ty == "llm")
+                && node
+                    .config
+                    .get("origin")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("host")
+            {
+                host_origin_seen = true;
+            }
+        }
+
+        if host_origin_seen {
+            scope.insert(crate::types::EnvId::local());
+        }
+
+        let mut out: Vec<crate::types::EnvId> = scope.into_iter().collect();
+        out.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        out
+    }
+}
+
 const fn default_schema_version() -> u32 {
     1
 }
