@@ -86,6 +86,37 @@ impl NodeExecutor for ParallelExecutor {
         })?;
         let child_wf = crate::workflows::load(engine.home(), &workflow_id)
             .map_err(|e| NodeError::Config(format!("parallel: load workflow: {e}")))?;
+
+        // BL-H pre-flight: the child's env scope must be a subset of the
+        // parent's snapshot, and the child must not carry its own
+        // `resources:` block. Validating once here surfaces a clean
+        // `NodeError::Config` instead of N identical per-child failures
+        // wrapped through the JoinSet's string-typed error channel.
+        if !child_wf.resources.is_empty() {
+            return Err(NodeError::Config(
+                crate::EngineError::ChildResourcesUnsupported {
+                    parent_run_id: ctx.run_snapshot.run_id.clone(),
+                    child_workflow_id: child_wf.id.clone(),
+                    resource_count: child_wf.resources.len(),
+                }
+                .to_string(),
+            ));
+        }
+        let parent_envs: std::collections::HashSet<&crate::environment::runtime::EnvId> =
+            ctx.run_snapshot.dispatchers.keys().collect();
+        for env in child_wf.envs_in_scope() {
+            if !parent_envs.contains(&env) {
+                return Err(NodeError::Config(
+                    crate::EngineError::ChildEnvNotInScope {
+                        parent_run_id: ctx.run_snapshot.run_id.clone(),
+                        child_workflow_id: child_wf.id.clone(),
+                        env_id: env,
+                    }
+                    .to_string(),
+                ));
+            }
+        }
+
         let child_wf = Arc::new(child_wf);
 
         let base_vars = base_vars_from_config(node, ctx)?;

@@ -321,6 +321,36 @@ impl Engine {
         parent_snapshot: Arc<crate::environment::runtime::RunSnapshot>,
     ) -> Result<(RunSummary, HashMap<(String, String), PortValue>)> {
         crate::validation::validate(&child_wf)?;
+
+        // BL-H check 1: child workflows cannot carry their own `resources:`
+        // block in Phase E. Children inherit the parent's frozen registry
+        // snapshot; a child-side overlay would require rebuilding the
+        // snapshot mid-run (or registry-overlay-on-overlay), both deferred.
+        if !child_wf.resources.is_empty() {
+            return Err(EngineError::ChildResourcesUnsupported {
+                parent_run_id: parent_snapshot.run_id.clone(),
+                child_workflow_id: child_wf.id.clone(),
+                resource_count: child_wf.resources.len(),
+            });
+        }
+
+        // BL-H check 2: every env the child references must be in the
+        // parent's snapshot. `envs_in_scope()` walks node `target_env`s,
+        // `default_env`, and adds `local` for any `http`/`llm` node with
+        // `origin: host` (those route through the host loopback dispatcher,
+        // which always lives at `EnvId::local()`).
+        let parent_envs: std::collections::HashSet<&crate::environment::runtime::EnvId> =
+            parent_snapshot.dispatchers.keys().collect();
+        for env in child_wf.envs_in_scope() {
+            if !parent_envs.contains(&env) {
+                return Err(EngineError::ChildEnvNotInScope {
+                    parent_run_id: parent_snapshot.run_id.clone(),
+                    child_workflow_id: child_wf.id.clone(),
+                    env_id: env,
+                });
+            }
+        }
+
         let rec = Arc::new(RunRecorder::start(
             self.pool(),
             &child_wf,

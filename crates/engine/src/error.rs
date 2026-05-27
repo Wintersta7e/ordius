@@ -88,6 +88,45 @@ pub enum EngineError {
     /// dispatchers + catalogs at run start.
     #[error("env '{0}' not in the engine's env registry")]
     EnvUnknown(crate::environment::runtime::EnvId),
+    /// A `compose` or `parallel` child workflow references an `env_id` that
+    /// is not present in the parent run's `RunSnapshot` scope. Child
+    /// workflows inherit the parent's frozen dispatchers + catalogs; envs
+    /// the parent did not reference cannot be reached from the child.
+    #[error(
+        "compose/parallel child '{child_workflow_id}': target_env '{env_id}' is not in the \
+         parent run's scope. Add it as a node target_env or default_env in the parent workflow \
+         to pull it into scope, or run the child as a top-level workflow."
+    )]
+    ChildEnvNotInScope {
+        /// Parent run id (for diagnostic correlation).
+        parent_run_id: String,
+        /// Offending child workflow id.
+        child_workflow_id: String,
+        /// Offending env id referenced by the child but absent from the
+        /// parent's snapshot.
+        env_id: crate::environment::runtime::EnvId,
+    },
+    /// A `compose` or `parallel` child workflow declares its own
+    /// `resources:` block, which Phase E cannot support: children inherit
+    /// the parent's registry snapshot (built from the parent's resources),
+    /// and a child-side registry overlay would require either rebuilding
+    /// the snapshot mid-run or stacking overlay-on-overlay. Both are
+    /// deferred. Users move child resources into the parent workflow or
+    /// into their user-global `resources.toml`.
+    #[error(
+        "compose/parallel child '{child_workflow_id}': child workflow declares \
+         {resource_count} resource(s), which is not supported in Phase E. Move the resources \
+         into the parent workflow (or your user-global resources.toml) and reference them by \
+         id from the child."
+    )]
+    ChildResourcesUnsupported {
+        /// Parent run id (for diagnostic correlation).
+        parent_run_id: String,
+        /// Offending child workflow id.
+        child_workflow_id: String,
+        /// Number of resource definitions in the child workflow.
+        resource_count: usize,
+    },
     /// A code path that intentionally returns `NotImplemented` in this
     /// release. The static string identifies the missing capability
     /// (e.g. `"container backend"` for the v1.0 stub).

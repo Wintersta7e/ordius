@@ -71,7 +71,17 @@ impl NodeExecutor for ComposeExecutor {
                 Arc::clone(&ctx.run_snapshot),
             )
             .await
-            .map_err(|e| NodeError::Other(format!("compose: child run: {e}")))?;
+            .map_err(|e| match e {
+                // BL-H rejections are misconfigured workflows, not runtime
+                // failures — surface them as `NodeError::Config` so the
+                // run-event stream tags the compose node with a config
+                // error rather than a generic "Other".
+                crate::EngineError::ChildEnvNotInScope { .. }
+                | crate::EngineError::ChildResourcesUnsupported { .. } => {
+                    NodeError::Config(e.to_string())
+                },
+                other => NodeError::Other(format!("compose: child run: {other}")),
+            })?;
 
         let mut out = NodeOutputs::new();
         out.insert(
