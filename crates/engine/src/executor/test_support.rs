@@ -6,6 +6,9 @@
 use crate::checkpoints::CheckpointRegistry;
 use crate::db::open;
 use crate::emitter::Emitter;
+use crate::environment::runtime::dispatcher::Dispatcher;
+use crate::environment::runtime::env::{EnvInfo, EnvSpec, EnvState};
+use crate::environment::runtime::local::LocalDispatcher;
 use crate::environment::runtime::{EnvId, ResourceRegistry, RunSnapshot, WorkflowId};
 use crate::events::RunEvent;
 use crate::executor::{RunContext, wrap_process_env};
@@ -20,16 +23,32 @@ use tempfile::TempDir;
 use tokio::sync::broadcast;
 
 /// Build a minimal `Arc<RunSnapshot>` for tests that need a
-/// `RunContext` without booting a full `Engine`. The snapshot has
-/// no dispatchers, catalogs, or env specs — tests that exercise
+/// `RunContext` without booting a full `Engine`. The snapshot
+/// installs a `LocalDispatcher` for `EnvId::local()` so legacy
+/// literal-URL paths can send through the per-env transport;
+/// catalogs and specs remain empty. Tests that exercise non-local
 /// dispatcher selection should build via a real `Engine` instead.
 pub(super) fn test_run_snapshot(run_id: &str, workflow_id: &str) -> Arc<RunSnapshot> {
+    let local_env_id = EnvId::local();
+    let local_info = EnvInfo {
+        id: local_env_id.clone(),
+        label: "local".into(),
+        spec: EnvSpec::Local {
+            resources: Vec::new(),
+            host_direct_verifications: HashMap::new(),
+        },
+        state: EnvState::Reachable,
+        enabled: true,
+    };
+    let local_dispatcher: Arc<dyn Dispatcher> = Arc::new(LocalDispatcher::new(local_info));
+    let mut dispatchers: HashMap<EnvId, Arc<dyn Dispatcher>> = HashMap::new();
+    dispatchers.insert(local_env_id.clone(), local_dispatcher);
     Arc::new(RunSnapshot {
         run_id: run_id.to_string(),
         workflow_id: WorkflowId(workflow_id.to_string()),
-        default_env: EnvId::local(),
+        default_env: local_env_id,
         registry: ResourceRegistry::new().snapshot(),
-        dispatchers: Arc::new(HashMap::new()),
+        dispatchers: Arc::new(dispatchers),
         catalogs: Arc::new(HashMap::new()),
         specs: Arc::new(HashMap::new()),
     })

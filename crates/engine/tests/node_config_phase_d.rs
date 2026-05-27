@@ -100,6 +100,16 @@ async fn llm_resource_form_dispatches_via_registry() {
         .expect(1)
         .mount(&llm)
         .await;
+    // Probe route mock — Phase E's resolver runs an opportunistic
+    // re-probe when the catalog is cold, then derives the dispatch URL
+    // from the proven route's base + stem + suffix.
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "test-model"}]
+        })))
+        .mount(&llm)
+        .await;
 
     let dir = TempDir::new().unwrap();
     let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
@@ -469,6 +479,13 @@ async fn engine_load_workflow_for_run_seeds_scope_and_runs_end_to_end() {
         .expect(1)
         .mount(&llm)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "test-model"}]
+        })))
+        .mount(&llm)
+        .await;
 
     let dir = TempDir::new().unwrap();
     let port = mock_port(&llm);
@@ -555,6 +572,13 @@ async fn start_run_installs_workflow_scope_as_safety_net() {
             "usage": {"total_tokens": 4},
         })))
         .expect(1)
+        .mount(&llm)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "test-model"}]
+        })))
         .mount(&llm)
         .await;
 

@@ -153,22 +153,37 @@ impl ResourceCatalog {
         id: &ResourceId,
         capability: Capability,
     ) -> Option<RouteAddress> {
-        match self.resources.get(id)? {
-            ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
-                base_url,
-                routes_by_capability,
-                ..
-            }) => {
-                let route = routes_by_capability.get(&capability)?;
-                Some(RouteAddress {
-                    base_url: base_url.clone(),
-                    path: route.path.clone(),
-                    method: route.method,
-                })
-            },
-            _ => None,
-        }
+        let ResourceProbeOutcome::Found(detail) = self.resources.get(id)? else {
+            return None;
+        };
+        route_for_capability_from_detail(detail, capability)
     }
+}
+
+/// `&ResourceDetail` variant of [`ResourceCatalog::route_for_capability`].
+///
+/// Used by executors that already hold the detail from a
+/// `RunCatalog::lookup` (or `opportunistic_reprobe`) call so they do
+/// not pay for a second `HashMap::get` on the catalog.
+#[must_use]
+pub fn route_for_capability_from_detail(
+    detail: &ResourceDetail,
+    capability: Capability,
+) -> Option<RouteAddress> {
+    let ResourceDetail::HttpEndpoint {
+        base_url,
+        routes_by_capability,
+        ..
+    } = detail
+    else {
+        return None;
+    };
+    let route = routes_by_capability.get(&capability)?;
+    Some(RouteAddress {
+        base_url: base_url.clone(),
+        path: route.path.clone(),
+        method: route.method,
+    })
 }
 
 #[cfg(test)]

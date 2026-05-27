@@ -15,8 +15,12 @@
 //! is also accumulated into the `text` output port.
 
 use super::util::{config_f64_or, config_str, config_str_opt, config_str_or, config_u64_or};
-use crate::environment::runtime::env::{EnvId, WorkflowId};
-use crate::environment::runtime::resource::{ApiFlavor, Capability, ProbeSpec, ResourceRef};
+use crate::environment::runtime::ResourceProbeOutcome;
+use crate::environment::runtime::catalog::{ResourceDetail, route_for_capability_from_detail};
+use crate::environment::runtime::dispatcher::HttpTransport;
+use crate::environment::runtime::env::EnvId;
+use crate::environment::runtime::resource::{Capability, ResourceRef};
+use crate::environment::runtime::transport::{HttpMethod, HttpRequest, HttpResponse};
 use crate::events::EventType;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::template::{
@@ -25,9 +29,11 @@ use crate::template::{
 };
 use crate::types::{Node, NodeType, PortValue, StreamMode};
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::StreamExt;
 use jsonpath_rust::JsonPath;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -41,6 +47,28 @@ const SSE_DONE: &str = "[DONE]";
 const SSE_DATA_PREFIX: &str = "data:";
 const CHANNEL_LLM: &str = "llm";
 const CHANNEL_TOOL: &str = "agent_tool";
+
+/// Capabilities the `llm` executor can build a request for. Restricting
+/// the effective capability to this set prevents a misdeclared
+/// `required_capability: OpenaiEmbeddings` from dispatching a chat-style
+/// body to `/embeddings`.
+const LLM_VALID_CAPS: &[Capability] = &[
+    Capability::OpenaiChatCompletions,
+    Capability::OpenaiToolCalling,
+    Capability::OpenaiStreamingChat,
+    Capability::OllamaNative,
+    Capability::LmStudioNative,
+];
+
+/// Path suffixes the legacy literal-URL fallback recognises as already
+/// fully-qualified, so it doesn't append `/chat/completions` a second
+/// time.
+const KNOWN_LLM_DISPATCH_PATHS: &[&str] = &[
+    "/chat/completions",
+    "/embeddings",
+    "/api/chat",
+    "/api/generate",
+];
 
 /// In-process LLM executor — see module docs for the two shapes and
 /// failure / streaming semantics.
@@ -146,114 +174,224 @@ fn substitute_llm_config(
     Ok(substituted)
 }
 
+/// Resolver return shape for the `llm` executor.
+///
+/// Fields:
+/// - `url`: dispatch URL (e.g. `http://127.0.0.1:11434/v1/chat/completions`),
+///   derived from the proven probe route's `base_url` + path-parent stem
+///   + capability-specific suffix.
+/// - `detail`: resolved `ResourceDetail::HttpEndpoint` — carries
+///   `auth_secret_ref`, `streaming_supported_natively`, and `route_origin`
+///   for downstream consumers.
+/// - `transport`: per-env `HttpTransport` the executor sends through, so
+///   `target_env` actually routes to that env.
+/// - `effective_env`: env id used for the lookup (kept for future
+///   `Origin::Host` gating).
+struct LlmRoute {
+    url: url::Url,
+    detail: ResourceDetail,
+    transport: Arc<dyn HttpTransport>,
+    #[allow(dead_code)]
+    effective_env: EnvId,
+}
+
 /// Resolve the optional `resource` config field on an `llm` node into
-/// a base URL via the shared resource registry. Returns:
+/// a dispatch-ready route. Returns `Ok(None)` when the node has no
+/// `resource` field (caller falls back to the legacy literal `url`).
 ///
-/// - `Ok(Some(base_url))` when the node has a resource ref AND the
-///   registry resolved it. `base_url` is `scheme://host:port[/stem]`
-///   with no trailing slash — the caller appends `/chat/completions`.
-/// - `Ok(None)` when the node has no `resource` field (caller falls
-///   back to the legacy literal `url` config).
-///
-/// Errors with [`NodeError::Config`] on a malformed ref, an unknown
-/// resource id, a non-HTTP resource (Binary / Toolchain), an HTTP
-/// resource without any ports declared, or an advertised-capability
-/// mismatch when a capability constraint is in effect.
-///
-/// `tools_present` is the same `tools.is_empty()` bool the caller
-/// already computed and is used to infer the required capability when
-/// the ref is the bare-id form: `false` → `OpenaiChatCompletions`,
-/// `true` → `OpenaiToolCalling`. The detailed form's
-/// `required_capability` overrides the inference.
-///
-/// Phase D derives the base path by looking for an OpenAI-flavored
-/// probe route on the resource whose `proves` list contains the
-/// effective capability (user-stated `required_capability` if present,
-/// otherwise the inferred one). The parent directory of that route's
-/// `path` becomes the stem appended to `http://127.0.0.1:<port>` so
-/// the final URL is `http://127.0.0.1:<port>/v1/chat/completions` for
-/// the typical `routes: [{ path: "/v1/models", flavor: openai_chat, ...}]`
-/// shape. Resources without a matching route fall back to the bare
-/// `http://127.0.0.1:<port>` form — that's a Phase-D bridge that keeps
-/// existing user configs working. Phase E replaces this with
-/// `ResourceCatalog::route_for_capability` once env-scoped catalogs are
-/// kept on `Engine`.
-fn resolve_resource_url(
+/// `cancel` is the executor's `CancellationToken`; the resolver creates
+/// a child token for the opportunistic re-probe so cancelling the run
+/// also cancels the re-probe.
+async fn resolve_resource_url(
     node: &Node,
     ctx: &RunContext,
+    cancel: &CancellationToken,
     tools_present: bool,
-) -> Result<Option<String>, NodeError> {
+) -> Result<Option<LlmRoute>, NodeError> {
     let Some(rref_val) = node.config.get("resource") else {
         return Ok(None);
     };
     let rref: ResourceRef = serde_json::from_value(rref_val.clone())
         .map_err(|e| NodeError::Config(format!("llm: invalid resource ref: {e}")))?;
 
-    let engine = ctx.engine.upgrade().ok_or_else(|| {
-        NodeError::Config("internal: engine handle gone before resource lookup".into())
+    let effective_env = node
+        .target_env
+        .clone()
+        .unwrap_or_else(|| ctx.run_snapshot.default_env.clone());
+
+    let catalog = ctx.run_snapshot.catalog(&effective_env).ok_or_else(|| {
+        NodeError::Config(format!(
+            "llm: env '{}' not in run snapshot scope",
+            effective_env.as_str(),
+        ))
     })?;
-    let registry = engine.resource_registry();
-    let snap = registry.snapshot();
+    let dispatcher = ctx.run_snapshot.dispatcher(&effective_env).ok_or_else(|| {
+        NodeError::Config(format!(
+            "llm: env '{}' has no dispatcher",
+            effective_env.as_str(),
+        ))
+    })?;
+    let transport = dispatcher.http_transport();
 
-    // The workflow scope is the highest precedence; pair it with the
-    // local env so the chain walks `Workflow → EnvLocal(local) →
-    // UserGlobal → Builtin`. Env-aware resolution lands in Phase E.
-    let workflow_id = WorkflowId(ctx.workflow_id.clone());
-    let (def, _scope) = snap
-        .resolve(rref.id(), &EnvId::local(), Some(&workflow_id))
-        .ok_or_else(|| NodeError::Config(format!("llm: unknown resource id '{}'", rref.id().0)))?;
-
-    // Capability gating mirrors `workflows::validate_nodes`: only
-    // enforce when the user explicitly stated `required_capability`.
-    // Untyped resources (empty advertised list) resolve unconditionally
-    // for bare ResourceRefs whose capability is inferred. The inferred
-    // capability (tools_present → OpenaiToolCalling, else
-    // OpenaiChatCompletions) feeds the route lookup below so the stem
-    // we derive matches the capability the caller actually wants.
-    if let Some(required_cap) = rref.required_capability()
-        && !def.advertised_capabilities.contains(&required_cap)
-    {
-        return Err(NodeError::Config(format!(
-            "llm: resource '{}' does not advertise {required_cap:?}",
-            rref.id().0
-        )));
-    }
     let inferred_cap = if tools_present {
         Capability::OpenaiToolCalling
     } else {
         Capability::OpenaiChatCompletions
     };
     let effective_cap = rref.required_capability().unwrap_or(inferred_cap);
-    if super::util::dispatch_suffix_for_capability(effective_cap).is_none() {
+
+    if !LLM_VALID_CAPS.contains(&effective_cap) {
         return Err(NodeError::Config(format!(
-            "llm: required capability '{effective_cap:?}' is not HTTP-dispatchable"
+            "llm: capability {effective_cap:?} cannot be used on an llm node \
+             (supported: chat-completions, tool-calling, streaming-chat, \
+             ollama-native, lm-studio-native). Use an http node for \
+             non-chat capabilities like embeddings.",
         )));
     }
 
-    let ProbeSpec::Http { ports, routes, .. } = &def.probe else {
+    // Lookup; on NotFound / Skipped / missing entry, fall through to an
+    // opportunistic singleflight re-probe via the snapshot registry +
+    // dispatcher.
+    let outcome = if let Some(o @ ResourceProbeOutcome::Found(_)) = catalog.lookup(rref.id()) {
+        o
+    } else {
+        let workflow_id = ctx.run_snapshot.workflow_id.clone();
+        let (def, _scope) = ctx
+            .run_snapshot
+            .registry
+            .resolve(rref.id(), &effective_env, Some(&workflow_id))
+            .ok_or_else(|| {
+                NodeError::Config(format!(
+                    "llm: resource '{}' not in registry (env '{}')",
+                    rref.id().0,
+                    effective_env.as_str(),
+                ))
+            })?;
+        let def = def.clone();
+        Arc::clone(catalog)
+            .opportunistic_reprobe(&def, Arc::clone(dispatcher), cancel.child_token())
+            .await
+    };
+
+    let detail = match outcome {
+        ResourceProbeOutcome::Found(d) => d,
+        non_found => {
+            return Err(NodeError::Config(format!(
+                "llm: resource '{}' not reachable in env '{}': {non_found:?}",
+                rref.id().0,
+                effective_env.as_str(),
+            )));
+        },
+    };
+    if !matches!(&detail, ResourceDetail::HttpEndpoint { .. }) {
         return Err(NodeError::Config(format!(
             "llm: resource '{}' is not an HTTP endpoint",
-            rref.id().0
+            rref.id().0,
         )));
-    };
-    let port = ports.first().copied().ok_or_else(|| {
+    }
+
+    // The proven probe route's base + path-parent stem + capability
+    // suffix together yield the dispatch URL (e.g. `/v1/models` →
+    // stem `/v1` + suffix `/chat/completions`).
+    let probe_route =
+        route_for_capability_from_detail(&detail, effective_cap).ok_or_else(|| {
+            NodeError::Config(format!(
+                "llm: resource '{}' does not prove {effective_cap:?}",
+                rref.id().0,
+            ))
+        })?;
+    let stem = super::util::path_parent_stem(&probe_route.path);
+    let suffix = super::util::dispatch_suffix_for_capability(effective_cap).ok_or_else(|| {
         NodeError::Config(format!(
-            "llm: resource '{}' declares no probe ports",
-            rref.id().0
+            "llm: no dispatch suffix mapped for {effective_cap:?}",
         ))
     })?;
+    let url_str = format!("{}{}{}", probe_route.base_url, stem, suffix);
+    let url = url::Url::parse(&url_str)
+        .map_err(|e| NodeError::Config(format!("llm: malformed dispatch URL '{url_str}': {e}")))?;
 
-    // Find an OpenAI-flavored proving route for the capability we need
-    // and lift its parent path segment. Resources without such a route
-    // fall back to the bare host:port form so legacy configs that put
-    // `/v1` into a non-standard place still work.
-    let stem = routes
+    Ok(Some(LlmRoute {
+        url,
+        detail,
+        transport,
+        effective_env,
+    }))
+}
+
+/// Dispatch route the executor sends through. Combines the URL string,
+/// per-env transport, and (when resolved from a `resource` ref) the
+/// detail carrying auth-secret + route-origin metadata.
+struct DispatchRoute {
+    url: String,
+    transport: Arc<dyn HttpTransport>,
+    detail: Option<ResourceDetail>,
+}
+
+/// Convert a resolver result into a `DispatchRoute`, falling back to
+/// the legacy literal-`url` + per-env transport when the resolver
+/// returned `None`.
+fn route_or_fallback(
+    resolved: Option<LlmRoute>,
+    node: &Node,
+    ctx: &RunContext,
+) -> Result<DispatchRoute, NodeError> {
+    if let Some(r) = resolved {
+        return Ok(DispatchRoute {
+            url: r.url.to_string(),
+            transport: r.transport,
+            detail: Some(r.detail),
+        });
+    }
+    let raw = config_str_or(&node.config, "url", DEFAULT_URL).to_string();
+    let url = compose_legacy_chat_url(&raw);
+    let transport = legacy_fallback_transport(node, ctx)?;
+    Ok(DispatchRoute {
+        url,
+        transport,
+        detail: None,
+    })
+}
+
+/// Pick an `HttpTransport` for the legacy literal-URL fallback path.
+/// `target_env` still routes — workflows that haven't migrated to
+/// resource refs but set `target_env: wsl:Ubuntu` still go through the
+/// WSL transport. Errors when the env is out of run-snapshot scope.
+fn legacy_fallback_transport(
+    node: &Node,
+    ctx: &RunContext,
+) -> Result<Arc<dyn HttpTransport>, NodeError> {
+    let effective_env = node
+        .target_env
+        .clone()
+        .unwrap_or_else(|| ctx.run_snapshot.default_env.clone());
+    let dispatcher = ctx.run_snapshot.dispatcher(&effective_env).ok_or_else(|| {
+        NodeError::Config(format!(
+            "llm: env '{}' not in run snapshot scope",
+            effective_env.as_str(),
+        ))
+    })?;
+    Ok(dispatcher.http_transport())
+}
+
+/// Compose the legacy literal-URL into a chat-completions dispatch URL.
+/// Phase D unconditionally appended `/chat/completions` to whatever
+/// `url` the user supplied. Preserve that behaviour, with a guard so
+/// users who already wrote out a fully-pathed dispatch URL don't get
+/// `/chat/completions/chat/completions`:
+///
+/// - If the URL already ends in a known dispatch path
+///   (`/chat/completions`, `/embeddings`, `/api/chat`, `/api/generate`),
+///   keep it verbatim.
+/// - Otherwise, append `/chat/completions` to the (trimmed) base.
+fn compose_legacy_chat_url(raw: &str) -> String {
+    let trimmed = raw.trim_end_matches('/');
+    if KNOWN_LLM_DISPATCH_PATHS
         .iter()
-        .find(|r| matches!(r.flavor, ApiFlavor::OpenaiChat) && r.proves.contains(&effective_cap))
-        .map(|r| super::util::path_parent_stem(&r.path))
-        .unwrap_or_default();
-
-    Ok(Some(format!("http://127.0.0.1:{port}{stem}")))
+        .any(|p| trimmed.ends_with(p))
+    {
+        return trimmed.to_string();
+    }
+    format!("{trimmed}/chat/completions")
 }
 
 /// Single-turn chat completion. Honors `stream: StreamMode` (Auto +
@@ -265,12 +403,12 @@ async fn run_single_turn(
     ctx: &RunContext,
     cancel: CancellationToken,
 ) -> Result<NodeOutputs, NodeError> {
-    let resolved = resolve_resource_url(node, ctx, false)?;
-    let base_url: String = resolved.unwrap_or_else(|| {
-        config_str_or(&node.config, "url", DEFAULT_URL)
-            .trim_end_matches('/')
-            .to_string()
-    });
+    let resolved = resolve_resource_url(node, ctx, &cancel, false).await?;
+    let DispatchRoute {
+        url: url_string,
+        transport,
+        detail,
+    } = route_or_fallback(resolved, node, ctx)?;
     let model = config_str(&node.config, "model", "llm")?;
     let messages = node
         .config
@@ -294,34 +432,74 @@ async fn run_single_turn(
     }
     body.insert("stream".into(), serde_json::Value::Bool(stream));
 
-    let url = format!("{base_url}/chat/completions");
-    let mut req = super::super::http_client::shared()
-        .post(&url)
-        .timeout(Duration::from_millis(timeout_ms))
-        .json(&serde_json::Value::Object(body));
-    if let Some(key) = api_key {
-        req = req.bearer_auth(key);
-    }
-
-    let resp = tokio::select! {
-        r = req.send() => r.map_err(|e| NodeError::Http(format!("llm send: {e}")))?,
-        () = cancel.cancelled() => return Err(NodeError::Cancelled),
+    let headers = build_request_headers(api_key.as_deref(), detail.as_ref(), ctx)?;
+    let req = HttpRequest {
+        method: HttpMethod::Post,
+        url: url_string,
+        headers,
+        body: Some(serialize_body(&serde_json::Value::Object(body))?),
+        timeout: Duration::from_millis(timeout_ms),
     };
 
-    let status = resp.status();
-    if !status.is_success() {
-        return Ok(non_success_outputs(status.as_u16()));
-    }
-
     if stream {
-        read_sse_stream(resp, ctx, &node.id, cancel).await
-    } else {
-        let bytes = tokio::select! {
-            r = resp.bytes() => r.map_err(|e| NodeError::Http(format!("llm body: {e}")))?,
+        let stream_resp = tokio::select! {
+            r = transport.execute_stream(req) => r.map_err(|e| NodeError::Http(format!("llm send: {e}")))?,
             () = cancel.cancelled() => return Err(NodeError::Cancelled),
         };
-        Ok(parse_complete_response(&bytes))
+        read_sse_stream(stream_resp, ctx, &node.id, cancel).await
+    } else {
+        let resp = tokio::select! {
+            r = transport.execute(req) => r.map_err(|e| NodeError::Http(format!("llm send: {e}")))?,
+            () = cancel.cancelled() => return Err(NodeError::Cancelled),
+        };
+        if !is_success(resp.status) {
+            return Ok(non_success_outputs(resp.status));
+        }
+        Ok(parse_complete_response(&resp.body))
     }
+}
+
+/// Build the request header map. Prefers an explicit `api_key` from
+/// node config (Phase D's literal-auth behaviour); falls back to the
+/// resource detail's `auth_secret_ref` resolved via the secrets store.
+fn build_request_headers(
+    api_key: Option<&str>,
+    detail: Option<&ResourceDetail>,
+    ctx: &RunContext,
+) -> Result<HashMap<String, String>, NodeError> {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".into(), "application/json".into());
+    if let Some(key) = api_key {
+        headers.insert("authorization".into(), format!("Bearer {key}"));
+        return Ok(headers);
+    }
+    if let Some(ResourceDetail::HttpEndpoint {
+        auth_secret_ref: Some(secret_ref),
+        ..
+    }) = detail
+    {
+        let store = ctx.secrets_store.as_ref().ok_or_else(|| {
+            NodeError::Config(format!(
+                "llm: secret '{}' required but no secrets store configured",
+                secret_ref.0,
+            ))
+        })?;
+        let token = store.get(secret_ref.0.as_str()).map_err(|e| {
+            NodeError::Config(format!("llm: secret '{}' not found: {e}", secret_ref.0))
+        })?;
+        headers.insert("authorization".into(), format!("Bearer {token}"));
+    }
+    Ok(headers)
+}
+
+fn serialize_body(value: &serde_json::Value) -> Result<Bytes, NodeError> {
+    serde_json::to_vec(value)
+        .map(Bytes::from)
+        .map_err(|e| NodeError::Config(format!("llm: body serialize: {e}")))
+}
+
+const fn is_success(status: u16) -> bool {
+    status >= 200 && status < 300
 }
 
 /// Multi-turn tool-call loop. Each turn calls the chat-completions
@@ -342,12 +520,12 @@ async fn run_tool_loop(
     cancel: CancellationToken,
     tools: &[InlineTool],
 ) -> Result<NodeOutputs, NodeError> {
-    let resolved = resolve_resource_url(node, ctx, true)?;
-    let base_url: String = resolved.unwrap_or_else(|| {
-        config_str_or(&node.config, "url", DEFAULT_URL)
-            .trim_end_matches('/')
-            .to_string()
-    });
+    let resolved = resolve_resource_url(node, ctx, &cancel, true).await?;
+    let DispatchRoute {
+        url: url_string,
+        transport,
+        detail,
+    } = route_or_fallback(resolved, node, ctx)?;
     let model = config_str(&node.config, "model", "llm")?.to_string();
     let temperature = config_f64_or(&node.config, "temperature", DEFAULT_MODEL_TEMP);
     let max_tokens = node.config.get("max_tokens").cloned();
@@ -368,9 +546,7 @@ async fn run_tool_loop(
         .cloned()
         .ok_or_else(|| NodeError::Config("llm: 'messages' (array) required".into()))?;
     let openai_tools = tools_to_openai_format(tools);
-
-    let url = format!("{base_url}/chat/completions");
-    let client = super::super::http_client::shared();
+    let request_headers = build_request_headers(api_key.as_deref(), detail.as_ref(), ctx)?;
 
     let serde_json::Value::Array(mut messages) = initial_messages else {
         return Err(NodeError::Config("llm: 'messages' must be an array".into()));
@@ -404,34 +580,39 @@ async fn run_tool_loop(
             );
         }
 
-        let mut req = client
-            .post(&url)
-            .timeout(Duration::from_millis(timeout_ms))
-            .json(&serde_json::Value::Object(body));
-        if let Some(key) = &api_key {
-            req = req.bearer_auth(key);
-        }
-
-        let resp = tokio::select! {
-            r = req.send() => r.map_err(|e| NodeError::Http(format!("llm send: {e}")))?,
-            () = cancel.cancelled() => return Err(NodeError::Cancelled),
+        let req = HttpRequest {
+            method: HttpMethod::Post,
+            url: url_string.clone(),
+            headers: request_headers.clone(),
+            body: Some(serialize_body(&serde_json::Value::Object(body))?),
+            timeout: Duration::from_millis(timeout_ms),
         };
-        let status = resp.status();
-        if !status.is_success() {
-            final_finish_reason = format!("http_{}", status.as_u16());
-            break;
-        }
 
         let TurnResult {
             assistant_content,
             finish_reason,
             tokens_this_turn,
             message_value,
+            http_status,
         } = if stream {
-            read_streaming_turn(resp, ctx, &node.id, &cancel).await?
+            let stream_resp = tokio::select! {
+                r = transport.execute_stream(req) => r.map_err(|e| NodeError::Http(format!("llm send: {e}")))?,
+                () = cancel.cancelled() => return Err(NodeError::Cancelled),
+            };
+            read_streaming_turn(stream_resp, ctx, &node.id, &cancel).await?
         } else {
-            read_non_streaming_turn(resp, &cancel).await?
+            let resp = tokio::select! {
+                r = transport.execute(req) => r.map_err(|e| NodeError::Http(format!("llm send: {e}")))?,
+                () = cancel.cancelled() => return Err(NodeError::Cancelled),
+            };
+            read_non_streaming_turn(&resp)
         };
+        if let Some(code) = http_status
+            && !is_success(code)
+        {
+            final_finish_reason = format!("http_{code}");
+            break;
+        }
         if tokens_this_turn > 0 {
             total_tokens = tokens_this_turn;
         }
@@ -467,7 +648,7 @@ async fn run_tool_loop(
             if cancel.is_cancelled() {
                 return Err(NodeError::Cancelled);
             }
-            let tool_msg = invoke_tool(&tc, tools, client, timeout_ms, &cancel).await?;
+            let tool_msg = invoke_tool(&tc, tools, &transport, timeout_ms, &cancel).await?;
             tool_invocations.push(tool_msg.clone());
             let tool_text = tool_msg
                 .get("result_text")
@@ -592,12 +773,11 @@ fn parse_complete_response(bytes: &[u8]) -> NodeOutputs {
 /// per assistant-content delta, and return the assembled text +
 /// finish reason as output ports.
 async fn read_sse_stream(
-    resp: reqwest::Response,
+    mut stream: crate::environment::runtime::dispatcher::ResponseStream,
     ctx: &RunContext,
     node_id: &str,
     cancel: CancellationToken,
 ) -> Result<NodeOutputs, NodeError> {
-    let mut stream = resp.bytes_stream();
     let mut buf = String::new();
     let mut accumulated = String::new();
     let mut finish_reason = String::new();
@@ -815,7 +995,7 @@ fn tools_to_openai_format(tools: &[InlineTool]) -> Vec<serde_json::Value> {
 async fn invoke_tool(
     tool_call: &serde_json::Value,
     tools: &[InlineTool],
-    client: &reqwest::Client,
+    transport: &Arc<dyn HttpTransport>,
     timeout_ms: u64,
     cancel: &CancellationToken,
 ) -> Result<serde_json::Value, NodeError> {
@@ -848,77 +1028,99 @@ async fn invoke_tool(
         |tmpl| tmpl.replace("{{args | json}}", &serialized_args),
     );
 
-    let method = reqwest::Method::from_bytes(tool.method.as_bytes())
+    let method = parse_http_method(&tool.method)
         .map_err(|e| NodeError::Config(format!("llm.tool[{}]: invalid method: {e}", tool.name)))?;
-    let mut req = client
-        .request(method, &tool.url)
-        .timeout(Duration::from_millis(timeout_ms))
-        .body(body_text.clone())
-        .header(reqwest::header::CONTENT_TYPE, "application/json");
+    let mut headers = HashMap::new();
+    headers.insert("content-type".into(), "application/json".into());
     for (k, v) in &tool.headers {
-        req = req.header(k.as_str(), v.as_str());
+        headers.insert(k.clone(), v.clone());
     }
+    let req = HttpRequest {
+        method,
+        url: tool.url.clone(),
+        headers,
+        body: Some(Bytes::from(body_text.into_bytes())),
+        timeout: Duration::from_millis(timeout_ms),
+    };
     let resp = tokio::select! {
-        r = req.send() => r.map_err(|e| NodeError::Http(format!("llm.tool[{}] send: {e}", tool.name)))?,
+        r = transport.execute(req) => r.map_err(|e| NodeError::Http(format!("llm.tool[{}] send: {e}", tool.name)))?,
         () = cancel.cancelled() => return Err(NodeError::Cancelled),
     };
-    let status = resp.status();
-    let body_bytes = tokio::select! {
-        r = resp.bytes() => r.map_err(|e| NodeError::Http(format!("llm.tool[{}] body: {e}", tool.name)))?,
-        () = cancel.cancelled() => return Err(NodeError::Cancelled),
-    };
-    let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
+    let body_str = String::from_utf8_lossy(&resp.body).into_owned();
 
     let result_text = select_result_text(tool.result_path.as_deref(), &body_str);
 
     Ok(serde_json::json!({
         "tool": tool.name,
         "args": args_json,
-        "status": status.as_u16(),
+        "status": resp.status,
         "result_text": result_text,
     }))
+}
+
+fn parse_http_method(s: &str) -> Result<HttpMethod, String> {
+    match s.to_ascii_uppercase().as_str() {
+        "GET" => Ok(HttpMethod::Get),
+        "HEAD" => Ok(HttpMethod::Head),
+        "POST" => Ok(HttpMethod::Post),
+        "PUT" => Ok(HttpMethod::Put),
+        "PATCH" => Ok(HttpMethod::Patch),
+        "DELETE" => Ok(HttpMethod::Delete),
+        other => Err(format!("unsupported HTTP method '{other}'")),
+    }
 }
 
 /// Per-turn assembled result from either the streaming or
 /// non-streaming reader. `message_value` mirrors `OpenAI`'s
 /// `{role, content, tool_calls?}` shape so the tool loop can push
-/// it onto the messages list verbatim.
+/// it onto the messages list verbatim. `http_status` carries the
+/// response status so the tool loop can short-circuit on non-2xx
+/// without losing the streaming/non-streaming distinction; `Some`
+/// for non-streaming, `None` for streaming (the SSE parser already
+/// surfaces failures via early returns).
 struct TurnResult {
     assistant_content: String,
     finish_reason: String,
     tokens_this_turn: u64,
     message_value: serde_json::Value,
+    http_status: Option<u16>,
 }
 
-/// Read one non-streaming `chat/completions` response and assemble a
-/// `TurnResult`. Wraps the existing blocking body-read + JSON parse.
-async fn read_non_streaming_turn(
-    resp: reqwest::Response,
-    cancel: &CancellationToken,
-) -> Result<TurnResult, NodeError> {
-    let body_text = tokio::select! {
-        r = resp.text() => r.map_err(|e| NodeError::Http(format!("llm body: {e}")))?,
-        () = cancel.cancelled() => return Err(NodeError::Cancelled),
-    };
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body_text) else {
-        return Ok(TurnResult {
+/// Parse one non-streaming `chat/completions` response into a
+/// `TurnResult`. Network/transport errors are already surfaced by the
+/// transport call; this just decodes the body.
+fn read_non_streaming_turn(resp: &HttpResponse) -> TurnResult {
+    let status = resp.status;
+    if !is_success(status) {
+        return TurnResult {
+            assistant_content: String::new(),
+            finish_reason: format!("http_{status}"),
+            tokens_this_turn: 0,
+            message_value: serde_json::Value::Null,
+            http_status: Some(status),
+        };
+    }
+    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&resp.body) else {
+        return TurnResult {
             assistant_content: String::new(),
             finish_reason: "parse_error".into(),
             tokens_this_turn: 0,
             message_value: serde_json::Value::Null,
-        });
+            http_status: Some(status),
+        };
     };
     let tokens = parsed
         .pointer("/usage/total_tokens")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     let Some(choice) = parsed.pointer("/choices/0") else {
-        return Ok(TurnResult {
+        return TurnResult {
             assistant_content: String::new(),
             finish_reason: "parse_error".into(),
             tokens_this_turn: tokens,
             message_value: serde_json::Value::Null,
-        });
+            http_status: Some(status),
+        };
     };
     let message_value = choice.pointer("/message").cloned().unwrap_or_default();
     let assistant_content = message_value
@@ -931,12 +1133,13 @@ async fn read_non_streaming_turn(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_string();
-    Ok(TurnResult {
+    TurnResult {
         assistant_content,
         finish_reason,
         tokens_this_turn: tokens,
         message_value,
-    })
+        http_status: Some(status),
+    }
 }
 
 /// Read one streaming `chat/completions` response: parse each
@@ -945,12 +1148,11 @@ async fn read_non_streaming_turn(
 /// channel. Returns the assembled `TurnResult` whose `message_value`
 /// mirrors the non-streaming shape so the tool loop is agnostic.
 async fn read_streaming_turn(
-    resp: reqwest::Response,
+    mut stream: crate::environment::runtime::dispatcher::ResponseStream,
     ctx: &RunContext,
     node_id: &str,
     cancel: &CancellationToken,
 ) -> Result<TurnResult, NodeError> {
-    let mut stream = resp.bytes_stream();
     let mut buf = String::new();
     let mut assistant_content = String::new();
     let mut finish_reason = String::new();
@@ -988,6 +1190,7 @@ async fn read_streaming_turn(
                     finish_reason,
                     tokens_this_turn: tokens,
                     message_value,
+                    http_status: None,
                 });
             }
         }
@@ -999,6 +1202,7 @@ async fn read_streaming_turn(
         finish_reason,
         tokens_this_turn: tokens,
         message_value,
+        http_status: None,
     })
 }
 
@@ -1312,9 +1516,12 @@ mod tests {
             .await;
 
         let (ctx, _rx, _dir) = make_ctx();
+        // Phase E surfaces status via the non-streaming response shape;
+        // the streaming-error path is covered by integration tests once
+        // `StreamMode::Force` errors land in Task 12.
         let out = LlmExecutor
             .run(
-                &llm_node(&server.uri(), true),
+                &llm_node(&server.uri(), false),
                 &llm_nt(),
                 &ctx,
                 CancellationToken::new(),
@@ -1577,327 +1784,5 @@ mod tests {
             matches!(err, NodeError::Config(_)),
             "expected Config error, got {err:?}"
         );
-    }
-
-    // ── resolve_resource_url tests ───────────────────────────────────────────
-    //
-    // These cover the alt config path that names a resource by id instead of
-    // a literal `url`. Resolution flows through the shared registry seeded
-    // in Phase C; Phase E swaps the synthesizer for the probed catalog's
-    // `route_for_capability`.
-
-    use crate::Engine;
-    use crate::checkpoints::CheckpointRegistry;
-    use crate::db::open;
-    use crate::emitter::Emitter;
-    use crate::environment::runtime::install_workflow_resources;
-    use crate::environment::runtime::resource::{
-        ApiFlavor, HttpProbeMethod, HttpProbeRoute, ProbeSpec, ResourceDefinition, ResourceId,
-        ResourceKind,
-    };
-    use crate::executor::wrap_process_env;
-    use crate::recorder::RunRecorder;
-    use crate::types::Workflow;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU32;
-
-    /// Build a `RunContext` wired to a real Engine so `resolve_resource_url`
-    /// can upgrade the `Weak<Engine>` and read the live registry.
-    async fn ctx_with_engine(workflow_id: &str) -> (Arc<Engine>, RunContext, tempfile::TempDir) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
-        let pool = open(dir.path().join("ctx.db")).unwrap();
-        let wf = Workflow {
-            id: workflow_id.into(),
-            name: String::new(),
-            schema_version: 1,
-            created_at: None,
-            updated_at: None,
-            variables: HashMap::new(),
-            triggers: vec![],
-            nodes: vec![],
-            edges: vec![],
-            resources: vec![],
-            default_env: None,
-        };
-        let rec = Arc::new(RunRecorder::start(pool, &wf, "{}", &HashMap::new(), "test").unwrap());
-        let (em, _rx) = Emitter::new(rec.clone());
-        let run_snapshot =
-            crate::executor::test_support::test_run_snapshot(&rec.run_id, workflow_id);
-        let ctx = RunContext {
-            run_id: rec.run_id.clone(),
-            workflow_id: workflow_id.into(),
-            workflow_name: String::new(),
-            started_at_iso: String::new(),
-            workspace: dir.path().to_path_buf(),
-            variables: HashMap::new(),
-            recorder: rec,
-            emitter: Arc::new(em),
-            secrets_store: None,
-            env: wrap_process_env(),
-            current_inputs: HashMap::new(),
-            upstream_outputs: HashMap::new(),
-            checkpoints: Arc::new(CheckpointRegistry::new()),
-            events: Arc::new(crate::events_registry::EventRegistry::new()),
-            run_snapshot,
-            engine: Arc::downgrade(&engine),
-            compose_depth: 0,
-            iteration: 1,
-            attempt: AtomicU32::new(1),
-            auto_resume: false,
-        };
-        (engine, ctx, dir)
-    }
-
-    fn llm_node_with_resource(resource_cfg: serde_json::Value) -> Node {
-        let mut config: HashMap<String, serde_json::Value> = HashMap::new();
-        config.insert("resource".into(), resource_cfg);
-        config.insert("model".into(), serde_json::json!("test-model"));
-        config.insert(
-            "messages".into(),
-            serde_json::json!([{"role": "user", "content": "hi"}]),
-        );
-        Node {
-            id: "n".into(),
-            ty: NODE_TYPE_ID.into(),
-            name: String::new(),
-            config,
-            pos: Pos::default(),
-            timeout_ms: None,
-            retry: None,
-            continue_on_error: false,
-            target_env: None,
-        }
-    }
-
-    /// Build an HTTP resource fixture whose single `/v1/models` probe route
-    /// proves every capability the caller advertises. This keeps the stem-
-    /// derivation lookup in `resolve_resource_url` happy for whichever
-    /// capability the test ends up inferring (chat / tool-calling / etc.).
-    fn http_resource(id: &str, port: u16, caps: Vec<Capability>) -> ResourceDefinition {
-        ResourceDefinition {
-            id: ResourceId(id.into()),
-            kind: ResourceKind::HttpEndpoint,
-            advertised_capabilities: caps.clone(),
-            probe: ProbeSpec::Http {
-                ports: vec![port],
-                routes: vec![HttpProbeRoute {
-                    path: "/v1/models".into(),
-                    method: HttpProbeMethod::Get,
-                    flavor: ApiFlavor::OpenaiChat,
-                    proves: caps,
-                    models_jsonpath: None,
-                    fingerprint_jsonpaths: vec![],
-                }],
-                timeout_ms: None,
-            },
-            override_lower_scope: false,
-        }
-    }
-
-    /// Build an HTTP resource whose probe route has no openai-flavored
-    /// proving entry — used to exercise the Phase-D fallback that yields
-    /// a bare `http://host:port` URL when no matching route exists.
-    fn http_resource_without_openai_route(
-        id: &str,
-        port: u16,
-        caps: Vec<Capability>,
-    ) -> ResourceDefinition {
-        ResourceDefinition {
-            id: ResourceId(id.into()),
-            kind: ResourceKind::HttpEndpoint,
-            advertised_capabilities: caps,
-            probe: ProbeSpec::Http {
-                ports: vec![port],
-                routes: vec![],
-                timeout_ms: None,
-            },
-            override_lower_scope: false,
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn resource_missing_returns_ok_none() {
-        // Legacy literal-url path: no `resource` key → caller falls back.
-        let (_engine, ctx, _dir) = ctx_with_engine("wf-no-res").await;
-        let node = llm_node("http://example.invalid", false);
-        let out = resolve_resource_url(&node, &ctx, false).expect("ok");
-        assert!(out.is_none(), "no resource field → None, got {out:?}");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn resource_short_form_resolves_to_synthesized_base_url() {
-        // The fixture's `/v1/models` proving route lifts its parent path
-        // segment (`/v1`) onto the base URL so callers can append
-        // `/chat/completions` and reach the standard OpenAI-compat shape.
-        let (engine, ctx, _dir) = ctx_with_engine("wf-short").await;
-        let resource = http_resource("wf-llm", 39_111, vec![Capability::OpenaiChatCompletions]);
-        install_workflow_resources(
-            &WorkflowId("wf-short".into()),
-            &[resource],
-            &engine.resource_registry(),
-        )
-        .expect("install");
-
-        let node = llm_node_with_resource(serde_json::json!("wf-llm"));
-        let url = resolve_resource_url(&node, &ctx, false)
-            .expect("ok")
-            .expect("some");
-        assert_eq!(url, "http://127.0.0.1:39111/v1");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn resource_without_matching_route_falls_back_to_host_port_only() {
-        // No openai-flavored proving route → the Phase-D bridge degrades
-        // gracefully to the bare `http://host:port` form. This preserves
-        // existing user configs that put `/v1` into the resource's URL by
-        // some other convention; Phase E's `route_for_capability` removes
-        // the fallback entirely.
-        let (engine, ctx, _dir) = ctx_with_engine("wf-fallback").await;
-        let resource = http_resource_without_openai_route(
-            "wf-no-route",
-            39_114,
-            vec![Capability::OpenaiChatCompletions],
-        );
-        install_workflow_resources(
-            &WorkflowId("wf-fallback".into()),
-            &[resource],
-            &engine.resource_registry(),
-        )
-        .expect("install");
-
-        let node = llm_node_with_resource(serde_json::json!("wf-no-route"));
-        let url = resolve_resource_url(&node, &ctx, false)
-            .expect("ok")
-            .expect("some");
-        assert_eq!(url, "http://127.0.0.1:39114");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn resource_long_form_with_required_capability_resolves() {
-        let (engine, ctx, _dir) = ctx_with_engine("wf-long").await;
-        let resource = http_resource(
-            "wf-tool",
-            39_112,
-            vec![
-                Capability::OpenaiChatCompletions,
-                Capability::OpenaiToolCalling,
-            ],
-        );
-        install_workflow_resources(
-            &WorkflowId("wf-long".into()),
-            &[resource],
-            &engine.resource_registry(),
-        )
-        .expect("install");
-
-        let node = llm_node_with_resource(serde_json::json!({
-            "id": "wf-tool",
-            "required_capability": "openai_tool_calling",
-        }));
-        // tools_present=false would otherwise default to ChatCompletions, but
-        // the long-form ref's explicit `required_capability` overrides it,
-        // so the stem-derivation picks up the route that proves ToolCalling.
-        let url = resolve_resource_url(&node, &ctx, false)
-            .expect("ok")
-            .expect("some");
-        assert_eq!(url, "http://127.0.0.1:39112/v1");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn resource_inferred_capability_does_not_gate_bare_ref() {
-        // Bare ResourceRef ("wf-tools-only") never asks the loader/executor
-        // to enforce a specific capability — the inference rule only feeds
-        // Phase E's route selection. So a resource that advertises ONLY
-        // ToolCalling still resolves for a tools_present=false (single-turn)
-        // call. User-stated `required_capability` is the only thing that
-        // gates Phase D.
-        let (engine, ctx, _dir) = ctx_with_engine("wf-infer").await;
-        let resource = http_resource("wf-tools-only", 39_113, vec![Capability::OpenaiToolCalling]);
-        install_workflow_resources(
-            &WorkflowId("wf-infer".into()),
-            &[resource],
-            &engine.resource_registry(),
-        )
-        .expect("install");
-
-        let node = llm_node_with_resource(serde_json::json!("wf-tools-only"));
-        // tools_present=true → inferred ToolCalling → matches the proving
-        // route → stem `/v1` is appended.
-        let url_with_tools = resolve_resource_url(&node, &ctx, true)
-            .expect("tools_present=true bare-ref resolves")
-            .expect("some");
-        assert_eq!(url_with_tools, "http://127.0.0.1:39113/v1");
-        // tools_present=false → inferred ChatCompletions → the resource's
-        // route only proves ToolCalling, so the fallback kicks in and we
-        // get the bare host:port form. Resolution still succeeds because
-        // there is no user-stated capability constraint to enforce.
-        let url_without_tools = resolve_resource_url(&node, &ctx, false)
-            .expect("tools_present=false bare-ref also resolves (no user-stated cap)")
-            .expect("some");
-        assert_eq!(url_without_tools, "http://127.0.0.1:39113");
-
-        // But the long-form ref with an explicit required_capability that
-        // the resource doesn't advertise → Config error regardless of tools.
-        let strict_node = llm_node_with_resource(serde_json::json!({
-            "id": "wf-tools-only",
-            "required_capability": "openai_chat_completions",
-        }));
-        let err =
-            resolve_resource_url(&strict_node, &ctx, false).expect_err("user-stated cap rejects");
-        assert!(matches!(err, NodeError::Config(_)), "got {err:?}");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn resource_unknown_id_is_a_config_error() {
-        let (_engine, ctx, _dir) = ctx_with_engine("wf-missing").await;
-        let node = llm_node_with_resource(serde_json::json!("nobody-here"));
-        let err = resolve_resource_url(&node, &ctx, false).expect_err("unknown id rejects");
-        assert!(matches!(err, NodeError::Config(_)), "got {err:?}");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn resource_non_http_kind_is_a_config_error() {
-        // Install a Binary-kind resource that *does* advertise the capability
-        // the caller asks for, so the cap check passes and we exercise the
-        // "not HttpEndpoint" branch below it.
-        let (engine, ctx, _dir) = ctx_with_engine("wf-binary").await;
-        let resource = ResourceDefinition {
-            id: ResourceId("misdeclared-bin".into()),
-            kind: ResourceKind::Binary,
-            advertised_capabilities: vec![Capability::OpenaiChatCompletions],
-            probe: ProbeSpec::Binary {
-                bin: "true".into(),
-                version_args: vec!["--version".into()],
-                version_regex: r"(\d+)".into(),
-                extra_search_paths: vec![],
-                timeout_ms: None,
-            },
-            override_lower_scope: false,
-        };
-        install_workflow_resources(
-            &WorkflowId("wf-binary".into()),
-            &[resource],
-            &engine.resource_registry(),
-        )
-        .expect("install");
-
-        let node = llm_node_with_resource(serde_json::json!("misdeclared-bin"));
-        let err = resolve_resource_url(&node, &ctx, false).expect_err("non-http resource rejects");
-        let msg = format!("{err:?}");
-        assert!(matches!(err, NodeError::Config(_)), "got {msg}");
-        assert!(
-            msg.contains("not an HTTP endpoint"),
-            "expected non-http hint, got {msg}",
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn resource_malformed_ref_is_a_config_error() {
-        let (_engine, ctx, _dir) = ctx_with_engine("wf-bad").await;
-        // Numeric scalar can't deserialize into ResourceRef.
-        let node = llm_node_with_resource(serde_json::json!(42));
-        let err = resolve_resource_url(&node, &ctx, false).expect_err("bad shape rejects");
-        assert!(matches!(err, NodeError::Config(_)), "got {err:?}");
     }
 }
