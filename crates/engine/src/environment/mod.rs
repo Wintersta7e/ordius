@@ -1,16 +1,7 @@
 //! Host environment discovery.
-
-mod types;
-pub use types::*;
-
-mod local;
-
-mod detect;
-pub use detect::{detect, detect_platform};
-
-mod wsl;
-pub use wsl::{WslDistroEntry, enumerate_running_distros, enumerate_wsl_distros};
-
-mod custom;
-
+//!
+//! Phase E moved the entire substrate into [`runtime`]. The legacy session-C
+//! `EnvironmentReport` types are gone; the desktop IPC consumes
+//! `runtime::EnvRegistry` directly.
 pub mod runtime;
+pub use runtime::*;

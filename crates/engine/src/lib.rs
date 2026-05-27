@@ -18,7 +18,6 @@ pub mod events_registry;
 pub mod executor;
 pub mod loader;
 pub mod manifests;
-pub mod namespaces;
 pub mod recorder;
 pub mod registry;
 pub mod run;
