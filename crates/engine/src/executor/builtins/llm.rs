@@ -146,34 +146,6 @@ fn substitute_llm_config(
     Ok(substituted)
 }
 
-/// Return the parent-directory stem of a probe path. The result is
-/// concatenated onto `http://127.0.0.1:<port>` to form the base URL
-/// for `/chat/completions`. Examples (and the edge cases we care about):
-///
-/// - `"/v1/models"` → `"/v1"` (the normal OpenAI-compat shape)
-/// - `"/api/version"` → `"/api"` (Ollama-native, but kept generic)
-/// - `"/"` or `""` → `""` (nothing to derive a stem from)
-/// - `"/chat/completions"` → `"/chat"` (would be unusual but consistent)
-/// - `"models"` (no leading slash) → `""` (no parent segment exists)
-/// - `"/v1/"` (trailing slash, empty leaf) → `"/v1"` (drop the trailing
-///   slash before taking the parent)
-///
-/// The stem is meant to be appended verbatim to `http://host:port`, so
-/// the empty string degrades gracefully to the bare host:port form.
-fn path_parent_stem(path: &str) -> String {
-    // Drop a trailing slash so paths like "/v1/" don't collapse to "/v1"
-    // with an empty leaf segment that then yields "/v1" anyway — the
-    // trim happens up-front so the rfind below sees the real leaf.
-    let trimmed = path.trim_end_matches('/');
-    let Some(idx) = trimmed.rfind('/') else {
-        // No slash anywhere → there's no parent segment to lift.
-        return String::new();
-    };
-    // `trimmed[..idx]` keeps everything before the last `/`. For
-    // `"/v1/models"` that's `"/v1"`; for `"/models"` it's `""`.
-    trimmed[..idx].to_string()
-}
-
 /// Resolve the optional `resource` config field on an `llm` node into
 /// a base URL via the shared resource registry. Returns:
 ///
@@ -252,6 +224,11 @@ fn resolve_resource_url(
         Capability::OpenaiChatCompletions
     };
     let effective_cap = rref.required_capability().unwrap_or(inferred_cap);
+    if super::util::dispatch_suffix_for_capability(effective_cap).is_none() {
+        return Err(NodeError::Config(format!(
+            "llm: required capability '{effective_cap:?}' is not HTTP-dispatchable"
+        )));
+    }
 
     let ProbeSpec::Http { ports, routes, .. } = &def.probe else {
         return Err(NodeError::Config(format!(
@@ -273,7 +250,7 @@ fn resolve_resource_url(
     let stem = routes
         .iter()
         .find(|r| matches!(r.flavor, ApiFlavor::OpenaiChat) && r.proves.contains(&effective_cap))
-        .map(|r| path_parent_stem(&r.path))
+        .map(|r| super::util::path_parent_stem(&r.path))
         .unwrap_or_default();
 
     Ok(Some(format!("http://127.0.0.1:{port}{stem}")))
