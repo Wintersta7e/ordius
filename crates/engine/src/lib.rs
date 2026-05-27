@@ -106,12 +106,15 @@ pub struct Engine {
     env_disabled_specs:
         ArcSwap<HashMap<environment::runtime::EnvId, environment::runtime::EnvSpec>>,
     /// Serialises concurrent `refresh_environment` / inline-`EnvSpec`-write
-    /// callers so the boot-probe orchestrator stays atomic. Consumed in Task 5.
-    #[allow(dead_code)]
+    /// callers so the spec read + remove paths stay atomic. The lock is NOT
+    /// held across the background probe — it covers only the synchronous
+    /// section in [`Self::refresh_environment_locked`].
     env_refresh_lock: tokio::sync::Mutex<()>,
-    /// Monotonic refresh counter; bumped on every successful refresh so
-    /// long-lived snapshots can notice they're stale. Consumed in Task 5.
-    #[allow(dead_code)]
+    /// Engine-wide refresh epoch, bumped on every successful swap of the env
+    /// registry or per-env catalog. A background refresh captures the epoch
+    /// before probing and `compare_exchange`s it before storing — concurrent
+    /// writes invalidate each other's results, and the loser silently aborts
+    /// instead of clobbering newer state.
     env_refresh_epoch: AtomicU64,
     /// Active-run broadcast senders so subscribers (CLI
     /// `--json-events`, GUI Tauri commands) can stream events for
@@ -172,8 +175,7 @@ impl Engine {
         // later phases), probes each, and returns the entries/catalogs/
         // disabled maps. An empty `env_specs` table synthesizes a default
         // Local env so first-run installs always have one usable target.
-        let outcome =
-            environment::runtime::boot_probe::run(&pool, &resource_registry).await;
+        let outcome = environment::runtime::boot_probe::run(&pool, &resource_registry).await;
         tracing::info!(
             envs = outcome.entries.len(),
             disabled = outcome.disabled_specs.len(),
@@ -226,6 +228,111 @@ impl Engine {
         &self,
     ) -> Arc<HashMap<environment::runtime::EnvId, environment::runtime::EnvSpec>> {
         self.env_disabled_specs.load_full()
+    }
+
+    /// Re-probe the host environment.
+    ///
+    /// `refresh_environment(None)` schedules a full re-probe of every enabled
+    /// env. `refresh_environment(Some(env_id))` schedules a single-env
+    /// re-probe; when the row is missing or disabled, the env entry and its
+    /// catalog are removed synchronously (no probe needed).
+    ///
+    /// **The probe itself runs in a background task** — this method returns
+    /// as soon as the spec has been read and the probe spawned. Active
+    /// `RunSnapshot`s are NOT mutated by the refresh; only the engine's
+    /// `env_registry` + `env_catalogs` `ArcSwap` caches swap on probe
+    /// completion, and the next run after the swap sees the new catalog.
+    ///
+    /// Concurrent refresh calls serialise on `env_refresh_lock` for the
+    /// synchronous spec read, then race against `env_refresh_epoch` via CAS
+    /// before committing. The loser of a race silently drops its result —
+    /// the engine never holds inconsistent maps but may transiently hold
+    /// the older of two completed probes until the next refresh.
+    pub async fn refresh_environment(
+        self: &Arc<Self>,
+        env_id: Option<&environment::runtime::EnvId>,
+    ) -> Result<()> {
+        let _guard = self.env_refresh_lock.lock().await;
+        self.refresh_environment_locked(env_id)
+    }
+
+    /// Internal helper: caller MUST already hold `env_refresh_lock`.
+    /// Future inline-`EnvSpec` writers (`add_env`, `remove_env`,
+    /// `set_env_enabled` — Task 15) call this directly to avoid re-locking.
+    /// Synchronous because the background probe is spawned, not awaited.
+    fn refresh_environment_locked(
+        self: &Arc<Self>,
+        env_id: Option<&environment::runtime::EnvId>,
+    ) -> Result<()> {
+        use std::sync::atomic::Ordering;
+
+        // SECTION A — synchronous (under the caller's lock): read the spec
+        // and capture the epoch before scheduling any background work.
+        let pending = match env_id {
+            None => RefreshPending::Full,
+            Some(env) => {
+                match environment::runtime::boot_probe::load_spec_single(&self.pool, env) {
+                    Ok(Some(spec)) => RefreshPending::Single {
+                        env_id: env.clone(),
+                        spec: Box::new(spec),
+                    },
+                    Ok(None) => RefreshPending::Remove {
+                        env_id: env.clone(),
+                    },
+                    Err(e) => {
+                        return Err(EngineError::Db(format!("refresh load_spec: {e}")));
+                    },
+                }
+            },
+        };
+        let epoch_before = self.env_refresh_epoch.load(Ordering::Acquire);
+
+        // SECTION B — handle Remove inline. No probe required; CoW the maps
+        // under the lock, bump the epoch, swap. Concurrent background probes
+        // for this env then fail their CAS commit and drop stale results.
+        if let RefreshPending::Remove { env_id } = pending {
+            self.apply_remove(&env_id);
+            return Ok(());
+        }
+
+        // SECTION C — spawn the background probe. Returns immediately; the
+        // spawned task probes + CAS-commits + swaps.
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            match pending {
+                RefreshPending::Full => run_full_refresh(&engine, epoch_before).await,
+                RefreshPending::Single { env_id, spec } => {
+                    run_single_refresh(&engine, epoch_before, env_id, *spec).await;
+                },
+                RefreshPending::Remove { .. } => {
+                    // SECTION B handles Remove inline; reaching here is a
+                    // programming error in this module.
+                    unreachable!("RefreshPending::Remove handled before spawn");
+                },
+            }
+        });
+        Ok(())
+    }
+
+    /// Synchronous Remove: drops the env from `env_registry`, `env_catalogs`,
+    /// and `env_disabled_specs`. Bumps the epoch BEFORE the swap so an
+    /// in-flight background probe reads the bumped value on its CAS.
+    fn apply_remove(&self, env_id: &environment::runtime::EnvId) {
+        use std::sync::atomic::Ordering;
+
+        let current_entries = self.env_registry.entries();
+        let mut next_entries = (*current_entries).clone();
+        next_entries.remove(env_id);
+        let current_catalogs = self.env_catalogs.load();
+        let mut next_catalogs = (**current_catalogs).clone();
+        next_catalogs.remove(env_id);
+        let current_disabled = self.env_disabled_specs.load();
+        let mut next_disabled = (**current_disabled).clone();
+        next_disabled.remove(env_id);
+        self.env_refresh_epoch.fetch_add(1, Ordering::AcqRel);
+        self.env_registry.store(next_entries);
+        self.env_catalogs.store(Arc::new(next_catalogs));
+        self.env_disabled_specs.store(Arc::new(next_disabled));
     }
 
     /// Shared secrets store. Backed by `<home>/secrets-index.json`
@@ -374,6 +481,108 @@ impl Engine {
         // TerminateJobObject, etc.) before we return.
         tokio::time::sleep(Duration::from_millis(200)).await;
         Ok(())
+    }
+}
+
+/// Refresh-environment branches built under `env_refresh_lock` and consumed
+/// by [`Engine::refresh_environment_locked`].
+enum RefreshPending {
+    /// Full re-probe across every enabled `env_specs` row.
+    Full,
+    /// Re-probe a single env whose row was present and enabled at lock-read
+    /// time. The `spec` is captured under the lock so the background probe
+    /// works against a frozen snapshot of the user's configuration.
+    Single {
+        env_id: environment::runtime::EnvId,
+        /// `EnvSpec` is ~272 bytes; boxing keeps the enum variant size in
+        /// line with the other cheap variants (clippy `large_enum_variant`).
+        spec: Box<environment::runtime::EnvSpec>,
+    },
+    /// Row absent or disabled at lock-read time. Handled inline (no probe);
+    /// the env's entry + catalog are dropped under the lock.
+    Remove { env_id: environment::runtime::EnvId },
+}
+
+/// Background refresh body for `RefreshPending::Full`. Re-probes every env
+/// in the DB; CAS-commits the result against `epoch_before` so a concurrent
+/// `refresh_environment` write that ran during the probe drops this result
+/// silently. Tracing logs the loss at debug level.
+async fn run_full_refresh(engine: &Arc<Engine>, epoch_before: u64) {
+    use std::sync::atomic::Ordering;
+    let outcome =
+        environment::runtime::boot_probe::run(&engine.pool, &engine.resource_registry).await;
+    match engine.env_refresh_epoch.compare_exchange(
+        epoch_before,
+        epoch_before + 1,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            engine.env_registry.store(outcome.entries);
+            engine.env_catalogs.store(Arc::new(outcome.catalogs));
+            engine
+                .env_disabled_specs
+                .store(Arc::new(outcome.disabled_specs));
+        },
+        Err(current) => {
+            tracing::debug!(
+                epoch_before,
+                current,
+                "full refresh stale; another write happened during probe",
+            );
+        },
+    }
+}
+
+/// Background refresh body for `RefreshPending::Single`. Re-probes one env
+/// against the snapshot of its `EnvSpec` captured under the lock. On Ok the
+/// epoch CAS commits the merged update; on probe error / CAS loss the
+/// result is dropped.
+async fn run_single_refresh(
+    engine: &Arc<Engine>,
+    epoch_before: u64,
+    env_id: environment::runtime::EnvId,
+    spec: environment::runtime::EnvSpec,
+) {
+    use std::sync::atomic::Ordering;
+    match environment::runtime::boot_probe::run_single(&engine.resource_registry, &env_id, &spec)
+        .await
+    {
+        Ok(single) => {
+            match engine.env_refresh_epoch.compare_exchange(
+                epoch_before,
+                epoch_before + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let mut next_entries = (*engine.env_registry.entries()).clone();
+                    next_entries.insert(env_id.clone(), single.entry);
+                    engine.env_registry.store(next_entries);
+                    let mut next_catalogs = (**engine.env_catalogs.load()).clone();
+                    next_catalogs.insert(env_id.clone(), single.catalog);
+                    engine.env_catalogs.store(Arc::new(next_catalogs));
+                    // If the env was previously disabled (now enabled), drop
+                    // its entry from env_disabled_specs so the IPC stops
+                    // listing it under disabled.
+                    let mut next_disabled = (**engine.env_disabled_specs.load()).clone();
+                    if next_disabled.remove(&env_id).is_some() {
+                        engine.env_disabled_specs.store(Arc::new(next_disabled));
+                    }
+                },
+                Err(current) => {
+                    tracing::debug!(
+                        env_id = %env_id,
+                        epoch_before,
+                        current,
+                        "per-env refresh stale; dropping result",
+                    );
+                },
+            }
+        },
+        Err(e) => {
+            tracing::warn!(env_id = %env_id, error = %e, "background refresh failed");
+        },
     }
 }
 

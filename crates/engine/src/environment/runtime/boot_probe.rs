@@ -54,6 +54,35 @@ pub struct BootProbeOutcome {
     pub disabled_specs: HashMap<EnvId, EnvSpec>,
 }
 
+/// Output of [`run_single`]: a probed `EnvEntry` ready to install into the
+/// engine's `EnvRegistry` plus the matching `ResourceCatalog` for the
+/// `env_catalogs` map.
+pub struct SingleRefresh {
+    /// Constructed entry: spec, resolved state, dispatcher.
+    pub entry: Arc<EnvEntry>,
+    /// Probe outcome catalog (possibly empty if the env was reached but
+    /// no resources were Found).
+    pub catalog: Arc<ResourceCatalog>,
+}
+
+/// Errors surfaced by single-env helpers used by `Engine::refresh_environment`.
+///
+/// The full [`run`] orchestrator absorbs every failure into the resolved
+/// `EnvInfo.state`; `run_single` and `load_spec_single` are designed for
+/// callers (the refresh API) that want to surface a single env's failure to
+/// the user.
+#[derive(Debug, thiserror::Error)]
+pub enum BootError {
+    /// Dispatcher construction failed: the spec variant is not supported by
+    /// this build (Ssh / Container today), or the dispatcher returned an
+    /// error.
+    #[error("dispatcher: {0}")]
+    Dispatch(#[from] DispatchError),
+    /// `SQLite` read failure or `spec_json` deserialization failure.
+    #[error("db: {0}")]
+    Db(String),
+}
+
 /// Run the boot probe.
 ///
 /// Always returns; per-env probe failures are absorbed into the resolved
@@ -311,6 +340,68 @@ fn load_specs(pool: &DbPool) -> Vec<(EnvId, EnvSpec, bool)> {
             }
         })
         .collect()
+}
+
+/// Load a single `env_specs` row by id.
+///
+/// Returns `Ok(Some(spec))` only when the row exists AND `enabled = 1`;
+/// `Ok(None)` covers the absent-or-disabled case so the refresh API can
+/// treat both identically (remove the env from the registry without probing).
+pub fn load_spec_single(pool: &DbPool, env_id: &EnvId) -> Result<Option<EnvSpec>, BootError> {
+    let conn = pool.get().map_err(|e| BootError::Db(e.to_string()))?;
+    let mut stmt = conn
+        .prepare("SELECT spec_json FROM env_specs WHERE id = ?1 AND enabled = 1")
+        .map_err(|e| BootError::Db(e.to_string()))?;
+    let mut rows = stmt
+        .query(rusqlite::params![env_id.as_str()])
+        .map_err(|e| BootError::Db(e.to_string()))?;
+    let Some(row) = rows.next().map_err(|e| BootError::Db(e.to_string()))? else {
+        return Ok(None);
+    };
+    let json: String = row.get(0).map_err(|e| BootError::Db(e.to_string()))?;
+    let spec: EnvSpec =
+        serde_json::from_str(&json).map_err(|e| BootError::Db(format!("EnvSpec parse: {e}")))?;
+    Ok(Some(spec))
+}
+
+/// Construct + probe one env.
+///
+/// Used by `Engine::refresh_environment(Some(id))` to refresh a single env
+/// without re-running the full boot probe. Does NOT read from the database —
+/// the caller already holds the spec (typically from [`load_spec_single`])
+/// under the engine's refresh lock.
+pub async fn run_single(
+    resource_registry: &ResourceRegistry,
+    env_id: &EnvId,
+    spec: &EnvSpec,
+) -> Result<SingleRefresh, BootError> {
+    let probing_info = Arc::new(EnvInfo {
+        id: env_id.clone(),
+        label: human_label(spec),
+        spec: spec.clone(),
+        state: EnvState::Probing,
+        enabled: true,
+    });
+    let dispatcher = construct_dispatcher(spec, &probing_info)?;
+    let plan = build_plan(env_id, spec, resource_registry);
+    let summary = dispatcher
+        .probe(plan, CancellationToken::new())
+        .await
+        .map_err(BootError::Dispatch)?;
+    let catalog = Arc::new(summary.catalog);
+    // Probe Ok means the env answered within budget; treat as Reachable
+    // even when no resources were Found (matches the full-`run` arm).
+    let resolved_info = Arc::new(EnvInfo {
+        state: EnvState::Reachable,
+        ..(*probing_info).clone()
+    });
+    Ok(SingleRefresh {
+        entry: Arc::new(EnvEntry {
+            info: resolved_info,
+            dispatcher,
+        }),
+        catalog,
+    })
 }
 
 #[cfg(test)]
