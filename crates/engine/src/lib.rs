@@ -122,6 +122,13 @@ pub struct Engine {
     pub(crate) run_senders: Arc<Mutex<HashMap<String, broadcast::Sender<RunEvent>>>>,
     /// Active-run cancel tokens (cleaned up on completion).
     pub(crate) run_tokens: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    /// Active-run snapshot map. Populated synchronously by `start_run`
+    /// before `tokio::spawn`, and removed by an RAII guard inside the
+    /// spawned task — so any drop path (normal exit, `?`-propagation,
+    /// or panic unwind) cleans the entry. Used by the test-only
+    /// `Engine::run_snapshot` accessor to verify that an in-flight
+    /// run's view does not change under `refresh_environment`.
+    pub(crate) run_snapshots: Arc<Mutex<HashMap<String, Arc<environment::runtime::RunSnapshot>>>>,
 }
 
 impl Engine {
@@ -200,6 +207,7 @@ impl Engine {
             env_refresh_epoch: AtomicU64::new(0),
             run_senders: Arc::new(Mutex::new(HashMap::new())),
             run_tokens: Arc::new(Mutex::new(HashMap::new())),
+            run_snapshots: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -547,6 +555,20 @@ impl Engine {
             .expect("engine run_senders mutex poisoned")
             .get(run_id)
             .map(broadcast::Sender::subscribe)
+    }
+
+    /// Look up the per-run `RunSnapshot` for a currently active run.
+    ///
+    /// Returns `None` once the run has completed (the RAII guard
+    /// inside the spawned run task removes the entry on drop). Used
+    /// by isolation tests to assert that `refresh_environment` does
+    /// not perturb an in-flight run's frozen view of the env
+    /// substrate. Gated behind `cfg(test)` + the `testing` feature so
+    /// production code cannot rely on this introspection.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn run_snapshot(&self, run_id: &str) -> Option<Arc<environment::runtime::RunSnapshot>> {
+        self.run_snapshots.lock().ok()?.get(run_id).map(Arc::clone)
     }
 
     /// Cancel a running run by id. Returns `true` if the run was

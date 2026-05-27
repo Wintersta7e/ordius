@@ -45,6 +45,26 @@ pub struct RunSummary {
     pub node_runs: usize,
 }
 
+/// RAII guard that drops the run's entry from `Engine::run_snapshots`
+/// when the spawned run task returns or unwinds.
+///
+/// Held inside `tokio::spawn`'s future so any drop path — normal
+/// completion, `?`-propagation, or a panic unwind — cleans up the
+/// snapshot map. Without this, a panicking run loop would leak its
+/// `Arc<RunSnapshot>` and pin every per-env catalog past run exit.
+struct RunSnapshotGuard {
+    engine: Arc<Engine>,
+    run_id: String,
+}
+
+impl Drop for RunSnapshotGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.engine.run_snapshots.lock() {
+            g.remove(&self.run_id);
+        }
+    }
+}
+
 /// Handle returned by [`Engine::start_run`] — the caller can
 /// subscribe to events via `event_rx` and join the run loop via
 /// `join`.
@@ -227,9 +247,25 @@ impl Engine {
         let workspace =
             workspace_override.unwrap_or_else(|| self.ensure_run_workspace(&rec.run_id, ""));
 
+        // Insert SYNCHRONOUSLY before `tokio::spawn` so any subscriber
+        // that calls `Engine::run_snapshot(run_id)` immediately after
+        // `start_run` returns observes the entry. Inserting from inside
+        // the spawned task would race the subscriber to a `None` read.
+        self.run_snapshots
+            .lock()
+            .expect("engine run_snapshots mutex poisoned")
+            .insert(rec.run_id.clone(), Arc::clone(&run_snapshot));
+
         let run_id = rec.run_id.clone();
         let engine = Arc::clone(self);
+        let snap_run_id = rec.run_id.clone();
         let join = tokio::spawn(async move {
+            // RAII guard: removes the `run_snapshots` entry on Drop, so
+            // a panicking run loop or `?`-propagation also cleans up.
+            let _snap_guard = RunSnapshotGuard {
+                engine: Arc::clone(&engine),
+                run_id: snap_run_id,
+            };
             let res = engine
                 .run_loop_inner(
                     wf,
