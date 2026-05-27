@@ -17,7 +17,7 @@ use crate::environment::runtime::catalog::{
 };
 use crate::environment::runtime::env::EnvId;
 use crate::environment::runtime::error::DispatchError;
-use crate::environment::runtime::helper::SHELL_FALLBACK_SCRIPT;
+use crate::environment::runtime::helper::{SHELL_FALLBACK_HEAD_SCRIPT, SHELL_FALLBACK_SCRIPT};
 use crate::environment::runtime::resource::{
     HttpProbeMethod, HttpProbeRoute, ProbeSpec, ResourceDefinition,
 };
@@ -37,6 +37,14 @@ pub async fn probe_http_resource(distro: &str, def: &ResourceDefinition) -> Reso
             reason: "shell fallback covers HTTP probes only".into(),
         };
     };
+
+    // Zero-route liveness short-circuit: fire HEAD / via curl against each
+    // port. Any HTTP response (2xx-5xx) → Found(HttpEndpoint) with empty
+    // routes_by_capability. The empty Found is sufficient for the `http`
+    // alt form, which reads only base_url.
+    if routes.is_empty() {
+        return probe_http_liveness(distro, ports).await;
+    }
 
     let mut any_timeout = false;
     let mut first_error: Option<String> = None;
@@ -79,6 +87,48 @@ pub async fn probe_http_resource(distro: &str, def: &ResourceDefinition) -> Reso
                 streaming_supported_natively: false,
                 route_origin: RouteOrigin::EnvLoopback,
             });
+        }
+    }
+
+    if any_timeout {
+        return ResourceProbeOutcome::TimedOut;
+    }
+    if let Some(reason) = first_error {
+        return ResourceProbeOutcome::ProbeFailed { reason };
+    }
+    ResourceProbeOutcome::NotFound
+}
+
+/// Walk `ports` issuing `wsl.exe ... HEAD /` against each. The first
+/// port that answers with any HTTP status returns
+/// `Found(HttpEndpoint { routes_by_capability: empty, .. })`. Connection
+/// failure / timeout on every port collapses to `NotFound`.
+async fn probe_http_liveness(distro: &str, ports: &[u16]) -> ResourceProbeOutcome {
+    let mut any_timeout = false;
+    let mut first_error: Option<String> = None;
+
+    for &port in ports {
+        let base_url = format!("http://127.0.0.1:{port}");
+        match run_one_liveness(distro, &base_url).await {
+            // curl emits 000 (coerced to 0 by the script) on connection
+            // failure; treat that as "no answer" rather than a live port.
+            ShellProbe::Status(0) => {},
+            ShellProbe::Status(_) => {
+                return ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
+                    base_url,
+                    routes_by_capability: HashMap::default(),
+                    version: None,
+                    models_list: None,
+                    auth_secret_ref: None,
+                    streaming_supported_natively: false,
+                    route_origin: RouteOrigin::EnvLoopback,
+                });
+            },
+            ShellProbe::TimedOut => any_timeout = true,
+            ShellProbe::Error(reason) => {
+                first_error.get_or_insert(reason);
+            },
+            ShellProbe::Skipped(reason) => return ResourceProbeOutcome::Skipped { reason },
         }
     }
 
@@ -155,6 +205,51 @@ async fn run_one_route(distro: &str, base_url: &str, route: &HttpProbeRoute) -> 
         "--",
         base_url,
         &route.path,
+    ]);
+    let output = match run_with_timeout(cmd, PROBE_TIMEOUT).await {
+        Ok(o) => o,
+        Err(WslExecError::TimedOut(_)) => return ShellProbe::TimedOut,
+        Err(e) => return ShellProbe::Error(format!("shell-fallback spawn: {e}")),
+    };
+    if !output.status.success() {
+        return ShellProbe::Error(format!(
+            "shell-fallback exited with {:?}",
+            output.status.code()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let parsed: serde_json::Value = match serde_json::from_str(&stdout) {
+        Ok(v) => v,
+        Err(_) => {
+            return ShellProbe::Error(format!(
+                "shell-fallback emitted unparseable output: {stdout}"
+            ));
+        },
+    };
+    if parsed.get("error").is_some() {
+        return ShellProbe::Error("shell-fallback reported no curl/wget available in env".into());
+    }
+    let status_code: u16 = parsed
+        .get("status")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(0, |n| u16::try_from(n).unwrap_or(0));
+    ShellProbe::Status(status_code)
+}
+
+/// Liveness sibling of [`run_one_route`]. Invokes
+/// [`SHELL_FALLBACK_HEAD_SCRIPT`] which fires HEAD `/` against `base_url`
+/// and emits `{"status":<code>}` (or `{"status":0}` on connection failure).
+async fn run_one_liveness(distro: &str, base_url: &str) -> ShellProbe {
+    let mut cmd = Command::new("wsl.exe");
+    cmd.args([
+        "-d",
+        distro,
+        "--exec",
+        "/bin/sh",
+        "-c",
+        SHELL_FALLBACK_HEAD_SCRIPT,
+        "--",
+        base_url,
     ]);
     let output = match run_with_timeout(cmd, PROBE_TIMEOUT).await {
         Ok(o) => o,

@@ -99,6 +99,32 @@ else
 fi
 "#;
 
+/// Zero-route liveness shell script. Fires HEAD against `$base/` with a
+/// 1-second budget; emits `{"status":<code>}` for any HTTP response or
+/// `{"status":0}` on connection failure / timeout.
+///
+/// Used by [`shell_fallback::probe_http_resource`] when a `ProbeSpec::Http`
+/// has no declared routes — the caller only needs proof the port answers.
+///
+/// Invocation: `wsl.exe -d <name> --exec /bin/sh -c '<script>' -- <base_url>`.
+pub const SHELL_FALLBACK_HEAD_SCRIPT: &str = r#"set -u
+base=$1
+url="${base%/}/"
+if command -v curl >/dev/null 2>&1; then
+  code=$(curl -s -I -o /dev/null -w "%{http_code}" --connect-timeout 1 --max-time 1 "$url" 2>/dev/null)
+  case "$code" in ''|*[!0-9]*) code=0 ;; esac
+  printf '{"status":%d}\n' "$code"
+elif command -v wget >/dev/null 2>&1; then
+  if wget --spider -q -T 1 -t 1 "$url" 2>/dev/null; then
+    printf '{"status":200}\n'
+  else
+    printf '{"status":0}\n'
+  fi
+else
+  printf '{"error":"no-probe-tool"}\n'
+fi
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +158,26 @@ mod tests {
     fn shell_fallback_script_uses_argv_positional() {
         assert!(SHELL_FALLBACK_SCRIPT.contains("base=$1"));
         assert!(SHELL_FALLBACK_SCRIPT.contains("path=$2"));
+    }
+
+    #[test]
+    fn shell_fallback_head_script_takes_single_base_argv() {
+        // The HEAD script only needs base — `path` is hard-coded to "/".
+        assert!(SHELL_FALLBACK_HEAD_SCRIPT.contains("base=$1"));
+        assert!(
+            !SHELL_FALLBACK_HEAD_SCRIPT.contains("path=$2"),
+            "HEAD liveness script must not consume a second positional"
+        );
+        assert!(
+            SHELL_FALLBACK_HEAD_SCRIPT.contains("curl")
+                && SHELL_FALLBACK_HEAD_SCRIPT.contains("-I"),
+            "HEAD liveness script must use curl -I"
+        );
+        assert!(SHELL_FALLBACK_HEAD_SCRIPT.contains("--connect-timeout 1"));
+        assert!(SHELL_FALLBACK_HEAD_SCRIPT.contains("--max-time 1"));
+        // Same status-coercion contract as the GET script so the engine-side
+        // serde_json parser stays uniform.
+        assert!(SHELL_FALLBACK_HEAD_SCRIPT.contains("printf '{\"status\":%d}"));
     }
 
     #[test]

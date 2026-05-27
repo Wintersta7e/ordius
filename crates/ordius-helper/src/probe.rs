@@ -108,10 +108,20 @@ fn probe_http(
     routes: &[HttpProbeRouteV1],
     timeout: Option<Duration>,
 ) -> ProbeOutcomeBodyV1 {
-    if bases.is_empty() || routes.is_empty() {
+    if bases.is_empty() {
         return ProbeOutcomeBodyV1::ProbeFailed {
-            reason: "no base url or route declared".into(),
+            reason: "no base url declared".into(),
         };
+    }
+
+    // Zero-route liveness short-circuit: fire HEAD / against each base with a
+    // tight budget. Any HTTP response (2xx-5xx) → Found with empty
+    // proven_routes; transport / timeout on every base → NotFound. The empty
+    // proven_routes wire payload translates to a Found(HttpEndpoint) with an
+    // empty routes_by_capability on the engine side — sufficient for the
+    // `http` alt form that reads only base_url.
+    if routes.is_empty() {
+        return probe_http_liveness(bases);
     }
 
     let mut builder = ureq::AgentBuilder::new();
@@ -210,6 +220,44 @@ fn probe_http(
         ProbeOutcomeBodyV1::TimedOut
     } else if let Some(reason) = last_err {
         ProbeOutcomeBodyV1::ProbeFailed { reason }
+    } else {
+        ProbeOutcomeBodyV1::NotFound
+    }
+}
+
+/// Tight HEAD / against each base until one answers. Used when the probe
+/// declares no routes — the caller only wants "is this port alive?".
+///
+/// Any HTTP response (including 4xx / 5xx — ureq surfaces non-2xx as
+/// `Err(Status)`, which still proves the port answered) returns `Found`
+/// with an empty `proven_routes`. Transport errors fall through to the
+/// next base; running out of bases yields `NotFound`.
+fn probe_http_liveness(bases: &[String]) -> ProbeOutcomeBodyV1 {
+    const LIVENESS_TIMEOUT: Duration = Duration::from_millis(250);
+
+    let agent = ureq::AgentBuilder::new().timeout(LIVENESS_TIMEOUT).build();
+    let mut any_timeout = false;
+
+    for base in bases {
+        let url = format!("{}/", base.trim_end_matches('/'));
+        match agent.head(&url).call() {
+            Ok(_) | Err(ureq::Error::Status(_, _)) => {
+                return ProbeOutcomeBodyV1::Found(ProbeDetailV1::HttpEndpoint {
+                    base_url: base.clone(),
+                    proven_routes: Vec::new(),
+                });
+            },
+            Err(err) if is_ureq_timeout(&err) => {
+                any_timeout = true;
+            },
+            Err(ureq::Error::Transport(_)) => {
+                // Connection refused / DNS / etc. — try the next base.
+            },
+        }
+    }
+
+    if any_timeout {
+        ProbeOutcomeBodyV1::TimedOut
     } else {
         ProbeOutcomeBodyV1::NotFound
     }
@@ -640,6 +688,92 @@ mod tests {
         let fp = fingerprint(r#"{"version":"1.0"}"#, &paths);
         // Survives clamp without panic and still produces a fingerprint.
         assert!(!fp.is_empty());
+    }
+
+    #[test]
+    fn probe_http_zero_route_liveness_found_on_404() {
+        // Bind a TCP listener that returns a `404 Not Found` to the first
+        // request. The HEAD / liveness probe should land Found(HttpEndpoint)
+        // with an empty proven_routes — the port answered, that's enough.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let server_thread = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                drop(stream.read(&mut buf));
+                drop(stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"));
+                drop(stream.flush());
+            }
+        });
+
+        let plan = ProbePlanV1 {
+            version: 1,
+            per_resource_timeout_ms: 1000,
+            max_concurrency: 1,
+            overall_budget_ms: 5000,
+            resources: vec![ResourceSpecV1 {
+                id: "live-only".into(),
+                kind: ResourceKindV1::Http {
+                    bases: vec![format!("http://127.0.0.1:{port}")],
+                    routes: vec![],
+                },
+            }],
+        };
+        let input = serde_json::to_string(&plan).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        run(input.as_bytes(), &mut out).unwrap();
+        let line = std::str::from_utf8(&out).unwrap();
+        let outcome: ProbeOutcomeV1 = serde_json::from_str(line.trim()).unwrap();
+        match outcome.outcome {
+            ProbeOutcomeBodyV1::Found(ProbeDetailV1::HttpEndpoint {
+                base_url,
+                proven_routes,
+            }) => {
+                assert_eq!(base_url, format!("http://127.0.0.1:{port}"));
+                assert!(
+                    proven_routes.is_empty(),
+                    "liveness probe must not synthesize capabilities"
+                );
+            },
+            other => panic!("expected Found(HttpEndpoint), got {other:?}"),
+        }
+        // Best-effort join so the test thread does not leak — connection
+        // already closed above.
+        drop(server_thread.join());
+    }
+
+    #[test]
+    fn probe_http_zero_route_liveness_not_found_on_closed_port() {
+        // Bind + drop yields a port number that's now closed. HEAD /
+        // surfaces as transport error → NotFound.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let plan = ProbePlanV1 {
+            version: 1,
+            per_resource_timeout_ms: 1000,
+            max_concurrency: 1,
+            overall_budget_ms: 5000,
+            resources: vec![ResourceSpecV1 {
+                id: "dead-only".into(),
+                kind: ResourceKindV1::Http {
+                    bases: vec![format!("http://127.0.0.1:{port}")],
+                    routes: vec![],
+                },
+            }],
+        };
+        let input = serde_json::to_string(&plan).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        run(input.as_bytes(), &mut out).unwrap();
+        let line = std::str::from_utf8(&out).unwrap();
+        let outcome: ProbeOutcomeV1 = serde_json::from_str(line.trim()).unwrap();
+        assert!(
+            matches!(outcome.outcome, ProbeOutcomeBodyV1::NotFound),
+            "expected NotFound on closed port, got {:?}",
+            outcome.outcome
+        );
     }
 
     #[test]

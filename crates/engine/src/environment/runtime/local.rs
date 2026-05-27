@@ -331,6 +331,15 @@ impl LocalDispatcher {
         default_timeout: Duration,
         cancel: CancellationToken,
     ) -> ResourceProbeOutcome {
+        // Zero-route liveness short-circuit: when the probe declares no
+        // routes, fire HEAD / with a tight budget. Any HTTP response (2xx-5xx
+        // — even 404/405) proves the port answers; the empty
+        // `routes_by_capability` is enough for the `http` alt form, which
+        // reads only `base_url`.
+        if routes.is_empty() {
+            return self.probe_http_liveness(ports, &cancel).await;
+        }
+
         let timeout = timeout_ms.map_or(default_timeout, Duration::from_millis);
         let mut any_timeout = false;
         let mut first_transport_error = None;
@@ -401,6 +410,52 @@ impl LocalDispatcher {
 
         if let Some(reason) = first_transport_error {
             return ResourceProbeOutcome::ProbeFailed { reason };
+        }
+
+        ResourceProbeOutcome::NotFound
+    }
+
+    /// Walk `ports` firing a single `HEAD /` against each. The first port that
+    /// produces any HTTP response (regardless of status) is reported as
+    /// `Found(HttpEndpoint)` with an empty `routes_by_capability`. Connection
+    /// refused / DNS / timeout on every port collapses to `NotFound`.
+    ///
+    /// Used when `ProbeSpec::Http` has no declared routes — the
+    /// authoring-time signal "this port is alive" without any
+    /// capability proof. The minimal Found is enough for the
+    /// `http` alt form, which reads only `base_url`.
+    async fn probe_http_liveness(
+        &self,
+        ports: &[u16],
+        cancel: &CancellationToken,
+    ) -> ResourceProbeOutcome {
+        const LIVENESS_TIMEOUT: Duration = Duration::from_millis(250);
+
+        for &port in ports {
+            let req = HttpRequest {
+                method: HttpMethod::Head,
+                url: format!("http://127.0.0.1:{port}/"),
+                headers: std::collections::HashMap::default(),
+                body: None,
+                timeout: LIVENESS_TIMEOUT,
+            };
+            let response = tokio::select! {
+                () = cancel.cancelled() => return cancelled_probe_outcome(),
+                response = self.transport.execute(req) => response,
+            };
+            // Any HTTP response — including 4xx/5xx — proves the port answers.
+            // Only transport / timeout errors fall through to the next port.
+            if response.is_ok() {
+                return ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
+                    base_url: format!("http://127.0.0.1:{port}"),
+                    routes_by_capability: std::collections::HashMap::new(),
+                    version: None,
+                    models_list: None,
+                    auth_secret_ref: None,
+                    streaming_supported_natively: false,
+                    route_origin: RouteOrigin::EnvLoopback,
+                });
+            }
         }
 
         ResourceProbeOutcome::NotFound
@@ -809,6 +864,73 @@ mod tests {
         let d = LocalDispatcher::new(local_info());
         let outcome = d.probe_resource(&def, CancellationToken::new()).await;
         assert!(matches!(outcome, ResourceProbeOutcome::NotFound));
+    }
+
+    #[tokio::test]
+    async fn probe_zero_route_liveness_found_on_404_response() {
+        // Wiremock with no Mock configured replies 404 to every request,
+        // including the HEAD / liveness probe. The port answers, so the
+        // empty-routes probe returns Found with an empty
+        // routes_by_capability — enough for the http alt form.
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        let def = ResourceDefinition {
+            id: ResourceId("live-only".into()),
+            kind: ResourceKind::HttpEndpoint,
+            advertised_capabilities: vec![],
+            probe: ProbeSpec::Http {
+                ports: vec![port],
+                routes: vec![],
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        };
+
+        let d = LocalDispatcher::new(local_info());
+        let outcome = d.probe_resource(&def, CancellationToken::new()).await;
+        let ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
+            base_url,
+            routes_by_capability,
+            route_origin,
+            ..
+        }) = outcome
+        else {
+            panic!("expected Found(HttpEndpoint), got {outcome:?}");
+        };
+        assert_eq!(base_url, format!("http://127.0.0.1:{port}"));
+        assert!(
+            routes_by_capability.is_empty(),
+            "zero-route liveness must not synthesize capabilities"
+        );
+        assert_eq!(route_origin, RouteOrigin::EnvLoopback);
+    }
+
+    #[tokio::test]
+    async fn probe_zero_route_liveness_not_found_on_closed_port() {
+        // Bind a port, drop the listener, then probe it: nothing answers,
+        // so the empty-routes probe collapses to NotFound.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+
+        let def = ResourceDefinition {
+            id: ResourceId("dead-only".into()),
+            kind: ResourceKind::HttpEndpoint,
+            advertised_capabilities: vec![],
+            probe: ProbeSpec::Http {
+                ports: vec![port],
+                routes: vec![],
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        };
+
+        let d = LocalDispatcher::new(local_info());
+        let outcome = d.probe_resource(&def, CancellationToken::new()).await;
+        assert!(
+            matches!(outcome, ResourceProbeOutcome::NotFound),
+            "expected NotFound on closed port, got {outcome:?}"
+        );
     }
 
     #[tokio::test]
