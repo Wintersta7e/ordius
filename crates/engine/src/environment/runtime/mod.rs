@@ -19,6 +19,8 @@ pub mod local;
 pub mod plan;
 pub mod registry;
 pub mod resource;
+pub mod run_catalog;
+pub mod run_snapshot;
 pub mod search_paths;
 pub mod transport;
 pub mod user_file;
@@ -111,3 +113,11 @@ pub use local::{LocalDispatcher, LocalHttpTransport};
 /// and integration tests; emits `EnvLoopback` route origin.
 #[cfg(any(test, feature = "testing"))]
 pub use fake::{FakeHttpTransport, FakeRemoteDispatcher, FakeResource};
+
+// ── Run-time snapshot ────────────────────────────────────────────────────────
+
+/// Per-run frozen view (registry + dispatchers + catalogs).
+pub use run_snapshot::RunSnapshot;
+
+/// Per-env probe catalog with run-local monotonic overlay + singleflight re-probe.
+pub use run_catalog::RunCatalog;
