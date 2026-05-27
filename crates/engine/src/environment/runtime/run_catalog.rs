@@ -477,7 +477,7 @@ mod singleflight_tests {
         }
 
         fn http_transport(&self) -> Arc<dyn HttpTransport> {
-            Arc::new(FakeHttpTransport)
+            Arc::new(FakeHttpTransport::default())
         }
 
         fn translate_path(&self, _host_path: &Path) -> Result<EnvPath, DispatchError> {

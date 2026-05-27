@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -90,8 +91,15 @@ impl FakeRemoteDispatcher {
         Self {
             info,
             seeded: Mutex::new(HashMap::new()),
-            transport: Arc::new(FakeHttpTransport),
+            transport: Arc::new(FakeHttpTransport::default()),
         }
+    }
+
+    /// Borrow the transport handle so tests can observe call counters
+    /// after running a workflow through this dispatcher.
+    #[must_use]
+    pub fn transport_handle(&self) -> Arc<FakeHttpTransport> {
+        Arc::clone(&self.transport)
     }
 
     /// Seed a resource outcome. Returns `self` for chaining.
@@ -266,13 +274,35 @@ fn cancelled_probe_outcome() -> ResourceProbeOutcome {
 ///
 /// Streaming is explicitly unsupported — callers testing streaming behaviour
 /// must use `LocalHttpTransport` against a wiremock server.
+///
+/// Tracks `execute` / `execute_stream` invocations on an internal atomic so
+/// integration tests can prove that the right env's transport was used by the
+/// run loop (rather than the host-local one).
 #[derive(Debug, Default)]
-pub struct FakeHttpTransport;
+pub struct FakeHttpTransport {
+    execute_calls: AtomicUsize,
+    stream_calls: AtomicUsize,
+}
+
+impl FakeHttpTransport {
+    /// Number of `execute` invocations observed so far.
+    #[must_use]
+    pub fn execute_calls(&self) -> usize {
+        self.execute_calls.load(Ordering::Acquire)
+    }
+
+    /// Number of `execute_stream` invocations observed so far.
+    #[must_use]
+    pub fn stream_calls(&self) -> usize {
+        self.stream_calls.load(Ordering::Acquire)
+    }
+}
 
 #[async_trait]
 impl HttpTransport for FakeHttpTransport {
     /// Return a minimal `200 {}` response without touching the network.
     async fn execute(&self, _req: HttpRequest) -> Result<HttpResponse, HttpError> {
+        self.execute_calls.fetch_add(1, Ordering::AcqRel);
         Ok(HttpResponse {
             status: 200,
             headers: HashMap::default(),
@@ -283,6 +313,7 @@ impl HttpTransport for FakeHttpTransport {
     /// Always returns `StreamingUnsupported` — the fake emulates a non-streaming
     /// env-wrapped transport (e.g. WSL tunnel before Phase G lands).
     async fn execute_stream(&self, _req: HttpRequest) -> Result<ResponseStream, HttpError> {
+        self.stream_calls.fetch_add(1, Ordering::AcqRel);
         Err(HttpError::StreamingUnsupported {
             route_origin: "env_loopback".into(),
         })

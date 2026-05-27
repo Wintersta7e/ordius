@@ -1887,7 +1887,7 @@ mod tests {
     #[test]
     fn streaming_supported_hostdirect_but_transport_cannot_stream_blocks() {
         // HostDirect route but FakeHttpTransport reports can_stream=false → false.
-        let transport = FakeHttpTransport;
+        let transport = FakeHttpTransport::default();
         let url = url::Url::parse("http://127.0.0.1:11434/v1/chat/completions").unwrap();
         let detail = http_endpoint(RouteOrigin::HostDirect);
         assert!(!streaming_supported_for(Some(&detail), &transport, &url));
@@ -1899,7 +1899,7 @@ mod tests {
         let url = url::Url::parse("http://127.0.0.1:11434/v1/chat/completions").unwrap();
         let local = LocalHttpTransport::new();
         assert!(streaming_supported_for(None, &local, &url));
-        let fake = FakeHttpTransport;
+        let fake = FakeHttpTransport::default();
         assert!(!streaming_supported_for(None, &fake, &url));
     }
 
