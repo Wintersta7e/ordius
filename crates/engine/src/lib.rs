@@ -63,6 +63,7 @@ use crate::registry::Registry;
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -89,8 +90,30 @@ pub struct Engine {
     events: Arc<events_registry::EventRegistry>,
     home: PathBuf,
     secrets_store: Arc<Store>,
-    environment: ArcSwap<environment::EnvironmentReport>,
+    /// Engine-owned per-env state: dispatcher + last-probed info per env id.
+    /// Populated by the boot probe (Task 4); empty at construction.
+    env_registry: Arc<environment::runtime::EnvRegistry>,
+    /// Per-env last-probed catalog. Cloned into `RunSnapshot` at run start;
+    /// `refresh_environment` swaps this atomically.
+    env_catalogs:
+        ArcSwap<HashMap<environment::runtime::EnvId, Arc<environment::runtime::ResourceCatalog>>>,
+    /// Envs the user added to `env_specs` but flagged disabled. Kept here
+    /// (NOT inside `env_registry`) so disabled envs surface in IPC listings
+    /// with an Enable affordance while workflow validation refuses them via
+    /// `validate_nodes` checking that the `target_env` is in the active
+    /// `env_registry`. Consumed by the boot probe + IPC handlers in Task 4
+    /// / Task 5; declared here so the struct shape stays stable.
+    #[allow(dead_code)]
+    env_disabled_specs:
+        ArcSwap<HashMap<environment::runtime::EnvId, environment::runtime::EnvSpec>>,
+    /// Serialises concurrent `refresh_environment` / inline-`EnvSpec`-write
+    /// callers so the boot-probe orchestrator stays atomic. Consumed in Task 5.
+    #[allow(dead_code)]
     env_refresh_lock: tokio::sync::Mutex<()>,
+    /// Monotonic refresh counter; bumped on every successful refresh so
+    /// long-lived snapshots can notice they're stale. Consumed in Task 5.
+    #[allow(dead_code)]
+    env_refresh_epoch: AtomicU64,
     /// Active-run broadcast senders so subscribers (CLI
     /// `--json-events`, GUI Tauri commands) can stream events for
     /// any run that this process started.
@@ -146,13 +169,10 @@ impl Engine {
             user_resources = user_count,
             "seeded resource registry",
         );
-        let env_report = environment::detect(&home, &pool).await;
-        tracing::info!(
-            platform = ?env_report.platform,
-            namespaces = env_report.namespaces.len(),
-            endpoints = env_report.endpoints.len(),
-            "environment probe",
-        );
+        // The env-runtime boot probe (Task 4) will populate env_registry +
+        // env_catalogs from `env_specs` rows. Until that lands the engine
+        // starts with no envs registered; workflows with a `target_env`
+        // will fail validation at load time.
         Ok(Self {
             pool,
             registry: Arc::new(registry),
@@ -161,31 +181,31 @@ impl Engine {
             events: Arc::new(events_registry::EventRegistry::new()),
             home,
             secrets_store,
-            environment: ArcSwap::new(Arc::new(env_report)),
+            env_registry: Arc::new(environment::runtime::EnvRegistry::new()),
+            env_catalogs: ArcSwap::new(Arc::new(HashMap::new())),
+            env_disabled_specs: ArcSwap::new(Arc::new(HashMap::new())),
             env_refresh_lock: tokio::sync::Mutex::new(()),
+            env_refresh_epoch: AtomicU64::new(0),
             run_senders: Arc::new(Mutex::new(HashMap::new())),
             run_tokens: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    /// Snapshot of the host environment captured at boot — platform,
-    /// namespaces, and the LLM endpoints discovered inside them.
-    /// Cheap (loads an `Arc` from the `ArcSwap` cache); never re-probes.
+    /// Engine-owned env registry. Lock-free reads via the inner `ArcSwap`.
+    /// Empty until the boot probe (Task 4) populates it.
     #[must_use]
-    pub fn environment(&self) -> Arc<environment::EnvironmentReport> {
-        self.environment.load_full()
+    pub fn env_registry(&self) -> Arc<environment::runtime::EnvRegistry> {
+        Arc::clone(&self.env_registry)
     }
 
-    /// Re-run host environment discovery and atomically swap the
-    /// cached report. Serialized via an internal mutex so concurrent
-    /// callers don't race; later callers observe the latest result.
-    pub async fn refresh_environment(
+    /// Cloned snapshot of every env's last-probed catalog. Returns an empty
+    /// map if no probe has completed (boot is async; the catalog map starts
+    /// empty in [`Self::new`]).
+    #[must_use]
+    pub fn env_catalogs(
         &self,
-    ) -> std::result::Result<Arc<environment::EnvironmentReport>, EngineError> {
-        let _guard = self.env_refresh_lock.lock().await;
-        let report = environment::detect(&self.home, &self.pool).await;
-        self.environment.store(Arc::new(report));
-        Ok(self.environment.load_full())
+    ) -> Arc<HashMap<environment::runtime::EnvId, Arc<environment::runtime::ResourceCatalog>>> {
+        self.env_catalogs.load_full()
     }
 
     /// Shared secrets store. Backed by `<home>/secrets-index.json`

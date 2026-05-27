@@ -13,6 +13,7 @@ pub mod builtin;
 pub mod catalog;
 pub mod dispatcher;
 pub mod env;
+pub mod env_registry;
 pub mod error;
 pub mod helper;
 pub mod local;
@@ -121,3 +122,10 @@ pub use run_snapshot::RunSnapshot;
 
 /// Per-env probe catalog with run-local monotonic overlay + singleflight re-probe.
 pub use run_catalog::RunCatalog;
+
+// ── Engine env registry ──────────────────────────────────────────────────────
+
+/// Engine-owned per-env state: `EnvEntry` pairs `Arc<EnvInfo>` with
+/// `Arc<dyn Dispatcher>`; `EnvRegistry` is the ArcSwap-backed map that the
+/// boot probe and refresh swap atomically.
+pub use env_registry::{EnvEntry, EnvRegistry};
