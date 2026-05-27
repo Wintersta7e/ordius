@@ -127,6 +127,27 @@ pub enum EngineError {
         /// Number of resource definitions in the child workflow.
         resource_count: usize,
     },
+    /// An [`add_env`](crate::Engine::add_env) call combined an env id with a
+    /// spec variant whose kind doesn't match the id prefix (e.g. `wsl:Ubuntu`
+    /// paired with `EnvSpec::Local`, or a WSL id whose `name` doesn't match
+    /// the suffix). Caught at the writer boundary so the boot probe never
+    /// builds a wrong-kind dispatcher.
+    #[error("env id '{id}' does not match spec kind '{spec_kind}'")]
+    EnvIdSpecMismatch {
+        /// Offending env id.
+        id: String,
+        /// Spec kind that failed the consistency check (one of
+        /// `local`, `wsl`, `ssh`, `container`).
+        spec_kind: &'static str,
+    },
+    /// A writer (typically [`set_env_enabled`](crate::Engine::set_env_enabled))
+    /// tried to disable a row the engine cannot run without. Today this only
+    /// applies to the canonical Local env — every workflow's `default_env`
+    /// resolves to Local unless overridden, so a disabled Local would break
+    /// snapshot construction. Surfaced so the IPC layer can show a clear
+    /// "Local cannot be disabled" message instead of a generic Db error.
+    #[error("env '{0}' cannot be disabled")]
+    EnvCannotBeDisabled(crate::environment::runtime::EnvId),
     /// A code path that intentionally returns `NotImplemented` in this
     /// release. The static string identifies the missing capability
     /// (e.g. `"container backend"` for the v1.0 stub).

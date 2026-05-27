@@ -358,6 +358,7 @@ impl Engine {
         enabled: bool,
         spec: environment::runtime::EnvSpec,
     ) -> Result<()> {
+        validate_id_spec_kind(&id, &spec)?;
         let _guard = self.env_refresh_lock.lock().await;
         let spec_json =
             serde_json::to_string(&spec).map_err(|e| EngineError::Db(format!("EnvSpec: {e}")))?;
@@ -403,6 +404,14 @@ impl Engine {
         id: &environment::runtime::EnvId,
         enabled: bool,
     ) -> Result<()> {
+        // Local cannot be disabled. Snapshot construction defaults to Local
+        // when a workflow omits `default_env`, and `validate_nodes` treats
+        // Local as always-valid — a disabled Local would corrupt both
+        // invariants. Reject at the writer so the IPC can render the
+        // constraint explicitly.
+        if !enabled && *id == environment::runtime::EnvId::local() {
+            return Err(EngineError::EnvCannotBeDisabled(id.clone()));
+        }
         let _guard = self.env_refresh_lock.lock().await;
         let now = chrono::Utc::now().timestamp_millis();
         let conn = self.pool.get()?;
@@ -713,6 +722,52 @@ enum RefreshPending {
     /// Row absent or disabled at lock-read time. Handled inline (no probe);
     /// the env's entry + catalog are dropped under the lock.
     Remove { env_id: environment::runtime::EnvId },
+}
+
+/// Reject (id, spec) combinations whose kinds don't match — e.g. `wsl:Ubuntu`
+/// paired with `EnvSpec::Local`, or a `wsl:` id whose suffix differs from the
+/// spec's `name`. Without this, the boot probe would silently construct a
+/// `LocalDispatcher` under a WSL id (and never reach the actual distro).
+fn validate_id_spec_kind(
+    id: &environment::runtime::EnvId,
+    spec: &environment::runtime::EnvSpec,
+) -> Result<()> {
+    use environment::runtime::{EnvId, EnvSpec};
+
+    let id_str = id.as_str();
+    let mismatch = || EngineError::EnvIdSpecMismatch {
+        id: id_str.to_string(),
+        spec_kind: spec.kind_str(),
+    };
+
+    if id_str == EnvId::LOCAL {
+        return if matches!(spec, EnvSpec::Local { .. }) {
+            Ok(())
+        } else {
+            Err(mismatch())
+        };
+    }
+    if let Some(suffix) = id_str.strip_prefix("wsl:") {
+        return match spec {
+            EnvSpec::WslDistro { name, .. } if name == suffix => Ok(()),
+            _ => Err(mismatch()),
+        };
+    }
+    if id_str.starts_with("ssh:") {
+        return if matches!(spec, EnvSpec::Ssh { .. }) {
+            Ok(())
+        } else {
+            Err(mismatch())
+        };
+    }
+    if id_str.starts_with("container:") {
+        return if matches!(spec, EnvSpec::Container { .. }) {
+            Ok(())
+        } else {
+            Err(mismatch())
+        };
+    }
+    Err(mismatch())
 }
 
 /// Background refresh body for `RefreshPending::Full`. Re-probes every env

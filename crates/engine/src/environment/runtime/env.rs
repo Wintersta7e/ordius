@@ -182,6 +182,21 @@ pub enum EnvSpec {
     },
 }
 
+impl EnvSpec {
+    /// Short token identifying the variant — `local`, `wsl`, `ssh`, or
+    /// `container`. Matches the `EnvId` prefix conventions so the two can
+    /// be cross-checked at writer boundaries.
+    #[must_use]
+    pub const fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Local { .. } => "local",
+            Self::WslDistro { .. } => "wsl",
+            Self::Ssh { .. } => "ssh",
+            Self::Container { .. } => "container",
+        }
+    }
+}
+
 /// How the workflow's workspace directory reaches inside an environment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
