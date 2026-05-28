@@ -485,6 +485,10 @@ export type RunEventType =
   | "node:loop"
   | "node:paused"
   | "node:resumed"
+  // Emitted by the engine when an `llm` node with `stream: "auto"`
+  // can't stream the resolved route (e.g. WSL EnvLoopback without
+  // HostDirect). Payload matches `StreamFallbackPayload`.
+  | "stream:fallback"
   // Synthesized by the desktop crate when the broadcast subscriber
   // falls behind; payload carries `dropped: number`.
   | "stream:lagged";

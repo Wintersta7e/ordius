@@ -27,6 +27,10 @@ export interface LiveRunState {
   activeEdges: Set<string>;
   traveledEdges: Set<string>;
   events: RunEvent[];
+  /** Per-node warning messages accumulated across the run. Currently
+   * populated from `stream:fallback` events so the run panel can show
+   * a ⚠ chip next to nodes whose llm streaming was downgraded. */
+  nodeWarnings?: Record<string, string[]>;
 }
 
 export function emptyRunState(): LiveRunState {
@@ -39,6 +43,7 @@ export function emptyRunState(): LiveRunState {
     activeEdges: new Set(),
     traveledEdges: new Set(),
     events: [],
+    nodeWarnings: {},
   };
 }
 
@@ -56,6 +61,7 @@ export function reduceRunEvent(state: LiveRunState, event: RunEvent): LiveRunSta
       next.statusByNode = {};
       next.activeEdges = new Set();
       next.traveledEdges = new Set();
+      next.nodeWarnings = {};
       break;
     case "workflow:done":
       next.status = "done";
@@ -101,6 +107,20 @@ export function reduceRunEvent(state: LiveRunState, event: RunEvent): LiveRunSta
         };
       }
       break;
+    case "stream:fallback": {
+      if (!event.nodeId) break;
+      const reason = String(event["reason"] ?? "unknown");
+      const url = String(event["url"] ?? "");
+      const message = `streaming fell back to non-streaming · ${reason}${
+        url ? ` · ${url}` : ""
+      }`;
+      const prev = state.nodeWarnings?.[event.nodeId] ?? [];
+      next.nodeWarnings = {
+        ...(state.nodeWarnings ?? {}),
+        [event.nodeId]: [...prev, message],
+      };
+      break;
+    }
     default:
       break;
   }
@@ -251,7 +271,15 @@ export function RunPanel({ state, onStop }: Props): JSX.Element {
           </div>
         ) : (
           state.events.map((event) => (
-            <EventRow key={`${event.runId}-${event.seq}`} event={event} />
+            <EventRow
+              key={`${event.runId}-${event.seq}`}
+              event={event}
+              warnings={
+                event.nodeId
+                  ? state.nodeWarnings?.[event.nodeId] ?? null
+                  : null
+              }
+            />
           ))
         )}
       </div>
@@ -259,8 +287,15 @@ export function RunPanel({ state, onStop }: Props): JSX.Element {
   );
 }
 
-function EventRow({ event }: { event: RunEvent }): JSX.Element {
+function EventRow({
+  event,
+  warnings,
+}: {
+  event: RunEvent;
+  warnings: string[] | null;
+}): JSX.Element {
   const color = eventColor(event.type);
+  const hasWarnings = warnings != null && warnings.length > 0;
   return (
     <div
       style={{
@@ -288,6 +323,21 @@ function EventRow({ event }: { event: RunEvent }): JSX.Element {
           <>
             {" "}
             <span style={{ color: "var(--accent)" }}>{event.nodeId}</span>
+            {hasWarnings ? (
+              <span
+                title={warnings.join("\n")}
+                style={{
+                  color: "var(--warn)",
+                  marginLeft: 4,
+                  cursor: "help",
+                }}
+                aria-label={`${warnings.length} stream warning${
+                  warnings.length === 1 ? "" : "s"
+                }`}
+              >
+                ⚠
+              </span>
+            ) : null}
           </>
         ) : null}
         {summariseEvent(event)}
@@ -301,7 +351,12 @@ function eventColor(type: string): string {
   if (type === "node:error" || type === "workflow:error") return "var(--err)";
   if (type === "node:retry") return "var(--warn)";
   if (type === "node:output") return "var(--accent)";
-  if (type === "workflow:stopped" || type === "stream:lagged") return "var(--warn)";
+  if (
+    type === "workflow:stopped" ||
+    type === "stream:lagged" ||
+    type === "stream:fallback"
+  )
+    return "var(--warn)";
   if (type === "node:started" || type === "workflow:started") return "var(--info)";
   return "var(--txt-dim)";
 }
@@ -336,6 +391,14 @@ function summariseEvent(event: RunEvent): string {
       return dropped != null
         ? ` · ${String(dropped)} dropped — refresh from history for accuracy`
         : "";
+    }
+    case "stream:fallback": {
+      const url = event["url"];
+      const reason = event["reason"];
+      const parts: string[] = ["[stream-fallback]"];
+      if (url != null && String(url).length > 0) parts.push(String(url));
+      if (reason != null && String(reason).length > 0) parts.push(String(reason));
+      return ` · ${parts.join(" · ")}`;
     }
     default:
       return "";
