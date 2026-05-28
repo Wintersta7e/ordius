@@ -94,6 +94,10 @@ export interface Node {
   timeoutMs?: number | null;
   retry?: RetryPolicy | null;
   continueOnError: boolean;
+  /** Optional override of the workflow's default env. `null` or
+   * undefined inherits the workflow default. Mirrors the engine's
+   * `Node.target_env` field. */
+  targetEnv?: string | null;
 }
 
 export type EdgeType = "forward" | "loop";
@@ -130,6 +134,31 @@ export interface Workflow {
   triggers: Trigger[];
   nodes: Node[];
   edges: Edge[];
+  /** Default env for nodes that don't set `targetEnv`. `null` or
+   * undefined falls back to `"local"`. Mirrors the engine's
+   * `Workflow.default_env` field. */
+  defaultEnv?: string | null;
+}
+
+/**
+ * Run-event payload emitted when an `llm` node with
+ * `stream: "auto"` falls back to non-streaming because the resolved
+ * route can't stream (e.g. WSL EnvLoopback without HostDirect
+ * verified). The run panel surfaces these as a per-node warning
+ * badge plus a log line.
+ */
+export interface StreamFallbackPayload {
+  type: "stream:fallback";
+  seq: number;
+  emittedAt: number;
+  runId: string;
+  nodeId: string;
+  iteration: number;
+  attempt: number;
+  /** The URL the executor tried to stream against. */
+  url: string;
+  /** The reason streaming fell back. Free-form string from the engine. */
+  reason: string;
 }
 
 /**
