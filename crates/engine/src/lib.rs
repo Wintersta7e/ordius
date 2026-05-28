@@ -221,6 +221,14 @@ fn resolve_probe_for_test(
     // `EnvLocal` rows during a live run snapshot, so checking it first
     // would silently route a user's `override_lower_scope: true` shadow
     // through the Builtin's probe spec.
+    //
+    // NOTE: this resolves the probe spec correctly for the override
+    // case, but the env catalog itself (used by `test_host_direct` for
+    // the `base_url`) is built from the registry and inherits the same
+    // gap — a Builtin id shadowed by an env-local override is still
+    // probed against the Builtin's ports at refresh time. Closing that
+    // gap requires installing `EnvLocal` layers into the engine-level
+    // registry at refresh time, not just at run-snapshot construction.
     let row = environment::runtime::boot_probe::load_spec_single(&engine.pool, env_id)
         .map_err(|e| EngineError::Db(format!("load env spec: {e}")))?
         .ok_or_else(|| EngineError::EnvUnknown(env_id.clone()))?;
