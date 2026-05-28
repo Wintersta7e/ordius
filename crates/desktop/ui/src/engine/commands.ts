@@ -7,6 +7,7 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 import type {
   EnvAddIpc,
+  EnvDefinitionListIpc,
   EnvSnapshotIpc,
   LoadWorkflowResultIpc,
   NodeType,
@@ -193,4 +194,19 @@ export function setEnvironmentEnabled(
   enabled: boolean,
 ): Promise<EnvSnapshotIpc> {
   return invoke("environment_set_enabled", { envId, enabled });
+}
+
+/**
+ * List resource definitions visible to `(envId, workflowId?)`. Used by
+ * the workflow editor's Resource Picker, which needs full capability +
+ * scope info that `listEnvironments()` strips.
+ */
+export function envDefinitions(
+  envId: string,
+  workflowId?: string,
+): Promise<EnvDefinitionListIpc> {
+  return invoke("environment_definitions", {
+    envId,
+    workflowId: workflowId ?? null,
+  });
 }

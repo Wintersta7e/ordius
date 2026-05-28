@@ -26,6 +26,7 @@ use crate::dto::{
 };
 use crate::state::AppState;
 use ordius_engine::settings::Settings as EngineSettings;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -559,6 +560,58 @@ pub async fn environment_set_enabled(
     Ok(build_env_snapshot(&state.engine))
 }
 
+/// List resource definitions visible to `(env_id, workflow_id?)`.
+///
+/// Returns each definition's declaring scope, advertised + proven
+/// capabilities, and the latest probe outcome. Used by the workflow
+/// editor's Resource Picker, which needs full capability info that the
+/// `environment_list` snapshot strips to keep the global poll cheap.
+#[tauri::command]
+pub fn environment_definitions(
+    state: tauri::State<'_, AppState>,
+    env_id: String,
+    workflow_id: Option<String>,
+) -> Result<crate::dto::EnvDefinitionListIpc, String> {
+    use ordius_engine::environment::runtime::{EnvId, WorkflowId};
+
+    let engine = &state.engine;
+    let env = EnvId::new(env_id.clone());
+    let wf = workflow_id.clone().map(WorkflowId);
+
+    let registry = engine.resource_registry();
+    let snap = registry.snapshot();
+    let catalogs = engine.env_catalogs();
+    let catalog = catalogs.get(&env).cloned();
+
+    let mut definitions = Vec::with_capacity(snap.layers.values().map(HashMap::len).sum());
+    for (def, scope) in snap.visible_to(&env, wf.as_ref()) {
+        let outcome_ref = catalog.as_ref().and_then(|c| c.resources.get(&def.id));
+        let (proven, route_origin, base_url, version) = extract_probe_detail(outcome_ref);
+        definitions.push(crate::dto::EnvDefinitionIpc {
+            id: def.id.0.clone(),
+            kind: resource_kind_str(def.kind).to_string(),
+            scope: scope_key_str(&scope).to_string(),
+            advertised_capabilities: def
+                .advertised_capabilities
+                .iter()
+                .map(|c| capability_str(*c))
+                .collect(),
+            proven_capabilities: proven,
+            outcome: probe_outcome_ipc(outcome_ref),
+            route_origin,
+            base_url,
+            version,
+        });
+    }
+
+    Ok(crate::dto::EnvDefinitionListIpc {
+        env_id,
+        workflow_id,
+        registry_revision: snap.revision,
+        definitions,
+    })
+}
+
 /// Loud-failure shim for the session-C `system_environment` command.
 ///
 /// Frontends that still call this see a clear rename message rather than
@@ -748,6 +801,96 @@ const fn route_origin_str(
         RouteOrigin::HostDirect => "host_direct",
         RouteOrigin::ForwardedTunnel => "forwarded_tunnel",
         RouteOrigin::ContainerBridge => "container_bridge",
+    }
+}
+
+const fn resource_kind_str(
+    kind: ordius_engine::environment::runtime::ResourceKind,
+) -> &'static str {
+    use ordius_engine::environment::runtime::ResourceKind;
+    match kind {
+        ResourceKind::HttpEndpoint => "http_endpoint",
+        ResourceKind::Binary => "binary",
+        ResourceKind::Toolchain => "toolchain",
+    }
+}
+
+const fn scope_key_str(scope: &ordius_engine::environment::runtime::ScopeKey) -> &'static str {
+    use ordius_engine::environment::runtime::ScopeKey;
+    match scope {
+        ScopeKey::Builtin => "builtin",
+        ScopeKey::UserGlobal => "user_global",
+        ScopeKey::EnvLocal { .. } => "env_local",
+        ScopeKey::Workflow { .. } => "workflow",
+    }
+}
+
+/// Capability variants serialise with `rename_all = "snake_case"`. Routing
+/// through `serde_json` avoids re-listing every variant; if a new variant
+/// lands without a snake-case derive the fallback `"unknown"` surfaces it
+/// loudly in the UI rather than crashing.
+fn capability_str(c: ordius_engine::environment::runtime::Capability) -> String {
+    serde_json::to_value(c)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn probe_outcome_ipc(
+    outcome: Option<&ordius_engine::environment::runtime::ResourceProbeOutcome>,
+) -> crate::dto::ResourceProbeOutcomeIpc {
+    use ordius_engine::environment::runtime::ResourceProbeOutcome;
+    match outcome {
+        None => crate::dto::ResourceProbeOutcomeIpc::Unknown,
+        Some(ResourceProbeOutcome::Found(_)) => crate::dto::ResourceProbeOutcomeIpc::Found,
+        Some(ResourceProbeOutcome::NotFound) => crate::dto::ResourceProbeOutcomeIpc::NotFound,
+        Some(ResourceProbeOutcome::Skipped { reason }) => {
+            crate::dto::ResourceProbeOutcomeIpc::Skipped(reason.clone())
+        },
+        Some(ResourceProbeOutcome::TimedOut) => crate::dto::ResourceProbeOutcomeIpc::TimedOut,
+        Some(ResourceProbeOutcome::ProbeFailed { reason }) => {
+            crate::dto::ResourceProbeOutcomeIpc::ProbeFailed(reason.clone())
+        },
+    }
+}
+
+/// For a `Found` outcome, pull out the wire-shaped detail fields the
+/// Resource Picker needs: proven capabilities, route origin, base URL,
+/// and version. Returns empty / `None` for every other outcome.
+fn extract_probe_detail(
+    outcome: Option<&ordius_engine::environment::runtime::ResourceProbeOutcome>,
+) -> (Vec<String>, Option<String>, Option<String>, Option<String>) {
+    use ordius_engine::environment::runtime::{ResourceDetail, ResourceProbeOutcome};
+    match outcome {
+        Some(ResourceProbeOutcome::Found(detail)) => match detail {
+            ResourceDetail::HttpEndpoint {
+                base_url,
+                routes_by_capability,
+                version,
+                route_origin,
+                ..
+            } => (
+                routes_by_capability
+                    .keys()
+                    .map(|c| capability_str(*c))
+                    .collect(),
+                Some(route_origin_str(*route_origin).to_string()),
+                Some(base_url.clone()),
+                version.clone(),
+            ),
+            ResourceDetail::Binary {
+                version,
+                capabilities,
+                ..
+            } => (
+                capabilities.iter().map(|c| capability_str(*c)).collect(),
+                None,
+                None,
+                version.clone(),
+            ),
+            ResourceDetail::Toolchain { version, .. } => (Vec::new(), None, None, version.clone()),
+        },
+        _ => (Vec::new(), None, None, None),
     }
 }
 

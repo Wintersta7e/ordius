@@ -665,6 +665,82 @@ const fn default_enabled() -> bool {
     true
 }
 
+// ─── Resource picker definitions ─────────────────────────────────
+
+/// One resource definition + its current probe outcome.
+///
+/// Scoped to an `(env_id, workflow_id?)` context. Used by the workflow
+/// editor's Resource Picker, which needs full capability + scope info
+/// that the [`EnvResourceIpc`] snapshot strips to keep the global poll
+/// cheap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvDefinitionIpc {
+    /// Stable resource id (matches the `ResourceDefinition::id`).
+    pub id: String,
+    /// `"http_endpoint" | "binary" | "toolchain"`.
+    pub kind: String,
+    /// Scope where this resource was declared. One of `"builtin"`,
+    /// `"user_global"`, `"env_local"`, `"workflow"`.
+    pub scope: String,
+    /// Capabilities the definition advertises (snake-case strings
+    /// matching `Capability`'s serde rename).
+    pub advertised_capabilities: Vec<String>,
+    /// Capabilities the latest probe *proved*. Subset of advertised.
+    /// Empty for non-`Found` outcomes.
+    pub proven_capabilities: Vec<String>,
+    /// Outcome of the latest probe of this resource. `Unknown` means the
+    /// catalog has no entry for this resource at all (cache miss
+    /// distinct from `NotFound`).
+    pub outcome: ResourceProbeOutcomeIpc,
+    /// `RouteOrigin` (snake-case) when outcome is `Found` AND kind is
+    /// `http_endpoint`; `None` otherwise.
+    pub route_origin: Option<String>,
+    /// Base URL when outcome is `Found` AND kind is `http_endpoint`.
+    pub base_url: Option<String>,
+    /// Version string when the probe captured one.
+    pub version: Option<String>,
+}
+
+/// Probe outcome flattened for the wire.
+///
+/// Mirrors `ordius_engine::environment::runtime::ResourceProbeOutcome`
+/// plus an `Unknown` variant for resources absent from the catalog
+/// (cache miss distinct from `NotFound`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "outcome", content = "reason", rename_all = "snake_case")]
+pub enum ResourceProbeOutcomeIpc {
+    /// The resource was reachable and details were captured.
+    Found,
+    /// No process / binary was discovered for this resource.
+    NotFound,
+    /// The probe was deliberately skipped; carries the reason.
+    Skipped(String),
+    /// The per-resource deadline elapsed.
+    TimedOut,
+    /// The probe request failed; carries the reason.
+    ProbeFailed(String),
+    /// The catalog has no entry for this resource (cache miss).
+    Unknown,
+}
+
+/// Listing returned by `environment_definitions(env_id, workflow_id?)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvDefinitionListIpc {
+    /// Env the definitions are scoped to.
+    pub env_id: String,
+    /// Workflow scope, when the caller asked for workflow-visible defs.
+    pub workflow_id: Option<String>,
+    /// Registry revision captured at snapshot time. UI uses it to
+    /// debounce/invalidate cached pickers.
+    pub registry_revision: u64,
+    /// One row per resource visible to `(env_id, workflow_id?)`. Order
+    /// matches `ResourceRegistry::visible_to` (highest precedence
+    /// scope first).
+    pub definitions: Vec<EnvDefinitionIpc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

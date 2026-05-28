@@ -310,6 +310,64 @@ export interface EnvAddIpc {
   spec: unknown;
 }
 
+// ─── Resource picker definitions ─────────────────────────────────
+// Mirrors `crates/desktop/src/dto.rs` (`EnvDefinitionListIpc` family).
+// The workflow editor's Resource Picker needs full capability + scope
+// info that `EnvResourceIpc` strips, so this is a separate endpoint.
+
+/**
+ * Probe outcome flattened for the wire. `unknown` represents a cache
+ * miss (no catalog entry for the resource at all), distinct from
+ * `not_found` which means the probe ran and found nothing.
+ */
+export type ResourceProbeOutcomeIpc =
+  | { outcome: "found" }
+  | { outcome: "not_found" }
+  | { outcome: "skipped"; reason: string }
+  | { outcome: "timed_out" }
+  | { outcome: "probe_failed"; reason: string }
+  | { outcome: "unknown" };
+
+/**
+ * One resource definition + its current probe outcome, scoped to an
+ * `(envId, workflowId?)` context.
+ */
+export interface EnvDefinitionIpc {
+  /** Stable resource id (matches the engine's `ResourceDefinition::id`). */
+  id: string;
+  /** Probe kind. */
+  kind: "http_endpoint" | "binary" | "toolchain";
+  /** Scope where the definition was declared. */
+  scope: "builtin" | "user_global" | "env_local" | "workflow";
+  /** Capabilities the definition advertises (snake-case wire strings). */
+  advertisedCapabilities: string[];
+  /** Capabilities the latest probe proved. Subset of `advertisedCapabilities`. */
+  provenCapabilities: string[];
+  outcome: ResourceProbeOutcomeIpc;
+  /**
+   * Route origin when outcome is `found` AND kind is `http_endpoint`;
+   * `null` otherwise.
+   */
+  routeOrigin: RouteOriginIpc | null;
+  /** Base URL when outcome is `found` AND kind is `http_endpoint`. */
+  baseUrl: string | null;
+  /** Version string when the probe captured one. */
+  version: string | null;
+}
+
+/** Listing returned by `environmentDefinitions(envId, workflowId?)`. */
+export interface EnvDefinitionListIpc {
+  envId: string;
+  workflowId: string | null;
+  /** Registry revision captured at snapshot time, for cache invalidation. */
+  registryRevision: number;
+  /**
+   * One row per resource visible to `(envId, workflowId?)`. Order
+   * matches the engine's `visible_to` precedence (highest scope first).
+   */
+  definitions: EnvDefinitionIpc[];
+}
+
 export interface RunWorkflowArgs {
   workflowId: string;
   variables?: Record<string, string>;
