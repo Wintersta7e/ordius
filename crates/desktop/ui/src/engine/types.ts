@@ -132,6 +132,24 @@ export interface Workflow {
   edges: Edge[];
 }
 
+/**
+ * Non-fatal lint emitted by the engine's workflow loader. The `kind`
+ * is the snake-case discriminant (`loopback_url_in_remote_env`, plus
+ * `unknown` for forward-compat with `#[non_exhaustive]` engine
+ * variants); render `message` verbatim.
+ */
+export interface WorkflowWarningIpc {
+  nodeId: string;
+  kind: string;
+  message: string;
+}
+
+/** Envelope returned by `load_workflow`. */
+export interface LoadWorkflowResultIpc {
+  workflow: Workflow;
+  warnings: WorkflowWarningIpc[];
+}
+
 // ─── DTOs that only exist at the Tauri boundary ─────────────────
 
 export interface SavedWorkflow {

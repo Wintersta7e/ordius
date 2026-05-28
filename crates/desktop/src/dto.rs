@@ -164,6 +164,53 @@ impl From<&Workflow> for SavedWorkflowDto {
 /// `snake_case` on-disk format.
 pub type WorkflowDto = JsonCamel<Workflow>;
 
+/// Envelope returned from `load_workflow`.
+///
+/// Carries the workflow plus any non-fatal lint warnings the loader
+/// emitted (e.g. loopback URLs targeting a non-local env) so the
+/// editor can render them inline without re-running the validator.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadWorkflowDto {
+    /// The workflow itself, camelCased for the webview.
+    pub workflow: WorkflowDto,
+    /// Per-node warnings emitted during load. May be empty.
+    pub warnings: Vec<WorkflowWarningDto>,
+}
+
+/// One workflow-load warning surfaced to the editor. Wire shape
+/// mirrors `ordius_engine::workflows::WorkflowWarning`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowWarningDto {
+    /// Id of the node the warning applies to.
+    pub node_id: String,
+    /// Snake-case discriminant matching `WorkflowWarningKind`.
+    /// Unknown future variants serialise as `"unknown"` so the
+    /// frontend can render them with a generic label.
+    pub kind: String,
+    /// Human-readable explanation suitable for surfacing in the UI.
+    pub message: String,
+}
+
+impl From<ordius_engine::workflows::WorkflowWarning> for WorkflowWarningDto {
+    fn from(w: ordius_engine::workflows::WorkflowWarning) -> Self {
+        use ordius_engine::workflows::WorkflowWarningKind;
+        let kind = match w.kind {
+            WorkflowWarningKind::LoopbackUrlInRemoteEnv => "loopback_url_in_remote_env",
+            // The engine marks `WorkflowWarningKind` as
+            // `#[non_exhaustive]`; new variants must not break this
+            // boundary, so fall back to a generic discriminant.
+            _ => "unknown",
+        };
+        Self {
+            node_id: w.node_id,
+            kind: kind.to_string(),
+            message: w.message,
+        }
+    }
+}
+
 /// Payload returned from `run_workflow` — the frontend immediately
 /// uses `runId` to subscribe to the live event stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -20,9 +20,9 @@
 #![allow(clippy::unnecessary_wraps)]
 
 use crate::dto::{
-    EndpointStatusDto, JsonCamel, ModelEndpointDto, NodeRunRowDto, NodeTypeDto, RunDetailDto,
-    RunEventDto, RunRowDto, RunStartedDto, RunWorkflowArgs, SavedWorkflowDto, SecretMetaDto,
-    SettingsDto, SystemStatusDto, WorkflowDto, WorkspaceDto,
+    EndpointStatusDto, JsonCamel, LoadWorkflowDto, ModelEndpointDto, NodeRunRowDto, NodeTypeDto,
+    RunDetailDto, RunEventDto, RunRowDto, RunStartedDto, RunWorkflowArgs, SavedWorkflowDto,
+    SecretMetaDto, SettingsDto, SystemStatusDto, WorkflowDto, WorkspaceDto,
 };
 use crate::state::AppState;
 use ordius_engine::settings::Settings as EngineSettings;
@@ -74,11 +74,29 @@ pub fn list_workflows(state: tauri::State<'_, AppState>) -> Result<Vec<SavedWork
 }
 
 /// Load a single workflow by id.
+///
+/// Goes through `Engine::load_workflow_for_run` so the editor sees
+/// the same lint pass the run path applies — non-fatal warnings
+/// (e.g. a loopback `http.url` targeting a non-local env) ride along
+/// in the response so the UI can render them inline.
 #[tauri::command]
-pub fn load_workflow(state: tauri::State<'_, AppState>, id: String) -> Result<WorkflowDto, String> {
+pub fn load_workflow(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<LoadWorkflowDto, String> {
     validate_workflow_id(&id)?;
-    let wf = ordius_engine::workflows::load(state.engine.home(), &id).map_err(|e| e.to_string())?;
-    Ok(JsonCamel(wf))
+    let engine = &state.engine;
+    let (wf_arc, warnings) = engine
+        .load_workflow_for_run(engine.home(), &id)
+        .map_err(|e| e.to_string())?;
+    // `load_workflow_for_run` returns `Arc<Workflow>` to keep the
+    // run path cheap; the IPC boundary needs an owned value to wrap
+    // in `JsonCamel`. The clone is one-per-load, not per-event.
+    let wf = (*wf_arc).clone();
+    Ok(LoadWorkflowDto {
+        workflow: JsonCamel(wf),
+        warnings: warnings.into_iter().map(Into::into).collect(),
+    })
 }
 
 /// Persist a workflow to disk. Validates structure before saving;

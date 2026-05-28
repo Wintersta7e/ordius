@@ -11,6 +11,7 @@ import type { JSX } from "react";
 import {
   type NodeType,
   type Workflow,
+  type WorkflowWarningIpc,
   type Workspace,
   listNodeTypes,
   listWorkflows,
@@ -66,6 +67,11 @@ export function Editor({
   const [tabs, setTabs] = useState<WorkflowTab[]>([]);
   const [activeId, setActiveId] = useState<string | null>(workflowId ?? null);
   const [workflow, setWorkflow] = useState<Workflow | null>(null);
+  // Per-load, non-fatal lint warnings surfaced by the engine loader
+  // (e.g. `loopback_url_in_remote_env`). Rendered as a dismissable
+  // stack between the chrome and the canvas. Dismissal is session-
+  // local; reload re-fetches the list from the IPC.
+  const [warnings, setWarnings] = useState<WorkflowWarningIpc[]>([]);
   const [nodeTypes, setNodeTypes] = useState<NodeType[]>([]);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
@@ -197,6 +203,7 @@ export function Editor({
     if (!workflowId) {
       const fresh = makeBlankWorkflow();
       setWorkflow(fresh);
+      setWarnings([]);
       setTabs((existing) => {
         if (existing.some((t) => t.id === fresh.id)) return existing;
         return [
@@ -211,6 +218,8 @@ export function Editor({
       setError(
         "running in browser preview · engine commands disabled — launch via `tauri dev` to open real workflows",
       );
+      // No engine → no warnings to surface.
+      setWarnings([]);
       // Unsaved tabs (id starts with `new-`) have no on-disk source,
       // so re-activating one in browser preview should keep its
       // blank canvas — not silently swap in the demo fixture.
@@ -240,9 +249,11 @@ export function Editor({
     let cancelled = false;
     void (async () => {
       try {
-        const wf = await loadWorkflow(workflowId);
+        const result = await loadWorkflow(workflowId);
         if (cancelled) return;
+        const wf = result.workflow;
         setWorkflow(wf);
+        setWarnings(result.warnings);
         setTabs((existing) => {
           if (existing.some((t) => t.id === wf.id)) return existing;
           return [
@@ -803,11 +814,18 @@ export function Editor({
     return { from, to: connect.cursorWorld };
   })();
 
+  // Splice an `auto` row in for the workflow-warning stack so the
+  // banners ride above the main column without squeezing the canvas.
+  const gridTemplateRows =
+    warnings.length > 0
+      ? "44px 30px auto 1fr 22px"
+      : "44px 30px 1fr 22px";
+
   return (
     <div
       style={{
         display: "grid",
-        gridTemplateRows: "44px 30px 1fr 22px",
+        gridTemplateRows,
         height: "100vh",
         minHeight: 720,
         background: "var(--bg)",
@@ -836,6 +854,32 @@ export function Editor({
         onClose={handleClose}
         onNew={handleNewTab}
       />
+
+      {warnings.length > 0 ? (
+        <section
+          aria-label="Workflow load warnings"
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+            padding: "8px 12px",
+            background: "var(--bg-panel)",
+            borderBottom: "1px solid var(--line)",
+          }}
+        >
+          {warnings.map((w, idx) => (
+            <NoticeBanner
+              key={`${w.nodeId}:${w.kind}:${idx}`}
+              kind="warn"
+              title={w.nodeId}
+              message={w.message}
+              onDismiss={() =>
+                setWarnings((prev) => prev.filter((_, i) => i !== idx))
+              }
+            />
+          ))}
+        </section>
+      ) : null}
 
       <main
         style={{

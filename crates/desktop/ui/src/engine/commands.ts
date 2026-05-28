@@ -8,6 +8,7 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 import type {
   EnvAddIpc,
   EnvSnapshotIpc,
+  LoadWorkflowResultIpc,
   NodeType,
   RunDetail,
   RunEvent,
@@ -28,7 +29,7 @@ export function listWorkflows(): Promise<SavedWorkflow[]> {
   return invoke("list_workflows");
 }
 
-export function loadWorkflow(id: string): Promise<Workflow> {
+export function loadWorkflow(id: string): Promise<LoadWorkflowResultIpc> {
   return invoke("load_workflow", { id });
 }
 
