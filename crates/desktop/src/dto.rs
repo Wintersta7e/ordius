@@ -667,20 +667,20 @@ const fn default_enabled() -> bool {
 
 /// Payload accepted by `environment_add_resource`.
 ///
-/// The `definition` is the raw JSON form of
-/// `ordius_engine::environment::runtime::ResourceDefinition` — the engine
-/// parses it server-side so the desktop crate stays decoupled from the
-/// definition's internal shape. Set `overrideLowerScope: true` on the
-/// inner JSON when the new resource shadows a built-in id.
+/// `definition` is a `ResourceDefinition` rendered in `camelCase` keys
+/// at the Tauri boundary — `JsonCamel` rewrites them to `snake_case`
+/// before handing the value to serde, so any mismatch surfaces as a
+/// typed deserialize error with the offending field path. Set
+/// `overrideLowerScope: true` on the definition when shadowing a
+/// built-in id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvAddResourceIpc {
     /// Env id the resource is added to.
     pub env_id: String,
-    /// Raw `ResourceDefinition` JSON. The command parses this into
-    /// `ResourceDefinition` before mutating the spec; malformed payloads
-    /// surface as a typed error.
-    pub definition: serde_json::Value,
+    /// Typed `ResourceDefinition` wrapped so `camelCase` keys land here
+    /// the same way the rest of the IPC surface does.
+    pub definition: JsonCamel<ordius_engine::environment::runtime::ResourceDefinition>,
 }
 
 // ─── Resource picker definitions ─────────────────────────────────

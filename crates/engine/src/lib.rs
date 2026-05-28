@@ -288,9 +288,11 @@ impl Engine {
     }
 
     /// Internal helper: caller MUST already hold `env_refresh_lock`.
-    /// Future inline-`EnvSpec` writers (`add_env`, `remove_env`,
-    /// `set_env_enabled` — Task 15) call this directly to avoid re-locking.
-    /// Synchronous because the background probe is spawned, not awaited.
+    /// Inline-`EnvSpec` writers (`add_env`, `remove_env`,
+    /// `set_env_enabled`, `add_env_local_resource`,
+    /// `remove_env_local_resource`) call this directly to avoid
+    /// re-locking. Synchronous because the background probe is spawned,
+    /// not awaited.
     fn refresh_environment_locked(
         self: &Arc<Self>,
         env_id: Option<&environment::runtime::EnvId>,

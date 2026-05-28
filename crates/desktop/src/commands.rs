@@ -571,13 +571,11 @@ pub async fn environment_add_resource(
     state: tauri::State<'_, AppState>,
     payload: crate::dto::EnvAddResourceIpc,
 ) -> Result<crate::dto::EnvSnapshotIpc, String> {
-    use ordius_engine::environment::runtime::{EnvId, ResourceDefinition};
+    use ordius_engine::environment::runtime::EnvId;
     let env_id = EnvId::new(payload.env_id);
-    let def: ResourceDefinition = serde_json::from_value(payload.definition)
-        .map_err(|e| format!("invalid ResourceDefinition: {e}"))?;
     state
         .engine
-        .add_env_local_resource(&env_id, def)
+        .add_env_local_resource(&env_id, payload.definition.0)
         .await
         .map_err(|e| e.to_string())?;
     Ok(build_env_snapshot(&state.engine))
