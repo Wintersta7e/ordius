@@ -1616,7 +1616,33 @@ mod tests {
     async fn start_run_rejects_concurrent_same_workflow() {
         let dir = TempDir::new().unwrap();
         let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
-        let wf = Arc::new(minimal_workflow());
+        // 60s delay so h1 cannot complete (and release the workflow lock)
+        // before the test thread reaches the second start_run call.
+        // `minimal_workflow`'s 1ms delay races the test thread under
+        // default test-threads parallelism.
+        let wf = Arc::new(Workflow {
+            id: "wf_concurrent_reject".into(),
+            name: "concurrent reject".into(),
+            schema_version: 1,
+            created_at: None,
+            updated_at: None,
+            variables: HashMap::new(),
+            triggers: vec![],
+            nodes: vec![Node {
+                id: "slow".into(),
+                ty: "delay".into(),
+                name: String::new(),
+                config: HashMap::from([("ms".into(), serde_json::json!(60_000))]),
+                pos: Pos::default(),
+                timeout_ms: None,
+                retry: None,
+                continue_on_error: false,
+                target_env: None,
+            }],
+            edges: vec![],
+            resources: vec![],
+            default_env: None,
+        });
 
         let h1 = engine
             .start_run(wf.clone(), HashMap::new(), "test", false, None)
@@ -1627,7 +1653,9 @@ mod tests {
             Ok(_) => panic!("expected AlreadyRunning, got Ok(RunHandle)"),
             Err(e) => panic!("expected AlreadyRunning, got Err({e})"),
         }
-        h1.join.await.expect("join").expect("first run completes");
+        assert!(engine.cancel_run(&h1.run_id));
+        let summary = h1.join.await.expect("join").expect("first run completes");
+        assert_eq!(summary.status, "stopped");
     }
 
     #[tokio::test(flavor = "multi_thread")]
