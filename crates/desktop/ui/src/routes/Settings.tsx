@@ -750,6 +750,9 @@ function EnvRow({
   onRefresh: () => void;
 }): JSX.Element {
   const isLocal = env.id === "local";
+  // Drawer is collapsed by default so a long resource list doesn't
+  // dominate the Environments section once several envs are registered.
+  const [open, setOpen] = useState(false);
   return (
     <div
       style={{
@@ -763,11 +766,29 @@ function EnvRow({
       <div
         style={{
           display: "grid",
-          gridTemplateColumns: "auto 1fr auto auto auto",
+          gridTemplateColumns: "auto auto 1fr auto auto auto",
           gap: 10,
           alignItems: "center",
         }}
       >
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-label={`${open ? "collapse" : "expand"} ${env.label}`}
+          style={{
+            appearance: "none",
+            background: "transparent",
+            border: 0,
+            color: "var(--txt-soft)",
+            fontSize: 12,
+            cursor: "pointer",
+            padding: 2,
+            width: 16,
+            lineHeight: 1,
+          }}
+        >
+          {open ? "▼" : "▸"}
+        </button>
         <input
           type="checkbox"
           checked={env.enabled}
@@ -814,19 +835,32 @@ function EnvRow({
           </button>
         )}
       </div>
-      {env.resources.length > 0 ? (
-        <div
-          style={{
-            marginTop: 6,
-            display: "flex",
-            flexDirection: "column",
-            gap: 2,
-          }}
-        >
-          {env.resources.map((res) => (
-            <EnvResourceRow key={res.id} resource={res} />
-          ))}
-        </div>
+      {open ? (
+        env.resources.length > 0 ? (
+          <div
+            style={{
+              marginTop: 6,
+              display: "flex",
+              flexDirection: "column",
+              gap: 2,
+            }}
+          >
+            {env.resources.map((res) => (
+              <EnvResourceRow key={res.id} resource={res} />
+            ))}
+          </div>
+        ) : (
+          <div
+            style={{
+              marginTop: 6,
+              padding: "8px 14px",
+              color: "var(--txt-faint)",
+              fontSize: 11,
+            }}
+          >
+            no resources probed. press ↻ above to refresh.
+          </div>
+        )
       ) : null}
     </div>
   );
