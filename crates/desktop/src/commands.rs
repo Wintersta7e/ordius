@@ -559,7 +559,7 @@ pub fn refresh_environment(_state: tauri::State<'_, AppState>) -> Result<(), Str
 /// Loud-failure shim for the session-C `add_custom_namespace` command.
 #[tauri::command]
 pub fn add_custom_namespace(_state: tauri::State<'_, AppState>) -> Result<(), String> {
-    Err("command renamed: use environment_add with a Custom EnvSpec".into())
+    Err("command renamed: use environment_add with an Ssh or Container EnvSpec".into())
 }
 
 /// Loud-failure shim for the session-C `remove_custom_namespace` command.

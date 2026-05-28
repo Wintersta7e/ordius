@@ -1,7 +1,6 @@
 //! Host environment discovery.
 //!
-//! Phase E moved the entire substrate into [`runtime`]. The legacy session-C
-//! `EnvironmentReport` types are gone; the desktop IPC consumes
-//! `runtime::EnvRegistry` directly.
+//! The runtime substrate lives in [`runtime`]. Desktop IPC consumes
+//! `runtime::EnvRegistry` and the per-env resource catalogs directly.
 pub mod runtime;
 pub use runtime::*;

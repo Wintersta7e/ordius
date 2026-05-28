@@ -342,7 +342,7 @@ pub fn install_resources_into_registry(
 /// Validate workflow nodes against the resource registry. Returns
 /// non-fatal warnings; hard errors are returned via the `Err` arm.
 ///
-/// Phase D validates:
+/// Phase E validates:
 /// - `resource.id` resolution against the registry's scope chain
 /// - `required_capability` (if set) is in the resource's
 ///   `advertised_capabilities` (empty list is treated as untyped and

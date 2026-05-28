@@ -148,6 +148,12 @@ impl NodeExecutor for ParallelExecutor {
             next_index += 1;
         }
 
+        // Direct child scope errors are checked before spawning. Once a
+        // spawned child enters its run loop, nested compose/parallel errors
+        // are persisted as child run status rather than returned as typed
+        // `EngineError` values; preserving those types would require a
+        // wider run-loop result. The compose executor can map immediate
+        // child errors directly because it awaits a single child call.
         let mut errors: HashMap<usize, String> = HashMap::new();
         let mut winner: Option<serde_json::Value> = None;
         // Drain results, spawning replacement children as slots free.
