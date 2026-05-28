@@ -14,6 +14,7 @@ import {
   type Settings as SettingsShape,
   type SystemStatus,
   type Workspace,
+  addEnvironmentResource,
   addSecret,
   addWorkspace,
   getSettings,
@@ -372,6 +373,8 @@ export function Settings({
             <EnvironmentsSection
               environment={environment}
               onEnvironmentChange={setEnvironment}
+              onError={setError}
+              insideTauri={insideTauri}
             />
           ) : null}
           {active === "workspaces" ? (
@@ -624,9 +627,13 @@ function SecretsSection({
 function EnvironmentsSection({
   environment,
   onEnvironmentChange,
+  onError,
+  insideTauri,
 }: {
   environment: EnvSnapshotIpc | null;
   onEnvironmentChange: (env: EnvSnapshotIpc) => void;
+  onError: (msg: string) => void;
+  insideTauri: boolean;
 }): JSX.Element | null {
   const [busy, setBusy] = useState(false);
   const [opError, setOpError] = useState<string | null>(null);
@@ -688,6 +695,9 @@ function EnvironmentsSection({
             onToggle={(enabled) => void handleToggle(env.id, enabled)}
             onRemove={() => void handleRemove(env.id)}
             onRefresh={() => void handleRefresh(env.id)}
+            onResourceAdded={onEnvironmentChange}
+            onError={onError}
+            insideTauri={insideTauri}
           />
         ))}
         {opError ? (
@@ -742,12 +752,18 @@ function EnvRow({
   onToggle,
   onRemove,
   onRefresh,
+  onResourceAdded,
+  onError,
+  insideTauri,
 }: {
   env: EnvEntryIpc;
   busy: boolean;
   onToggle: (enabled: boolean) => void;
   onRemove: () => void;
   onRefresh: () => void;
+  onResourceAdded: (snap: EnvSnapshotIpc) => void;
+  onError: (msg: string) => void;
+  insideTauri: boolean;
 }): JSX.Element {
   const isLocal = env.id === "local";
   // Drawer is collapsed by default so a long resource list doesn't
@@ -836,31 +852,39 @@ function EnvRow({
         )}
       </div>
       {open ? (
-        env.resources.length > 0 ? (
-          <div
-            style={{
-              marginTop: 6,
-              display: "flex",
-              flexDirection: "column",
-              gap: 2,
-            }}
-          >
-            {env.resources.map((res) => (
-              <EnvResourceRow key={res.id} resource={res} />
-            ))}
-          </div>
-        ) : (
-          <div
-            style={{
-              marginTop: 6,
-              padding: "8px 14px",
-              color: "var(--txt-faint)",
-              fontSize: 11,
-            }}
-          >
-            no resources probed. press ↻ above to refresh.
-          </div>
-        )
+        <>
+          {env.resources.length > 0 ? (
+            <div
+              style={{
+                marginTop: 6,
+                display: "flex",
+                flexDirection: "column",
+                gap: 2,
+              }}
+            >
+              {env.resources.map((res) => (
+                <EnvResourceRow key={res.id} resource={res} />
+              ))}
+            </div>
+          ) : (
+            <div
+              style={{
+                marginTop: 6,
+                padding: "8px 14px",
+                color: "var(--txt-faint)",
+                fontSize: 11,
+              }}
+            >
+              no resources probed. press ↻ above to refresh.
+            </div>
+          )}
+          <AddResourceForm
+            envId={env.id}
+            onAdded={onResourceAdded}
+            onError={onError}
+            insideTauri={insideTauri}
+          />
+        </>
       ) : null}
     </div>
   );
@@ -970,6 +994,205 @@ function EnvResourceRow({ resource }: { resource: EnvResourceIpc }): JSX.Element
       <span style={{ color, whiteSpace: "nowrap" }} title={stateReason ?? undefined}>
         {stateLabel.replace(/_/g, " ")}
       </span>
+    </div>
+  );
+}
+
+type AddResourceKind = "http_endpoint" | "binary" | "toolchain";
+
+function buildDefinition(args: {
+  kind: AddResourceKind;
+  id: string;
+  port: string;
+  routePath: string;
+  bin: string;
+  versionArgs: string;
+  versionRegex: string;
+}): unknown {
+  const id = args.id.trim();
+  if (args.kind === "http_endpoint") {
+    return {
+      id,
+      kind: "http_endpoint",
+      advertisedCapabilities: ["openai_chat_completions"],
+      probe: {
+        kind: "http",
+        ports: [Number(args.port)],
+        routes: [
+          {
+            path: args.routePath,
+            method: "get",
+            flavor: "openai_chat",
+            proves: ["openai_chat_completions"],
+            modelsJsonpath: null,
+            fingerprintJsonpaths: [],
+          },
+        ],
+        timeoutMs: null,
+      },
+      overrideLowerScope: false,
+    };
+  }
+  if (args.kind === "binary") {
+    return {
+      id,
+      kind: "binary",
+      advertisedCapabilities: ["cli_agent_print"],
+      probe: {
+        kind: "binary",
+        bin: args.bin,
+        versionArgs: args.versionArgs.split(/\s+/).filter(Boolean),
+        versionRegex: args.versionRegex,
+        extraSearchPaths: [],
+        timeoutMs: null,
+      },
+      overrideLowerScope: false,
+    };
+  }
+  return {
+    id,
+    kind: "toolchain",
+    advertisedCapabilities: [],
+    probe: {
+      kind: "toolchain",
+      bin: args.bin,
+      versionArgs: args.versionArgs.split(/\s+/).filter(Boolean),
+      versionRegex: args.versionRegex,
+      timeoutMs: null,
+    },
+    overrideLowerScope: false,
+  };
+}
+
+function AddResourceForm({
+  envId,
+  onAdded,
+  onError,
+  insideTauri,
+}: {
+  envId: string;
+  onAdded: (snap: EnvSnapshotIpc) => void;
+  onError: (msg: string) => void;
+  insideTauri: boolean;
+}): JSX.Element {
+  const [kind, setKind] = useState<AddResourceKind>("http_endpoint");
+  const [id, setId] = useState("");
+  const [port, setPort] = useState("8080");
+  const [routePath, setRoutePath] = useState("/v1/models");
+  const [bin, setBin] = useState("");
+  const [versionArgs, setVersionArgs] = useState("--version");
+  const [versionRegex, setVersionRegex] = useState(
+    String.raw`(\d+\.\d+\.\d+)`,
+  );
+  const [busy, setBusy] = useState(false);
+
+  const trimmedId = id.trim();
+  const disabled = !trimmedId || busy || !insideTauri;
+
+  const handleAdd = async () => {
+    if (disabled) return;
+    setBusy(true);
+    try {
+      const definition = buildDefinition({
+        kind,
+        id: trimmedId,
+        port,
+        routePath,
+        bin,
+        versionArgs,
+        versionRegex,
+      });
+      const snap = await addEnvironmentResource({ envId, definition });
+      onAdded(snap);
+      setId("");
+    } catch (e) {
+      onError(`add resource: ${String(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      style={{
+        marginTop: 10,
+        paddingTop: 10,
+        borderTop: "1px solid var(--line-soft)",
+      }}
+    >
+      <Field label="kind">
+        <SegRow
+          value={kind}
+          options={["http_endpoint", "binary", "toolchain"]}
+          onChange={(v) => setKind(v as AddResourceKind)}
+        />
+      </Field>
+      <Field label="id">
+        <TextInput
+          value={id}
+          onChange={setId}
+          placeholder="my-endpoint"
+          disabled={busy}
+        />
+      </Field>
+      {kind === "http_endpoint" ? (
+        <>
+          <Field label="port">
+            <TextInput
+              value={port}
+              onChange={setPort}
+              placeholder="8080"
+              disabled={busy}
+            />
+          </Field>
+          <Field label="probe route">
+            <TextInput
+              value={routePath}
+              onChange={setRoutePath}
+              placeholder="/v1/models"
+              disabled={busy}
+            />
+          </Field>
+        </>
+      ) : (
+        <>
+          <Field label="binary">
+            <TextInput
+              value={bin}
+              onChange={setBin}
+              placeholder={kind === "binary" ? "claude" : "node"}
+              disabled={busy}
+            />
+          </Field>
+          <Field label="version flag">
+            <TextInput
+              value={versionArgs}
+              onChange={setVersionArgs}
+              placeholder="--version"
+              disabled={busy}
+            />
+          </Field>
+          <Field label="version regex">
+            <TextInput
+              value={versionRegex}
+              onChange={setVersionRegex}
+              placeholder={String.raw`(\d+\.\d+\.\d+)`}
+              disabled={busy}
+            />
+          </Field>
+        </>
+      )}
+      <div style={{ padding: "8px 16px 6px" }}>
+        <button
+          type="button"
+          className="btn primary"
+          disabled={disabled}
+          onClick={() => void handleAdd()}
+          style={{ height: 26 }}
+        >
+          add resource
+        </button>
+      </div>
     </div>
   );
 }
