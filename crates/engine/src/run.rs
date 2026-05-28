@@ -177,7 +177,10 @@ impl Engine {
             run_id,
         ) {
             Ok(Some(r)) => Some(Arc::new(r)),
-            Ok(None) => None,
+            Ok(None) => {
+                restore_prior_scope();
+                None
+            },
             Err(e) => {
                 restore_prior_scope();
                 return Err(e);
@@ -1184,8 +1187,66 @@ fn substitute_node_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::environment::runtime::{
+        ProbeSpec, ResourceDefinition, ResourceId, ResourceKind, ScopeKey, WorkflowId,
+    };
     use crate::types::{Node, Pos};
     use tempfile::TempDir;
+
+    fn test_resource(id: &str) -> ResourceDefinition {
+        ResourceDefinition {
+            id: ResourceId(id.into()),
+            kind: ResourceKind::HttpEndpoint,
+            advertised_capabilities: vec![],
+            probe: ProbeSpec::Http {
+                ports: vec![9999],
+                routes: vec![],
+                timeout_ms: None,
+            },
+            override_lower_scope: false,
+        }
+    }
+
+    fn blocking_workflow_with_resource(resource_id: &str) -> Workflow {
+        Workflow {
+            id: "wf_a".into(),
+            name: format!("workflow with {resource_id}"),
+            schema_version: 1,
+            created_at: None,
+            updated_at: None,
+            variables: HashMap::new(),
+            triggers: vec![],
+            nodes: vec![Node {
+                id: "slow".into(),
+                ty: "delay".into(),
+                name: String::new(),
+                config: HashMap::from([("ms".into(), serde_json::json!(60_000))]),
+                pos: Pos::default(),
+                timeout_ms: None,
+                retry: None,
+                continue_on_error: false,
+                target_env: None,
+            }],
+            edges: vec![],
+            resources: vec![test_resource(resource_id)],
+            default_env: None,
+        }
+    }
+
+    fn workflow_scope_resource_visible(
+        engine: &Engine,
+        workflow_id: &str,
+        resource_id: &str,
+    ) -> bool {
+        engine
+            .resource_registry
+            .snapshot()
+            .layers
+            .get(&ScopeKey::Workflow {
+                id: WorkflowId(workflow_id.into()),
+            })
+            .is_some_and(|layer| layer.contains_key(&ResourceId(resource_id.into())))
+    }
 
     fn minimal_workflow() -> Workflow {
         Workflow {
@@ -1627,6 +1688,59 @@ mod tests {
             .unwrap();
         assert_eq!(running_count, 1);
         drop(conn);
+
+        assert!(engine.cancel_run(&first.run_id));
+        let summary = first
+            .join
+            .await
+            .expect("join")
+            .expect("first run completes");
+        assert_eq!(summary.status, "stopped");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_run_lock_conflict_restores_prior_workflow_resources() {
+        let dir = TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+        let original_resource = "test-rollback-resource";
+        let replacement_resource = "test-replacement-resource";
+        let wf_a = Arc::new(blocking_workflow_with_resource(original_resource));
+        let wf_b = Arc::new(blocking_workflow_with_resource(replacement_resource));
+
+        let first = engine
+            .start_run(wf_a.clone(), HashMap::new(), "test", false, None)
+            .expect("first run starts");
+
+        let conn = engine.pool().get().unwrap();
+        let lock_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_locks WHERE workflow_id=?",
+                [&wf_a.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(lock_count, 1, "first run should hold the workflow lock");
+        drop(conn);
+
+        assert!(
+            workflow_scope_resource_visible(&engine, "wf_a", original_resource),
+            "first run should install the original workflow resource",
+        );
+
+        let second = engine.start_run(wf_b.clone(), HashMap::new(), "test", false, None);
+        assert!(
+            matches!(second, Err(EngineError::AlreadyRunning { .. })),
+            "second start should report the workflow lock conflict",
+        );
+
+        assert!(
+            workflow_scope_resource_visible(&engine, "wf_a", original_resource),
+            "lock conflict should preserve the previously installed resource",
+        );
+        assert!(
+            !workflow_scope_resource_visible(&engine, "wf_a", replacement_resource),
+            "lock conflict should not leave the rejected workflow resource installed",
+        );
 
         assert!(engine.cancel_run(&first.run_id));
         let summary = first

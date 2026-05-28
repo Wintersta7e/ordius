@@ -31,9 +31,7 @@ pub struct WorkflowWarning {
 }
 
 /// Discriminant for [`WorkflowWarning`]. Marked `#[non_exhaustive]` so
-/// later phases can add new lint kinds (Phase E will add
-/// `ResourceUnreachableInEnv`, etc.) without breaking downstream
-/// matches.
+/// later phases can add new lint kinds without breaking downstream matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WorkflowWarningKind {
