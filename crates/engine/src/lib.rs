@@ -215,27 +215,28 @@ fn resolve_probe_for_test(
     env_id: &environment::runtime::EnvId,
     resource_id: &environment::runtime::ResourceId,
 ) -> Result<environment::runtime::ProbeSpec> {
+    // Inline env-local definitions take precedence over the engine-level
+    // registry, mirroring the runtime `Workflow > EnvLocal > UserGlobal >
+    // Builtin` precedence chain. The engine's registry only carries
+    // `EnvLocal` rows during a live run snapshot, so checking it first
+    // would silently route a user's `override_lower_scope: true` shadow
+    // through the Builtin's probe spec.
+    let row = environment::runtime::boot_probe::load_spec_single(&engine.pool, env_id)
+        .map_err(|e| EngineError::Db(format!("load env spec: {e}")))?
+        .ok_or_else(|| EngineError::EnvUnknown(env_id.clone()))?;
+    if let Some(def) = row.spec.resources().iter().find(|d| &d.id == resource_id) {
+        return Ok(def.probe.clone());
+    }
     let registry = engine.resource_registry();
     let snap = registry.snapshot();
     if let Some((def, _scope)) = snap.resolve(resource_id, env_id, None) {
         return Ok(def.probe.clone());
     }
-    let row = environment::runtime::boot_probe::load_spec_single(&engine.pool, env_id)
-        .map_err(|e| EngineError::Db(format!("load env spec: {e}")))?
-        .ok_or_else(|| EngineError::EnvUnknown(env_id.clone()))?;
-    let def = row
-        .spec
-        .resources()
-        .iter()
-        .find(|d| &d.id == resource_id)
-        .ok_or_else(|| {
-            EngineError::Db(format!(
-                "resource '{}' not declared in registry or env '{}' inline spec",
-                resource_id.0,
-                env_id.as_str(),
-            ))
-        })?;
-    Ok(def.probe.clone())
+    Err(EngineError::Db(format!(
+        "resource '{}' not declared in registry or env '{}' inline spec",
+        resource_id.0,
+        env_id.as_str(),
+    )))
 }
 
 /// Top-level engine handle.

@@ -301,3 +301,63 @@ async fn wait_for_refresh_helper_is_used() {
     let engine = Arc::new(Engine::new(tmp.path().to_path_buf()).await.unwrap());
     wait_for_refresh(&engine, None).await;
 }
+
+/// Regression: an env-local resource declared with `override_lower_scope:
+/// true` and a built-in id (`ollama`) must shadow the built-in's probe
+/// when the host-direct test fires. The engine's resource registry does
+/// not carry env-local layers outside a run snapshot, so a registry-first
+/// lookup would have silently routed through the built-in's `/api/version`
+/// route. Inline-spec precedence keeps the override honored.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_host_direct_respects_env_local_override_of_builtin() {
+    let server = MockServer::start().await;
+    // The override's route — wiremock only answers here.
+    Mock::given(method("GET"))
+        .and(path("/custom/override"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"v":"override-1"}"#))
+        .mount(&server)
+        .await;
+    let port = server.address().port();
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(tmp.path().to_path_buf()).await.unwrap());
+
+    // Shadow the built-in `ollama` id with a definition pointing at a
+    // distinct path. Without inline-spec precedence, the resolver picks
+    // the built-in and probes `/api/version`, which wiremock 404s.
+    let override_def = ResourceDefinition {
+        id: ResourceId("ollama".into()),
+        kind: ResourceKind::HttpEndpoint,
+        advertised_capabilities: vec![Capability::OllamaNative],
+        probe: ProbeSpec::Http {
+            ports: vec![port],
+            routes: vec![HttpProbeRoute {
+                path: "/custom/override".into(),
+                method: HttpProbeMethod::Get,
+                flavor: ApiFlavor::OllamaNative,
+                proves: vec![Capability::OllamaNative],
+                models_jsonpath: None,
+                fingerprint_jsonpaths: vec!["$.v".into()],
+            }],
+            timeout_ms: Some(500),
+        },
+        override_lower_scope: true,
+    };
+
+    seed_local_with_resource(&engine, override_def).await;
+
+    let rid = ResourceId("ollama".into());
+    let outcome = engine
+        .test_host_direct(&EnvId::local(), &rid)
+        .await
+        .expect("test_host_direct ok");
+
+    assert_eq!(
+        outcome.probe_route_path, "/custom/override",
+        "override's route must win over the built-in's: {outcome:?}",
+    );
+    assert!(
+        outcome.success(),
+        "override probe should succeed: {outcome:?}",
+    );
+}
