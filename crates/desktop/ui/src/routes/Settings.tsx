@@ -9,14 +9,18 @@ import { listen } from "@tauri-apps/api/event";
 import {
   type SecretMeta,
   type EnvEntryIpc,
+  type EnvKindIpc,
   type EnvSnapshotIpc,
   type EnvResourceIpc,
+  type HostDirectTestResultIpc,
+  type HostDirectVerificationIpc,
   type Settings as SettingsShape,
   type SystemStatus,
   type Workspace,
   addEnvironmentResource,
   addSecret,
   addWorkspace,
+  enableHostDirect,
   getSettings,
   listEnvironments,
   listSecrets,
@@ -29,6 +33,7 @@ import {
   setEnvironmentEnabled,
   setSettings,
   systemStatus,
+  testHostDirect,
 } from "../engine";
 import { TopBar } from "../components/chrome/TopBar";
 import { SectionTitle } from "../components/SectionTitle";
@@ -863,7 +868,13 @@ function EnvRow({
               }}
             >
               {env.resources.map((res) => (
-                <EnvResourceRow key={res.id} resource={res} />
+                <EnvResourceRow
+                  key={res.id}
+                  resource={res}
+                  envId={env.id}
+                  envKind={env.kind}
+                  onEnvironmentChange={onResourceAdded}
+                />
               ))}
             </div>
           ) : (
@@ -947,7 +958,17 @@ function EnvStatePill({ state }: { state: EnvEntryIpc["state"] }): JSX.Element {
   );
 }
 
-function EnvResourceRow({ resource }: { resource: EnvResourceIpc }): JSX.Element {
+function EnvResourceRow({
+  resource,
+  envId,
+  envKind,
+  onEnvironmentChange,
+}: {
+  resource: EnvResourceIpc;
+  envId: string;
+  envKind: EnvKindIpc;
+  onEnvironmentChange: (snap: EnvSnapshotIpc) => void;
+}): JSX.Element {
   const stateLabel = resource.state.state;
   const stateReason =
     resource.state.state === "skipped" || resource.state.state === "probe_failed"
@@ -959,11 +980,18 @@ function EnvResourceRow({ resource }: { resource: EnvResourceIpc }): JSX.Element
       : stateLabel === "timed_out" || stateLabel === "probe_failed"
         ? "var(--warn)"
         : "var(--txt-faint)";
+  // HostDirect wizard appears only for WSL Found loopback HTTP endpoints —
+  // exactly the case where direct reqwest routing can replace wrapped curl.
+  const showWizard =
+    envKind === "wsl_distro" &&
+    resource.kind === "http_endpoint" &&
+    resource.state.state === "found" &&
+    resource.routeOrigin === "env_loopback";
   return (
     <div
       style={{
         display: "grid",
-        gridTemplateColumns: "auto 1fr auto",
+        gridTemplateColumns: showWizard ? "auto 1fr auto auto" : "auto 1fr auto",
         gap: 8,
         alignItems: "center",
         paddingLeft: 26,
@@ -994,6 +1022,13 @@ function EnvResourceRow({ resource }: { resource: EnvResourceIpc }): JSX.Element
       <span style={{ color, whiteSpace: "nowrap" }} title={stateReason ?? undefined}>
         {stateLabel.replace(/_/g, " ")}
       </span>
+      {showWizard ? (
+        <HostDirectWizard
+          envId={envId}
+          resourceId={resource.id}
+          onComplete={onEnvironmentChange}
+        />
+      ) : null}
     </div>
   );
 }
@@ -1193,6 +1228,188 @@ function AddResourceForm({
           add resource
         </button>
       </div>
+    </div>
+  );
+}
+
+type HostDirectPhase = "idle" | "testing" | "result" | "enabling";
+
+function HostDirectWizard({
+  envId,
+  resourceId,
+  onComplete,
+}: {
+  envId: string;
+  resourceId: string;
+  onComplete: (snap: EnvSnapshotIpc) => void;
+}): JSX.Element {
+  const [phase, setPhase] = useState<HostDirectPhase>("idle");
+  const [result, setResult] = useState<HostDirectTestResultIpc | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const runTest = async (): Promise<void> => {
+    setPhase("testing");
+    setErr(null);
+    try {
+      const out = await testHostDirect(envId, resourceId);
+      setResult(out);
+      setPhase("result");
+    } catch (e) {
+      setErr(String(e));
+      setPhase("idle");
+    }
+  };
+
+  const enable = async (): Promise<void> => {
+    if (!result || !result.success || !result.stableFingerprint) return;
+    setPhase("enabling");
+    setErr(null);
+    try {
+      const verification: HostDirectVerificationIpc = {
+        verifiedAt: new Date().toISOString(),
+        method: "user_asserted_no_verification",
+        hostUrl: result.hostUrl,
+        probeRoutePath: result.probeRoutePath,
+        stableFingerprint: result.stableFingerprint,
+        // Backend recomputes via the probe spec's fingerprint_jsonpaths;
+        // we don't have them on the wire here so pass an empty list.
+        recomputeJsonpaths: [],
+      };
+      const snap = await enableHostDirect(envId, resourceId, verification);
+      onComplete(snap);
+      setPhase("idle");
+      setResult(null);
+    } catch (e) {
+      setErr(String(e));
+      setPhase("result");
+    }
+  };
+
+  if (phase === "testing") {
+    return (
+      <span
+        style={{
+          color: "var(--info)",
+          fontFamily: "var(--mono)",
+          fontSize: 10.5,
+          whiteSpace: "nowrap",
+        }}
+      >
+        testing…
+      </span>
+    );
+  }
+
+  if (phase === "enabling") {
+    return (
+      <span
+        style={{
+          color: "var(--info)",
+          fontFamily: "var(--mono)",
+          fontSize: 10.5,
+          whiteSpace: "nowrap",
+        }}
+      >
+        enabling…
+      </span>
+    );
+  }
+
+  if (phase === "result" && result) {
+    if (result.success && result.stableFingerprint) {
+      return (
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: 4,
+            alignItems: "flex-end",
+            fontFamily: "var(--mono)",
+            fontSize: 10.5,
+          }}
+        >
+          <span style={{ color: "var(--ok)", whiteSpace: "nowrap" }}>
+            ✓ direct probe ok ·{" "}
+            <span style={{ color: "var(--txt-dim)" }}>
+              {result.stableFingerprint.slice(0, 12)}
+            </span>
+          </span>
+          {err ? (
+            <span style={{ color: "var(--warn)", whiteSpace: "nowrap" }}>
+              {err}
+            </span>
+          ) : null}
+          <button
+            type="button"
+            className="btn"
+            onClick={() => void enable()}
+            style={{ height: 22, padding: "0 10px" }}
+          >
+            enable host-direct routing
+          </button>
+        </div>
+      );
+    }
+    return (
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: 4,
+          alignItems: "flex-end",
+          fontFamily: "var(--mono)",
+          fontSize: 10.5,
+        }}
+      >
+        <span
+          style={{ color: "var(--warn)", whiteSpace: "nowrap" }}
+          title={result.error ?? undefined}
+        >
+          ✗ {result.error ?? "probe failed"}
+        </span>
+        <button
+          type="button"
+          className="btn"
+          onClick={() => void runTest()}
+          style={{ height: 22, padding: "0 10px" }}
+        >
+          retry
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 4,
+        alignItems: "flex-end",
+      }}
+    >
+      <button
+        type="button"
+        className="btn"
+        onClick={() => void runTest()}
+        style={{ height: 22, padding: "0 10px" }}
+        title="probe the resource directly from the host process"
+      >
+        test direct access
+      </button>
+      {err ? (
+        <span
+          style={{
+            color: "var(--warn)",
+            fontFamily: "var(--mono)",
+            fontSize: 10.5,
+            whiteSpace: "nowrap",
+          }}
+          title={err}
+        >
+          {err.length > 60 ? `${err.slice(0, 57)}…` : err}
+        </span>
+      ) : null}
     </div>
   );
 }
