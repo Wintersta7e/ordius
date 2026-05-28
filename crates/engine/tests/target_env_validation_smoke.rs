@@ -130,6 +130,73 @@ async fn workflow_with_target_env_local_loads_successfully() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn workflow_resource_resolves_from_env_local_scope() {
+    // BL-1: a workflow with a `resource:` ref to an id declared only on the
+    // env's `EnvSpec.resources` must load successfully, even though the
+    // engine's `ResourceRegistry` only sees Builtin + UserGlobal + Workflow
+    // scopes at load time. The `EnvLocal` overlay is installed per-run; the
+    // validator now looks at the active env's spec resources as a fallback.
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("runs.db");
+
+    {
+        let pool = ordius_engine::db::open(&db_path).unwrap();
+        let conn = pool.get().unwrap();
+        let spec_json =
+            serde_json::to_string(&ordius_engine::environment::runtime::EnvSpec::Local {
+                resources: vec![
+                    ordius_engine::environment::runtime::resource::ResourceDefinition {
+                        id: ordius_engine::environment::runtime::resource::ResourceId(
+                            "env-only".into(),
+                        ),
+                        kind: ordius_engine::environment::runtime::resource::ResourceKind::Binary,
+                        advertised_capabilities: vec![],
+                        probe: ordius_engine::environment::runtime::resource::ProbeSpec::Binary {
+                            bin: "true".into(),
+                            version_args: vec![],
+                            version_regex: String::new(),
+                            extra_search_paths: vec![],
+                            timeout_ms: Some(1000),
+                        },
+                        override_lower_scope: false,
+                    },
+                ],
+                host_direct_verifications: std::collections::HashMap::new(),
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO env_specs (id, label, enabled, spec_json, created_at, updated_at)
+             VALUES ('local', 'Local', 1, ?1, 0, 0)",
+            rusqlite::params![spec_json],
+        )
+        .unwrap();
+    }
+
+    let engine = Engine::new(tmp.path().to_path_buf()).await.unwrap();
+
+    write_workflow(
+        &tmp,
+        "env-local-resource",
+        r#"{
+            "id": "env-local-resource",
+            "name": "env-local-resource",
+            "schema_version": 1,
+            "nodes": [{
+                "id": "n1",
+                "type": "shell",
+                "name": "n1",
+                "config": {"resource": "env-only", "command": "/bin/true"}
+            }],
+            "edges": []
+        }"#,
+    );
+
+    let (_wf, _warnings) = engine
+        .load_workflow_for_run(tmp.path(), "env-local-resource")
+        .expect("env-local resource should resolve at load time");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn workflow_default_env_unknown_rejected_at_load() {
     let tmp = TempDir::new().unwrap();
     let engine = Engine::new(tmp.path().to_path_buf()).await.unwrap();

@@ -367,9 +367,16 @@ fn validate_nodes<S: std::hash::BuildHasher>(
     env_disabled: &HashMap<EnvId, DisabledEnv, S>,
 ) -> Result<Vec<WorkflowWarning>, WorkflowsError> {
     let snap = registry.snapshot();
-    let env = EnvId::local();
+    let local_env = EnvId::local();
     let wf = WorkflowId(workflow.id.clone());
     let mut warnings: Vec<WorkflowWarning> = Vec::new();
+    let res_ctx = ResourceValidationCtx {
+        snap: &snap,
+        local_env: &local_env,
+        wf: &wf,
+        env_registry,
+        env_disabled,
+    };
 
     // Workflow-level default_env check.
     if let Some(default_env) = &workflow.default_env
@@ -403,35 +410,20 @@ fn validate_nodes<S: std::hash::BuildHasher>(
                 node_id: node.id.clone(),
             });
         }
+        // Effective env for this node: per-node override → workflow default
+        // → local. Used by the env-local resource lookup below so resources
+        // declared inline on a remote env's `EnvSpec.resources` still
+        // resolve at load time (before the per-run snapshot installs the
+        // `EnvLocal` overlay).
+        let effective_env: &EnvId = node
+            .target_env
+            .as_ref()
+            .or(workflow.default_env.as_ref())
+            .unwrap_or(&local_env);
+
         // 1. `resource` ref resolution + capability assertion.
         if let Some(rref_val) = node.config.get("resource") {
-            let rref: ResourceRef = serde_json::from_value(rref_val.clone()).map_err(|e| {
-                WorkflowsError::InvalidNodeConfig {
-                    node_id: node.id.clone(),
-                    reason: format!("invalid resource ref: {e}"),
-                }
-            })?;
-
-            let Some((def, _scope)) = snap.resolve(rref.id(), &env, Some(&wf)) else {
-                return Err(WorkflowsError::ResourceNotInRegistry {
-                    node_id: node.id.clone(),
-                    resource_id: rref.id().0.clone(),
-                });
-            };
-
-            if let Some(cap) = rref.required_capability()
-                && !def.advertised_capabilities.contains(&cap)
-            {
-                // Strict: an explicit required_capability must be in the
-                // resource's advertised list. Untyped resources (empty
-                // advertised list) only resolve through bare ResourceRefs
-                // that don't request a specific capability.
-                return Err(WorkflowsError::CapabilityNotAdvertised {
-                    node_id: node.id.clone(),
-                    resource_id: rref.id().0.clone(),
-                    capability: format!("{cap:?}"),
-                });
-            }
+            validate_node_resource(rref_val, node, &res_ctx, effective_env)?;
         }
 
         // 2. `http` node validations.
@@ -474,6 +466,105 @@ fn validate_nodes<S: std::hash::BuildHasher>(
     }
 
     Ok(warnings)
+}
+
+/// Inputs threaded through [`validate_node_resource`]. Grouped to keep the
+/// argument count below `clippy::too_many_arguments`'s threshold without
+/// reaching for an `#[allow]`.
+struct ResourceValidationCtx<'a, S: std::hash::BuildHasher> {
+    snap: &'a crate::environment::runtime::RegistryInner,
+    local_env: &'a EnvId,
+    wf: &'a WorkflowId,
+    env_registry: &'a EnvRegistry,
+    env_disabled: &'a HashMap<EnvId, DisabledEnv, S>,
+}
+
+/// Validate a single node's `resource` config field: parse the ref, resolve
+/// it against the engine registry with env-local fallback, and assert the
+/// requested capability is advertised. Returns `Ok(())` when the ref is
+/// valid; the `Err` arm is one of [`WorkflowsError::InvalidNodeConfig`],
+/// [`WorkflowsError::ResourceNotInRegistry`], or
+/// [`WorkflowsError::CapabilityNotAdvertised`].
+fn validate_node_resource<S: std::hash::BuildHasher>(
+    rref_val: &serde_json::Value,
+    node: &crate::types::Node,
+    ctx: &ResourceValidationCtx<'_, S>,
+    effective_env: &EnvId,
+) -> Result<(), WorkflowsError> {
+    let rref: ResourceRef = serde_json::from_value(rref_val.clone()).map_err(|e| {
+        WorkflowsError::InvalidNodeConfig {
+            node_id: node.id.clone(),
+            reason: format!("invalid resource ref: {e}"),
+        }
+    })?;
+
+    // Engine registry first (Workflow ∪ UserGlobal ∪ Builtin). Fall back to
+    // the effective env's `EnvSpec.resources` so a workflow targeting a
+    // non-local env can reference resources declared inline on that env
+    // without needing them at user-global scope. Disabled envs still
+    // expose their inline resources for validation; the env-disabled
+    // check upstream catches the runtime failure separately.
+    let resolved_caps: Option<Vec<_>> = ctx
+        .snap
+        .resolve(rref.id(), ctx.local_env, Some(ctx.wf))
+        .map(|(def, _scope)| def.advertised_capabilities.clone())
+        .or_else(|| {
+            lookup_env_local_resource(ctx.env_registry, ctx.env_disabled, effective_env, rref.id())
+        });
+
+    let Some(advertised) = resolved_caps else {
+        return Err(WorkflowsError::ResourceNotInRegistry {
+            node_id: node.id.clone(),
+            resource_id: rref.id().0.clone(),
+        });
+    };
+
+    if let Some(cap) = rref.required_capability()
+        && !advertised.contains(&cap)
+    {
+        // Strict: an explicit required_capability must be in the
+        // resource's advertised list. Untyped resources (empty advertised
+        // list) only resolve through bare ResourceRefs that don't request
+        // a specific capability.
+        return Err(WorkflowsError::CapabilityNotAdvertised {
+            node_id: node.id.clone(),
+            resource_id: rref.id().0.clone(),
+            capability: format!("{cap:?}"),
+        });
+    }
+    Ok(())
+}
+
+/// Resolve a resource id against the `env_local` resources of `env_id`.
+///
+/// The engine `ResourceRegistry` only carries the `Builtin`, `UserGlobal`,
+/// and `Workflow` scopes at load time — the `EnvLocal` scope is installed
+/// per-run by [`crate::Engine::build_run_snapshot`]. To let workflows that
+/// target a non-local env reference resources declared inline on that
+/// env's `EnvSpec.resources`, the validator walks the `EnvRegistry` (for
+/// enabled envs) and `env_disabled` (for disabled rows whose specs are
+/// still around) and returns the matching resource's advertised
+/// capabilities. Returns `None` when no entry with `id` exists in either
+/// map under `env_id`.
+fn lookup_env_local_resource<S: std::hash::BuildHasher>(
+    env_registry: &EnvRegistry,
+    env_disabled: &HashMap<EnvId, DisabledEnv, S>,
+    env_id: &EnvId,
+    rid: &crate::environment::runtime::resource::ResourceId,
+) -> Option<Vec<crate::environment::runtime::resource::Capability>> {
+    let active_spec = env_registry.get(env_id).map(|e| e.info.spec.clone());
+    let spec = active_spec.or_else(|| env_disabled.get(env_id).map(|d| d.spec.clone()))?;
+
+    let resources = match &spec {
+        crate::environment::runtime::EnvSpec::Local { resources, .. }
+        | crate::environment::runtime::EnvSpec::WslDistro { resources, .. }
+        | crate::environment::runtime::EnvSpec::Ssh { resources, .. }
+        | crate::environment::runtime::EnvSpec::Container { resources, .. } => resources,
+    };
+    resources
+        .iter()
+        .find(|def| &def.id == rid)
+        .map(|def| def.advertised_capabilities.clone())
 }
 
 /// Load a workflow, install its `resources:` block into the registry,
