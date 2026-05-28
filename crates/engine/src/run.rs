@@ -158,18 +158,15 @@ impl Engine {
             .default_env
             .clone()
             .unwrap_or_else(crate::environment::runtime::EnvId::local);
-        let run_snapshot = match self.build_run_snapshot(
-            &run_id,
-            workflow_id.clone(),
-            default_env,
-            &envs_in_scope,
-        ) {
-            Ok(snap) => snap,
-            Err(e) => {
-                restore_prior_scope();
-                return Err(e);
-            },
-        };
+        let run_snapshot =
+            match self.build_run_snapshot(run_id, workflow_id.clone(), default_env, &envs_in_scope)
+            {
+                Ok(snap) => snap,
+                Err(e) => {
+                    restore_prior_scope();
+                    return Err(e);
+                },
+            };
 
         let rec = match RunRecorder::start_with_run_id_and_lock(
             self.pool(),

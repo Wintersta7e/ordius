@@ -141,7 +141,7 @@ impl RunRecorder {
     }
 
     /// Variant of [`Self::start_with_run_id`] that claims the workflow lock
-    /// in the same SQLite transaction that writes the run snapshot and run
+    /// in the same `SQLite` transaction that writes the run snapshot and run
     /// row. Returns `Ok(None)` if another run already holds the lock.
     pub fn start_with_run_id_and_lock(
         pool: DbPool,
