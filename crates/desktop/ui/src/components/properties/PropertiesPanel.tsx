@@ -20,6 +20,7 @@ import { CATEGORIES, catColor } from "../../data/categories";
 import { NodeIcon, Ic } from "../icons";
 import { BracketHeader } from "../palette/BracketHeader";
 import { EnvPicker } from "./EnvPicker";
+import { ResourcePicker } from "./ResourcePicker";
 import {
   Field,
   KV,
@@ -122,10 +123,7 @@ function NodeProps({
   const tint = catColor(nodeType.category, "tint");
   const border = catColor(nodeType.category, "border");
   const configCount = Object.keys(node.config ?? {}).length;
-  const definedFieldNames = new Set(nodeType.config.map((f) => f.name));
-  const adhocEntries = Object.entries(node.config ?? {}).filter(
-    ([key]) => !definedFieldNames.has(key),
-  );
+  const effectiveEnv = node.targetEnv ?? workflowDefaultEnv ?? "local";
 
   return (
     <div>
@@ -261,41 +259,20 @@ function NodeProps({
 
       {/* PARAMETERS */}
       <Section label="parameters" suffix={`${configCount} params`}>
-        {nodeType.config.length === 0 && adhocEntries.length === 0 ? (
-          <div
-            style={{
-              padding: "6px 16px 12px",
-              color: "var(--txt-faint)",
-              fontSize: 11,
-            }}
-          >
-            no parameters
-          </div>
-        ) : null}
-        {nodeType.config.map((field) => (
-          <ConfigFieldRow
-            key={field.name}
-            field={field}
-            value={node.config?.[field.name]}
-            onChange={(value) =>
-              onPatch(node.id, {
-                config: { ...node.config, [field.name]: value },
-              })
-            }
+        {nodeType.id === "llm" ? (
+          <LlmParameters
+            node={node}
+            nodeType={nodeType}
+            effectiveEnv={effectiveEnv}
+            onPatch={onPatch}
           />
-        ))}
-        {adhocEntries.map(([key, value]) => (
-          <Field key={key} label={key} hint="custom">
-            <TextInput
-              value={String(value ?? "")}
-              onChange={(next) =>
-                onPatch(node.id, {
-                  config: { ...node.config, [key]: next },
-                })
-              }
-            />
-          </Field>
-        ))}
+        ) : (
+          <GenericParameters
+            node={node}
+            nodeType={nodeType}
+            onPatch={onPatch}
+          />
+        )}
       </Section>
 
       {/* EXECUTION CONTEXT */}
@@ -348,6 +325,138 @@ function NodeProps({
         </button>
       </div>
     </div>
+  );
+}
+
+// ─── Parameter renderers (per node-type) ─────────────────────────
+
+interface ParameterRendererProps {
+  node: Node;
+  nodeType: NodeType;
+  onPatch: (id: string, patch: Partial<Node>) => void;
+}
+
+function GenericParameters({
+  node,
+  nodeType,
+  onPatch,
+}: ParameterRendererProps): JSX.Element {
+  const definedFieldNames = new Set(nodeType.config.map((f) => f.name));
+  const adhocEntries = Object.entries(node.config ?? {}).filter(
+    ([key]) => !definedFieldNames.has(key),
+  );
+  return (
+    <>
+      {nodeType.config.length === 0 && adhocEntries.length === 0 ? (
+        <div
+          style={{
+            padding: "6px 16px 12px",
+            color: "var(--txt-faint)",
+            fontSize: 11,
+          }}
+        >
+          no parameters
+        </div>
+      ) : null}
+      {nodeType.config.map((field) => (
+        <ConfigFieldRow
+          key={field.name}
+          field={field}
+          value={node.config?.[field.name]}
+          onChange={(value) =>
+            onPatch(node.id, {
+              config: { ...node.config, [field.name]: value },
+            })
+          }
+        />
+      ))}
+      {adhocEntries.map(([key, value]) => (
+        <Field key={key} label={key} hint="custom">
+          <TextInput
+            value={String(value ?? "")}
+            onChange={(next) =>
+              onPatch(node.id, {
+                config: { ...node.config, [key]: next },
+              })
+            }
+          />
+        </Field>
+      ))}
+    </>
+  );
+}
+
+interface LlmParametersProps extends ParameterRendererProps {
+  effectiveEnv: string;
+}
+
+function LlmParameters({
+  node,
+  nodeType,
+  effectiveEnv,
+  onPatch,
+}: LlmParametersProps): JSX.Element {
+  const definedFieldNames = new Set(nodeType.config.map((f) => f.name));
+  const adhocEntries = Object.entries(node.config ?? {}).filter(
+    ([key]) => !definedFieldNames.has(key),
+  );
+  const remainingFields = nodeType.config.filter(
+    (f) => f.name !== "resource" && f.name !== "stream",
+  );
+  return (
+    <>
+      <Field label="resource" hint="LLM endpoint via env-aware registry">
+        <ResourcePicker
+          envId={effectiveEnv}
+          value={readResourceId(node.config.resource)}
+          onChange={(next) =>
+            onPatch(node.id, {
+              config: {
+                ...node.config,
+                resource: next
+                  ? { id: next, required_capability: "openai_chat_completions" }
+                  : null,
+              },
+            })
+          }
+          capabilityFilter="openai_chat_completions"
+          placeholder="(pick an LLM endpoint)"
+        />
+      </Field>
+      <Field label="stream" hint="auto · force · off">
+        <SegRow
+          value={(node.config.stream as string) ?? "auto"}
+          options={["auto", "force", "off"]}
+          onChange={(next) =>
+            onPatch(node.id, { config: { ...node.config, stream: next } })
+          }
+        />
+      </Field>
+      {remainingFields.map((field) => (
+        <ConfigFieldRow
+          key={field.name}
+          field={field}
+          value={node.config?.[field.name]}
+          onChange={(value) =>
+            onPatch(node.id, {
+              config: { ...node.config, [field.name]: value },
+            })
+          }
+        />
+      ))}
+      {adhocEntries.map(([key, value]) => (
+        <Field key={key} label={key} hint="custom">
+          <TextInput
+            value={String(value ?? "")}
+            onChange={(next) =>
+              onPatch(node.id, {
+                config: { ...node.config, [key]: next },
+              })
+            }
+          />
+        </Field>
+      ))}
+    </>
   );
 }
 
@@ -572,6 +681,15 @@ function extractSelectOptions(defaultValue: unknown): string[] {
     return defaultValue.filter((v): v is string => typeof v === "string");
   }
   return [];
+}
+
+function readResourceId(value: unknown): string | null {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object" && "id" in value) {
+    const id = (value as { id: unknown }).id;
+    return typeof id === "string" ? id : null;
+  }
+  return null;
 }
 
 // ─── Pin table ────────────────────────────────────────────────────
