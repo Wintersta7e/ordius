@@ -843,6 +843,42 @@ mod tests {
     }
 
     #[test]
+    fn run_event_dto_stream_fallback_payload_is_camel_addressable() {
+        // The run panel reads `event.nodeId`, `event["url"]`, and
+        // `event["reason"]` to render the fallback warning chip.
+        // `nodeId` comes from the typed field (camelCased by the
+        // rename_all); `url` / `reason` ride the flattened payload and
+        // are single-word keys that `snake_to_camel` passes through
+        // unchanged. Lock that contract so the chip can't silently stop
+        // appearing if the payload mapping ever changes.
+        let ev = RunEvent {
+            ty: EventType::StreamFallback,
+            seq: 11,
+            emitted_at: 1_700_000_000_000,
+            run_id: "r1".into(),
+            node_id: Some("llm-1".into()),
+            iteration: Some(1),
+            attempt: Some(1),
+            payload: HashMap::from([
+                (
+                    "url".to_string(),
+                    serde_json::json!("http://127.0.0.1:11434/v1/chat/completions"),
+                ),
+                (
+                    "reason".to_string(),
+                    serde_json::json!("route cannot stream"),
+                ),
+            ]),
+        };
+        let dto: RunEventDto = ev.into();
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(json.contains(r#""type":"stream:fallback""#));
+        assert!(json.contains(r#""nodeId":"llm-1""#));
+        assert!(json.contains(r#""url":"http://127.0.0.1:11434/v1/chat/completions""#));
+        assert!(json.contains(r#""reason":"route cannot stream""#));
+    }
+
+    #[test]
     fn settings_round_trip_preserves_fields() {
         let original = Settings {
             theme: "light".into(),
