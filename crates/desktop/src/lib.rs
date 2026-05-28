@@ -26,7 +26,7 @@ pub fn run() {
                     Box::new(EngineInitError(e.to_string()))
                 })?;
             let engine = Arc::new(engine);
-            spawn_env_refresh_bridge(app, Arc::clone(&engine));
+            spawn_env_refresh_bridge(app, &engine);
             app.manage(state::AppState::new(engine));
             Ok(())
         })
@@ -71,7 +71,7 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-fn spawn_env_refresh_bridge(app: &tauri::App, engine: Arc<Engine>) {
+fn spawn_env_refresh_bridge(app: &tauri::App, engine: &Engine) {
     let app_handle = app.handle().clone();
     let mut rx = engine.subscribe_env_refresh();
     tauri::async_runtime::spawn(async move {
