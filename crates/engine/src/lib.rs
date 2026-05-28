@@ -68,6 +68,17 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+/// User-visible environment refresh state change.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvRefreshEvent {
+    /// `None` means a full refresh committed; `Some` identifies a single env
+    /// whose active or disabled state changed.
+    pub env_id: Option<environment::runtime::EnvId>,
+    /// Engine refresh epoch after the commit.
+    pub epoch: u64,
+}
+
 /// Top-level engine handle.
 ///
 /// Owns the `SQLite` pool, the node-type registry, the live
@@ -107,8 +118,8 @@ pub struct Engine {
     >,
     /// Serialises concurrent `refresh_environment` / inline-`EnvSpec`-write
     /// callers so the spec read + remove paths stay atomic. The lock is NOT
-    /// held across the background probe — it covers only the synchronous
-    /// section in [`Self::refresh_environment_locked`].
+    /// held across the background probe, but spawned refresh tasks re-enter
+    /// it for their compare-and-swap commit section.
     env_refresh_lock: tokio::sync::Mutex<()>,
     /// Engine-wide refresh epoch, bumped on every successful swap of the env
     /// registry or per-env catalog. A background refresh captures the epoch
@@ -116,6 +127,9 @@ pub struct Engine {
     /// writes invalidate each other's results, and the loser silently aborts
     /// instead of clobbering newer state.
     env_refresh_epoch: AtomicU64,
+    /// Broadcasts after an env refresh/remove/disable commit so hosts can
+    /// re-fetch the lock-free snapshots returned by `environment_list`.
+    env_refresh_tx: broadcast::Sender<EnvRefreshEvent>,
     /// Active-run broadcast senders so subscribers (CLI
     /// `--json-events`, GUI Tauri commands) can stream events for
     /// any run that this process started.
@@ -192,6 +206,7 @@ impl Engine {
         env_registry.store(outcome.entries);
         let env_catalogs = ArcSwap::new(Arc::new(outcome.catalogs));
         let env_disabled_specs = ArcSwap::new(Arc::new(outcome.disabled_specs));
+        let (env_refresh_tx, _env_refresh_rx) = broadcast::channel(32);
         Ok(Self {
             pool,
             registry: Arc::new(registry),
@@ -205,6 +220,7 @@ impl Engine {
             env_disabled_specs,
             env_refresh_lock: tokio::sync::Mutex::new(()),
             env_refresh_epoch: AtomicU64::new(0),
+            env_refresh_tx,
             run_senders: Arc::new(Mutex::new(HashMap::new())),
             run_tokens: Arc::new(Mutex::new(HashMap::new())),
             run_snapshots: Arc::new(Mutex::new(HashMap::new())),
@@ -237,6 +253,12 @@ impl Engine {
     ) -> Arc<HashMap<environment::runtime::EnvId, environment::runtime::boot_probe::DisabledEnv>>
     {
         self.env_disabled_specs.load_full()
+    }
+
+    /// Subscribe to environment state changes committed after construction.
+    #[must_use]
+    pub fn subscribe_env_refresh(&self) -> broadcast::Receiver<EnvRefreshEvent> {
+        self.env_refresh_tx.subscribe()
     }
 
     /// Re-probe the host environment.
@@ -365,10 +387,11 @@ impl Engine {
         let current_disabled = self.env_disabled_specs.load();
         let mut next_disabled = (**current_disabled).clone();
         next_disabled.remove(env_id);
-        self.env_refresh_epoch.fetch_add(1, Ordering::AcqRel);
+        let epoch = self.env_refresh_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         self.env_registry.store(next_entries);
         self.env_catalogs.store(Arc::new(next_catalogs));
         self.env_disabled_specs.store(Arc::new(next_disabled));
+        self.publish_env_refresh(Some(env_id.clone()), epoch);
     }
 
     /// Synchronous Disable: drops the env from `env_registry` +
@@ -396,10 +419,16 @@ impl Engine {
             env_id.clone(),
             environment::runtime::boot_probe::DisabledEnv { label, spec },
         );
-        self.env_refresh_epoch.fetch_add(1, Ordering::AcqRel);
+        let epoch = self.env_refresh_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         self.env_registry.store(next_entries);
         self.env_catalogs.store(Arc::new(next_catalogs));
         self.env_disabled_specs.store(Arc::new(next_disabled));
+        self.publish_env_refresh(Some(env_id.clone()), epoch);
+    }
+
+    fn publish_env_refresh(&self, env_id: Option<environment::runtime::EnvId>, epoch: u64) {
+        let send_result = self.env_refresh_tx.send(EnvRefreshEvent { env_id, epoch });
+        drop(send_result);
     }
 
     /// Insert a new `EnvSpec` row and schedule a probe for it.
@@ -851,6 +880,7 @@ async fn run_full_refresh(engine: &Arc<Engine>, epoch_before: u64) {
     use std::sync::atomic::Ordering;
     let outcome =
         environment::runtime::boot_probe::run(&engine.pool, &engine.resource_registry).await;
+    let _guard = engine.env_refresh_lock.lock().await;
     match engine.env_refresh_epoch.compare_exchange(
         epoch_before,
         epoch_before + 1,
@@ -863,6 +893,7 @@ async fn run_full_refresh(engine: &Arc<Engine>, epoch_before: u64) {
             engine
                 .env_disabled_specs
                 .store(Arc::new(outcome.disabled_specs));
+            engine.publish_env_refresh(None, epoch_before + 1);
         },
         Err(current) => {
             tracing::debug!(
@@ -895,6 +926,7 @@ async fn run_single_refresh(
     .await
     {
         Ok(single) => {
+            let _guard = engine.env_refresh_lock.lock().await;
             match engine.env_refresh_epoch.compare_exchange(
                 epoch_before,
                 epoch_before + 1,
@@ -912,9 +944,9 @@ async fn run_single_refresh(
                     // its entry from env_disabled_specs so the IPC stops
                     // listing it under disabled.
                     let mut next_disabled = (**engine.env_disabled_specs.load()).clone();
-                    if next_disabled.remove(&env_id).is_some() {
-                        engine.env_disabled_specs.store(Arc::new(next_disabled));
-                    }
+                    next_disabled.remove(&env_id);
+                    engine.env_disabled_specs.store(Arc::new(next_disabled));
+                    engine.publish_env_refresh(Some(env_id.clone()), epoch_before + 1);
                 },
                 Err(current) => {
                     tracing::debug!(

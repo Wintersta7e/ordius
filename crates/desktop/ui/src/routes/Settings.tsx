@@ -4,6 +4,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import type { JSX } from "react";
+import { listen } from "@tauri-apps/api/event";
 
 import {
   type SecretMeta,
@@ -58,7 +59,7 @@ const SECTIONS: Array<{
   description: string;
 }> = [
   { id: "secrets", label: "Secrets", description: "API keys, tokens, passwords" },
-  { id: "environments", label: "Environments", description: "Namespaces probed for LLM services" },
+  { id: "environments", label: "Environments", description: "Environments probed for LLM services" },
   { id: "workspaces", label: "Workspaces", description: "Project folders workflows run against" },
   { id: "retention", label: "Retention", description: "Run history & workspace cleanup" },
   { id: "concurrency", label: "Concurrency", description: "Parallel workflow & node limits" },
@@ -170,6 +171,27 @@ export function Settings({
   useEffect(() => {
     void reload();
   }, [reload]);
+
+  useEffect(() => {
+    if (!insideTauri) return;
+    let disposed = false;
+    const unlisten = listen("env_refresh_completed", () => {
+      void reload();
+    }).catch((e: unknown) => {
+      if (!disposed) {
+        setError(String(e));
+      }
+      return null;
+    });
+    return () => {
+      disposed = true;
+      void unlisten.then((removeListener) => {
+        if (removeListener) {
+          removeListener();
+        }
+      });
+    };
+  }, [insideTauri, reload]);
 
   const patchSettings = useCallback(
     async (patch: Partial<SettingsShape>) => {

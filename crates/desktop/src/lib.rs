@@ -9,7 +9,7 @@ use ordius_engine::Engine;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 /// Boot the Tauri runtime. Called from `main.rs` and (when
 /// `mobile` cfg is set) from Tauri's mobile entry-point macro.
@@ -25,7 +25,9 @@ pub fn run() {
                 .map_err(|e| -> Box<dyn std::error::Error> {
                     Box::new(EngineInitError(e.to_string()))
                 })?;
-            app.manage(state::AppState::new(Arc::new(engine)));
+            let engine = Arc::new(engine);
+            spawn_env_refresh_bridge(app, Arc::clone(&engine));
+            app.manage(state::AppState::new(engine));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -67,6 +69,26 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn spawn_env_refresh_bridge(app: &tauri::App, engine: Arc<Engine>) {
+    let app_handle = app.handle().clone();
+    let mut rx = engine.subscribe_env_refresh();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if let Err(e) = app_handle.emit("env_refresh_completed", event) {
+                        tracing::warn!(error = ?e, "failed to emit env refresh event");
+                    }
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "env refresh event listener lagged");
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }
 
 /// Wrap engine init failure in a `std::error::Error`-compatible type
