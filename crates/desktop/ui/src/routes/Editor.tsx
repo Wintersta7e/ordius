@@ -7,12 +7,15 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { JSX } from "react";
+import { listen } from "@tauri-apps/api/event";
 
 import {
+  type EnvSnapshotIpc,
   type NodeType,
   type Workflow,
   type WorkflowWarningIpc,
   type Workspace,
+  listEnvironments,
   listNodeTypes,
   listWorkflows,
   listWorkspaces,
@@ -80,6 +83,7 @@ export function Editor({
   const [runState, setRunState] = useState<LiveRunState>(emptyRunState);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [workspaceId, setWorkspaceId] = useState<string | null>(null);
+  const [envs, setEnvs] = useState<EnvSnapshotIpc | null>(null);
   const [runDialogOpen, setRunDialogOpen] = useState(false);
   const [paletteW, setPaletteW] = useState<number>(() => readStoredWidth("ordius.layout.paletteW", 220, PALETTE_MIN, PALETTE_MAX));
   const [propsW, setPropsW] = useState<number>(() => readStoredWidth("ordius.layout.propsW", 320, PROPS_MIN, PROPS_MAX));
@@ -174,6 +178,51 @@ export function Editor({
   useEffect(() => {
     void reloadWorkspaces();
   }, [reloadWorkspaces]);
+
+  // Env snapshot drives the workflow header's default-env picker (and
+  // later per-node target_env). Loaded once and re-fetched whenever
+  // Settings (or a background refresh) emits `env_refresh_completed`
+  // so the dropdown stays in sync with reachability + enabled flags.
+  useEffect(() => {
+    if (!insideTauri) {
+      setEnvs({
+        envs: [
+          {
+            id: "local",
+            label: "Local (this machine)",
+            kind: "local",
+            enabled: true,
+            state: { state: "reachable" },
+            resources: [],
+          },
+        ],
+      });
+      return;
+    }
+    let cancelled = false;
+    const fetchEnvs = () => {
+      void listEnvironments()
+        .then((snap) => {
+          if (!cancelled) setEnvs(snap);
+        })
+        .catch((e: unknown) => {
+          if (!cancelled) setError(String(e));
+        });
+    };
+    fetchEnvs();
+    const unlisten = listen("env_refresh_completed", () => {
+      fetchEnvs();
+    }).catch((e: unknown) => {
+      if (!cancelled) setError(String(e));
+      return null;
+    });
+    return () => {
+      cancelled = true;
+      void unlisten.then((removeListener) => {
+        if (removeListener) removeListener();
+      });
+    };
+  }, [insideTauri]);
 
   // Load node-type catalog once (under Tauri) — used by the Canvas
   // for port lookup and category tinting.
@@ -974,6 +1023,7 @@ export function Editor({
                 : null
             }
             nodeTypes={nodeTypes}
+            envs={envs}
             onPatchNode={handlePatchNode}
             onPatchWorkflow={handlePatchWorkflow}
             onDeleteNode={handleDeleteNode}

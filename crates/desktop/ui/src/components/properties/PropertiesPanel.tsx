@@ -10,6 +10,7 @@ import type { JSX } from "react";
 
 import type {
   ConfigFieldDef,
+  EnvSnapshotIpc,
   Node,
   NodeType,
   PortDef,
@@ -18,6 +19,7 @@ import type {
 import { CATEGORIES, catColor } from "../../data/categories";
 import { NodeIcon, Ic } from "../icons";
 import { BracketHeader } from "../palette/BracketHeader";
+import { EnvPicker } from "./EnvPicker";
 import {
   Field,
   KV,
@@ -36,6 +38,7 @@ interface Props {
   workflow: Workflow;
   selectedNode: Node | null;
   nodeTypes: NodeType[];
+  envs: EnvSnapshotIpc | null;
   onPatchNode: (id: string, patch: Partial<Node>) => void;
   onPatchWorkflow: (patch: Partial<Workflow>) => void;
   onDeleteNode: (id: string) => void;
@@ -45,6 +48,7 @@ export function PropertiesPanel({
   workflow,
   selectedNode,
   nodeTypes,
+  envs,
   onPatchNode,
   onPatchWorkflow,
   onDeleteNode,
@@ -78,7 +82,11 @@ export function PropertiesPanel({
             onDelete={onDeleteNode}
           />
         ) : (
-          <WorkflowProps workflow={workflow} onPatch={onPatchWorkflow} />
+          <WorkflowProps
+            workflow={workflow}
+            envs={envs}
+            onPatch={onPatchWorkflow}
+          />
         )}
       </div>
     </div>
@@ -326,10 +334,15 @@ function NodeProps({
 
 interface WorkflowPropsProps {
   workflow: Workflow;
+  envs: EnvSnapshotIpc | null;
   onPatch: (patch: Partial<Workflow>) => void;
 }
 
-function WorkflowProps({ workflow, onPatch }: WorkflowPropsProps): JSX.Element {
+function WorkflowProps({
+  workflow,
+  envs,
+  onPatch,
+}: WorkflowPropsProps): JSX.Element {
   const loopCount = workflow.edges.filter((e) => e.edgeType === "loop").length;
   return (
     <div>
@@ -342,6 +355,17 @@ function WorkflowProps({ workflow, onPatch }: WorkflowPropsProps): JSX.Element {
         </Field>
         <Field label="id">
           <Mono value={workflow.id} />
+        </Field>
+        <Field
+          label="default env"
+          hint="env nodes use when target_env is unset"
+        >
+          <EnvPicker
+            envs={envs}
+            value={workflow.defaultEnv ?? null}
+            onChange={(next) => onPatch({ defaultEnv: next })}
+            inheritLabel="(host / local)"
+          />
         </Field>
       </div>
 
