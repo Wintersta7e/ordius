@@ -266,6 +266,13 @@ function NodeProps({
             effectiveEnv={effectiveEnv}
             onPatch={onPatch}
           />
+        ) : nodeType.id === "http" ? (
+          <HttpParameters
+            node={node}
+            nodeType={nodeType}
+            effectiveEnv={effectiveEnv}
+            onPatch={onPatch}
+          />
         ) : (
           <GenericParameters
             node={node}
@@ -429,6 +436,120 @@ function LlmParameters({
           options={["auto", "force", "off"]}
           onChange={(next) =>
             onPatch(node.id, { config: { ...node.config, stream: next } })
+          }
+        />
+      </Field>
+      {remainingFields.map((field) => (
+        <ConfigFieldRow
+          key={field.name}
+          field={field}
+          value={node.config?.[field.name]}
+          onChange={(value) =>
+            onPatch(node.id, {
+              config: { ...node.config, [field.name]: value },
+            })
+          }
+        />
+      ))}
+      {adhocEntries.map(([key, value]) => (
+        <Field key={key} label={key} hint="custom">
+          <TextInput
+            value={String(value ?? "")}
+            onChange={(next) =>
+              onPatch(node.id, {
+                config: { ...node.config, [key]: next },
+              })
+            }
+          />
+        </Field>
+      ))}
+    </>
+  );
+}
+
+interface HttpParametersProps extends ParameterRendererProps {
+  effectiveEnv: string;
+}
+
+function HttpParameters({
+  node,
+  nodeType,
+  effectiveEnv,
+  onPatch,
+}: HttpParametersProps): JSX.Element {
+  const definedFieldNames = new Set(nodeType.config.map((f) => f.name));
+  const adhocEntries = Object.entries(node.config ?? {}).filter(
+    ([key]) => !definedFieldNames.has(key),
+  );
+  const remainingFields = nodeType.config.filter(
+    (f) =>
+      f.name !== "url" &&
+      f.name !== "resource" &&
+      f.name !== "path" &&
+      f.name !== "origin",
+  );
+  const formMode: "literal" | "resource" = node.config.resource
+    ? "resource"
+    : "literal";
+  const originValue = (node.config.origin as string) ?? "env";
+  return (
+    <>
+      <Field label="form" hint="literal URL or env-resolved resource">
+        <SegRow
+          value={formMode}
+          options={["literal", "resource"]}
+          onChange={(next) =>
+            onPatch(node.id, {
+              config: switchForm(
+                node.config,
+                next as "literal" | "resource",
+              ),
+            })
+          }
+        />
+      </Field>
+      {formMode === "literal" ? (
+        <Field label="url" hint="literal URL — supports {{template}}">
+          <TextInput
+            value={(node.config.url as string) ?? ""}
+            onChange={(next) =>
+              onPatch(node.id, { config: { ...node.config, url: next } })
+            }
+          />
+        </Field>
+      ) : (
+        <>
+          <Field label="resource" hint="env-resolved HTTP endpoint">
+            <ResourcePicker
+              envId={effectiveEnv}
+              value={readResourceId(node.config.resource)}
+              onChange={(next) =>
+                onPatch(node.id, {
+                  config: {
+                    ...node.config,
+                    resource: next ? { id: next } : null,
+                  },
+                })
+              }
+              placeholder="(pick an HTTP resource)"
+            />
+          </Field>
+          <Field label="path" hint="appended to the resource's base URL">
+            <TextInput
+              value={(node.config.path as string) ?? ""}
+              onChange={(next) =>
+                onPatch(node.id, { config: { ...node.config, path: next } })
+              }
+            />
+          </Field>
+        </>
+      )}
+      <Field label="origin" hint="env (default) or host">
+        <SegRow
+          value={originValue}
+          options={["env", "host"]}
+          onChange={(next) =>
+            onPatch(node.id, { config: { ...node.config, origin: next } })
           }
         />
       </Field>
@@ -690,6 +811,23 @@ function readResourceId(value: unknown): string | null {
     return typeof id === "string" ? id : null;
   }
   return null;
+}
+
+function switchForm(
+  config: Record<string, unknown>,
+  next: "literal" | "resource",
+): Record<string, unknown> {
+  const out = { ...config };
+  if (next === "literal") {
+    delete out.resource;
+    delete out.path;
+  } else {
+    delete out.url;
+    if (!out.resource) {
+      out.resource = { id: null };
+    }
+  }
+  return out;
 }
 
 // ─── Pin table ────────────────────────────────────────────────────
