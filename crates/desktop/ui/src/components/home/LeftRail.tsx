@@ -4,6 +4,7 @@
 // doesn't scroll with the workflow grid (only the grid scrolls).
 
 import type { JSX, ReactNode } from "react";
+import { useState } from "react";
 
 import type {
   EnvEntryIpc,
@@ -154,11 +155,9 @@ export function LeftRail({
                 detail={`v${status.engineVersion}`}
                 state="ok"
               />
-              {environment
-                ? environment.envs.map((env) => (
-                    <EnvSysRow key={env.id} env={env} />
-                  ))
-                : null}
+              {environment ? (
+                <EnvSummaryRows environment={environment} />
+              ) : null}
               {environment && envHasResources(environment) === false ? (
                 <SysRow
                   label="endpoints"
@@ -438,6 +437,71 @@ function summariseResources(resources: EnvResourceIpc[]): string {
   }
   return `${found.length} of ${resources.length} found`;
 }
+
+/**
+ * Render the env list collapsed by default. The summary line shows
+ * `N reachable`; "problem" envs (unreachable / probing) always render
+ * inline below the summary so the user can't miss them under a
+ * collapsed toggle. Disabled envs stay hidden until the user expands.
+ */
+function EnvSummaryRows({
+  environment,
+}: {
+  environment: EnvSnapshotIpc;
+}): JSX.Element {
+  const [expanded, setExpanded] = useState(false);
+  if (expanded) {
+    return (
+      <>
+        {environment.envs.map((env) => (
+          <EnvSysRow key={env.id} env={env} />
+        ))}
+        <button
+          type="button"
+          onClick={() => setExpanded(false)}
+          style={collapseButtonStyle}
+        >
+          ▲ collapse envs
+        </button>
+      </>
+    );
+  }
+  const reachable = environment.envs.filter(
+    (env) => env.state.state === "reachable",
+  ).length;
+  const problem = environment.envs.filter(
+    (env) =>
+      env.state.state === "unreachable" || env.state.state === "probing",
+  );
+  return (
+    <>
+      <SysRow label="envs" detail={`${reachable} reachable`} state="ok" />
+      {problem.map((env) => (
+        <EnvSysRow key={env.id} env={env} />
+      ))}
+      <button
+        type="button"
+        onClick={() => setExpanded(true)}
+        style={collapseButtonStyle}
+      >
+        ▼ show all envs
+      </button>
+    </>
+  );
+}
+
+const collapseButtonStyle = {
+  appearance: "none" as const,
+  background: "transparent",
+  border: 0,
+  color: "var(--accent)",
+  padding: "4px 14px",
+  fontFamily: "var(--mono)",
+  fontSize: 10,
+  cursor: "pointer" as const,
+  textAlign: "left" as const,
+  width: "100%",
+};
 
 function EnvSysRow({ env }: { env: EnvEntryIpc }): JSX.Element {
   const detail =
