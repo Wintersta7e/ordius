@@ -27,6 +27,7 @@ use crate::dto::{
 use crate::state::AppState;
 use ordius_engine::settings::Settings as EngineSettings;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Workflow ids become the filename stem under `<home>/workflows/`, so a
 /// hostile webview payload like `../../etc/passwd` would escape the dir.
@@ -89,10 +90,9 @@ pub fn load_workflow(
     let (wf_arc, warnings) = engine
         .load_workflow_for_run(engine.home(), &id)
         .map_err(|e| e.to_string())?;
-    // `load_workflow_for_run` returns `Arc<Workflow>` to keep the
-    // run path cheap; the IPC boundary needs an owned value to wrap
-    // in `JsonCamel`. The clone is one-per-load, not per-event.
-    let wf = (*wf_arc).clone();
+    // `load_workflow_for_run` returns `Arc<Workflow>` for the run path;
+    // unwrap when we're the only holder to avoid the per-load clone.
+    let wf = Arc::try_unwrap(wf_arc).unwrap_or_else(|arc| (*arc).clone());
     Ok(LoadWorkflowDto {
         workflow: JsonCamel(wf),
         warnings: warnings.into_iter().map(Into::into).collect(),

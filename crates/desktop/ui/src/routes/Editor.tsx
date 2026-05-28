@@ -867,14 +867,14 @@ export function Editor({
             borderBottom: "1px solid var(--line)",
           }}
         >
-          {warnings.map((w, idx) => (
+          {warnings.map((w) => (
             <NoticeBanner
-              key={`${w.nodeId}:${w.kind}:${idx}`}
+              key={`${w.nodeId}:${w.kind}`}
               kind="warn"
               title={w.nodeId}
               message={w.message}
               onDismiss={() =>
-                setWarnings((prev) => prev.filter((_, i) => i !== idx))
+                setWarnings((prev) => prev.filter((x) => x !== w))
               }
             />
           ))}
