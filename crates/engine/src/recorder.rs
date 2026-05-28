@@ -140,6 +140,76 @@ impl RunRecorder {
         })
     }
 
+    /// Variant of [`Self::start_with_run_id`] that claims the workflow lock
+    /// in the same SQLite transaction that writes the run snapshot and run
+    /// row. Returns `Ok(None)` if another run already holds the lock.
+    pub fn start_with_run_id_and_lock(
+        pool: DbPool,
+        wf: &Workflow,
+        node_specs_json: &str,
+        variables: &HashMap<String, String>,
+        trigger_kind: &str,
+        run_id: &str,
+    ) -> Result<Option<Self>> {
+        let snapshot_id = Uuid::new_v4().to_string();
+        let now = Utc::now().timestamp_millis();
+        let wf_json = serde_json::to_string(wf).map_err(|e| EngineError::Db(e.to_string()))?;
+        let vars_json =
+            serde_json::to_string(variables).map_err(|e| EngineError::Db(e.to_string()))?;
+        let pid = i64::from(std::process::id());
+        {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction()?;
+            let lock_res = tx.execute(
+                "INSERT INTO workflow_locks (workflow_id, run_id, holder_pid, acquired_at) \
+                 VALUES (?,?,?,?)",
+                rusqlite::params![&wf.id, run_id, pid, now],
+            );
+            match lock_res {
+                Ok(_) => {},
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    return Ok(None);
+                },
+                Err(e) => return Err(e.into()),
+            }
+            tx.prepare_cached(
+                "INSERT INTO run_snapshots (id, workflow_id, created_at, workflow_json, node_specs_json) \
+                 VALUES (?,?,?,?,?)",
+            )?
+            .execute(rusqlite::params![
+                &snapshot_id,
+                &wf.id,
+                now,
+                &wf_json,
+                node_specs_json,
+            ])?;
+            tx.prepare_cached(
+                "INSERT INTO runs (id, workflow_id, workflow_name, status, started_at, \
+                                   variables_json, trigger_kind, workflow_snapshot_id) \
+                 VALUES (?,?,?,?,?,?,?,?)",
+            )?
+            .execute(rusqlite::params![
+                run_id,
+                &wf.id,
+                &wf.name,
+                "running",
+                now,
+                &vars_json,
+                trigger_kind,
+                &snapshot_id,
+            ])?;
+            tx.commit()?;
+        }
+        Ok(Some(Self {
+            pool,
+            run_id: run_id.to_string(),
+            workflow_id: wf.id.clone(),
+            seq: AtomicU64::new(0),
+        }))
+    }
+
     /// Return the next monotonic sequence number for this run.
     /// Starts at 0 and increments by one per call.
     pub fn next_seq(&self) -> u64 {

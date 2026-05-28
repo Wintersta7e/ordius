@@ -101,8 +101,8 @@ impl Engine {
         }
     }
 
-    /// Install the workflow scope, mint a run id, build the per-run
-    /// snapshot, and create the recorder row.
+    /// Install the workflow scope, build the per-run snapshot, and create
+    /// the recorder row while acquiring the workflow lock.
     ///
     /// Failures between the scope install and the recorder write
     /// restore the prior scope so a snapshot construction error
@@ -112,8 +112,9 @@ impl Engine {
         wf: &Workflow,
         variables: &HashMap<String, String>,
         trigger_kind: &str,
+        run_id: &str,
     ) -> Result<(
-        Arc<RunRecorder>,
+        Option<Arc<RunRecorder>>,
         Arc<crate::environment::runtime::RunSnapshot>,
     )> {
         // Capture the prior workflow scope before re-installing so a
@@ -123,19 +124,6 @@ impl Engine {
             &workflow_id,
             &self.resource_registry,
         );
-
-        // Safety net: ensure the workflow's `resources:` block is installed
-        // under `ScopeKey::Workflow { id }` before any node executes.
-        // Production callers funnel through `load_workflow_for_run`, but
-        // programmatic `Workflow` construction (tests, future entry points)
-        // bypasses that path and would otherwise hit a "resource not in
-        // registry" failure at dispatch time. Replace-then-install keeps
-        // re-running an already-loaded workflow idempotent.
-        crate::environment::runtime::install_workflow_resources(
-            &workflow_id,
-            &wf.resources,
-            &self.resource_registry,
-        )?;
 
         // Best-effort rollback when a subsequent step fails. The
         // discarded result is fine — the rollback only matters when the
@@ -149,9 +137,21 @@ impl Engine {
             ));
         };
 
-        // Mint the run id eagerly so the snapshot can be keyed on it
-        // before any DB write. No `runs` row exists yet.
-        let run_id = RunRecorder::generate_run_id();
+        // Safety net: ensure the workflow's `resources:` block is installed
+        // under `ScopeKey::Workflow { id }` before any node executes.
+        // Production callers funnel through `load_workflow_for_run`, but
+        // programmatic `Workflow` construction (tests, future entry points)
+        // bypasses that path and would otherwise hit a "resource not in
+        // registry" failure at dispatch time. Replace-then-install keeps
+        // re-running an already-loaded workflow idempotent.
+        if let Err(e) = crate::environment::runtime::install_workflow_resources(
+            &workflow_id,
+            &wf.resources,
+            &self.resource_registry,
+        ) {
+            restore_prior_scope();
+            return Err(e.into());
+        }
 
         let envs_in_scope = wf.envs_in_scope();
         let default_env = wf
@@ -171,15 +171,16 @@ impl Engine {
             },
         };
 
-        let rec = match RunRecorder::start_with_run_id(
+        let rec = match RunRecorder::start_with_run_id_and_lock(
             self.pool(),
             wf,
             "{}",
             variables,
             trigger_kind,
-            &run_id,
+            run_id,
         ) {
-            Ok(r) => Arc::new(r),
+            Ok(Some(r)) => Some(Arc::new(r)),
+            Ok(None) => None,
             Err(e) => {
                 restore_prior_scope();
                 return Err(e);
@@ -207,17 +208,17 @@ impl Engine {
     ) -> Result<RunHandle> {
         crate::validation::validate(&wf)?;
 
+        // Mint the run id eagerly so the snapshot can be keyed on it
+        // before any DB write. No `runs` row exists yet.
+        let run_id = RunRecorder::generate_run_id();
         let (rec, run_snapshot) =
-            self.prepare_run_snapshot_and_recorder(&wf, &variables, trigger_kind)?;
-
-        // Lock acquisition failure means another run holds the workflow
-        // scope; don't restore — the holder's scope is the canonical one.
-        if !rec.try_acquire_lock()? {
+            self.prepare_run_snapshot_and_recorder(&wf, &variables, trigger_kind, &run_id)?;
+        let Some(rec) = rec else {
             return Err(EngineError::AlreadyRunning {
                 id: wf.id.clone(),
-                run_id: rec.run_id.clone(),
+                run_id,
             });
-        }
+        };
 
         let (em, rx) = Emitter::new(rec.clone());
         let em = Arc::new(em);
@@ -1569,6 +1570,74 @@ mod tests {
             Err(e) => panic!("expected AlreadyRunning, got Err({e})"),
         }
         h1.join.await.expect("join").expect("first run completes");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_run_lock_conflict_does_not_insert_orphan_run() {
+        let dir = TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+        let wf = Arc::new(Workflow {
+            id: "wf_lock_conflict".into(),
+            name: "lock conflict".into(),
+            schema_version: 1,
+            created_at: None,
+            updated_at: None,
+            variables: HashMap::new(),
+            triggers: vec![],
+            nodes: vec![Node {
+                id: "slow".into(),
+                ty: "delay".into(),
+                name: String::new(),
+                config: HashMap::from([("ms".into(), serde_json::json!(60_000))]),
+                pos: Pos::default(),
+                timeout_ms: None,
+                retry: None,
+                continue_on_error: false,
+                target_env: None,
+            }],
+            edges: vec![],
+            resources: vec![],
+            default_env: None,
+        });
+
+        let first = engine
+            .start_run(wf.clone(), HashMap::new(), "test", false, None)
+            .expect("first run starts");
+        let second = engine.start_run(wf.clone(), HashMap::new(), "test", false, None);
+        assert!(
+            matches!(second, Err(EngineError::AlreadyRunning { .. })),
+            "second start should report the workflow lock conflict",
+        );
+
+        let conn = engine.pool().get().unwrap();
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE workflow_id=?",
+                [&wf.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            row_count, 1,
+            "lock conflict must not leave a second run row behind",
+        );
+        let running_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE workflow_id=? AND status='running'",
+                [&wf.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(running_count, 1);
+        drop(conn);
+
+        assert!(engine.cancel_run(&first.run_id));
+        let summary = first
+            .join
+            .await
+            .expect("join")
+            .expect("first run completes");
+        assert_eq!(summary.status, "stopped");
     }
 
     #[tokio::test(flavor = "multi_thread")]
