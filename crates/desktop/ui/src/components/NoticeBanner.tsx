@@ -4,11 +4,14 @@
 // block sat in the document flow) and overlay (absolutely
 // positioned floater used inside the editor canvas).
 //
-// `kind` selects the accent color tier (info / warn / error). For
-// back-compat with the earlier `tone` prop, omitting `kind` falls
-// back to `tone` (`"warn"` default, `"ok"` for success). New call
-// sites should prefer `kind`; the editor's load-warning stack uses
-// it directly.
+// Two render paths gated on whether `kind` is provided:
+//   - Legacy path (no `kind`): dashed-border + canvas-bg, message
+//     coloured by `tone`. Used by Home / Settings / History / the
+//     editor's overlay error+validate banners.
+//   - Tiered path (`kind` set): accent-tinted bg, solid border, flex
+//     layout with optional `title` chip + `×` dismiss button. Used
+//     by the editor's workflow-warning stack (and future Phase F
+//     callers).
 
 import type { CSSProperties, JSX } from "react";
 
@@ -16,22 +19,22 @@ export type NoticeKind = "info" | "warn" | "error";
 
 export interface NoticeBannerProps {
   message: string;
-  /** Accent tier. Overrides `tone` when set. Defaults to `"warn"`
-   * via the legacy `tone` fallback so existing call sites are
-   * unaffected. */
+  /** Accent tier. When set, switches to the tiered look (solid
+   * border, accent-tinted fill, optional title chip + dismiss). */
   kind?: NoticeKind;
   /** Short label rendered as a mono chip before the message —
-   * used by the editor's load-warning stack to surface the node id. */
+   * used by the editor's load-warning stack to surface the node id.
+   * Only rendered on the tiered path (requires `kind`). */
   title?: string;
   /** Renders an inline dismiss `×` button when provided. The
    * dismissal is intentionally session-local; reload re-surfaces
-   * the warning. */
+   * the warning. Only rendered on the tiered path (requires `kind`). */
   onDismiss?: () => void;
   variant?: "inline" | "overlay";
   /** When true, the user can interact with the banner (eg copy text). */
   interactive?: boolean;
   /** Legacy fallback when `kind` is unset. `warn` renders a `!`
-   * accent; `ok` renders a `✓` accent. Prefer `kind` for new code. */
+   * accent; `ok` renders a `✓` accent. */
   tone?: "warn" | "ok";
 }
 
@@ -44,26 +47,96 @@ export function NoticeBanner({
   interactive = false,
   tone = "warn",
 }: NoticeBannerProps): JSX.Element {
-  const resolved: NoticeKind | "ok" = kind ?? (tone === "ok" ? "ok" : "warn");
+  if (kind !== undefined) {
+    return renderTiered({
+      message,
+      kind,
+      title,
+      onDismiss,
+      variant,
+      interactive,
+    });
+  }
+  return renderLegacy({ message, variant, interactive, tone });
+}
+
+interface LegacyArgs {
+  message: string;
+  variant: "inline" | "overlay";
+  interactive: boolean;
+  tone: "warn" | "ok";
+}
+
+function renderLegacy({
+  message,
+  variant,
+  interactive,
+  tone,
+}: LegacyArgs): JSX.Element {
+  const accent = tone === "ok" ? "var(--ok)" : "var(--warn)";
+  const glyph = tone === "ok" ? "✓ " : "! ";
+  const baseStyle: CSSProperties = {
+    padding: "8px 12px",
+    fontFamily: "var(--mono)",
+    fontSize: 11,
+    color: accent,
+    background: "var(--bg-canvas)",
+    border: "1px dashed var(--line)",
+    borderRadius: 3,
+  };
+
+  if (variant === "overlay") {
+    return (
+      <div
+        style={{
+          ...baseStyle,
+          position: "absolute",
+          top: 10,
+          left: 10,
+          right: 10,
+          pointerEvents: interactive ? "auto" : "none",
+        }}
+      >
+        <span style={{ color: accent }}>{glyph}</span>
+        {message}
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ ...baseStyle, marginBottom: 18 }}>
+      <span style={{ color: accent }}>{glyph}</span>
+      {message}
+    </div>
+  );
+}
+
+interface TieredArgs {
+  message: string;
+  kind: NoticeKind;
+  title: string | undefined;
+  onDismiss: (() => void) | undefined;
+  variant: "inline" | "overlay";
+  interactive: boolean;
+}
+
+function renderTiered({
+  message,
+  kind,
+  title,
+  onDismiss,
+  variant,
+  interactive,
+}: TieredArgs): JSX.Element {
   const accent =
-    resolved === "ok"
-      ? "var(--ok)"
-      : resolved === "info"
-        ? "var(--info)"
-        : resolved === "error"
-          ? "var(--err)"
-          : "var(--warn)";
-  const glyph =
-    resolved === "ok"
-      ? "✓ "
-      : resolved === "info"
-        ? "i "
-        : resolved === "error"
-          ? "✕ "
-          : "! ";
+    kind === "info"
+      ? "var(--info)"
+      : kind === "error"
+        ? "var(--err)"
+        : "var(--warn)";
+  const glyph = kind === "info" ? "i " : kind === "error" ? "✕ " : "! ";
   // Faint accent-tinted background so warn/error/info banners read
-  // as distinct tiers without inventing new tokens. Falls back to
-  // `--bg-canvas` for the legacy `tone`-driven path.
+  // as distinct tiers without inventing new tokens.
   const softBg = `color-mix(in srgb, ${accent} 8%, var(--bg-canvas))`;
   const baseStyle: CSSProperties = {
     padding: "8px 12px",
