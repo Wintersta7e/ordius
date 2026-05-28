@@ -79,6 +79,165 @@ pub struct EnvRefreshEvent {
     pub epoch: u64,
 }
 
+/// Outcome of [`Engine::test_host_direct`].
+///
+/// Returned both for hits and for transport / parse failures so the
+/// wizard can render a single uniform result screen. Hard errors
+/// (env / resource / probe spec missing) propagate as `EngineError`
+/// instead of populating this struct.
+#[derive(Debug, Clone)]
+pub struct HostDirectTestOutcome {
+    /// Base URL the probe was sent to.
+    pub host_url: String,
+    /// Probe route path appended to `host_url`.
+    pub probe_route_path: String,
+    /// HTTP status code; `None` when the request never returned a
+    /// response (transport error, timeout).
+    pub status_code: Option<u16>,
+    /// Stable fingerprint derived from the response body. `None` when
+    /// the request failed, the body did not parse as JSON, or any
+    /// `fingerprint_jsonpaths` entry had no match.
+    pub stable_fingerprint: Option<String>,
+    /// Up to ~2 KB of the response body as a UTF-8 string. `None` for
+    /// failures and for bodies whose first 2 KB are not valid UTF-8.
+    pub response_excerpt: Option<String>,
+    /// Set when `success()` is `false`.
+    pub error: Option<String>,
+}
+
+impl HostDirectTestOutcome {
+    /// `true` when the request returned a 2xx response AND a stable
+    /// fingerprint was extracted from the body.
+    #[must_use]
+    pub fn success(&self) -> bool {
+        self.error.is_none()
+            && self.stable_fingerprint.is_some()
+            && matches!(self.status_code, Some(s) if (200..300).contains(&s))
+    }
+}
+
+/// Maximum bytes of response body returned on `response_excerpt`. The
+/// wizard renders this verbatim, so a small ceiling keeps the IPC
+/// payload bounded.
+const HOST_DIRECT_EXCERPT_LIMIT: usize = 2048;
+
+/// 5-second ceiling for the host-direct probe request. Surfaces a
+/// "request timed out" error on the outcome rather than blocking the
+/// caller indefinitely.
+const HOST_DIRECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Fire a single HTTP probe at `base_url + route_path` via the shared
+/// `reqwest::Client` and turn the response into a
+/// [`HostDirectTestOutcome`]. Pure of any engine state — split from
+/// [`Engine::test_host_direct`] so the per-call body stays under the
+/// crate's clippy line ceiling.
+async fn probe_host_direct(
+    base_url: String,
+    probe_route_path: String,
+    method: environment::runtime::HttpProbeMethod,
+    fingerprint_jsonpaths: Vec<String>,
+) -> HostDirectTestOutcome {
+    let url = format!("{base_url}{probe_route_path}");
+    let client = crate::executor::http_client::shared();
+    let request = match method {
+        environment::runtime::HttpProbeMethod::Get => client.get(&url),
+        environment::runtime::HttpProbeMethod::Head => client.head(&url),
+    };
+
+    let response = match tokio::time::timeout(HOST_DIRECT_TIMEOUT, request.send()).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            return HostDirectTestOutcome {
+                host_url: base_url,
+                probe_route_path,
+                status_code: None,
+                stable_fingerprint: None,
+                response_excerpt: None,
+                error: Some(format!("request failed: {e}")),
+            };
+        },
+        Err(_) => {
+            return HostDirectTestOutcome {
+                host_url: base_url,
+                probe_route_path,
+                status_code: None,
+                stable_fingerprint: None,
+                response_excerpt: None,
+                error: Some("request timed out after 5s".into()),
+            };
+        },
+    };
+    let status_code = response.status().as_u16();
+    let bytes = match response.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            return HostDirectTestOutcome {
+                host_url: base_url,
+                probe_route_path,
+                status_code: Some(status_code),
+                stable_fingerprint: None,
+                response_excerpt: None,
+                error: Some(format!("read body failed: {e}")),
+            };
+        },
+    };
+
+    let excerpt_len = bytes.len().min(HOST_DIRECT_EXCERPT_LIMIT);
+    let response_excerpt = std::str::from_utf8(&bytes[..excerpt_len])
+        .ok()
+        .map(std::string::ToString::to_string);
+    let stable_fingerprint =
+        environment::runtime::wsl::host_direct::compute_fingerprint(&bytes, &fingerprint_jsonpaths);
+
+    HostDirectTestOutcome {
+        host_url: base_url,
+        probe_route_path,
+        status_code: Some(status_code),
+        stable_fingerprint,
+        response_excerpt,
+        error: None,
+    }
+}
+
+/// Resolve the [`environment::runtime::ProbeSpec`] for
+/// `(env_id, resource_id)` consulting both the engine's resource
+/// registry and the env's persisted inline `EnvSpec.resources`.
+///
+/// The engine-level registry only carries `Builtin` + `UserGlobal`
+/// scopes — env-local resources live inline on the `EnvSpec` row and
+/// are layered in by `with_env_local_overlay` only at run-snapshot
+/// construction. Host-direct verification runs outside a run, so the
+/// registry-only lookup misses inline env-local defs; this helper
+/// falls back to a row read of `EnvSpec::resources()` so the wizard
+/// can target the same definitions probed at refresh time.
+fn resolve_probe_for_test(
+    engine: &Arc<Engine>,
+    env_id: &environment::runtime::EnvId,
+    resource_id: &environment::runtime::ResourceId,
+) -> Result<environment::runtime::ProbeSpec> {
+    let registry = engine.resource_registry();
+    let snap = registry.snapshot();
+    if let Some((def, _scope)) = snap.resolve(resource_id, env_id, None) {
+        return Ok(def.probe.clone());
+    }
+    let row = environment::runtime::boot_probe::load_spec_single(&engine.pool, env_id)
+        .map_err(|e| EngineError::Db(format!("load env spec: {e}")))?
+        .ok_or_else(|| EngineError::EnvUnknown(env_id.clone()))?;
+    let def = row
+        .spec
+        .resources()
+        .iter()
+        .find(|d| &d.id == resource_id)
+        .ok_or_else(|| {
+            EngineError::Db(format!(
+                "resource '{}' not declared in registry or env '{}' inline spec",
+                resource_id.0,
+                env_id.as_str(),
+            ))
+        })?;
+    Ok(def.probe.clone())
+}
+
 /// Top-level engine handle.
 ///
 /// Owns the `SQLite` pool, the node-type registry, the live
@@ -589,6 +748,129 @@ impl Engine {
         let spec_json = serde_json::to_string(&row.spec)
             .map_err(|e| EngineError::Db(format!("EnvSpec: {e}")))?;
         let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE env_specs SET spec_json = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![spec_json, now, env_id.as_str()],
+        )?;
+        drop(conn);
+        self.refresh_environment_locked(Some(env_id))
+    }
+
+    /// Probe a Found HTTP resource directly from the engine process and
+    /// derive a stable fingerprint from the response body.
+    ///
+    /// Read-only: this never mutates the env registry, the resource
+    /// registry, or `env_specs`. The `HostDirect` wizard in the GUI calls
+    /// this to populate the "Test direct access" preview before
+    /// committing the result via [`Self::enable_host_direct`].
+    ///
+    /// The catalog supplies the `base_url` (so the probe targets whatever
+    /// loopback the env's last probe resolved). The registry supplies the
+    /// resource's probe routes; the first route advertising at least one
+    /// `fingerprint_jsonpaths` entry is selected. Reqwest is issued via
+    /// the shared client (same connection pool as built-in HTTP nodes)
+    /// with a 5-second deadline applied around `send()`.
+    ///
+    /// Returns a [`HostDirectTestOutcome`] in every non-error path: an
+    /// unreachable host or a parse failure still produces a well-formed
+    /// outcome carrying the error message so the wizard can display it.
+    /// Hard errors (env / resource / probe-spec missing) propagate as
+    /// [`EngineError::EnvUnknown`] or [`EngineError::Db`].
+    pub async fn test_host_direct(
+        self: &Arc<Self>,
+        env_id: &environment::runtime::EnvId,
+        resource_id: &environment::runtime::ResourceId,
+    ) -> Result<HostDirectTestOutcome> {
+        use environment::runtime::{ProbeSpec, ResourceDetail, ResourceProbeOutcome};
+
+        let catalogs = self.env_catalogs();
+        let catalog = catalogs
+            .get(env_id)
+            .ok_or_else(|| EngineError::EnvUnknown(env_id.clone()))?;
+        let outcome = catalog.resources.get(resource_id).ok_or_else(|| {
+            EngineError::Db(format!(
+                "resource '{}' has no catalog entry in env '{}'",
+                resource_id.0,
+                env_id.as_str(),
+            ))
+        })?;
+        let base_url = match outcome {
+            ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint { base_url, .. }) => {
+                base_url.clone()
+            },
+            _ => {
+                return Err(EngineError::Db(format!(
+                    "resource '{}' is not a Found HTTP endpoint in env '{}'",
+                    resource_id.0,
+                    env_id.as_str(),
+                )));
+            },
+        };
+
+        let probe = resolve_probe_for_test(self, env_id, resource_id)?;
+        let probe_route = match &probe {
+            ProbeSpec::Http { routes, .. } => routes
+                .iter()
+                .find(|r| !r.fingerprint_jsonpaths.is_empty())
+                .ok_or_else(|| {
+                    EngineError::Db(format!(
+                        "resource '{}' has no probe route with fingerprint_jsonpaths",
+                        resource_id.0,
+                    ))
+                })?,
+            _ => {
+                return Err(EngineError::Db(format!(
+                    "resource '{}' is not an HTTP probe",
+                    resource_id.0,
+                )));
+            },
+        };
+
+        Ok(probe_host_direct(
+            base_url,
+            probe_route.path.clone(),
+            probe_route.method,
+            probe_route.fingerprint_jsonpaths.clone(),
+        )
+        .await)
+    }
+
+    /// Persist a [`environment::runtime::HostDirectVerification`] inline
+    /// on the env's `EnvSpec.host_direct_verifications` map.
+    ///
+    /// Holds `env_refresh_lock` across the SQL `UPDATE` + the call to
+    /// [`Self::refresh_environment_locked`] so concurrent dispatchers see
+    /// either the pre- or the post-mutation spec — never a partially
+    /// applied state. Existing entries for the same resource id are
+    /// replaced (the wizard re-runs verification when a fingerprint
+    /// drifts).
+    ///
+    /// Errors:
+    ///   - [`EngineError::EnvUnknown`] if no row matches `env_id`.
+    ///   - [`EngineError::Db`] when the env kind does not carry
+    ///     `host_direct_verifications` (today: `Ssh`).
+    pub async fn enable_host_direct(
+        self: &Arc<Self>,
+        env_id: &environment::runtime::EnvId,
+        resource_id: &environment::runtime::ResourceId,
+        verification: environment::runtime::HostDirectVerification,
+    ) -> Result<()> {
+        let _guard = self.env_refresh_lock.lock().await;
+        let mut row = environment::runtime::boot_probe::load_spec_single(&self.pool, env_id)
+            .map_err(|e| EngineError::Db(format!("load env spec: {e}")))?
+            .ok_or_else(|| EngineError::EnvUnknown(env_id.clone()))?;
+        let kind = row.spec.kind_str();
+        let map = row.spec.host_direct_verifications_mut().ok_or_else(|| {
+            EngineError::Db(format!(
+                "env '{}' kind '{kind}' does not support host-direct verifications",
+                env_id.as_str(),
+            ))
+        })?;
+        map.insert(resource_id.clone(), verification);
+        let spec_json = serde_json::to_string(&row.spec)
+            .map_err(|e| EngineError::Db(format!("EnvSpec: {e}")))?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let conn = self.pool.get()?;
         conn.execute(
             "UPDATE env_specs SET spec_json = ?1, updated_at = ?2 WHERE id = ?3",
             rusqlite::params![spec_json, now, env_id.as_str()],

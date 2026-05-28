@@ -601,6 +601,66 @@ pub async fn environment_remove_resource(
     Ok(build_env_snapshot(&state.engine))
 }
 
+/// Probe a Found HTTP resource directly from the engine process and
+/// derive a stable fingerprint from the response. Read-only — does not
+/// mutate `env_specs` or the registry.
+///
+/// Hard errors (env / resource / probe-spec missing) surface as a
+/// string. Transport failures (unreachable host, non-2xx, body parse)
+/// land on the returned [`crate::dto::HostDirectTestResultIpc`] with
+/// `success: false` and a populated `error` field so the wizard can
+/// render a uniform result screen.
+#[tauri::command]
+pub async fn environment_test_host_direct(
+    state: tauri::State<'_, AppState>,
+    env_id: String,
+    resource_id: String,
+) -> Result<crate::dto::HostDirectTestResultIpc, String> {
+    use ordius_engine::environment::runtime::{EnvId, ResourceId};
+    let env = EnvId::new(env_id);
+    let rid = ResourceId(resource_id);
+    let outcome = state
+        .engine
+        .test_host_direct(&env, &rid)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(crate::dto::HostDirectTestResultIpc {
+        success: outcome.success(),
+        status_code: outcome.status_code,
+        host_url: outcome.host_url,
+        probe_route_path: outcome.probe_route_path,
+        stable_fingerprint: outcome.stable_fingerprint,
+        response_excerpt: outcome.response_excerpt,
+        error: outcome.error,
+    })
+}
+
+/// Persist a `HostDirectVerification` inline on the env's spec.
+///
+/// Mutates under `env_refresh_lock` then schedules a single-env
+/// refresh. Returns the post-mutation snapshot so the caller can
+/// refresh its rendered list immediately.
+///
+/// Rejects envs whose kind carries no `host_direct_verifications`
+/// field (today: `Ssh`).
+#[tauri::command]
+pub async fn environment_enable_host_direct(
+    state: tauri::State<'_, AppState>,
+    env_id: String,
+    resource_id: String,
+    verification: crate::dto::HostDirectVerificationIpc,
+) -> Result<crate::dto::EnvSnapshotIpc, String> {
+    use ordius_engine::environment::runtime::{EnvId, ResourceId};
+    let env = EnvId::new(env_id);
+    let rid = ResourceId(resource_id);
+    state
+        .engine
+        .enable_host_direct(&env, &rid, verification.0)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(build_env_snapshot(&state.engine))
+}
+
 /// List resource definitions visible to `(env_id, workflow_id?)`.
 ///
 /// Returns each definition's declaring scope, advertised + proven

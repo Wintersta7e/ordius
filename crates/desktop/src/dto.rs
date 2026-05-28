@@ -683,6 +683,45 @@ pub struct EnvAddResourceIpc {
     pub definition: JsonCamel<ordius_engine::environment::runtime::ResourceDefinition>,
 }
 
+// ─── Host-direct verification ────────────────────────────────────
+
+/// Outcome of `environment_test_host_direct`.
+///
+/// The wizard renders this once per click of "Test direct access" — a
+/// fully populated record on success, and a record with `success:
+/// false` plus an `error` string on failure.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostDirectTestResultIpc {
+    /// `true` when the request returned 2xx AND the response yielded a
+    /// stable fingerprint.
+    pub success: bool,
+    /// HTTP status code; `None` when the request never returned
+    /// (transport error, timeout).
+    pub status_code: Option<u16>,
+    /// Base URL the probe was issued against.
+    pub host_url: String,
+    /// Probe route path appended to `host_url`.
+    pub probe_route_path: String,
+    /// Stable fingerprint derived from the response body via the probe
+    /// route's `fingerprint_jsonpaths`. `None` on failure.
+    pub stable_fingerprint: Option<String>,
+    /// Up to ~2 KB of the response body as a UTF-8 string. `None` for
+    /// failures and for bodies whose first 2 KB are not valid UTF-8.
+    pub response_excerpt: Option<String>,
+    /// Human-readable error message; populated when `success` is
+    /// `false`.
+    pub error: Option<String>,
+}
+
+/// Verification record sent to `environment_enable_host_direct`.
+///
+/// The engine type already declares typed fields (including
+/// `chrono::DateTime<Utc>`); `JsonCamel` rewrites `camelCase` keys to
+/// `snake_case` so the wire form mirrors the rest of the IPC surface.
+pub type HostDirectVerificationIpc =
+    JsonCamel<ordius_engine::environment::runtime::HostDirectVerification>;
+
 // ─── Resource picker definitions ─────────────────────────────────
 
 /// One resource definition + its current probe outcome.

@@ -327,6 +327,53 @@ export interface EnvAddResourceIpc {
   definition: unknown;
 }
 
+// ─── Host-direct verification ────────────────────────────────────
+// Mirrors `crates/desktop/src/dto.rs` (`HostDirectTestResultIpc` and
+// `HostDirectVerificationIpc`). The wizard fires `testHostDirect`
+// first, then commits the response into `enableHostDirect` after the
+// user confirms.
+
+/** Outcome of `testHostDirect`. */
+export interface HostDirectTestResultIpc {
+  /** `true` only when 2xx AND a fingerprint was extracted. */
+  success: boolean;
+  /** Status code; `null` on transport error / timeout. */
+  statusCode: number | null;
+  /** Base URL the probe was issued against. */
+  hostUrl: string;
+  /** Probe route path appended to `hostUrl`. */
+  probeRoutePath: string;
+  /** Stable fingerprint derived from the response body; `null` on failure. */
+  stableFingerprint: string | null;
+  /** Up to ~2 KB of response body (truncated). `null` on failure or non-UTF-8. */
+  responseExcerpt: string | null;
+  /** Populated when `success` is `false`. */
+  error: string | null;
+}
+
+/**
+ * Verification record sent to `enableHostDirect`. The desktop crate
+ * re-renames keys through `JsonCamel` before persisting, so the wire
+ * form here is `camelCase`.
+ */
+export interface HostDirectVerificationIpc {
+  /** ISO-8601 timestamp captured when the user committed the record. */
+  verifiedAt: string;
+  /** Verification method tag. */
+  method:
+    | "wsl_mirrored_networking"
+    | "explicit_rebind_to_all_interfaces"
+    | "user_asserted_no_verification";
+  /** Host URL the wizard verified. */
+  hostUrl: string;
+  /** Probe route path that produced the fingerprint. */
+  probeRoutePath: string;
+  /** Stable fingerprint captured during the test. */
+  stableFingerprint: string;
+  /** `JSONPath` expressions used to recompute the fingerprint on refresh. */
+  recomputeJsonpaths: string[];
+}
+
 // ─── Resource picker definitions ─────────────────────────────────
 // Mirrors `crates/desktop/src/dto.rs` (`EnvDefinitionListIpc` family).
 // The workflow editor's Resource Picker needs full capability + scope

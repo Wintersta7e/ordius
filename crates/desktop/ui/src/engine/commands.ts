@@ -10,6 +10,8 @@ import type {
   EnvAddResourceIpc,
   EnvDefinitionListIpc,
   EnvSnapshotIpc,
+  HostDirectTestResultIpc,
+  HostDirectVerificationIpc,
   LoadWorkflowResultIpc,
   NodeType,
   RunDetail,
@@ -230,5 +232,36 @@ export function listEnvironmentDefinitions(
   return invoke("environment_definitions", {
     envId,
     workflowId: workflowId ?? null,
+  });
+}
+
+/**
+ * Probe a Found HTTP resource directly from the engine process and
+ * derive a stable fingerprint from the response. Read-only — never
+ * mutates `env_specs` or the registry. The HostDirect wizard calls this
+ * before committing the result via {@link enableHostDirect}.
+ */
+export function testHostDirect(
+  envId: string,
+  resourceId: string,
+): Promise<HostDirectTestResultIpc> {
+  return invoke("environment_test_host_direct", { envId, resourceId });
+}
+
+/**
+ * Persist a `HostDirectVerification` inline on the env's spec.
+ * Returns the post-mutation snapshot so the caller can refresh its
+ * rendered list immediately. SSH envs reject because they carry no
+ * `host_direct_verifications` field.
+ */
+export function enableHostDirect(
+  envId: string,
+  resourceId: string,
+  verification: HostDirectVerificationIpc,
+): Promise<EnvSnapshotIpc> {
+  return invoke("environment_enable_host_direct", {
+    envId,
+    resourceId,
+    verification,
   });
 }

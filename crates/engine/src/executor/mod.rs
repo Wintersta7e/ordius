@@ -5,7 +5,7 @@ pub mod builtins;
 pub mod container;
 pub mod context;
 pub mod dispatcher;
-mod http_client;
+pub mod http_client;
 pub mod in_process;
 pub mod subprocess;
 pub mod supervisor;

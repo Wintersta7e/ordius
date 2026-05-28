@@ -220,6 +220,31 @@ impl EnvSpec {
             | Self::Container { resources, .. } => resources,
         }
     }
+
+    /// Borrow the inline `host_direct_verifications` map mutably.
+    ///
+    /// Returns `None` for the `Ssh` variant which carries no such field —
+    /// callers (the host-direct enable IPC) map that to a typed error so the
+    /// UI can refuse the action up front rather than silently no-op.
+    pub const fn host_direct_verifications_mut(
+        &mut self,
+    ) -> Option<&mut HashMap<ResourceId, HostDirectVerification>> {
+        match self {
+            Self::Local {
+                host_direct_verifications,
+                ..
+            }
+            | Self::WslDistro {
+                host_direct_verifications,
+                ..
+            }
+            | Self::Container {
+                host_direct_verifications,
+                ..
+            } => Some(host_direct_verifications),
+            Self::Ssh { .. } => None,
+        }
+    }
 }
 
 /// How the workflow's workspace directory reaches inside an environment.
