@@ -22,11 +22,13 @@ import {
   addWorkspace,
   enableHostDirect,
   getSettings,
+  listEnvironmentDefinitions,
   listEnvironments,
   listSecrets,
   listWorkspaces,
   refreshEnvironment,
   removeEnvironment,
+  removeEnvironmentResource,
   renameWorkspace,
   removeSecret,
   removeWorkspace,
@@ -795,6 +797,43 @@ function EnvRow({
   // Drawer is collapsed by default so a long resource list doesn't
   // dominate the Environments section once several envs are registered.
   const [open, setOpen] = useState(false);
+  // `env.resources` strips the declaring scope, so to learn which rows
+  // are user-removable we fetch the resource *definitions* (which carry
+  // scope) when the drawer opens and keep the set of env-local ids.
+  // Re-runs when `env.resources` changes so the set stays correct after
+  // an add or remove. Skipped outside Tauri where the IPC isn't
+  // reachable; a failed fetch just hides the remove affordances (the
+  // resources themselves still render), so it degrades quietly.
+  const [envLocalIds, setEnvLocalIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  useEffect(() => {
+    if (!open || !insideTauri) {
+      return;
+    }
+    let cancelled = false;
+    listEnvironmentDefinitions(env.id)
+      .then((list) => {
+        if (cancelled) {
+          return;
+        }
+        setEnvLocalIds(
+          new Set(
+            list.definitions
+              .filter((d) => d.scope === "env_local")
+              .map((d) => d.id),
+          ),
+        );
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setEnvLocalIds(new Set());
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, insideTauri, env.id, env.resources]);
   return (
     <div
       style={{
@@ -894,7 +933,9 @@ function EnvRow({
                   resource={res}
                   envId={env.id}
                   envKind={env.kind}
+                  removable={envLocalIds.has(res.id)}
                   onEnvironmentChange={onResourceAdded}
+                  onError={onError}
                 />
               ))}
             </div>
@@ -983,13 +1024,18 @@ function EnvResourceRow({
   resource,
   envId,
   envKind,
+  removable,
   onEnvironmentChange,
+  onError,
 }: {
   resource: EnvResourceIpc;
   envId: string;
   envKind: EnvKindIpc;
+  removable: boolean;
   onEnvironmentChange: (snap: EnvSnapshotIpc) => void;
+  onError: (msg: string) => void;
 }): JSX.Element {
+  const [removing, setRemoving] = useState(false);
   const stateLabel = resource.state.state;
   const stateReason =
     resource.state.state === "skipped" || resource.state.state === "probe_failed"
@@ -1008,11 +1054,17 @@ function EnvResourceRow({
     resource.kind === "http_endpoint" &&
     resource.state.state === "found" &&
     resource.routeOrigin === "env_loopback";
+  // Columns: marker · info · state [· wizard] [· remove]. Push the
+  // optional trailing columns so they line up with the conditionally
+  // rendered children below — order here must match the JSX order.
+  const gridCols = ["auto", "1fr", "auto"];
+  if (showWizard) gridCols.push("auto");
+  if (removable) gridCols.push("auto");
   return (
     <div
       style={{
         display: "grid",
-        gridTemplateColumns: showWizard ? "auto 1fr auto auto" : "auto 1fr auto",
+        gridTemplateColumns: gridCols.join(" "),
         gap: 8,
         alignItems: "center",
         paddingLeft: 26,
@@ -1049,6 +1101,25 @@ function EnvResourceRow({
           resourceId={resource.id}
           onComplete={onEnvironmentChange}
         />
+      ) : null}
+      {removable ? (
+        <button
+          type="button"
+          className="btn"
+          onClick={() => {
+            setRemoving(true);
+            removeEnvironmentResource(envId, resource.id)
+              .then(onEnvironmentChange)
+              .catch((e: unknown) => onError(`remove resource: ${String(e)}`))
+              .finally(() => setRemoving(false));
+          }}
+          disabled={removing}
+          aria-label={`remove resource ${resource.id}`}
+          title="remove this env-local resource"
+          style={{ height: 20, padding: "0 8px", fontSize: 10 }}
+        >
+          ✕
+        </button>
       ) : null}
     </div>
   );
