@@ -355,7 +355,7 @@ export interface EnvDefinitionIpc {
   version: string | null;
 }
 
-/** Listing returned by `environmentDefinitions(envId, workflowId?)`. */
+/** Listing returned by `listEnvironmentDefinitions(envId, workflowId?)`. */
 export interface EnvDefinitionListIpc {
   envId: string;
   workflowId: string | null;

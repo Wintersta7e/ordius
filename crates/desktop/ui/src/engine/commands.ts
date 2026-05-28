@@ -201,7 +201,7 @@ export function setEnvironmentEnabled(
  * the workflow editor's Resource Picker, which needs full capability +
  * scope info that `listEnvironments()` strips.
  */
-export function envDefinitions(
+export function listEnvironmentDefinitions(
   envId: string,
   workflowId?: string,
 ): Promise<EnvDefinitionListIpc> {
