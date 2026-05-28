@@ -7,6 +7,7 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 import type {
   EnvAddIpc,
+  EnvAddResourceIpc,
   EnvDefinitionListIpc,
   EnvSnapshotIpc,
   LoadWorkflowResultIpc,
@@ -194,6 +195,27 @@ export function setEnvironmentEnabled(
   enabled: boolean,
 ): Promise<EnvSnapshotIpc> {
   return invoke("environment_set_enabled", { envId, enabled });
+}
+
+/**
+ * Append a user-declared resource to an env's spec. Returns the new
+ * snapshot so the caller can update its rendered list immediately.
+ * Duplicate ids at the env-local scope reject; callers needing to
+ * shadow a built-in id must set `overrideLowerScope: true` on the
+ * inner definition.
+ */
+export function addEnvironmentResource(
+  payload: EnvAddResourceIpc,
+): Promise<EnvSnapshotIpc> {
+  return invoke("environment_add_resource", { payload });
+}
+
+/** Remove a user-declared resource by id. Unknown ids reject loudly. */
+export function removeEnvironmentResource(
+  envId: string,
+  resourceId: string,
+): Promise<EnvSnapshotIpc> {
+  return invoke("environment_remove_resource", { envId, resourceId });
 }
 
 /**

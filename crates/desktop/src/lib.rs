@@ -58,6 +58,8 @@ pub fn run() {
             commands::environment_add,
             commands::environment_remove,
             commands::environment_set_enabled,
+            commands::environment_add_resource,
+            commands::environment_remove_resource,
             commands::environment_definitions,
             // Loud-failure shims for the session-C names. Phase F deletes
             // these once the frontend has migrated to the `environment_*`

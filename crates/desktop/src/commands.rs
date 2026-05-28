@@ -560,6 +560,49 @@ pub async fn environment_set_enabled(
     Ok(build_env_snapshot(&state.engine))
 }
 
+/// Append a user-declared resource to an env's `spec_json` under
+/// `env_refresh_lock`.
+///
+/// Returns the post-mutation snapshot so the frontend renders the new
+/// resource immediately. Duplicate ids at the env-local scope return an
+/// error rather than silently overwriting.
+#[tauri::command]
+pub async fn environment_add_resource(
+    state: tauri::State<'_, AppState>,
+    payload: crate::dto::EnvAddResourceIpc,
+) -> Result<crate::dto::EnvSnapshotIpc, String> {
+    use ordius_engine::environment::runtime::{EnvId, ResourceDefinition};
+    let env_id = EnvId::new(payload.env_id);
+    let def: ResourceDefinition = serde_json::from_value(payload.definition)
+        .map_err(|e| format!("invalid ResourceDefinition: {e}"))?;
+    state
+        .engine
+        .add_env_local_resource(&env_id, def)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(build_env_snapshot(&state.engine))
+}
+
+/// Remove a user-declared resource by id from an env's `spec_json`.
+/// Unknown resource ids return an error so stale UI clicks surface
+/// loudly rather than no-op silently.
+#[tauri::command]
+pub async fn environment_remove_resource(
+    state: tauri::State<'_, AppState>,
+    env_id: String,
+    resource_id: String,
+) -> Result<crate::dto::EnvSnapshotIpc, String> {
+    use ordius_engine::environment::runtime::{EnvId, ResourceId};
+    let env_id = EnvId::new(env_id);
+    let rid = ResourceId(resource_id);
+    state
+        .engine
+        .remove_env_local_resource(&env_id, &rid)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(build_env_snapshot(&state.engine))
+}
+
 /// List resource definitions visible to `(env_id, workflow_id?)`.
 ///
 /// Returns each definition's declaring scope, advertised + proven

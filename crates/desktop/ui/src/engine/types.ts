@@ -310,6 +310,23 @@ export interface EnvAddIpc {
   spec: unknown;
 }
 
+/**
+ * Payload accepted by `addEnvironmentResource`. `definition` is the
+ * raw JSON form of `ordius_engine::environment::runtime::ResourceDefinition`
+ * — the engine parses it server-side so the wire shape stays opaque
+ * here. Set `overrideLowerScope: true` on the inner JSON when the new
+ * resource shadows a built-in id.
+ */
+export interface EnvAddResourceIpc {
+  envId: string;
+  /**
+   * Raw JSON form of `ResourceDefinition`. Must include `id`, `kind`,
+   * `probe`, `advertisedCapabilities`, and optionally
+   * `overrideLowerScope: true` when shadowing a built-in.
+   */
+  definition: unknown;
+}
+
 // ─── Resource picker definitions ─────────────────────────────────
 // Mirrors `crates/desktop/src/dto.rs` (`EnvDefinitionListIpc` family).
 // The workflow editor's Resource Picker needs full capability + scope

@@ -195,6 +195,31 @@ impl EnvSpec {
             Self::Container { .. } => "container",
         }
     }
+
+    /// Borrow the inline `resources` vec immutably. Every variant carries
+    /// this field today; the helper saves callers from a 4-arm match when
+    /// they only need read access.
+    #[must_use]
+    pub fn resources(&self) -> &[ResourceDefinition] {
+        match self {
+            Self::Local { resources, .. }
+            | Self::WslDistro { resources, .. }
+            | Self::Ssh { resources, .. }
+            | Self::Container { resources, .. } => resources,
+        }
+    }
+
+    /// Borrow the inline `resources` vec mutably. Writers (the env-local
+    /// resource add / remove IPC) use this to mutate the resources in
+    /// place before re-serialising the spec to `env_specs.spec_json`.
+    pub const fn resources_mut(&mut self) -> &mut Vec<ResourceDefinition> {
+        match self {
+            Self::Local { resources, .. }
+            | Self::WslDistro { resources, .. }
+            | Self::Ssh { resources, .. }
+            | Self::Container { resources, .. } => resources,
+        }
+    }
 }
 
 /// How the workflow's workspace directory reaches inside an environment.

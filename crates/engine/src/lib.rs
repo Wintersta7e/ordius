@@ -512,6 +512,89 @@ impl Engine {
         self.refresh_environment_locked(Some(id))
     }
 
+    /// Append an env-local resource to `<env>.spec.resources` atomically.
+    ///
+    /// Holds `env_refresh_lock` across:
+    ///   1. UPDATE `env_specs.spec_json` with the mutated resources vec
+    ///   2. `refresh_environment_locked(Some(env))` so the per-env catalog
+    ///      and registry layer pick up the new resource on the next probe.
+    ///
+    /// Errors:
+    ///   - [`EngineError::EnvUnknown`] if no row matches `env_id`.
+    ///   - [`EngineError::Db`] when a resource with the same id is already
+    ///     declared inline on this env (collisions across scopes must use
+    ///     `override_lower_scope` at higher layers; the env-local layer
+    ///     never duplicates ids within itself).
+    pub async fn add_env_local_resource(
+        self: &Arc<Self>,
+        env_id: &environment::runtime::EnvId,
+        def: environment::runtime::ResourceDefinition,
+    ) -> Result<()> {
+        let _guard = self.env_refresh_lock.lock().await;
+        let conn = self.pool.get()?;
+        let mut row = environment::runtime::boot_probe::load_spec_single(&self.pool, env_id)
+            .map_err(|e| EngineError::Db(format!("load env spec: {e}")))?
+            .ok_or_else(|| EngineError::EnvUnknown(env_id.clone()))?;
+        if row.spec.resources().iter().any(|r| r.id == def.id) {
+            return Err(EngineError::Db(format!(
+                "resource id '{}' already declared on env '{}'",
+                def.id.0,
+                env_id.as_str(),
+            )));
+        }
+        row.spec.resources_mut().push(def);
+        let spec_json = serde_json::to_string(&row.spec)
+            .map_err(|e| EngineError::Db(format!("EnvSpec: {e}")))?;
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE env_specs SET spec_json = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![spec_json, now, env_id.as_str()],
+        )?;
+        drop(conn);
+        self.refresh_environment_locked(Some(env_id))
+    }
+
+    /// Remove an env-local resource by id from `<env>.spec.resources`.
+    ///
+    /// Holds `env_refresh_lock` across the SQL UPDATE + the call to
+    /// [`Self::refresh_environment_locked`] so callers see the new
+    /// catalog state immediately after the await resolves.
+    ///
+    /// Errors:
+    ///   - [`EngineError::EnvUnknown`] if no row matches `env_id`.
+    ///   - [`EngineError::Db`] when `resource_id` is not present on the
+    ///     env's inline list — surfaces as a clear error rather than a
+    ///     silent no-op so the IPC can refuse stale UI clicks.
+    pub async fn remove_env_local_resource(
+        self: &Arc<Self>,
+        env_id: &environment::runtime::EnvId,
+        resource_id: &environment::runtime::ResourceId,
+    ) -> Result<()> {
+        let _guard = self.env_refresh_lock.lock().await;
+        let conn = self.pool.get()?;
+        let mut row = environment::runtime::boot_probe::load_spec_single(&self.pool, env_id)
+            .map_err(|e| EngineError::Db(format!("load env spec: {e}")))?
+            .ok_or_else(|| EngineError::EnvUnknown(env_id.clone()))?;
+        let before = row.spec.resources().len();
+        row.spec.resources_mut().retain(|r| &r.id != resource_id);
+        if row.spec.resources().len() == before {
+            return Err(EngineError::Db(format!(
+                "resource id '{}' not declared on env '{}'",
+                resource_id.0,
+                env_id.as_str(),
+            )));
+        }
+        let spec_json = serde_json::to_string(&row.spec)
+            .map_err(|e| EngineError::Db(format!("EnvSpec: {e}")))?;
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE env_specs SET spec_json = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![spec_json, now, env_id.as_str()],
+        )?;
+        drop(conn);
+        self.refresh_environment_locked(Some(env_id))
+    }
+
     /// Shared secrets store. Backed by `<home>/secrets-index.json`
     /// plus whatever credential builder the host has installed for
     /// `keyring_core` (libsecret / Credential Manager / Keychain /

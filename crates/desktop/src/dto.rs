@@ -665,6 +665,24 @@ const fn default_enabled() -> bool {
     true
 }
 
+/// Payload accepted by `environment_add_resource`.
+///
+/// The `definition` is the raw JSON form of
+/// `ordius_engine::environment::runtime::ResourceDefinition` — the engine
+/// parses it server-side so the desktop crate stays decoupled from the
+/// definition's internal shape. Set `overrideLowerScope: true` on the
+/// inner JSON when the new resource shadows a built-in id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvAddResourceIpc {
+    /// Env id the resource is added to.
+    pub env_id: String,
+    /// Raw `ResourceDefinition` JSON. The command parses this into
+    /// `ResourceDefinition` before mutating the spec; malformed payloads
+    /// surface as a typed error.
+    pub definition: serde_json::Value,
+}
+
 // ─── Resource picker definitions ─────────────────────────────────
 
 /// One resource definition + its current probe outcome.
