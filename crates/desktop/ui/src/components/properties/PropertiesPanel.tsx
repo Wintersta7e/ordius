@@ -78,6 +78,8 @@ export function PropertiesPanel({
           <NodeProps
             node={selectedNode}
             nodeType={nodeType}
+            envs={envs}
+            workflowDefaultEnv={workflow.defaultEnv ?? null}
             onPatch={onPatchNode}
             onDelete={onDeleteNode}
           />
@@ -98,6 +100,11 @@ export function PropertiesPanel({
 interface NodePropsProps {
   node: Node;
   nodeType: NodeType;
+  envs: EnvSnapshotIpc | null;
+  /** Workflow's defaultEnv used to render the per-node inherit
+   * sentinel. `null` falls back to `"local"` in the label so the user
+   * knows what dispatch picks when target_env is unset. */
+  workflowDefaultEnv: string | null;
   onPatch: (id: string, patch: Partial<Node>) => void;
   onDelete: (id: string) => void;
 }
@@ -105,6 +112,8 @@ interface NodePropsProps {
 function NodeProps({
   node,
   nodeType,
+  envs,
+  workflowDefaultEnv,
   onPatch,
   onDelete,
 }: NodePropsProps): JSX.Element {
@@ -287,6 +296,18 @@ function NodeProps({
             />
           </Field>
         ))}
+      </Section>
+
+      {/* EXECUTION CONTEXT */}
+      <Section label="execution context">
+        <Field label="run in" hint="env this node dispatches to">
+          <EnvPicker
+            envs={envs}
+            value={node.targetEnv ?? null}
+            onChange={(next) => onPatch(node.id, { targetEnv: next })}
+            inheritLabel={`(workflow default: ${workflowDefaultEnv ?? "local"})`}
+          />
+        </Field>
       </Section>
 
       {/* EXECUTION */}
