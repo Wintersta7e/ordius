@@ -727,15 +727,36 @@ function EnvironmentsSection({
             gap: 10,
           }}
         >
-          <span
-            style={{
-              fontSize: 10.5,
-              color: "var(--txt-faint)",
-              fontFamily: "var(--mono)",
-            }}
-          >
-            adding remote envs (SSH · container) lands with v1.3 dispatchers.
-          </span>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              type="button"
+              className="btn"
+              disabled
+              title="Remote SSH environments are coming in a later release."
+              style={{
+                height: 22,
+                padding: "0 10px",
+                opacity: 0.5,
+                cursor: "not-allowed",
+              }}
+            >
+              + Add SSH environment
+            </button>
+            <button
+              type="button"
+              className="btn"
+              disabled
+              title="Docker / container environments are coming in a later release."
+              style={{
+                height: 22,
+                padding: "0 10px",
+                opacity: 0.5,
+                cursor: "not-allowed",
+              }}
+            >
+              + Add Container environment
+            </button>
+          </div>
           <button
             type="button"
             className="btn"
