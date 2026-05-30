@@ -661,6 +661,35 @@ pub async fn environment_enable_host_direct(
     Ok(build_env_snapshot(&state.engine))
 }
 
+/// Perform a TOFU host-key enrollment for an SSH env spec.
+///
+/// Connects to the remote host, captures the presented public key during
+/// the transport handshake, then disconnects — **no authentication is
+/// attempted**. Returns the captured key as an inline pin so the caller
+/// can persist it on the spec.
+///
+/// The `spec` field must serialise as `EnvSpec::Ssh`; any other variant
+/// is rejected by the engine.
+#[tauri::command]
+pub async fn environment_test_ssh(
+    state: tauri::State<'_, AppState>,
+    payload: crate::dto::SshTestIpc,
+) -> Result<crate::dto::SshTestResultIpc, String> {
+    use ordius_engine::environment::runtime::{EnvId, EnvSpec};
+    let env_id = EnvId::new(payload.id);
+    let env_spec: EnvSpec =
+        serde_json::from_value(payload.spec).map_err(|e| format!("invalid EnvSpec: {e}"))?;
+    let pin = state
+        .engine
+        .test_ssh_enrollment(&env_id, payload.label, env_spec)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(crate::dto::SshTestResultIpc {
+        pin: crate::dto::JsonCamel(pin),
+        probe_ok: true,
+    })
+}
+
 /// List resource definitions visible to `(env_id, workflow_id?)`.
 ///
 /// Returns each definition's declaring scope, advertised + proven

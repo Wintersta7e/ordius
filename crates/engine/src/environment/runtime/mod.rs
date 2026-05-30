@@ -24,6 +24,7 @@ pub mod resource;
 pub mod run_catalog;
 pub mod run_snapshot;
 pub mod search_paths;
+pub mod ssh;
 pub mod transport;
 pub mod user_file;
 pub mod workflow_scope;

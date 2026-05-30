@@ -798,6 +798,35 @@ pub struct EnvDefinitionListIpc {
     pub definitions: Vec<EnvDefinitionIpc>,
 }
 
+// ─── SSH enrollment ──────────────────────────────────────────────────────────
+
+/// Payload accepted by `environment_test_ssh`.
+///
+/// `spec` is the raw JSON form of `EnvSpec::Ssh`; parsing happens
+/// engine-side so the desktop crate stays decoupled from the spec shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshTestIpc {
+    /// Stable env id (e.g. `ssh:mybox`).
+    pub id: String,
+    /// Display label shown in the env picker.
+    pub label: String,
+    /// Raw `EnvSpec` JSON. Must be `EnvSpec::Ssh`; other variants are
+    /// rejected engine-side.
+    pub spec: serde_json::Value,
+}
+
+/// Outcome returned by `environment_test_ssh`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshTestResultIpc {
+    /// Host-key pin captured during the transport handshake.
+    pub pin: JsonCamel<ordius_engine::environment::runtime::SshHostKeyPin>,
+    /// `true` when the connect+handshake succeeded cleanly. Full
+    /// auth and probe gating are layered in later tasks.
+    pub probe_ok: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

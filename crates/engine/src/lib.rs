@@ -930,6 +930,85 @@ impl Engine {
         self.refresh_environment_locked(Some(env_id))
     }
 
+    /// Perform a TOFU SSH enrollment: connect to the remote host, capture the
+    /// server's public key during the transport handshake (before any auth),
+    /// and return it as an [`SshHostKeyPin`] ready for inline persistence.
+    ///
+    /// The caller is responsible for persisting the pin (e.g. via a follow-up
+    /// call to `add_env` or by patching the existing `EnvSpec`). This method
+    /// is purely read-only — it opens a connection, reads the host key, and
+    /// disconnects without touching the database.
+    ///
+    /// `spec` must be `EnvSpec::Ssh`; any other variant returns an error.
+    /// The `(host, port)` tuple is passed directly to `russh::client::connect`
+    /// which accepts `tokio::net::ToSocketAddrs` — async DNS is handled
+    /// internally, so no blocking `getaddrinfo` call occurs on the tokio thread.
+    /// A 10-second TCP connect timeout guards against unreachable hosts.
+    /// Connection failures are reported as [`EngineError::Dispatch`] with
+    /// [`DispatchError::EnvUnreachable`].
+    pub async fn test_ssh_enrollment(
+        self: &Arc<Self>,
+        _env_id: &environment::runtime::EnvId,
+        _label: String,
+        spec: environment::runtime::EnvSpec,
+    ) -> Result<environment::runtime::SshHostKeyPin> {
+        use std::sync::Arc as StdArc;
+        use std::time::Duration;
+
+        use environment::runtime::error::DispatchError;
+        use environment::runtime::ssh::config::extract_target;
+        use environment::runtime::ssh::host_key::HostKeyHandler;
+
+        let (host, port) = extract_target(&spec).map_err(|e| DispatchError::EnvUnreachable {
+            env_id: "ssh:enrollment".to_string(),
+            reason: e.to_string(),
+        })?;
+
+        let config = russh::client::Config {
+            inactivity_timeout: Some(Duration::from_secs(30)),
+            ..Default::default()
+        };
+        let handler = HostKeyHandler::enroll();
+        let captured = handler.captured_key();
+
+        // Pass the unresolved (host, port) tuple directly — russh/tokio performs
+        // async DNS internally (no blocking getaddrinfo on a worker thread).
+        // Wrap in a 10-second timeout so an unreachable host (TCP SYN to a
+        // dropped port) fails fast instead of hanging for the OS retransmit window.
+        let session = tokio::time::timeout(
+            Duration::from_secs(10),
+            russh::client::connect(StdArc::new(config), (host.as_str(), port), handler),
+        )
+        .await
+        .map_err(|_| DispatchError::EnvUnreachable {
+            env_id: format!("{host}:{port}"),
+            reason: "SSH enrollment: connection timed out".to_string(),
+        })?
+        .map_err(|e| DispatchError::EnvUnreachable {
+            env_id: format!("{host}:{port}"),
+            reason: format!("SSH enrollment connect: {e}"),
+        })?;
+
+        let presented =
+            captured
+                .lock()
+                .await
+                .take()
+                .ok_or_else(|| DispatchError::EnvUnreachable {
+                    env_id: format!("{host}:{port}"),
+                    reason: "SSH enrollment: no host key captured".to_string(),
+                })?;
+
+        // Disconnect gracefully; ignore errors (connection may already be torn down).
+        drop(
+            session
+                .disconnect(russh::Disconnect::ByApplication, "enrollment", "en")
+                .await,
+        );
+
+        Ok(presented.to_pin(chrono::Utc::now()))
+    }
+
     /// Shared secrets store. Backed by `<home>/secrets-index.json`
     /// plus whatever credential builder the host has installed for
     /// `keyring_core` (libsecret / Credential Manager / Keychain /

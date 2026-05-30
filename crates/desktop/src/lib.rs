@@ -63,6 +63,7 @@ pub fn run() {
             commands::environment_definitions,
             commands::environment_test_host_direct,
             commands::environment_enable_host_direct,
+            commands::environment_test_ssh,
             // Loud-failure shims for the session-C names. Phase F deletes
             // these once the frontend has migrated to the `environment_*`
             // family.
