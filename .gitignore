@@ -61,6 +61,10 @@ AGENTS.md
 .claude/
 .serena/
 
+# Ephemeral SSH test keypair (never commit a private key), if the container
+# script is ever pointed back at the repo via ORDIUS_SSH_TEST_HOME
+.ssh-test/
+
 # Spec, plans, briefs — internal-only, never tracked
 /docs/
 
