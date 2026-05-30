@@ -1,6 +1,7 @@
 //! russh-native SSH dispatcher implementation.
 
 pub mod auth;
+pub mod bootstrap;
 pub mod config;
 pub mod connection;
 pub mod dispatcher;

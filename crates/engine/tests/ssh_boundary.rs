@@ -60,6 +60,33 @@ fn ssh_host_key_enrollment_builds_inline_pin() {
 
 use ordius_engine::environment::runtime::{SecretRef, SshAuth};
 
+#[tokio::test(flavor = "multi_thread")]
+async fn ssh_bootstrap_uses_home_cache_not_tmp() {
+    use ordius_engine::environment::runtime::ssh::bootstrap::{FakeSftp, SshBootstrapper};
+
+    let sftp = FakeSftp::new("/home/me")
+        .with_uploaded_sha("abc123")
+        .with_embedded("x86_64-unknown-linux-musl", b"helper", "abc123");
+    let bootstrapper = SshBootstrapper::with_helper_source(sftp.clone(), sftp.helper_source());
+
+    let helper = bootstrapper
+        .bootstrap("x86_64-unknown-linux-musl")
+        .await
+        .unwrap();
+
+    assert!(helper.env_side_path.starts_with("/home/me/.cache/ordius/"));
+    assert!(
+        sftp.renames()
+            .iter()
+            .any(|(_, dst)| dst == &helper.env_side_path)
+    );
+    assert!(sftp.modes().iter().any(|(_, mode)| *mode == 0o755));
+    assert!(
+        sftp.removes().contains(&helper.env_side_path),
+        "remove_file must be called on the destination before rename (SFTP v3 cannot overwrite)"
+    );
+}
+
 #[test]
 fn ssh_password_auth_resolves_secret_ref() {
     keyring::use_sample_store(&std::collections::HashMap::from([("persist", "false")])).unwrap();
