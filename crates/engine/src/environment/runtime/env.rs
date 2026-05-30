@@ -87,6 +87,52 @@ pub struct SecretRef(
     pub String,
 );
 
+/// SSH authentication configuration. Interactive prompts are not supported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum SshAuth {
+    /// Private key file on the Ordius host. Optional passphrase comes from the keyring.
+    KeyFile {
+        /// Host-side private key path.
+        path: String,
+        /// Optional passphrase secret reference.
+        #[serde(default)]
+        passphrase_ref: Option<SecretRef>,
+    },
+    /// Password authentication. Secret value comes from the keyring.
+    Password {
+        /// Password secret reference.
+        secret_ref: SecretRef,
+    },
+    /// Deferred implementation. Persistable so the UI can store intent, but dispatch rejects it.
+    Agent {
+        /// Optional public key path used to select an agent identity.
+        #[serde(default)]
+        public_key_path: Option<String>,
+        /// Optional expected fingerprint for the agent identity.
+        #[serde(default)]
+        fingerprint: Option<String>,
+    },
+}
+
+/// Inline SSH host-key trust pin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshHostKeyPin {
+    /// SSH key algorithm, for example `ssh-ed25519`.
+    pub algorithm: String,
+    /// SHA-256 fingerprint string, for example `SHA256:abc123`.
+    pub sha256: String,
+    /// Full OpenSSH public-key line.
+    pub public_key_openssh: String,
+    /// Pin creation time.
+    pub pinned_at: DateTime<Utc>,
+}
+
+/// Default SSH port.
+pub const fn default_ssh_port() -> u16 {
+    22
+}
+
 /// Newtype for a run id, kept here so `env.rs` does not depend on `run.rs`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RunId(
@@ -153,10 +199,16 @@ pub enum EnvSpec {
     Ssh {
         /// SSH host name or address.
         host: String,
+        /// SSH TCP port.
+        #[serde(default = "default_ssh_port")]
+        port: u16,
         /// SSH user name.
         user: String,
-        /// Reference to the authentication secret.
-        auth_ref: SecretRef,
+        /// Authentication method.
+        auth: SshAuth,
+        /// Inline TOFU host-key pins.
+        #[serde(default)]
+        host_key_pins: Vec<SshHostKeyPin>,
         /// Resources scoped to this environment.
         #[serde(default)]
         resources: Vec<ResourceDefinition>,
@@ -380,6 +432,57 @@ pub enum HostDirectMethod {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_spec_ssh_new_shape_roundtrips_with_default_port() {
+        let json = r#"{
+            "type":"ssh",
+            "host":"devbox.local",
+            "user":"winter",
+            "auth":{"method":"password","secret_ref":"ssh-devbox-password"},
+            "resources":[]
+        }"#;
+
+        let spec: EnvSpec = serde_json::from_str(json).unwrap();
+        let EnvSpec::Ssh {
+            host,
+            port,
+            user,
+            auth,
+            host_key_pins,
+            resources,
+        } = spec
+        else {
+            panic!("expected ssh spec");
+        };
+
+        assert_eq!(host, "devbox.local");
+        assert_eq!(port, 22);
+        assert_eq!(user, "winter");
+        assert!(matches!(
+            auth,
+            SshAuth::Password {
+                secret_ref: SecretRef(ref name)
+            } if name == "ssh-devbox-password"
+        ));
+        assert!(host_key_pins.is_empty());
+        assert!(resources.is_empty());
+    }
+
+    #[test]
+    fn ssh_host_key_pin_serializes_snake_case_fields() {
+        let pin = SshHostKeyPin {
+            algorithm: "ssh-ed25519".into(),
+            sha256: "SHA256:abc".into(),
+            public_key_openssh: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIabc".into(),
+            pinned_at: chrono::DateTime::parse_from_rfc3339("2026-05-28T12:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        };
+        let s = serde_json::to_string(&pin).unwrap();
+        assert!(s.contains("\"public_key_openssh\""));
+        assert!(s.contains("\"pinned_at\""));
+    }
 
     #[test]
     fn env_id_roundtrips_through_serde() {

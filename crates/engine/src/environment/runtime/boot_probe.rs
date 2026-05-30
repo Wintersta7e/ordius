@@ -61,8 +61,10 @@ pub struct BootProbeOutcome {
 pub struct DisabledEnv {
     /// Persisted display label from the `env_specs` row.
     pub label: String,
-    /// Decoded environment spec.
-    pub spec: EnvSpec,
+    /// Decoded environment spec, when the row still conforms to the current schema.
+    pub spec: Option<EnvSpec>,
+    /// Reason the row is disabled, if the engine disabled it while loading.
+    pub reason: Option<String>,
 }
 
 /// Output of [`run_single`]: a probed `EnvEntry` ready to install into the
@@ -94,13 +96,8 @@ pub enum BootError {
     Db(String),
 }
 
-/// Run the boot probe.
-///
-/// Always returns; per-env probe failures are absorbed into the resolved
-/// `EnvInfo.state` (`Unreachable { reason }`) and a catalog with no
-/// resources. Probes that exceed `OVERALL_BUDGET` are cancelled and their
-/// envs are dropped from the outcome.
-pub async fn run(pool: &DbPool, resource_registry: &ResourceRegistry) -> BootProbeOutcome {
+/// Load all rows from `env_specs` and synthesize the Local env when absent.
+fn load_and_ensure_local(pool: &DbPool) -> Vec<EnvSpecRow> {
     let mut specs = load_specs(pool);
     // Local is ALWAYS synthesized when absent so every workflow that
     // targets the default Local env can validate at load time even on
@@ -114,30 +111,81 @@ pub async fn run(pool: &DbPool, resource_registry: &ResourceRegistry) -> BootPro
         specs.push(EnvSpecRow {
             id: EnvId::local(),
             label: "Local".to_string(),
-            spec: EnvSpec::Local {
+            spec: Some(EnvSpec::Local {
                 resources: Vec::new(),
                 host_direct_verifications: HashMap::new(),
-            },
+            }),
             enabled: true,
+            disabled_reason: None,
         });
     }
+    specs
+}
+
+/// Classify one `EnvSpecRow`: push it into `disabled_specs` when it should
+/// not be probed, or return `Some((id, label, spec))` when it is ready to
+/// probe. Rows with `spec: None` that somehow slip through as `enabled` are
+/// treated as disabled (belt-and-suspenders guard for legacy rows).
+fn classify_row(
+    row: EnvSpecRow,
+    disabled_specs: &mut HashMap<EnvId, DisabledEnv>,
+) -> Option<(EnvId, String, EnvSpec)> {
+    let EnvSpecRow {
+        id,
+        label,
+        spec,
+        enabled,
+        disabled_reason,
+    } = row;
+    if !enabled {
+        tracing::info!(env_id = %id, "env disabled; staged for disabled_specs");
+        disabled_specs.insert(
+            id,
+            DisabledEnv {
+                label,
+                spec,
+                reason: disabled_reason,
+            },
+        );
+        return None;
+    }
+    if let Some(s) = spec {
+        Some((id, label, s))
+    } else {
+        debug_assert!(
+            false,
+            "classify_row: enabled row has no parseable spec — load_specs invariant violated"
+        );
+        tracing::error!(env_id = %id, "enabled row has no parseable spec; staging as disabled (load_specs invariant violated)");
+        disabled_specs.insert(
+            id,
+            DisabledEnv {
+                label,
+                spec: None,
+                reason: Some("internal error: enabled row has no parseable spec".into()),
+            },
+        );
+        None
+    }
+}
+
+/// Run the boot probe.
+///
+/// Always returns; per-env probe failures are absorbed into the resolved
+/// `EnvInfo.state` (`Unreachable { reason }`) and a catalog with no
+/// resources. Probes that exceed `OVERALL_BUDGET` are cancelled and their
+/// envs are dropped from the outcome.
+pub async fn run(pool: &DbPool, resource_registry: &ResourceRegistry) -> BootProbeOutcome {
+    let specs = load_and_ensure_local(pool);
 
     let cancel = CancellationToken::new();
     let mut tasks: JoinSet<(EnvId, Arc<EnvEntry>, Arc<ResourceCatalog>)> = JoinSet::new();
     let mut disabled_specs: HashMap<EnvId, DisabledEnv> = HashMap::new();
 
-    for EnvSpecRow {
-        id: env_id,
-        label,
-        spec,
-        enabled,
-    } in specs
-    {
-        if !enabled {
-            tracing::info!(env_id = %env_id, "env disabled; staged for disabled_specs");
-            disabled_specs.insert(env_id, DisabledEnv { label, spec });
+    for row in specs {
+        let Some((env_id, label, spec)) = classify_row(row, &mut disabled_specs) else {
             continue;
-        }
+        };
         // Probing-state info; rebuilt with the resolved state after probe.
         let probing_info = Arc::new(EnvInfo {
             id: env_id.clone(),
@@ -323,14 +371,33 @@ pub struct EnvSpecRow {
     /// Persisted display label (user-customised; never re-synthesised from
     /// the spec at load time).
     pub label: String,
-    /// Decoded environment spec.
-    pub spec: EnvSpec,
+    /// Decoded environment spec. `None` when the row is a legacy format that
+    /// could not be migrated automatically (e.g. old `auth_ref` SSH rows).
+    pub spec: Option<EnvSpec>,
     /// `true` when the row is enabled for scheduling.
     pub enabled: bool,
+    /// Engine-assigned disable reason, set when the engine detects a schema
+    /// that requires reconfiguration.
+    pub disabled_reason: Option<String>,
+}
+
+/// Returns `true` when the JSON blob looks like a pre-T4 SSH spec that
+/// uses the old `auth_ref` field instead of the current typed `auth` object.
+/// These rows cannot be parsed as the current `EnvSpec::Ssh` and must be
+/// disabled with a reconfiguration notice rather than silently dropped.
+fn is_legacy_ssh_auth_ref(json: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return false;
+    };
+    value.get("type").and_then(serde_json::Value::as_str) == Some("ssh")
+        && value.get("auth").is_none()
+        && value.get("auth_ref").is_some()
 }
 
 /// Load every row from `env_specs`. Bad rows (unparseable `spec_json`) are
 /// logged + skipped — the boot probe must not panic on a corrupted file.
+/// Legacy SSH `auth_ref` rows are disabled with a reconfiguration notice
+/// rather than silently dropped, so the UI can surface them.
 fn load_specs(pool: &DbPool) -> Vec<EnvSpecRow> {
     let conn = match pool.get() {
         Ok(c) => c,
@@ -359,23 +426,36 @@ fn load_specs(pool: &DbPool) -> Vec<EnvSpecRow> {
             return Vec::new();
         },
     };
-    row_iter
-        .filter_map(|r| {
-            let (id_s, label, json, enabled) = r.ok()?;
-            match serde_json::from_str::<EnvSpec>(&json) {
-                Ok(spec) => Some(EnvSpecRow {
-                    id: EnvId::new(id_s),
-                    label,
-                    spec,
-                    enabled,
-                }),
-                Err(e) => {
-                    tracing::warn!(env_id = %id_s, error = %e, "env_specs: bad spec_json; skipping");
-                    None
-                }
-            }
-        })
-        .collect()
+    let mut out = Vec::new();
+    for r in row_iter {
+        let Ok((id_s, label, json, enabled)) = r else {
+            continue;
+        };
+        if is_legacy_ssh_auth_ref(&json) {
+            tracing::warn!(env_id = %id_s, "legacy SSH auth_ref row disabled; needs reconfiguration");
+            out.push(EnvSpecRow {
+                id: EnvId::new(id_s),
+                label,
+                spec: None,
+                enabled: false,
+                disabled_reason: Some("needs SSH reconfiguration".into()),
+            });
+            continue;
+        }
+        match serde_json::from_str::<EnvSpec>(&json) {
+            Ok(spec) => out.push(EnvSpecRow {
+                id: EnvId::new(id_s),
+                label,
+                spec: Some(spec),
+                enabled,
+                disabled_reason: None,
+            }),
+            Err(e) => {
+                tracing::warn!(env_id = %id_s, error = %e, "env_specs: bad spec_json; skipping");
+            },
+        }
+    }
+    out
 }
 
 /// Load a single `env_specs` row by id.
@@ -383,6 +463,7 @@ fn load_specs(pool: &DbPool) -> Vec<EnvSpecRow> {
 /// Returns the full row (label + spec + enabled flag) when present so the
 /// refresh API can distinguish disabled rows (insert into
 /// `env_disabled_specs`, no probe) from absent rows (drop from all maps).
+/// Legacy SSH `auth_ref` rows are returned as disabled with `spec: None`.
 pub fn load_spec_single(pool: &DbPool, env_id: &EnvId) -> Result<Option<EnvSpecRow>, BootError> {
     let conn = pool.get().map_err(|e| BootError::Db(e.to_string()))?;
     let mut stmt = conn
@@ -397,13 +478,26 @@ pub fn load_spec_single(pool: &DbPool, env_id: &EnvId) -> Result<Option<EnvSpecR
     let label: String = row.get(0).map_err(|e| BootError::Db(e.to_string()))?;
     let json: String = row.get(1).map_err(|e| BootError::Db(e.to_string()))?;
     let enabled: i64 = row.get(2).map_err(|e| BootError::Db(e.to_string()))?;
+
+    if is_legacy_ssh_auth_ref(&json) {
+        tracing::warn!(env_id = %env_id, "legacy SSH auth_ref row disabled; needs reconfiguration");
+        return Ok(Some(EnvSpecRow {
+            id: env_id.clone(),
+            label,
+            spec: None,
+            enabled: false,
+            disabled_reason: Some("needs SSH reconfiguration".into()),
+        }));
+    }
+
     let spec: EnvSpec =
         serde_json::from_str(&json).map_err(|e| BootError::Db(format!("EnvSpec parse: {e}")))?;
     Ok(Some(EnvSpecRow {
         id: env_id.clone(),
         label,
-        spec,
+        spec: Some(spec),
         enabled: enabled != 0,
+        disabled_reason: None,
     }))
 }
 
@@ -453,6 +547,41 @@ mod tests {
     use super::*;
     use crate::db::open;
     use tempfile::TempDir;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn legacy_ssh_auth_ref_row_is_disabled_for_reconfiguration() {
+        let tmp = TempDir::new().unwrap();
+        let pool = open(tmp.path().join("runs.db")).unwrap();
+        {
+            let conn = pool.get().unwrap();
+            conn.execute(
+                "INSERT INTO env_specs (id, label, enabled, spec_json, created_at, updated_at)
+                 VALUES ('ssh:legacy', 'Legacy SSH', 1,
+                         '{\"type\":\"ssh\",\"host\":\"devbox\",\"user\":\"me\",\"auth_ref\":\"old-secret\",\"resources\":[]}',
+                         0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let registry = ResourceRegistry::new();
+        let outcome = run(&pool, &registry).await;
+
+        assert!(!outcome.entries.contains_key(&EnvId::new("ssh:legacy")));
+        let disabled = outcome
+            .disabled_specs
+            .get(&EnvId::new("ssh:legacy"))
+            .expect("legacy ssh must be disabled");
+        assert_eq!(disabled.label, "Legacy SSH");
+        assert!(
+            disabled
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("needs SSH reconfiguration")
+        );
+        assert!(disabled.spec.is_none());
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn empty_db_synthesizes_local_env() {

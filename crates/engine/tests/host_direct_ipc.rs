@@ -18,7 +18,7 @@ use ordius_engine::environment::runtime::boot_probe::load_spec_single;
 use ordius_engine::environment::runtime::{
     ApiFlavor, Capability, EnvId, EnvSpec, HostDirectMethod, HostDirectVerification,
     HttpProbeMethod, HttpProbeRoute, ProbeSpec, ResourceDefinition, ResourceId, ResourceKind,
-    SecretRef,
+    SecretRef, SshAuth,
 };
 use tokio::time::timeout;
 use wiremock::matchers::{method, path};
@@ -231,7 +231,7 @@ async fn enable_host_direct_persists_inline_and_refreshes() {
     let row = load_spec_single(&engine.pool(), &EnvId::local())
         .expect("load row")
         .expect("row present");
-    let map = match &row.spec {
+    let map = match row.spec.as_ref().expect("local env has parseable spec") {
         EnvSpec::Local {
             host_direct_verifications,
             ..
@@ -261,8 +261,12 @@ async fn enable_host_direct_ssh_kind_rejects() {
             true,
             EnvSpec::Ssh {
                 host: "127.0.0.1".into(),
+                port: 22,
                 user: "tester".into(),
-                auth_ref: SecretRef("ssh-test".into()),
+                auth: SshAuth::Password {
+                    secret_ref: SecretRef("ssh-test".into()),
+                },
+                host_key_pins: vec![],
                 resources: vec![],
             },
         )

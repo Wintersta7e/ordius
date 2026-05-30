@@ -551,7 +551,7 @@ fn lookup_env_local_resource<S: std::hash::BuildHasher>(
     rid: &crate::environment::runtime::resource::ResourceId,
 ) -> Option<Vec<crate::environment::runtime::resource::Capability>> {
     let active_spec = env_registry.get(env_id).map(|e| e.info.spec.clone());
-    let spec = active_spec.or_else(|| env_disabled.get(env_id).map(|d| d.spec.clone()))?;
+    let spec = active_spec.or_else(|| env_disabled.get(env_id).and_then(|d| d.spec.clone()))?;
 
     let resources = match &spec {
         crate::environment::runtime::EnvSpec::Local { resources, .. }

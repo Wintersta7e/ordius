@@ -46,6 +46,8 @@ fn persisted_resource_ids(engine: &Engine, env_id: &EnvId) -> Vec<String> {
         .expect("load_spec_single ok")
         .expect("env row present");
     row.spec
+        .as_ref()
+        .expect("test env has a parseable spec")
         .resources()
         .iter()
         .map(|r| r.id.0.clone())

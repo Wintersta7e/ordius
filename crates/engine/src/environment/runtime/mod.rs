@@ -38,8 +38,8 @@ pub mod fake;
 /// Environment identifier, kind, spec variants, state, and runtime info.
 pub use env::{
     BindMount, ConflictDetect, EnvId, EnvInfo, EnvKind, EnvSpec, EnvState, HostDirectMethod,
-    HostDirectVerification, RunId, SecretRef, SyncStrategy, WorkflowId, WorkspaceBinding,
-    WriteBackPolicy, default_max_files,
+    HostDirectVerification, RunId, SecretRef, SshAuth, SshHostKeyPin, SyncStrategy, WorkflowId,
+    WorkspaceBinding, WriteBackPolicy, default_max_files, default_ssh_port,
 };
 
 // ── Resource definitions + probe specs ──────────────────────────────────────

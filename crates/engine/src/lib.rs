@@ -232,7 +232,11 @@ fn resolve_probe_for_test(
     let row = environment::runtime::boot_probe::load_spec_single(&engine.pool, env_id)
         .map_err(|e| EngineError::Db(format!("load env spec: {e}")))?
         .ok_or_else(|| EngineError::EnvUnknown(env_id.clone()))?;
-    if let Some(def) = row.spec.resources().iter().find(|d| &d.id == resource_id) {
+    if let Some(def) = row
+        .spec
+        .as_ref()
+        .and_then(|s| s.resources().iter().find(|d| &d.id == resource_id))
+    {
         return Ok(def.probe.clone());
     }
     let registry = engine.resource_registry();
@@ -475,16 +479,30 @@ impl Engine {
                 match environment::runtime::boot_probe::load_spec_single(&self.pool, env) {
                     Ok(Some(row)) => {
                         if row.enabled {
-                            RefreshPending::Single {
-                                env_id: env.clone(),
-                                label: row.label,
-                                spec: Box::new(row.spec),
+                            // `spec` is `Option<EnvSpec>`; a None-spec row is
+                            // forced to `enabled = false` by `load_spec_single`,
+                            // so unwrap is safe here. Use unwrap_or_else as a
+                            // belt-and-suspenders guard: treat a None-spec
+                            // enabled row as Disabled.
+                            match row.spec {
+                                Some(spec) => RefreshPending::Single {
+                                    env_id: env.clone(),
+                                    label: row.label,
+                                    spec: Box::new(spec),
+                                },
+                                None => RefreshPending::Disabled {
+                                    env_id: env.clone(),
+                                    label: row.label,
+                                    spec: None,
+                                    reason: row.disabled_reason,
+                                },
                             }
                         } else {
                             RefreshPending::Disabled {
                                 env_id: env.clone(),
                                 label: row.label,
-                                spec: Box::new(row.spec),
+                                spec: row.spec.map(Box::new),
+                                reason: row.disabled_reason,
                             }
                         }
                     },
@@ -512,8 +530,9 @@ impl Engine {
                 env_id,
                 label,
                 spec,
+                reason,
             } => {
-                self.apply_disable(&env_id, label, *spec);
+                self.apply_disable(&env_id, label, spec.map(|b| *b), reason);
                 return Ok(());
             },
             _ => {},
@@ -573,7 +592,8 @@ impl Engine {
         &self,
         env_id: &environment::runtime::EnvId,
         label: String,
-        spec: environment::runtime::EnvSpec,
+        spec: Option<environment::runtime::EnvSpec>,
+        reason: Option<String>,
     ) {
         use std::sync::atomic::Ordering;
 
@@ -587,7 +607,11 @@ impl Engine {
         let mut next_disabled = (**current_disabled).clone();
         next_disabled.insert(
             env_id.clone(),
-            environment::runtime::boot_probe::DisabledEnv { label, spec },
+            environment::runtime::boot_probe::DisabledEnv {
+                label,
+                spec,
+                reason,
+            },
         );
         let epoch = self.env_refresh_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         self.env_registry.store(next_entries);
@@ -705,16 +729,22 @@ impl Engine {
         let mut row = environment::runtime::boot_probe::load_spec_single(&self.pool, env_id)
             .map_err(|e| EngineError::Db(format!("load env spec: {e}")))?
             .ok_or_else(|| EngineError::EnvUnknown(env_id.clone()))?;
-        if row.spec.resources().iter().any(|r| r.id == def.id) {
+        let spec = row.spec.as_mut().ok_or_else(|| {
+            EngineError::Db(format!(
+                "env '{}' requires reconfiguration and cannot accept new resources",
+                env_id.as_str(),
+            ))
+        })?;
+        if spec.resources().iter().any(|r| r.id == def.id) {
             return Err(EngineError::Db(format!(
                 "resource id '{}' already declared on env '{}'",
                 def.id.0,
                 env_id.as_str(),
             )));
         }
-        row.spec.resources_mut().push(def);
-        let spec_json = serde_json::to_string(&row.spec)
-            .map_err(|e| EngineError::Db(format!("EnvSpec: {e}")))?;
+        spec.resources_mut().push(def);
+        let spec_json =
+            serde_json::to_string(&*spec).map_err(|e| EngineError::Db(format!("EnvSpec: {e}")))?;
         let now = chrono::Utc::now().timestamp_millis();
         conn.execute(
             "UPDATE env_specs SET spec_json = ?1, updated_at = ?2 WHERE id = ?3",
@@ -745,17 +775,23 @@ impl Engine {
         let mut row = environment::runtime::boot_probe::load_spec_single(&self.pool, env_id)
             .map_err(|e| EngineError::Db(format!("load env spec: {e}")))?
             .ok_or_else(|| EngineError::EnvUnknown(env_id.clone()))?;
-        let before = row.spec.resources().len();
-        row.spec.resources_mut().retain(|r| &r.id != resource_id);
-        if row.spec.resources().len() == before {
+        let spec = row.spec.as_mut().ok_or_else(|| {
+            EngineError::Db(format!(
+                "env '{}' requires reconfiguration and cannot accept resource changes",
+                env_id.as_str(),
+            ))
+        })?;
+        let before = spec.resources().len();
+        spec.resources_mut().retain(|r| &r.id != resource_id);
+        if spec.resources().len() == before {
             return Err(EngineError::Db(format!(
                 "resource id '{}' not declared on env '{}'",
                 resource_id.0,
                 env_id.as_str(),
             )));
         }
-        let spec_json = serde_json::to_string(&row.spec)
-            .map_err(|e| EngineError::Db(format!("EnvSpec: {e}")))?;
+        let spec_json =
+            serde_json::to_string(&*spec).map_err(|e| EngineError::Db(format!("EnvSpec: {e}")))?;
         let now = chrono::Utc::now().timestamp_millis();
         conn.execute(
             "UPDATE env_specs SET spec_json = ?1, updated_at = ?2 WHERE id = ?3",
@@ -868,16 +904,22 @@ impl Engine {
         let mut row = environment::runtime::boot_probe::load_spec_single(&self.pool, env_id)
             .map_err(|e| EngineError::Db(format!("load env spec: {e}")))?
             .ok_or_else(|| EngineError::EnvUnknown(env_id.clone()))?;
-        let kind = row.spec.kind_str();
-        let map = row.spec.host_direct_verifications_mut().ok_or_else(|| {
+        let spec = row.spec.as_mut().ok_or_else(|| {
+            EngineError::Db(format!(
+                "env '{}' requires reconfiguration and cannot accept host-direct verifications",
+                env_id.as_str(),
+            ))
+        })?;
+        let kind = spec.kind_str();
+        let map = spec.host_direct_verifications_mut().ok_or_else(|| {
             EngineError::Db(format!(
                 "env '{}' kind '{kind}' does not support host-direct verifications",
                 env_id.as_str(),
             ))
         })?;
         map.insert(resource_id.clone(), verification);
-        let spec_json = serde_json::to_string(&row.spec)
-            .map_err(|e| EngineError::Db(format!("EnvSpec: {e}")))?;
+        let spec_json =
+            serde_json::to_string(&*spec).map_err(|e| EngineError::Db(format!("EnvSpec: {e}")))?;
         let now = chrono::Utc::now().timestamp_millis();
         let conn = self.pool.get()?;
         conn.execute(
@@ -1195,7 +1237,10 @@ enum RefreshPending {
         /// Persisted display label, threaded through so the IPC entry shows
         /// the user-customised name.
         label: String,
-        spec: Box<environment::runtime::EnvSpec>,
+        /// Decoded spec, absent for legacy rows that cannot be parsed.
+        spec: Option<Box<environment::runtime::EnvSpec>>,
+        /// Engine-assigned reason, forwarded into `DisabledEnv`.
+        reason: Option<String>,
     },
     /// Row absent at lock-read time. Handled inline (no probe); the env's
     /// entry, catalog, and any prior disabled-spec are all dropped.
