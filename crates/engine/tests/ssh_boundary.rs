@@ -97,3 +97,64 @@ fn ssh_agent_auth_is_explicitly_deferred() {
 
     assert!(err.to_string().contains("SSH agent auth is deferred"));
 }
+
+// ── Connection-cache tests ────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ssh_connection_cache_reuses_open_connection() {
+    use ordius_engine::environment::runtime::ssh::connection::{
+        FakeSshConnector, SshConnectionCache, SshConnectionLike,
+    };
+
+    let connector = FakeSshConnector::new()
+        .with_connection("c1", false)
+        .with_connection("c2", false);
+    let cache = SshConnectionCache::new(connector.clone(), "ssh:test");
+
+    let first = cache.connection().await.unwrap();
+    let second = cache.connection().await.unwrap();
+
+    assert_eq!(first.id(), "c1");
+    assert_eq!(second.id(), "c1");
+    assert_eq!(connector.connect_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ssh_connection_cache_reconnects_closed_connection_once() {
+    use ordius_engine::environment::runtime::ssh::connection::{
+        FakeSshConnector, SshConnectionCache, SshConnectionLike,
+    };
+
+    let connector = FakeSshConnector::new()
+        .with_connection("closed", true)
+        .with_connection("fresh", false);
+    let cache = SshConnectionCache::new(connector.clone(), "ssh:test");
+
+    let first = cache.connection().await.unwrap();
+    assert_eq!(first.id(), "fresh");
+    assert_eq!(connector.connect_count(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ssh_connection_cache_returns_error_when_both_attempts_closed() {
+    use ordius_engine::environment::runtime::DispatchError;
+    use ordius_engine::environment::runtime::ssh::connection::{
+        FakeSshConnector, SshConnectionCache,
+    };
+
+    // Both connections the fake returns are already closed.
+    let connector = FakeSshConnector::new()
+        .with_connection("dead-1", true)
+        .with_connection("dead-2", true);
+    let cache = SshConnectionCache::new(connector.clone(), "ssh:test");
+
+    let result = cache.connection().await;
+
+    // Must return an error — not a closed connection.
+    assert!(
+        matches!(result, Err(DispatchError::EnvUnreachable { .. })),
+        "expected EnvUnreachable, got {result:?}",
+    );
+    // Both connect attempts must have been made.
+    assert_eq!(connector.connect_count(), 2);
+}
