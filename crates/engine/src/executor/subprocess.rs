@@ -20,7 +20,9 @@
 //! onto the node's declared output ports.
 
 use crate::emitter::Emitter;
-use crate::environment::runtime::transport::{ProcessCmd, Stdio as ProcessStdio};
+use crate::environment::runtime::transport::{
+    ProcessCmd, ProcessExit, ProcessPipe, Stdio as ProcessStdio,
+};
 use crate::events::EventType;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::template::{SubstitutionContext, default_env_allowlist, substitute};
@@ -30,11 +32,9 @@ use bytes::Bytes;
 use jsonpath_rust::JsonPath;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-
-use super::supervisor::{self, Supervised};
 
 // ---- Contract strings shared with the registry + downstream consumers ----
 
@@ -128,8 +128,9 @@ impl NodeExecutor for SubprocessExecutor {
             stderr: ProcessStdio::Piped,
         };
 
-        let mut sup: Supervised = dispatcher
+        let mut proc = dispatcher
             .spawn(process_cmd)
+            .await
             .map_err(|e| NodeError::Subprocess(format!("spawn: {e}")))?;
 
         let emitter = ctx.emitter.clone();
@@ -140,7 +141,7 @@ impl NodeExecutor for SubprocessExecutor {
         let iteration = ctx.iteration;
         let attempt = ctx.attempt.load(std::sync::atomic::Ordering::Relaxed);
         let stdout_handle = spawn_line_reader(
-            sup.child_mut().stdout.take(),
+            proc.take_stdout(),
             emitter.clone(),
             node.id.clone(),
             iteration,
@@ -148,7 +149,7 @@ impl NodeExecutor for SubprocessExecutor {
             CHANNEL_STDOUT,
         );
         let stderr_handle = spawn_line_reader(
-            sup.child_mut().stderr.take(),
+            proc.take_stderr(),
             emitter,
             node.id.clone(),
             iteration,
@@ -157,9 +158,9 @@ impl NodeExecutor for SubprocessExecutor {
         );
 
         let outcome = tokio::select! {
-            wait_res = sup.child_mut().wait() => Outcome::Exit(wait_res),
+            wait_res = proc.wait() => Outcome::Exit(wait_res),
             () = cancel.cancelled() => {
-                let _ = supervisor::cancel(&mut sup).await;
+                drop(proc.cancel().await);
                 Outcome::Cancelled
             }
         };
@@ -170,7 +171,7 @@ impl NodeExecutor for SubprocessExecutor {
         match outcome {
             Outcome::Cancelled => Err(NodeError::Cancelled),
             Outcome::Exit(Err(e)) => Err(NodeError::Subprocess(format!("wait: {e}"))),
-            Outcome::Exit(Ok(status)) => parse_outputs(nt, &stdout_lines, status),
+            Outcome::Exit(Ok(exit)) => parse_outputs(nt, &stdout_lines, &exit),
         }
     }
 }
@@ -301,9 +302,9 @@ fn resolve_templated_inputs(
     })
 }
 
-/// Outcome of the `tokio::select!` between `child.wait()` and `cancel`.
+/// Outcome of the `tokio::select!` between `proc.wait()` and `cancel`.
 enum Outcome {
-    Exit(std::io::Result<std::process::ExitStatus>),
+    Exit(Result<ProcessExit, crate::environment::runtime::DispatchError>),
     Cancelled,
 }
 
@@ -311,17 +312,14 @@ enum Outcome {
 /// line as a `node:output` event tagged with `channel`, and returns
 /// the lines after EOF. EOF arrives when the child closes its end
 /// of the pipe — which happens when the child exits.
-fn spawn_line_reader<R>(
-    pipe: Option<R>,
+fn spawn_line_reader(
+    pipe: Option<ProcessPipe>,
     emitter: Arc<Emitter>,
     node_id: String,
     iteration: u32,
     attempt: u32,
     channel: &'static str,
-) -> JoinHandle<Vec<String>>
-where
-    R: AsyncRead + Send + Unpin + 'static,
-{
+) -> JoinHandle<Vec<String>> {
     tokio::spawn(async move {
         let Some(p) = pipe else {
             return Vec::new();
@@ -365,12 +363,14 @@ where
 fn parse_outputs(
     nt: &NodeType,
     stdout_lines: &[String],
-    status: std::process::ExitStatus,
+    exit: &ProcessExit,
 ) -> Result<NodeOutputs, NodeError> {
     let mut outputs = NodeOutputs::new();
 
-    let code = status.code().unwrap_or(-1);
-    outputs.insert(PORT_EXIT_CODE.into(), PortValue::Number(f64::from(code)));
+    outputs.insert(
+        PORT_EXIT_CODE.into(),
+        PortValue::Number(f64::from(exit.code)),
+    );
 
     let joined = stdout_lines.join("\n");
 
@@ -831,6 +831,23 @@ mod tests {
             .expect("non-zero exit is a successful run from the executor's POV");
 
         assert_eq!(res.get("exit_code"), Some(&PortValue::Number(7.0)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parse_outputs_uses_process_exit_code() {
+        let nt = subprocess_node_type(vec!["sh".into(), "-c".into(), "exit 9".into()]);
+        let outputs = parse_outputs(
+            &nt,
+            &[],
+            &crate::environment::runtime::transport::ProcessExit {
+                code: 9,
+                signal: None,
+            },
+        )
+        .expect("parse outputs");
+
+        assert_eq!(outputs.get("exit_code"), Some(&PortValue::Number(9.0)));
     }
 
     #[cfg(windows)]

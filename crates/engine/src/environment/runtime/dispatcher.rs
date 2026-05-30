@@ -10,15 +10,13 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::executor::supervisor::Supervised;
-
 use super::catalog::ResourceProbeOutcome;
 use super::env::{EnvInfo, RunId, WorkspaceBinding};
 use super::error::DispatchError;
 use super::plan::{ProbePlan, ProbeSummary};
 use super::resource::ResourceDefinition;
 use super::transport::{
-    EnvPath, HttpError, HttpRequest, HttpResponse, ProcessCmd, WorkspaceHandle,
+    EnvPath, EnvProcess, HttpError, HttpRequest, HttpResponse, ProcessCmd, WorkspaceHandle,
 };
 
 /// Async object-safe trait implemented by every env type.
@@ -45,13 +43,12 @@ pub trait Dispatcher: Send + Sync {
         cancel: CancellationToken,
     ) -> ResourceProbeOutcome;
 
-    /// Spawn a process inside this environment and return a supervised handle.
-    /// The supervisor owns process-group / Job-Object lifetime.
+    /// Spawn a process inside this environment and return an env-neutral handle.
     ///
     /// Implementations MUST honor `cmd.stdin`: pipe the bytes to the child's
     /// stdin and close it. A child that closes stdin early is legitimate; do
     /// not surface the resulting `BrokenPipe` as an error.
-    fn spawn(&self, cmd: ProcessCmd) -> std::io::Result<Supervised>;
+    async fn spawn(&self, cmd: ProcessCmd) -> Result<Box<dyn EnvProcess>, DispatchError>;
 
     /// Return the HTTP transport bound to this environment.
     /// `Arc<dyn HttpTransport>` keeps the trait object-safe.

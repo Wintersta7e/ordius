@@ -214,9 +214,12 @@ impl Dispatcher for FakeRemoteDispatcher {
     }
 
     /// Not implemented — fake dispatcher is for probe/catalog tests only.
-    fn spawn(&self, _cmd: ProcessCmd) -> std::io::Result<crate::executor::supervisor::Supervised> {
-        Err(std::io::Error::other(
-            "FakeRemoteDispatcher::spawn not yet implemented",
+    async fn spawn(
+        &self,
+        _cmd: ProcessCmd,
+    ) -> Result<Box<dyn super::transport::EnvProcess>, DispatchError> {
+        Err(DispatchError::Unsupported(
+            "test dispatcher does not spawn processes".into(),
         ))
     }
 

@@ -27,9 +27,8 @@ use crate::environment::runtime::resource::{
     Capability, HttpProbeMethod, ProbeSpec, ResourceDefinition, ResourceId, ResourceKind,
 };
 use crate::environment::runtime::transport::{
-    EnvPath, ProcessCmd, Stdio as ProcessStdio, WorkspaceHandle,
+    EnvPath, LocalProcess, ProcessCmd, Stdio as ProcessStdio, WorkspaceHandle,
 };
-use crate::executor::supervisor::Supervised;
 
 use super::bootstrap::BootstrappedHelper;
 
@@ -631,7 +630,10 @@ impl Dispatcher for WslDispatcher {
         }
     }
 
-    fn spawn(&self, cmd: ProcessCmd) -> std::io::Result<Supervised> {
+    async fn spawn(
+        &self,
+        cmd: ProcessCmd,
+    ) -> Result<Box<dyn crate::environment::runtime::transport::EnvProcess>, DispatchError> {
         use std::process::Stdio as StdStdio;
         let mut tokio_cmd = build_wsl_command(&self.distro_name, &cmd);
         // Only pipe stdin when bytes are actually queued; otherwise the
@@ -644,7 +646,12 @@ impl Dispatcher for WslDispatcher {
         });
         tokio_cmd.stdout(map_stdio(cmd.stdout));
         tokio_cmd.stderr(map_stdio(cmd.stderr));
-        let mut sup = crate::executor::supervisor::spawn(tokio_cmd)?;
+        let mut sup = crate::executor::supervisor::spawn(tokio_cmd).map_err(|source| {
+            DispatchError::Spawn {
+                env_id: self.info.id.to_string(),
+                source,
+            }
+        })?;
         if let Some(bytes) = cmd.stdin
             && let Some(mut child_stdin) = sup.child_mut().stdin.take()
         {
@@ -655,7 +662,7 @@ impl Dispatcher for WslDispatcher {
                 drop(child_stdin.shutdown().await);
             });
         }
-        Ok(sup)
+        Ok(Box::new(LocalProcess::new(self.info.id.to_string(), sup)))
     }
 
     fn http_transport(&self) -> Arc<dyn HttpTransport> {

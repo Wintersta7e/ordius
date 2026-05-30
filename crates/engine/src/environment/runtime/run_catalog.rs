@@ -372,7 +372,6 @@ mod singleflight_tests {
     };
     use super::super::transport::{EnvPath, ProcessCmd, WorkspaceHandle};
     use super::RunCatalog;
-    use crate::executor::supervisor::Supervised;
 
     fn local_info() -> EnvInfo {
         EnvInfo {
@@ -472,8 +471,14 @@ mod singleflight_tests {
             self.outcome.clone()
         }
 
-        fn spawn(&self, _cmd: ProcessCmd) -> std::io::Result<Supervised> {
-            unimplemented!("GatedDispatcher::spawn is not used by singleflight tests")
+        async fn spawn(
+            &self,
+            _cmd: ProcessCmd,
+        ) -> Result<Box<dyn crate::environment::runtime::transport::EnvProcess>, DispatchError>
+        {
+            Err(DispatchError::Unsupported(
+                "singleflight test dispatcher does not spawn processes".into(),
+            ))
         }
 
         fn http_transport(&self) -> Arc<dyn HttpTransport> {

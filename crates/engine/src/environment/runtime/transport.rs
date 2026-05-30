@@ -9,10 +9,12 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::io::AsyncRead;
 
 use super::dispatcher::ResponseStream;
 
@@ -93,6 +95,110 @@ pub enum Stdio {
     Piped,
     /// Discard the stream (`/dev/null` / `nul:`).
     Null,
+}
+
+/// Pipe returned by environment process implementations.
+pub type ProcessPipe = std::pin::Pin<Box<dyn AsyncRead + Send + 'static>>;
+
+/// Environment process exit summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessExit {
+    /// Integer exit code. Signal-only exits use `128 + signum` when a signal is known.
+    pub code: i32,
+    /// Optional signal name or number, when the platform exposes one.
+    pub signal: Option<String>,
+}
+
+impl ProcessExit {
+    /// Convert a local OS exit status into the environment-neutral shape.
+    pub fn from_exit_status(status: std::process::ExitStatus) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(code) = status.code() {
+                return Self { code, signal: None };
+            }
+            let signal = status.signal();
+            let code = signal.map_or(-1, |sig| 128 + sig);
+            Self {
+                code,
+                signal: signal.map(|sig| sig.to_string()),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                code: status.code().unwrap_or(-1),
+                signal: None,
+            }
+        }
+    }
+}
+
+/// Process handle returned by a Dispatcher.
+#[async_trait]
+pub trait EnvProcess: Send {
+    /// Take stdout once.
+    fn take_stdout(&mut self) -> Option<ProcessPipe>;
+    /// Take stderr once.
+    fn take_stderr(&mut self) -> Option<ProcessPipe>;
+    /// Wait for process completion.
+    async fn wait(&mut self) -> Result<ProcessExit, super::error::DispatchError>;
+    /// Cancel the process and its child tree where supported.
+    async fn cancel(&mut self) -> Result<(), super::error::DispatchError>;
+}
+
+/// Adapter for local `tokio::process::Child` processes supervised by Ordius.
+pub struct LocalProcess {
+    env_id: String,
+    supervised: crate::executor::supervisor::Supervised,
+}
+
+impl LocalProcess {
+    /// Wrap a supervised child in the environment-neutral process handle.
+    pub fn new(
+        env_id: impl Into<String>,
+        supervised: crate::executor::supervisor::Supervised,
+    ) -> Self {
+        Self {
+            env_id: env_id.into(),
+            supervised,
+        }
+    }
+}
+
+#[async_trait]
+impl EnvProcess for LocalProcess {
+    fn take_stdout(&mut self) -> Option<ProcessPipe> {
+        self.supervised
+            .child_mut()
+            .stdout
+            .take()
+            .map(|stdout| -> ProcessPipe { Box::pin(stdout) })
+    }
+
+    fn take_stderr(&mut self) -> Option<ProcessPipe> {
+        self.supervised
+            .child_mut()
+            .stderr
+            .take()
+            .map(|stderr| -> ProcessPipe { Box::pin(stderr) })
+    }
+
+    async fn wait(&mut self) -> Result<ProcessExit, super::error::DispatchError> {
+        let status = self.supervised.child_mut().wait().await.map_err(|source| {
+            super::error::DispatchError::Spawn {
+                env_id: self.env_id.clone(),
+                source,
+            }
+        })?;
+        Ok(ProcessExit::from_exit_status(status))
+    }
+
+    async fn cancel(&mut self) -> Result<(), super::error::DispatchError> {
+        let _ = crate::executor::supervisor::cancel(&mut self.supervised).await;
+        Ok(())
+    }
 }
 
 /// argv-only process command. The [`crate::environment::runtime::dispatcher::Dispatcher`]
@@ -260,6 +366,55 @@ const fn http_method_to_reqwest(m: HttpMethod) -> reqwest::Method {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_process_wait_returns_exit_code() {
+        use std::process::Stdio as StdStdio;
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "printf hello"]);
+        cmd.stdout(StdStdio::piped());
+        cmd.stderr(StdStdio::piped());
+
+        let sup = crate::executor::supervisor::spawn(cmd).expect("spawn");
+        let mut process = LocalProcess::new("local", sup);
+
+        let stdout = process.take_stdout().expect("stdout pipe");
+        let mut reader = tokio::io::BufReader::new(stdout);
+        let mut text = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut text)
+            .await
+            .expect("read stdout");
+
+        let exit = process.wait().await.expect("wait");
+        assert_eq!(text, "hello");
+        assert_eq!(exit.code, 0);
+        assert_eq!(exit.signal, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_process_cancel_kills_process_group() {
+        use std::process::Stdio as StdStdio;
+        use std::time::Duration;
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30 & sleep 30"]);
+        cmd.stdout(StdStdio::null());
+        cmd.stderr(StdStdio::null());
+
+        let sup = crate::executor::supervisor::spawn(cmd).expect("spawn");
+        let mut process = LocalProcess::new("local", sup);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        process.cancel().await.expect("cancel");
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(5), process.wait())
+            .await
+            .expect("wait after cancel timed out")
+            .expect("wait after cancel");
+        assert!(exit.code != 0 || exit.signal.is_some(), "exit = {exit:?}");
+    }
 
     #[test]
     fn http_method_serializes() {

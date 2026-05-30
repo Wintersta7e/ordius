@@ -17,8 +17,8 @@ use super::error::DispatchError;
 use super::plan::{ProbePlan, ProbeSummary};
 use super::resource::{HttpProbeMethod, HttpProbeRoute, ProbeSpec, ResourceDefinition};
 use super::transport::{
-    EnvPath, HttpError, HttpMethod, HttpRequest, HttpResponse, ProcessCmd, Stdio as ProcessStdio,
-    WorkspaceHandle,
+    EnvPath, HttpError, HttpMethod, HttpRequest, HttpResponse, LocalProcess, ProcessCmd,
+    Stdio as ProcessStdio, WorkspaceHandle,
 };
 
 const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -203,7 +203,10 @@ impl Dispatcher for LocalDispatcher {
     /// (Unix) or Job Object (Windows) for correct tree teardown. The stdout /
     /// stderr disposition follows `cmd.stdout` / `cmd.stderr`; callers that
     /// want line-by-line streaming pass `Stdio::Piped`.
-    fn spawn(&self, cmd: ProcessCmd) -> std::io::Result<crate::executor::supervisor::Supervised> {
+    async fn spawn(
+        &self,
+        cmd: ProcessCmd,
+    ) -> Result<Box<dyn super::transport::EnvProcess>, DispatchError> {
         use std::process::Stdio as StdStdio;
         let mut command = tokio::process::Command::new(&cmd.program);
         command.args(&cmd.args);
@@ -220,7 +223,11 @@ impl Dispatcher for LocalDispatcher {
         });
         command.stdout(map_stdio(cmd.stdout));
         command.stderr(map_stdio(cmd.stderr));
-        let mut sup = crate::executor::supervisor::spawn(command)?;
+        let mut sup =
+            crate::executor::supervisor::spawn(command).map_err(|source| DispatchError::Spawn {
+                env_id: self.info.id.to_string(),
+                source,
+            })?;
         if let Some(bytes) = cmd.stdin
             && let Some(mut child_stdin) = sup.child_mut().stdin.take()
         {
@@ -230,7 +237,7 @@ impl Dispatcher for LocalDispatcher {
                 drop(child_stdin.shutdown().await);
             });
         }
-        Ok(sup)
+        Ok(Box::new(LocalProcess::new(self.info.id.to_string(), sup)))
     }
 
     /// Return the host-network HTTP transport.
@@ -701,8 +708,8 @@ mod tests {
             stdout: ProcessStdio::default(),
             stderr: ProcessStdio::default(),
         };
-        let mut sup = d.spawn(cmd).expect("spawn");
-        let _exit = crate::executor::supervisor::cancel(&mut sup).await;
+        let mut proc = d.spawn(cmd).await.expect("spawn");
+        let _exit = proc.cancel().await;
     }
 
     #[tokio::test]
@@ -710,7 +717,6 @@ mod tests {
         // Phase E contract: ProcessCmd::stdout = Piped means the supervisor
         // can read the child's stdout. Without this fix shell node output
         // would silently drop.
-        use tokio::io::AsyncReadExt;
         let d = LocalDispatcher::new(local_info());
         let cmd = if cfg!(windows) {
             ProcessCmd {
@@ -733,16 +739,18 @@ mod tests {
                 stderr: ProcessStdio::Inherit,
             }
         };
-        let mut sup = d.spawn(cmd).expect("spawn");
+        let mut proc = d.spawn(cmd).await.expect("spawn");
+        let stdout_pipe = proc
+            .take_stdout()
+            .expect("Stdio::Piped should open the stdout pipe");
         let mut buf = String::new();
-        sup.child_mut()
-            .stdout
-            .as_mut()
-            .expect("Stdio::Piped should open the stdout pipe")
-            .read_to_string(&mut buf)
-            .await
-            .expect("read stdout");
-        let _exit = sup.child_mut().wait().await.expect("wait");
+        tokio::io::AsyncReadExt::read_to_string(
+            &mut tokio::io::BufReader::new(stdout_pipe),
+            &mut buf,
+        )
+        .await
+        .expect("read stdout");
+        let _exit = proc.wait().await.expect("wait");
         assert!(buf.contains("pipe-ok"), "got {buf:?}");
     }
 
