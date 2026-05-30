@@ -7,8 +7,10 @@
 use std::sync::Arc;
 
 use tokio::sync::OnceCell;
+use tokio_util::sync::CancellationToken;
 
 use crate::environment::runtime::error::DispatchError;
+use crate::environment::runtime::plan::{ProbePlan, ProbeSummary};
 use crate::environment::runtime::{EnvInfo, SshAuth, SshHostKeyPin};
 use crate::secrets::Store;
 
@@ -98,5 +100,45 @@ impl SshDispatcher {
                 bootstrapper.bootstrap(triple).await
             })
             .await
+    }
+
+    /// Build a helper probe plan and dispatch it over the SSH connection.
+    ///
+    /// The plan is serialised with the shared wire-format logic from
+    /// [`crate::environment::runtime::helper_wire`] so SSH and WSL produce
+    /// identical plans.  The actual helper execution is wired in T10 once
+    /// `SshProcess` exists.
+    #[allow(dead_code)] // wired in T10
+    async fn probe_plan_via_helper(
+        &self,
+        helper_path: &str,
+        plan: ProbePlan,
+        cancel: CancellationToken,
+    ) -> Result<ProbeSummary, DispatchError> {
+        let wire_plan = crate::environment::runtime::helper_wire::build_wire_plan(&plan)?;
+        let plan_json = serde_json::to_vec(&wire_plan)
+            .map_err(|e| DispatchError::PlanBuild(format!("serialize helper probe plan: {e}")))?;
+        self.run_helper_probe_stream(helper_path, plan, plan_json, cancel)
+            .await
+    }
+
+    /// Execute the helper binary over SSH and stream its probe outcomes.
+    ///
+    /// Stub until T10 wires in `SshProcess`.
+    #[allow(dead_code)] // wired in T10
+    async fn run_helper_probe_stream(
+        &self,
+        _helper_path: &str,
+        _plan: ProbePlan,
+        _plan_json: Vec<u8>,
+        _cancel: CancellationToken,
+    ) -> Result<ProbeSummary, DispatchError> {
+        // T10 will replace this body with real SSH execution.
+        // The `async` + trivial await below keeps `clippy::unused_async` quiet
+        // while the signature is stable.
+        std::future::ready(Err(DispatchError::NotImplemented(
+            "run_helper_probe_stream: wired in T10".into(),
+        )))
+        .await
     }
 }

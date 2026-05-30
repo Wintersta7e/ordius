@@ -17,6 +17,7 @@ pub mod env;
 pub mod env_registry;
 pub mod error;
 pub mod helper;
+pub mod helper_wire;
 pub mod local;
 pub mod plan;
 pub mod registry;

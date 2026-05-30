@@ -8,24 +8,17 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use ordius_helper::protocol::{
-    HttpProbeMethodV1, HttpProbeRouteV1, ProbeDetailV1, ProbeOutcomeBodyV1, ProbeOutcomeV1,
-    ProbePlanV1, ProvenRouteV1, ResourceKindV1, ResourceSpecV1,
-};
+use ordius_helper::protocol::{ProbeOutcomeV1, ProbePlanV1};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
-use crate::environment::runtime::catalog::{
-    ProvenRoute, ResourceCatalog, ResourceDetail, ResourceProbeOutcome, RouteOrigin,
-};
+use crate::environment::runtime::catalog::{ResourceCatalog, ResourceProbeOutcome};
 use crate::environment::runtime::dispatcher::{Dispatcher, HttpTransport};
 use crate::environment::runtime::env::{EnvInfo, HostDirectVerification, RunId, WorkspaceBinding};
 use crate::environment::runtime::error::DispatchError;
 use crate::environment::runtime::plan::{ProbePlan, ProbeSummary};
-use crate::environment::runtime::resource::{
-    Capability, HttpProbeMethod, ProbeSpec, ResourceDefinition, ResourceId, ResourceKind,
-};
+use crate::environment::runtime::resource::{ProbeSpec, ResourceDefinition, ResourceId};
 use crate::environment::runtime::transport::{
     EnvPath, LocalProcess, ProcessCmd, Stdio as ProcessStdio, WorkspaceHandle,
 };
@@ -130,7 +123,11 @@ impl WslDispatcher {
             ));
         }
 
-        wire_outcome_to_engine(wire.outcome, def, &host_direct)
+        crate::environment::runtime::helper_wire::wire_outcome_to_engine(
+            wire.outcome,
+            def,
+            host_direct.contains_key(&def.id),
+        )
     }
 
     fn helper_probe_command(&self, helper_path: &str) -> tokio::process::Command {
@@ -168,7 +165,7 @@ impl WslDispatcher {
         cancel: &CancellationToken,
     ) -> Result<ProbeSummary, DispatchError> {
         let started = std::time::Instant::now();
-        let wire_plan = build_wire_plan(plan)?;
+        let wire_plan = crate::environment::runtime::helper_wire::build_wire_plan(plan)?;
         let host_direct = self.host_direct_snapshot();
         let plan_json = serde_json::to_string(&wire_plan)
             .map_err(|e| DispatchError::PlanBuild(format!("serialize probe plan: {e}")))?;
@@ -300,6 +297,7 @@ async fn consume_helper_stream(
     host_direct: &HashMap<ResourceId, HostDirectVerification>,
     cancel: &CancellationToken,
 ) -> HelperStreamOutcome {
+    use crate::environment::runtime::helper_wire::wire_outcome_to_engine;
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut reader = BufReader::new(stdout).lines();
     let mut resources: HashMap<ResourceId, ResourceProbeOutcome> = HashMap::default();
@@ -341,7 +339,11 @@ async fn consume_helper_stream(
                         if resources
                             .insert(
                                 def.id.clone(),
-                                wire_outcome_to_engine(wire.outcome, def, host_direct),
+                                wire_outcome_to_engine(
+                                    wire.outcome,
+                                    def,
+                                    host_direct.contains_key(&def.id),
+                                ),
                             )
                             .is_none()
                         {
@@ -488,7 +490,7 @@ fn parse_helper_probe_output(output: &std::process::Output) -> Result<ProbeOutco
 }
 
 fn helper_probe_plan_json(def: &ResourceDefinition) -> Result<(Vec<u8>, u64), String> {
-    let spec = resource_spec_v1_from_def(def)?;
+    let spec = crate::environment::runtime::helper_wire::resource_spec_v1_from_def(def)?;
     let timeout_ms = probe_timeout_ms(def);
     let plan = ProbePlanV1 {
         version: 1,
@@ -500,26 +502,6 @@ fn helper_probe_plan_json(def: &ResourceDefinition) -> Result<(Vec<u8>, u64), St
     serde_json::to_vec(&plan)
         .map(|json| (json, timeout_ms))
         .map_err(|e| format!("serialize helper probe plan: {e}"))
-}
-
-fn build_wire_plan(plan: &ProbePlan) -> Result<ProbePlanV1, DispatchError> {
-    let mut resources = Vec::with_capacity(plan.defs.len());
-    for def in &plan.defs {
-        let spec = resource_spec_v1_from_def(def)
-            .map_err(|e| DispatchError::PlanBuild(format!("plan build: {e}")))?;
-        resources.push(spec);
-    }
-    Ok(ProbePlanV1 {
-        version: 1,
-        per_resource_timeout_ms: duration_millis_u64(plan.per_resource_timeout),
-        max_concurrency: u32::try_from(plan.max_concurrency).unwrap_or(u32::MAX),
-        overall_budget_ms: duration_millis_u64(plan.overall_budget),
-        resources,
-    })
-}
-
-fn duration_millis_u64(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn probe_failed(reason: impl Into<String>) -> ResourceProbeOutcome {
@@ -707,9 +689,9 @@ fn probe_timeout_ms(def: &ResourceDefinition) -> u64 {
     match &def.probe {
         ProbeSpec::Http { timeout_ms, .. }
         | ProbeSpec::Binary { timeout_ms, .. }
-        | ProbeSpec::Toolchain { timeout_ms, .. } => {
-            timeout_ms.unwrap_or_else(|| duration_millis_u64(DEFAULT_PROBE_TIMEOUT))
-        },
+        | ProbeSpec::Toolchain { timeout_ms, .. } => timeout_ms.unwrap_or_else(|| {
+            crate::environment::runtime::helper_wire::duration_millis_u64(DEFAULT_PROBE_TIMEOUT)
+        }),
     }
 }
 
@@ -736,209 +718,20 @@ fn cancelled_probe_outcome() -> ResourceProbeOutcome {
     }
 }
 
-fn resource_spec_v1_from_def(def: &ResourceDefinition) -> Result<ResourceSpecV1, String> {
-    let kind = match &def.probe {
-        ProbeSpec::Http { ports, routes, .. } => {
-            if def.kind != ResourceKind::HttpEndpoint {
-                return Err(format!(
-                    "resource {} has HTTP probe but {:?} kind",
-                    def.id, def.kind
-                ));
-            }
-            ResourceKindV1::Http {
-                bases: ports
-                    .iter()
-                    .map(|port| format!("http://127.0.0.1:{port}"))
-                    .collect(),
-                routes: routes
-                    .iter()
-                    .map(|route| HttpProbeRouteV1 {
-                        path: route.path.clone(),
-                        method: match route.method {
-                            HttpProbeMethod::Get => HttpProbeMethodV1::Get,
-                            HttpProbeMethod::Head => HttpProbeMethodV1::Head,
-                        },
-                        proves: route
-                            .proves
-                            .iter()
-                            .map(|cap| capability_to_wire(*cap))
-                            .collect(),
-                        expect_status: Vec::new(),
-                        fingerprint_jsonpaths: route.fingerprint_jsonpaths.clone(),
-                    })
-                    .collect(),
-            }
-        },
-        ProbeSpec::Binary {
-            bin,
-            extra_search_paths,
-            ..
-        } => {
-            if def.kind != ResourceKind::Binary {
-                return Err(format!(
-                    "resource {} has binary probe but {:?} kind",
-                    def.id, def.kind
-                ));
-            }
-            ResourceKindV1::Binary {
-                bin: bin.clone(),
-                extra_search_paths: extra_search_paths.clone(),
-            }
-        },
-        ProbeSpec::Toolchain {
-            bin,
-            version_args,
-            version_regex,
-            extra_search_paths,
-            ..
-        } => {
-            if def.kind != ResourceKind::Toolchain {
-                return Err(format!(
-                    "resource {} has toolchain probe but {:?} kind",
-                    def.id, def.kind
-                ));
-            }
-            ResourceKindV1::Toolchain {
-                bin: bin.clone(),
-                version_args: version_args.clone(),
-                version_regex: version_regex.clone(),
-                extra_search_paths: extra_search_paths.clone(),
-            }
-        },
-    };
-
-    Ok(ResourceSpecV1 {
-        id: def.id.0.clone(),
-        kind,
-    })
-}
-
-fn wire_outcome_to_engine(
-    body: ProbeOutcomeBodyV1,
-    def: &ResourceDefinition,
-    host_direct: &HashMap<ResourceId, HostDirectVerification>,
-) -> ResourceProbeOutcome {
-    match body {
-        ProbeOutcomeBodyV1::Found(detail) => wire_detail_to_engine(detail, def, host_direct),
-        ProbeOutcomeBodyV1::NotFound => ResourceProbeOutcome::NotFound,
-        ProbeOutcomeBodyV1::Skipped { reason } => ResourceProbeOutcome::Skipped { reason },
-        ProbeOutcomeBodyV1::ProbeFailed { reason } => ResourceProbeOutcome::ProbeFailed { reason },
-        ProbeOutcomeBodyV1::TimedOut => ResourceProbeOutcome::TimedOut,
-    }
-}
-
-fn wire_detail_to_engine(
-    detail: ProbeDetailV1,
-    def: &ResourceDefinition,
-    host_direct: &HashMap<ResourceId, HostDirectVerification>,
-) -> ResourceProbeOutcome {
-    match detail {
-        ProbeDetailV1::HttpEndpoint {
-            base_url,
-            proven_routes,
-        } => {
-            let route_origin = if host_direct.contains_key(&def.id) {
-                RouteOrigin::HostDirect
-            } else {
-                RouteOrigin::EnvLoopback
-            };
-            ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
-                base_url,
-                routes_by_capability: routes_by_capability_from_wire(&proven_routes, def),
-                version: None,
-                models_list: None,
-                auth_secret_ref: None,
-                streaming_supported_natively: false,
-                route_origin,
-            })
-        },
-        ProbeDetailV1::Binary { path } => ResourceProbeOutcome::Found(ResourceDetail::Binary {
-            path,
-            version: None,
-            capabilities: def.advertised_capabilities.clone(),
-        }),
-        ProbeDetailV1::Toolchain { path, version } => match &def.probe {
-            ProbeSpec::Binary { .. } => ResourceProbeOutcome::Found(ResourceDetail::Binary {
-                path,
-                version: Some(version),
-                capabilities: def.advertised_capabilities.clone(),
-            }),
-            ProbeSpec::Http { .. } | ProbeSpec::Toolchain { .. } => {
-                ResourceProbeOutcome::Found(ResourceDetail::Toolchain {
-                    name: def.id.0.clone(),
-                    version: Some(version),
-                    exe_path: path,
-                })
-            },
-        },
-    }
-}
-
-fn routes_by_capability_from_wire(
-    proven_routes: &[ProvenRouteV1],
-    def: &ResourceDefinition,
-) -> HashMap<Capability, ProvenRoute> {
-    let ProbeSpec::Http { routes, .. } = &def.probe else {
-        return HashMap::new();
-    };
-
-    let mut by_capability = HashMap::new();
-    for wire_route in proven_routes {
-        for wire_cap in &wire_route.capabilities {
-            let Some(capability) = capability_from_wire(wire_cap) else {
-                continue;
-            };
-            let Some(route) = routes
-                .iter()
-                .find(|route| route.path == wire_route.path && route.proves.contains(&capability))
-            else {
-                tracing::debug!(
-                    capability = %wire_cap,
-                    path = %wire_route.path,
-                    "dropping helper proven route absent from original probe definition"
-                );
-                continue;
-            };
-
-            by_capability
-                .entry(capability)
-                .or_insert_with(|| ProvenRoute {
-                    path: wire_route.path.clone(),
-                    method: route.method,
-                    flavor: route.flavor,
-                });
-        }
-    }
-    by_capability
-}
-
-fn capability_to_wire(capability: Capability) -> String {
-    match serde_json::to_value(capability).expect("capability serializes as JSON") {
-        serde_json::Value::String(value) => value,
-        other => unreachable!("capability serialized to non-string JSON value: {other:?}"),
-    }
-}
-
-fn capability_from_wire(value: &str) -> Option<Capability> {
-    serde_json::from_value(serde_json::Value::String(value.to_string()))
-        .inspect_err(|err| {
-            tracing::debug!(
-                capability = value,
-                error = %err,
-                "dropping helper proven route with unknown capability"
-            );
-        })
-        .ok()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
+    use ordius_helper::protocol::{
+        HttpProbeMethodV1, ProbeDetailV1, ProbeOutcomeBodyV1, ProvenRouteV1, ResourceKindV1,
+    };
+
     use super::*;
+    use crate::environment::runtime::catalog::{ProvenRoute, ResourceDetail, RouteOrigin};
     use crate::environment::runtime::env::{EnvId, EnvSpec, EnvState};
+    use crate::environment::runtime::helper_wire;
     use crate::environment::runtime::resource::{
-        ApiFlavor, Capability, HttpProbeRoute, ResourceId,
+        ApiFlavor, Capability, HttpProbeMethod, HttpProbeRoute, ResourceId, ResourceKind,
     };
     use crate::environment::runtime::transport::EnvPath;
 
@@ -1116,7 +909,7 @@ mod tests {
             override_lower_scope: false,
         };
 
-        let spec = resource_spec_v1_from_def(&def).expect("spec");
+        let spec = helper_wire::resource_spec_v1_from_def(&def).expect("spec");
         let ResourceKindV1::Http { bases, routes } = spec.kind else {
             panic!("expected HTTP spec");
         };
@@ -1143,7 +936,7 @@ mod tests {
     #[test]
     fn wire_http_outcome_rebuilds_routes_by_capability() {
         let def = http_def();
-        let outcome = wire_outcome_to_engine(
+        let outcome = helper_wire::wire_outcome_to_engine(
             ProbeOutcomeBodyV1::Found(ProbeDetailV1::HttpEndpoint {
                 base_url: "http://127.0.0.1:11434".into(),
                 proven_routes: vec![ProvenRouteV1 {
@@ -1154,7 +947,7 @@ mod tests {
                 }],
             }),
             &def,
-            &HashMap::new(),
+            false,
         );
 
         let ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
@@ -1208,7 +1001,7 @@ mod tests {
             override_lower_scope: false,
         };
 
-        let outcome = wire_outcome_to_engine(
+        let outcome = helper_wire::wire_outcome_to_engine(
             ProbeOutcomeBodyV1::Found(ProbeDetailV1::HttpEndpoint {
                 base_url: "http://127.0.0.1:1234".into(),
                 proven_routes: vec![ProvenRouteV1 {
@@ -1222,7 +1015,7 @@ mod tests {
                 }],
             }),
             &def,
-            &HashMap::new(),
+            false,
         );
 
         let ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
@@ -1322,7 +1115,7 @@ mod tests {
             max_concurrency: 1,
             overall_budget: Duration::from_secs(5),
         };
-        let err = build_wire_plan(&plan).unwrap_err();
+        let err = helper_wire::build_wire_plan(&plan).unwrap_err();
         assert!(matches!(err, DispatchError::PlanBuild(_)), "got {err:?}");
     }
 
@@ -1344,13 +1137,13 @@ mod tests {
             },
         );
 
-        let outcome = wire_detail_to_engine(
+        let outcome = helper_wire::wire_detail_to_engine(
             ProbeDetailV1::HttpEndpoint {
                 base_url: "http://127.0.0.1:11434".into(),
                 proven_routes: vec![],
             },
             &def,
-            &host_direct,
+            host_direct.contains_key(&def.id),
         );
 
         let ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint { route_origin, .. }) =
@@ -1364,7 +1157,7 @@ mod tests {
     #[test]
     fn wire_http_outcome_drops_unknown_capability() {
         let def = http_def();
-        let outcome = wire_outcome_to_engine(
+        let outcome = helper_wire::wire_outcome_to_engine(
             ProbeOutcomeBodyV1::Found(ProbeDetailV1::HttpEndpoint {
                 base_url: "http://127.0.0.1:11434".into(),
                 proven_routes: vec![ProvenRouteV1 {
@@ -1375,7 +1168,7 @@ mod tests {
                 }],
             }),
             &def,
-            &HashMap::new(),
+            false,
         );
 
         let ResourceProbeOutcome::Found(ResourceDetail::HttpEndpoint {
