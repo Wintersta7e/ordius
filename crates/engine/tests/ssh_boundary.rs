@@ -57,3 +57,43 @@ fn ssh_host_key_enrollment_builds_inline_pin() {
     assert_eq!(pin.sha256, "SHA256:enrolled");
     assert_eq!(pin.public_key_openssh, "ssh-ed25519 AAAAenrolled");
 }
+
+use ordius_engine::environment::runtime::{SecretRef, SshAuth};
+
+#[test]
+fn ssh_password_auth_resolves_secret_ref() {
+    keyring::use_sample_store(&std::collections::HashMap::from([("persist", "false")])).unwrap();
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = ordius_engine::Store::with_index_path(dir.path().join("secrets.json"));
+    store.set("ssh-password", "s3cr3t").unwrap();
+
+    let resolved = ordius_engine::environment::runtime::ssh::auth::resolve_auth_material(
+        &store,
+        &SshAuth::Password {
+            secret_ref: SecretRef("ssh-password".into()),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        resolved,
+        ordius_engine::environment::runtime::ssh::auth::ResolvedSshAuth::Password("s3cr3t".into())
+    );
+}
+
+#[test]
+fn ssh_agent_auth_is_explicitly_deferred() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = ordius_engine::Store::with_index_path(dir.path().join("secrets.json"));
+
+    let err = ordius_engine::environment::runtime::ssh::auth::resolve_auth_material(
+        &store,
+        &SshAuth::Agent {
+            public_key_path: None,
+            fingerprint: None,
+        },
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("SSH agent auth is deferred"));
+}

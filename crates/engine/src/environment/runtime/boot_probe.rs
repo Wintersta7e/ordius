@@ -175,7 +175,11 @@ fn classify_row(
 /// `EnvInfo.state` (`Unreachable { reason }`) and a catalog with no
 /// resources. Probes that exceed `OVERALL_BUDGET` are cancelled and their
 /// envs are dropped from the outcome.
-pub async fn run(pool: &DbPool, resource_registry: &ResourceRegistry) -> BootProbeOutcome {
+pub async fn run(
+    pool: &DbPool,
+    resource_registry: &ResourceRegistry,
+    secrets_store: Arc<crate::secrets::Store>,
+) -> BootProbeOutcome {
     let specs = load_and_ensure_local(pool);
 
     let cancel = CancellationToken::new();
@@ -194,7 +198,11 @@ pub async fn run(pool: &DbPool, resource_registry: &ResourceRegistry) -> BootPro
             state: EnvState::Probing,
             enabled: true,
         });
-        let dispatcher = match construct_dispatcher(&spec, &probing_info) {
+        let dispatcher = match construct_dispatcher(
+            &spec,
+            &probing_info,
+            Arc::clone(&secrets_store),
+        ) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(env_id = %env_id, error = %e, "skipping env: dispatcher unsupported");
@@ -286,6 +294,7 @@ async fn drain_tasks(
 fn construct_dispatcher(
     spec: &EnvSpec,
     info: &Arc<EnvInfo>,
+    _secrets_store: Arc<crate::secrets::Store>,
 ) -> Result<Arc<dyn Dispatcher>, DispatchError> {
     match spec {
         EnvSpec::Local { .. } => Ok(Arc::new(LocalDispatcher::new((**info).clone()))),
@@ -512,6 +521,7 @@ pub async fn run_single(
     env_id: &EnvId,
     label: &str,
     spec: &EnvSpec,
+    secrets_store: Arc<crate::secrets::Store>,
 ) -> Result<SingleRefresh, BootError> {
     let probing_info = Arc::new(EnvInfo {
         id: env_id.clone(),
@@ -520,7 +530,7 @@ pub async fn run_single(
         state: EnvState::Probing,
         enabled: true,
     });
-    let dispatcher = construct_dispatcher(spec, &probing_info)?;
+    let dispatcher = construct_dispatcher(spec, &probing_info, secrets_store)?;
     let plan = build_plan(env_id, spec, resource_registry);
     let summary = dispatcher
         .probe(plan, CancellationToken::new())
@@ -565,7 +575,10 @@ mod tests {
         }
 
         let registry = ResourceRegistry::new();
-        let outcome = run(&pool, &registry).await;
+        let store = Arc::new(crate::secrets::Store::with_index_path(
+            tmp.path().join("secrets.json"),
+        ));
+        let outcome = run(&pool, &registry, store).await;
 
         assert!(!outcome.entries.contains_key(&EnvId::new("ssh:legacy")));
         let disabled = outcome
@@ -588,7 +601,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let pool = open(tmp.path().join("runs.db")).unwrap();
         let registry = ResourceRegistry::new();
-        let outcome = run(&pool, &registry).await;
+        let store = Arc::new(crate::secrets::Store::with_index_path(
+            tmp.path().join("secrets.json"),
+        ));
+        let outcome = run(&pool, &registry, store).await;
         assert!(
             outcome.entries.contains_key(&EnvId::local()),
             "boot probe must always synthesize Local when env_specs is empty",
@@ -617,7 +633,10 @@ mod tests {
             .unwrap();
         }
         let registry = ResourceRegistry::new();
-        let outcome = run(&pool, &registry).await;
+        let store = Arc::new(crate::secrets::Store::with_index_path(
+            tmp.path().join("secrets.json"),
+        ));
+        let outcome = run(&pool, &registry, store).await;
         assert!(
             !outcome.entries.contains_key(&EnvId::new("wsl:Disabled")),
             "disabled env must not land in entries",

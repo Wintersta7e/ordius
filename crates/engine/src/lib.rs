@@ -368,7 +368,12 @@ impl Engine {
         // later phases), probes each, and returns the entries/catalogs/
         // disabled maps. An empty `env_specs` table synthesizes a default
         // Local env so first-run installs always have one usable target.
-        let outcome = environment::runtime::boot_probe::run(&pool, &resource_registry).await;
+        let outcome = environment::runtime::boot_probe::run(
+            &pool,
+            &resource_registry,
+            Arc::clone(&secrets_store),
+        )
+        .await;
         tracing::info!(
             envs = outcome.entries.len(),
             disabled = outcome.disabled_specs.len(),
@@ -1378,8 +1383,12 @@ fn validate_id_spec_kind(
 /// silently. Tracing logs the loss at debug level.
 async fn run_full_refresh(engine: &Arc<Engine>, epoch_before: u64) {
     use std::sync::atomic::Ordering;
-    let outcome =
-        environment::runtime::boot_probe::run(&engine.pool, &engine.resource_registry).await;
+    let outcome = environment::runtime::boot_probe::run(
+        &engine.pool,
+        &engine.resource_registry,
+        Arc::clone(&engine.secrets_store),
+    )
+    .await;
     let _guard = engine.env_refresh_lock.lock().await;
     match engine.env_refresh_epoch.compare_exchange(
         epoch_before,
@@ -1422,6 +1431,7 @@ async fn run_single_refresh(
         &env_id,
         &label,
         &spec,
+        Arc::clone(&engine.secrets_store),
     )
     .await
     {
