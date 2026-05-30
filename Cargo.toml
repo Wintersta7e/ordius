@@ -58,6 +58,7 @@ base64 = "0.22"
 bytes = { version = "1", features = ["serde"] }
 reqwest = { version = "0.13", features = ["json", "stream", "query"] }
 ureq = { version = "2", default-features = false, features = ["rustls", "json"] }
+signal-hook = "0.3"
 jsonpath-rust = "1"
 keyring = "4"
 keyring-core = "1"

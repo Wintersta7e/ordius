@@ -117,3 +117,49 @@ fn exec_subcommand_runs_with_explicit_env() {
     let status = child.wait().expect("wait");
     assert!(status.success(), "explicit env not propagated");
 }
+
+#[cfg(unix)]
+#[test]
+fn exec_subcommand_finds_sh_with_empty_env() {
+    let req = r#"{
+        "version":1,
+        "program":"sh",
+        "args":["-c","printf ok"]
+    }"#;
+    let mut child = Command::new(helper_path())
+        .args(["exec", "--argv-json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn helper");
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(req.as_bytes()).unwrap();
+    }
+    let out = child.wait_with_output().expect("wait");
+    assert!(out.status.success(), "helper failed: {out:?}");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "ok");
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_subcommand_explicit_path_overrides_default_path() {
+    let req = r#"{
+        "version":1,
+        "program":"sh",
+        "args":["-c","test \"$PATH\" = \"/custom/bin\""],
+        "env":{"PATH":"/custom/bin"}
+    }"#;
+    let mut child = Command::new(helper_path())
+        .args(["exec", "--argv-json"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn helper");
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(req.as_bytes()).unwrap();
+    }
+    let status = child.wait().expect("wait");
+    assert!(status.success(), "explicit PATH was not preserved");
+}

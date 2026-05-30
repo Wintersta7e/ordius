@@ -28,6 +28,10 @@ regex = { workspace = true }
 wait-timeout = { workspace = true }
 jsonpath-rust = { workspace = true }
 glob = { workspace = true }
+signal-hook = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["process", "signal"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
