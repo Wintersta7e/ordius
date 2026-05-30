@@ -1,21 +1,34 @@
-//! SSH dispatcher — struct and constructor only (T7).
+//! SSH dispatcher — process spawn (T10) over the cached connection.
 //!
-//! `Dispatcher::spawn` is wired in T10; the HTTP transport in T11;
-//! boot-probe wiring in T12. This file exists so the public module
-//! surface is stable from T7 onward.
+//! `Dispatcher::spawn` is wired here (T10) via the `ordius-helper exec` channel;
+//! the HTTP transport lands in T11 and boot-probe wiring in T12. The other
+//! `Dispatcher` methods stay stubbed until their owning task.
 
+use std::path::Path;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
+use crate::environment::runtime::catalog::ResourceProbeOutcome;
+use crate::environment::runtime::dispatcher::{Dispatcher, HttpTransport};
 use crate::environment::runtime::error::DispatchError;
 use crate::environment::runtime::plan::{ProbePlan, ProbeSummary};
-use crate::environment::runtime::{EnvInfo, SshAuth, SshHostKeyPin};
+use crate::environment::runtime::resource::ResourceDefinition;
+use crate::environment::runtime::transport::{EnvPath, EnvProcess, ProcessCmd, WorkspaceHandle};
+use crate::environment::runtime::{EnvInfo, RunId, SshAuth, SshHostKeyPin, WorkspaceBinding};
 use crate::secrets::Store;
 
 use super::bootstrap::{RusshSftp, SshBootstrappedHelper, SshBootstrapper};
-use super::connection::{RusshConnector, SshConnectionCache};
+use super::connection::{
+    RusshConnector, SshConnection, SshConnectionCache, SshConnectionLike as _,
+};
+
+/// Target triple of the only helper binary we currently cross-compile and
+/// embed. SSH targets are assumed to be `x86_64` Linux; remote-arch detection
+/// is deferred (a later task can probe `uname -m` and pick a triple).
+const HELPER_TRIPLE: &str = "x86_64-unknown-linux-musl";
 
 /// Dispatches work to a remote SSH environment.
 ///
@@ -102,6 +115,24 @@ impl SshDispatcher {
             .await
     }
 
+    /// Return an open, cached connection (reconnecting once if dropped).
+    pub(crate) async fn connection(&self) -> Result<Arc<SshConnection>, DispatchError> {
+        self.cache.connection().await
+    }
+
+    /// Ensure the helper is bootstrapped on the remote, returning its installed
+    /// state. The SFTP upload runs exactly once: subsequent calls return the
+    /// cached [`SshBootstrappedHelper`] without opening an SFTP channel.
+    pub(crate) async fn ensure_helper(&self) -> Result<&SshBootstrappedHelper, DispatchError> {
+        // Fast path: already bootstrapped — avoid opening an SFTP channel.
+        if let Some(helper) = self.helper.get() {
+            return Ok(helper);
+        }
+        let conn = self.connection().await?;
+        let sftp = open_sftp(&conn).await?;
+        self.bootstrap_helper_with_triple(sftp, HELPER_TRIPLE).await
+    }
+
     /// Build a helper probe plan and dispatch it over the SSH connection.
     ///
     /// The plan is serialised with the shared wire-format logic from
@@ -140,5 +171,151 @@ impl SshDispatcher {
             "run_helper_probe_stream: wired in T10".into(),
         )))
         .await
+    }
+}
+
+/// Open an SFTP subsystem channel on `conn` and wrap it in the `SftpOps` adapter.
+///
+/// Holds the `Handle` lock only long enough to open the session channel and
+/// request the `sftp` subsystem; the resulting stream is owned by the returned
+/// [`RusshSftp`], so the lock is released before any SFTP I/O.
+async fn open_sftp(conn: &SshConnection) -> Result<RusshSftp, DispatchError> {
+    let map_err = |what: &str, e: russh::Error| {
+        conn.mark_closed();
+        DispatchError::EnvUnreachable {
+            env_id: conn.id().to_string(),
+            reason: format!("{what}: {e}"),
+        }
+    };
+
+    let stream = {
+        let handle = conn.handle().await;
+        let channel = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| map_err("open sftp channel", e))?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|e| map_err("request sftp subsystem", e))?;
+        // The channel is owned, not borrowed from the handle — release the lock
+        // before converting to a stream and running the SFTP handshake.
+        drop(handle);
+        channel.into_stream()
+    };
+
+    let session = russh_sftp::client::SftpSession::new(stream)
+        .await
+        .map_err(|e| {
+            DispatchError::HelperBootstrap(format!("open sftp session on {}: {e}", conn.id()))
+        })?;
+    Ok(RusshSftp::new(session))
+}
+
+#[async_trait]
+impl Dispatcher for SshDispatcher {
+    fn info(&self) -> &EnvInfo {
+        &self.env_info
+    }
+
+    async fn probe(
+        &self,
+        _plan: ProbePlan,
+        _cancel: CancellationToken,
+    ) -> Result<ProbeSummary, DispatchError> {
+        Err(DispatchError::NotImplemented(
+            "SSH probe: wired in T12".into(),
+        ))
+    }
+
+    async fn probe_resource(
+        &self,
+        _def: &ResourceDefinition,
+        _cancel: CancellationToken,
+    ) -> ResourceProbeOutcome {
+        ResourceProbeOutcome::Skipped {
+            reason: "SSH probe_resource: wired in T12".into(),
+        }
+    }
+
+    async fn spawn(&self, cmd: ProcessCmd) -> Result<Box<dyn EnvProcess>, DispatchError> {
+        let helper_path = self.ensure_helper().await?.env_side_path.clone();
+        let conn = self.connection().await?;
+        let proc = super::exec::open_helper_exec(conn, &helper_path, cmd).await?;
+        Ok(Box::new(proc))
+    }
+
+    fn http_transport(&self) -> Arc<dyn HttpTransport> {
+        // Wired in T11. A panic here would crash the run loop; instead return a
+        // transport whose every call yields a transport error.
+        Arc::new(UnimplementedHttpTransport {
+            env_id: self.env_info.id.to_string(),
+        })
+    }
+
+    fn translate_path(&self, host_path: &Path) -> Result<EnvPath, DispatchError> {
+        // Remote hosts share no filesystem with the host; path translation is a
+        // workspace-sync concern deferred past T10.
+        Err(DispatchError::PathTranslation {
+            host_path: host_path.display().to_string(),
+            reason: "SSH path translation is deferred (compute-first; workspace sync not wired)"
+                .into(),
+        })
+    }
+
+    async fn prepare_workspace(
+        &self,
+        _workspace_host: &Path,
+        _binding: &WorkspaceBinding,
+        _run_id: &RunId,
+    ) -> Result<WorkspaceHandle, DispatchError> {
+        Err(DispatchError::Unsupported(
+            "SSH workspace preparation is deferred (compute-first; sync not wired)".into(),
+        ))
+    }
+}
+
+/// Placeholder [`HttpTransport`] returned until T11 wires the real tunnel.
+///
+/// Every method yields a transport error rather than panicking, so a misrouted
+/// HTTP node fails the node cleanly instead of crashing the run loop.
+struct UnimplementedHttpTransport {
+    env_id: String,
+}
+
+#[async_trait]
+impl HttpTransport for UnimplementedHttpTransport {
+    async fn execute(
+        &self,
+        _req: crate::environment::runtime::transport::HttpRequest,
+    ) -> Result<
+        crate::environment::runtime::transport::HttpResponse,
+        crate::environment::runtime::transport::HttpError,
+    > {
+        Err(
+            crate::environment::runtime::transport::HttpError::Transport(format!(
+                "SSH HTTP transport not wired yet ({})",
+                self.env_id
+            )),
+        )
+    }
+
+    async fn execute_stream(
+        &self,
+        _req: crate::environment::runtime::transport::HttpRequest,
+    ) -> Result<
+        crate::environment::runtime::dispatcher::ResponseStream,
+        crate::environment::runtime::transport::HttpError,
+    > {
+        Err(
+            crate::environment::runtime::transport::HttpError::Transport(format!(
+                "SSH HTTP transport not wired yet ({})",
+                self.env_id
+            )),
+        )
+    }
+
+    fn can_stream(&self, _url: &url::Url) -> bool {
+        false
     }
 }

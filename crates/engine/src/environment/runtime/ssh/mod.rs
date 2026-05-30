@@ -5,4 +5,5 @@ pub mod bootstrap;
 pub mod config;
 pub mod connection;
 pub mod dispatcher;
+pub mod exec;
 pub mod host_key;

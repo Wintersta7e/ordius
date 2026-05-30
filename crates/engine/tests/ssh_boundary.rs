@@ -185,3 +185,30 @@ async fn ssh_connection_cache_returns_error_when_both_attempts_closed() {
     // Both connect attempts must have been made.
     assert_eq!(connector.connect_count(), 2);
 }
+
+// ── Exec-request boundary ─────────────────────────────────────────────────────
+
+#[test]
+fn ssh_exec_request_preserves_argv_env_cwd_and_stdin() {
+    use bytes::Bytes;
+    use std::collections::HashMap;
+
+    let req = ordius_engine::environment::runtime::ssh::exec::exec_request_from_cmd(
+        &ordius_engine::environment::runtime::ProcessCmd {
+            program: "python3".into(),
+            args: vec!["-c".into(), "print('hi')".into()],
+            env: HashMap::from([("A".into(), "B".into())]),
+            cwd: Some(ordius_engine::environment::runtime::EnvPath::new("/work")),
+            stdin: Some(Bytes::from_static(b"input")),
+            stdout: ordius_engine::environment::runtime::transport::Stdio::Piped,
+            stderr: ordius_engine::environment::runtime::transport::Stdio::Piped,
+        },
+    );
+
+    assert_eq!(req.version, 1);
+    assert_eq!(req.program, "python3");
+    assert_eq!(req.args, vec!["-c", "print('hi')"]);
+    assert_eq!(req.env.get("A").map(String::as_str), Some("B"));
+    assert_eq!(req.cwd.as_deref(), Some("/work"));
+    assert_eq!(req.stdin_b64.as_deref(), Some("aW5wdXQ="));
+}
