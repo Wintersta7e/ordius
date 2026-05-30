@@ -47,6 +47,8 @@ keyring-core = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 ordius-helper = { path = "../ordius-helper", default-features = false }
+russh = { workspace = true }
+russh-sftp = { workspace = true }
 
 [build-dependencies]
 sha2 = { workspace = true }
@@ -69,3 +71,5 @@ tempfile = { workspace = true }
 serial_test = { workspace = true }
 keyring = { workspace = true }
 wiremock = { workspace = true }
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }

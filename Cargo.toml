@@ -62,6 +62,10 @@ jsonpath-rust = "1"
 keyring = "4"
 keyring-core = "1"
 
+# SSH
+russh = { version = "=0.61.1", default-features = false, features = ["aws-lc-rs"] }
+russh-sftp = { version = "=2.3.0" }
+
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 rpassword = "7"
