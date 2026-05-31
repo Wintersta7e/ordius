@@ -197,7 +197,7 @@ fn platform_spawn(mut cmd: Command) -> std::io::Result<Supervised> {
     let proc_handle = unsafe {
         windows::Win32::System::Threading::OpenProcess(
             windows::Win32::System::Threading::PROCESS_ALL_ACCESS,
-            windows::Win32::Foundation::FALSE,
+            false,
             pid_raw,
         )
     }

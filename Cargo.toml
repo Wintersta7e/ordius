@@ -21,7 +21,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # serde_yaml is deprecated upstream; using the actively-maintained fork via Cargo package rename.
 serde_yaml = { version = "0.10", package = "serde_yaml_ng" }
-toml = "0.8"
+toml = "1"
 
 # Errors / logging
 thiserror = "2"
@@ -46,7 +46,7 @@ cron = "0.15"
 notify = "7"
 notify-debouncer-mini = "0.5"
 bollard = "0.18"
-axum = "0.7"
+axum = "0.8"
 
 # Storage
 rusqlite = { version = "0.39", features = ["bundled", "chrono"] }
@@ -58,7 +58,7 @@ base64 = "0.22"
 bytes = { version = "1", features = ["serde"] }
 reqwest = { version = "0.13", features = ["json", "stream", "query"] }
 ureq = { version = "2", default-features = false, features = ["rustls", "json"] }
-signal-hook = "0.3"
+signal-hook = "0.4"
 jsonpath-rust = "1"
 keyring = "4"
 keyring-core = "1"

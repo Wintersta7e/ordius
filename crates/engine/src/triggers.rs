@@ -448,7 +448,7 @@ fn spawn_webhook_server(engine: Arc<Engine>, cancel: CancellationToken) -> Optio
     };
 
     let app = Router::new()
-        .route("/webhooks/:workflow_id", post(webhook_handler))
+        .route("/webhooks/{workflow_id}", post(webhook_handler))
         .with_state(engine);
 
     let join = tokio::spawn(async move {
