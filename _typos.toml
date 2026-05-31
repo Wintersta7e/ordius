@@ -1,0 +1,5 @@
+# Project-specific terms typos should treat as correct.
+[default.extend-words]
+bord = "bord"               # UI border-field abbreviations (bordL / bordC / bordA)
+unparseable = "unparseable" # valid alternative spelling used in error messages
+hel = "hel"                 # substring test fixture ("hello".starts_with("hel"))
