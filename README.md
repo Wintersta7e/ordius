@@ -58,8 +58,8 @@ finished, packaged app.
 - Execution environments — local, WSL, and remote SSH
 - SQLite run history, OS-keyring secrets, template substitution, NDJSON events
 
-**Not done yet:** end-to-end polish, packaged installers, and the
-planned items below.
+**Not done yet:** end-to-end polish and packaged installers (plus the
+items under [Features → Planned](#features)).
 
 ## Features
 
