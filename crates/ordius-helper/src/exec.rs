@@ -127,6 +127,27 @@ fn install_signal_forwarder(_child_pgid: Arc<AtomicU32>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Spawn a thread that blocks reading `input` to EOF, then kills the child
+/// group. Stdin EOF means the SSH dispatcher closed the exec channel to
+/// cancel (OpenSSH does not SIGHUP a non-PTY exec process on channel-close),
+/// so EOF — not a signal — is what we wait on. Guards `pgid == 0` (the
+/// pre-spawn race window) before signalling.
+#[cfg(unix)]
+fn spawn_stdin_eof_monitor<R: BufRead + Send + 'static>(mut input: R, child_pgid: Arc<AtomicU32>) {
+    std::thread::spawn(move || {
+        // Blocks until stdin reaches EOF (the dispatcher closed the channel) or
+        // errors; either way the next step is to kill the child group.
+        drop(input.read_to_end(&mut Vec::new()));
+        let pgid = child_pgid.load(Ordering::SeqCst);
+        if pgid != 0 {
+            terminate_process_group(pgid, Duration::from_secs(2));
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_stdin_eof_monitor<R: BufRead + Send + 'static>(_input: R, _child_pgid: Arc<AtomicU32>) {}
+
 fn wait_child(mut child: Child) -> anyhow::Result<std::process::ExitStatus> {
     child.wait().context("wait on child")
 }
@@ -137,10 +158,17 @@ fn wait_child(mut child: Child) -> anyhow::Result<std::process::ExitStatus> {
 /// this process exits with the child's status code (so the parent observing
 /// helper stdout/stderr gets identical wire semantics to a direct
 /// `ssh -t host -- program args`).
-pub fn run<R: BufRead>(mut input: R) -> anyhow::Result<()> {
+///
+/// The request is read as a single newline-terminated line, leaving `input`
+/// (stdin) OPEN. A background monitor thread then blocks reading `input` to
+/// EOF: when the SSH dispatcher cancels by closing the exec channel, sshd
+/// closes the helper's stdin, the monitor unblocks, and it kills the child's
+/// process group. OpenSSH does not SIGHUP a non-PTY exec process on
+/// channel-close, so stdin-EOF — not a signal — is the cancel trigger here.
+pub fn run<R: BufRead + Send + 'static>(mut input: R) -> anyhow::Result<()> {
     let mut buf = String::new();
     input
-        .read_to_string(&mut buf)
+        .read_line(&mut buf)
         .context("read exec request from stdin")?;
     let req: ExecRequestV1 = serde_json::from_str(&buf).context("parse exec request from stdin")?;
     anyhow::ensure!(
@@ -179,6 +207,15 @@ pub fn run<R: BufRead>(mut input: R) -> anyhow::Result<()> {
         .spawn()
         .with_context(|| format!("spawn `{}` failed", req.program))?;
     child_pgid.store(child.id(), Ordering::SeqCst);
+
+    // Cancel monitor: own `input` and block reading it to EOF. The SSH
+    // dispatcher cancels by closing the exec channel, which closes the
+    // helper's stdin — `read_to_end` then returns and we kill the child
+    // group. On normal completion the child exits, `wait_child` returns, and
+    // the helper process exits abruptly — process exit kills all threads, so
+    // this still-blocked monitor never runs to completion. It thus only fires
+    // on a real cancel (stdin stays open until the dispatcher closes the channel).
+    spawn_stdin_eof_monitor(input, Arc::clone(&child_pgid));
 
     if let Some(bytes) = stdin_bytes
         && let Some(mut child_stdin) = child.stdin.take()
@@ -234,7 +271,7 @@ mod tests {
             stdin_b64: None,
         };
         let s = serde_json::to_string(&req).unwrap();
-        let err = run(s.as_bytes()).unwrap_err();
+        let err = run(std::io::Cursor::new(s.into_bytes())).unwrap_err();
         assert!(err.to_string().contains("unsupported exec request version"));
     }
 
@@ -249,7 +286,7 @@ mod tests {
             stdin_b64: None,
         };
         let s = serde_json::to_string(&req).unwrap();
-        let err = run(s.as_bytes()).unwrap_err();
+        let err = run(std::io::Cursor::new(s.into_bytes())).unwrap_err();
         assert!(err.to_string().contains("empty program"));
     }
 

@@ -65,17 +65,19 @@ fn probe_subcommand_reports_missing_binary() {
 #[cfg(unix)]
 #[test]
 fn exec_subcommand_runs_true() {
+    // Protocol: write the request as one line, then keep stdin OPEN until the
+    // helper exits. Closing stdin early would trip the helper's cancel monitor
+    // (stdin-EOF = cancel) and kill the child before it completes.
     let req = r#"{"version":1,"program":"true","args":[]}"#;
     let mut child = Command::new(helper_path())
         .args(["exec", "--argv-json"])
         .stdin(Stdio::piped())
         .spawn()
         .expect("spawn helper");
-    {
-        let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(req.as_bytes()).unwrap();
-    }
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{req}").unwrap();
     let status = child.wait().expect("wait");
+    drop(stdin);
     assert!(status.success());
 }
 
@@ -88,44 +90,35 @@ fn exec_subcommand_propagates_failure() {
         .stdin(Stdio::piped())
         .spawn()
         .expect("spawn helper");
-    {
-        let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(req.as_bytes()).unwrap();
-    }
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{req}").unwrap();
     let status = child.wait().expect("wait");
+    drop(stdin);
     assert!(!status.success(), "false should propagate non-zero exit");
 }
 
 #[cfg(unix)]
 #[test]
 fn exec_subcommand_runs_with_explicit_env() {
-    let req = r#"{
-        "version":1,
-        "program":"sh",
-        "args":["-c","test \"$ORDIUS_HELPER_TEST_VAR\" = \"set\""],
-        "env":{"ORDIUS_HELPER_TEST_VAR":"set"}
-    }"#;
+    // Single-line JSON: the helper reads the request via `read_line`, so the
+    // request must not contain embedded newlines.
+    let req = r#"{"version":1,"program":"sh","args":["-c","test \"$ORDIUS_HELPER_TEST_VAR\" = \"set\""],"env":{"ORDIUS_HELPER_TEST_VAR":"set"}}"#;
     let mut child = Command::new(helper_path())
         .args(["exec", "--argv-json"])
         .stdin(Stdio::piped())
         .spawn()
         .expect("spawn helper");
-    {
-        let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(req.as_bytes()).unwrap();
-    }
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{req}").unwrap();
     let status = child.wait().expect("wait");
+    drop(stdin);
     assert!(status.success(), "explicit env not propagated");
 }
 
 #[cfg(unix)]
 #[test]
 fn exec_subcommand_finds_sh_with_empty_env() {
-    let req = r#"{
-        "version":1,
-        "program":"sh",
-        "args":["-c","printf ok"]
-    }"#;
+    let req = r#"{"version":1,"program":"sh","args":["-c","printf ok"]}"#;
     let mut child = Command::new(helper_path())
         .args(["exec", "--argv-json"])
         .stdin(Stdio::piped())
@@ -133,11 +126,12 @@ fn exec_subcommand_finds_sh_with_empty_env() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn helper");
-    {
-        let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(req.as_bytes()).unwrap();
-    }
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{req}").unwrap();
+    // Hold stdin open until the helper has produced its output and exited;
+    // closing it early would trip the cancel monitor (stdin-EOF = cancel).
     let out = child.wait_with_output().expect("wait");
+    drop(stdin);
     assert!(out.status.success(), "helper failed: {out:?}");
     assert_eq!(String::from_utf8(out.stdout).unwrap(), "ok");
 }
@@ -145,21 +139,15 @@ fn exec_subcommand_finds_sh_with_empty_env() {
 #[cfg(unix)]
 #[test]
 fn exec_subcommand_explicit_path_overrides_default_path() {
-    let req = r#"{
-        "version":1,
-        "program":"sh",
-        "args":["-c","test \"$PATH\" = \"/custom/bin\""],
-        "env":{"PATH":"/custom/bin"}
-    }"#;
+    let req = r#"{"version":1,"program":"sh","args":["-c","test \"$PATH\" = \"/custom/bin\""],"env":{"PATH":"/custom/bin"}}"#;
     let mut child = Command::new(helper_path())
         .args(["exec", "--argv-json"])
         .stdin(Stdio::piped())
         .spawn()
         .expect("spawn helper");
-    {
-        let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(req.as_bytes()).unwrap();
-    }
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{req}").unwrap();
     let status = child.wait().expect("wait");
+    drop(stdin);
     assert!(status.success(), "explicit PATH was not preserved");
 }

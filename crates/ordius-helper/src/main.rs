@@ -33,7 +33,9 @@ fn main() -> anyhow::Result<()> {
         Cmd::Probe => probe::run(std::io::stdin().lock(), std::io::stdout().lock()),
         Cmd::Exec { argv_json } => {
             anyhow::ensure!(argv_json, "only --argv-json is supported in this version");
-            exec::run(std::io::stdin().lock())
+            // Owned `Stdin` (not `stdin().lock()`, which is `!Send`): the exec
+            // monitor thread moves the reader to wait on stdin EOF for cancel.
+            exec::run(std::io::BufReader::new(std::io::stdin()))
         },
     }
 }

@@ -13,11 +13,13 @@
 //! ## Cancel
 //!
 //! russh / OpenSSH do not reliably forward a client channel "signal" request to
-//! the server process, so [`SshExecHandle::cancel`] does **not** rely on
-//! `channel.signal(..)`. Instead it closes the channel: sshd then sends SIGHUP
-//! to the remote helper, and the helper's signal-forwarder (T3) kills the
-//! remote child's process group. Closing one channel kills one process — the
-//! shared connection is left intact.
+//! the server process — and OpenSSH does **not** SIGHUP a non-PTY exec process
+//! on channel-close either — so [`SshExecHandle::cancel`] relies on neither.
+//! Instead the request is written as one line and the channel's write side is
+//! left open; the remote helper keeps stdin open and runs a monitor thread that
+//! blocks on stdin EOF. `cancel` closes the channel, sshd closes the helper's
+//! stdin, the monitor unblocks and kills the remote child's process group.
+//! Closing one channel kills one process — the shared connection stays intact.
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -79,7 +81,8 @@ pub struct SshProcess {
 pub trait SshExecHandle: Send {
     /// Await the remote process's exit status.
     async fn wait_exit(&mut self) -> Result<ProcessExit, DispatchError>;
-    /// Best-effort cancel: closes the channel so sshd SIGHUPs the remote helper.
+    /// Best-effort cancel: EOF + closes the channel so sshd closes the helper's
+    /// stdin; the helper's stdin-EOF monitor then kills the remote child group.
     async fn cancel(&mut self) -> Result<(), DispatchError>;
 }
 
@@ -166,11 +169,11 @@ impl SshExecHandle for RusshExecHandle {
 /// Open a helper exec channel on `conn` and return a process handle.
 ///
 /// Serialises the command into an [`ExecRequestV1`], opens a session channel,
-/// runs `<quoted-helper> exec --argv-json`, writes the request JSON to stdin,
-/// EOFs stdin, then spawns a demux task that streams stdout/stderr and the exit
-/// status. The `Handle` mutex is released as soon as the channel is open — all
-/// subsequent channel I/O happens on the owned [`russh::Channel`], which is
-/// independently `Send + Sync`.
+/// runs `<quoted-helper> exec --argv-json`, writes the request JSON line to
+/// stdin (leaving stdin open for the cancel monitor), then spawns a demux task
+/// that streams stdout/stderr and the exit status. The `Handle` mutex is
+/// released as soon as the channel is open — all subsequent channel I/O happens
+/// on the owned [`russh::Channel`], which is independently `Send + Sync`.
 pub async fn open_helper_exec(
     conn: std::sync::Arc<SshConnection>,
     helper_path: &str,
@@ -180,26 +183,37 @@ pub async fn open_helper_exec(
     let request_json = serde_json::to_vec(&request)
         .map_err(|e| DispatchError::PlanBuild(format!("serialize exec request: {e}")))?;
     let remote_cmd = format!("{} exec --argv-json", posix_single_quote(helper_path));
-    open_command_channel(conn, &remote_cmd, request_json).await
+    // Keep stdin open after the request: the helper's cancel monitor blocks on
+    // stdin EOF, so closing the channel later is what cancels the remote child.
+    open_command_channel(conn, &remote_cmd, request_json, true).await
 }
 
 /// Open a helper **probe** channel on `conn` and return a process handle.
 ///
 /// Runs `<quoted-helper> probe`, writes the serialized probe plan
-/// (`ProbePlanV1` JSON) to stdin, then streams the helper's JSONL probe
-/// outcomes on stdout. Same channel/demux machinery as [`open_helper_exec`];
-/// the only differences are the remote subcommand and the stdin payload.
+/// (`ProbePlanV1` JSON) to stdin, EOFs stdin, then streams the helper's JSONL
+/// probe outcomes on stdout. Same channel/demux machinery as
+/// [`open_helper_exec`]; the differences are the remote subcommand, the stdin
+/// payload, and that the probe helper reads its plan to EOF — so stdin is
+/// closed right after the plan (no cancel monitor on the probe path).
 pub async fn open_helper_probe(
     conn: std::sync::Arc<SshConnection>,
     helper_path: &str,
     plan_json: Vec<u8>,
 ) -> Result<SshProcess, DispatchError> {
     let remote_cmd = format!("{} probe", posix_single_quote(helper_path));
-    open_command_channel(conn, &remote_cmd, plan_json).await
+    // Probe reads its plan to EOF: close stdin right after writing it.
+    open_command_channel(conn, &remote_cmd, plan_json, false).await
 }
 
 /// Shared channel plumbing: open a session, run `remote_cmd`, write `stdin`,
-/// EOF, then spawn a demux task that streams stdout/stderr + the exit status.
+/// then spawn a demux task that streams stdout/stderr + the exit status.
+///
+/// When `keep_stdin_open` is `false` (probe path) the write side is EOF'd right
+/// after the payload — the remote reads stdin to EOF. When `true` (exec path)
+/// the payload is sent as one newline-terminated line and stdin is left OPEN:
+/// the helper reads one line and its cancel monitor blocks on stdin EOF, so
+/// closing the channel later (cancel) is what kills the remote child.
 ///
 /// The `Handle` mutex is released as soon as the channel is open; all further
 /// channel I/O happens on the owned [`russh::Channel`], which is independently
@@ -208,6 +222,7 @@ async fn open_command_channel(
     conn: std::sync::Arc<SshConnection>,
     remote_cmd: &str,
     stdin: Vec<u8>,
+    keep_stdin_open: bool,
 ) -> Result<SshProcess, DispatchError> {
     let env_id = conn.id().to_string();
 
@@ -233,16 +248,31 @@ async fn open_command_channel(
             .exec(true, remote_cmd.as_bytes())
             .await
             .map_err(|e| map_lost("exec helper", e))?;
-        // Write the request to the remote helper's stdin, then signal EOF so the
-        // helper's `read_to_end` on stdin returns and it begins executing.
+        // Exec path: frame the request as one newline-terminated line and leave
+        // the write side OPEN. The helper reads one line and its cancel monitor
+        // blocks on stdin EOF; sending EOF here would unblock it immediately and
+        // kill the remote child. On cancel the demux branch eof+closes the
+        // channel → the helper's stdin closes → the monitor kills the child.
+        //
+        // Probe path: the helper reads its plan to EOF, so write the payload
+        // then send EOF right away.
+        let payload = if keep_stdin_open {
+            let mut framed = stdin;
+            framed.push(b'\n');
+            framed
+        } else {
+            stdin
+        };
         channel
-            .data_bytes(stdin)
+            .data_bytes(payload)
             .await
             .map_err(|e| map_lost("write exec request", e))?;
-        channel
-            .eof()
-            .await
-            .map_err(|e| map_lost("eof exec stdin", e))?;
+        if !keep_stdin_open {
+            channel
+                .eof()
+                .await
+                .map_err(|e| map_lost("eof exec stdin", e))?;
+        }
         // Release the Handle lock now: all further channel I/O is on the owned
         // `Channel`, which is independently `Send + Sync`.
         drop(handle);
@@ -302,8 +332,9 @@ async fn demux_channel(
 
     loop {
         tokio::select! {
-            // Cancel: close the channel so sshd SIGHUPs the remote helper, then
-            // keep draining until the channel reports closed.
+            // Cancel: EOF + close the channel so sshd closes the helper's stdin;
+            // the helper's stdin-EOF monitor then kills the remote child group.
+            // Keep draining until the channel reports closed.
             () = cancel.notified() => {
                 drop(channel.eof().await);
                 drop(channel.close().await);
