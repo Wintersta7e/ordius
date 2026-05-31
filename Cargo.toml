@@ -45,7 +45,7 @@ humantime = "2"
 cron = "0.15"
 notify = "7"
 notify-debouncer-mini = "0.5"
-bollard = "0.18"
+bollard = "0.21"
 axum = "0.7"
 
 # Storage
