@@ -98,6 +98,12 @@ pub trait SftpOps: Clone + Send + Sync + 'static {
     ///
     /// Used to clear the destination before a rename (correction 2).
     async fn remove_file(&self, path: &str) -> Result<(), DispatchError>;
+
+    /// Create a directory at `path` on the remote.
+    ///
+    /// Callers use this best-effort (ignore "already exists") to ensure parent
+    /// directories exist before writing a file into them.
+    async fn create_dir(&self, path: &str) -> Result<(), DispatchError>;
 }
 
 // ── Bootstrapper ─────────────────────────────────────────────────────────────
@@ -164,6 +170,17 @@ where
             triple
         );
         let tmp = format!("{base}.tmp");
+
+        // Ensure the parent directories exist before writing.
+        //
+        // SFTP `create` (O_CREAT) does NOT create parent directories, and on a
+        // fresh remote `~/.cache/ordius/` will not exist → SSH_FX_NO_SUCH_FILE.
+        // Create each ancestor best-effort so "already exists" on a re-run is
+        // silently ignored, exactly like the best-effort remove_file below.
+        let cache_dir = format!("{home}/.cache");
+        let ordius_dir = format!("{home}/.cache/ordius");
+        drop(self.sftp.create_dir(&cache_dir).await);
+        drop(self.sftp.create_dir(&ordius_dir).await);
 
         // Write bytes to the .tmp path.
         self.sftp.write_file(&tmp, &artifact.bytes).await?;
@@ -309,6 +326,16 @@ mod prod {
                 .map_err(|ref e| sftp_err(e))?;
             Ok(())
         }
+
+        async fn create_dir(&self, path: &str) -> Result<(), DispatchError> {
+            // russh-sftp 2.3.0: SftpSession::create_dir calls mkdir with empty
+            // FileAttributes. Confirmed against session.rs line 136.
+            self.session
+                .create_dir(path)
+                .await
+                .map_err(|ref e| sftp_err(e))?;
+            Ok(())
+        }
     }
 }
 
@@ -340,6 +367,8 @@ mod fake {
         renames: Vec<(String, String)>,
         /// Remove calls: path.
         removes: Vec<String>,
+        /// Directories created via `create_dir`.
+        mkdirs: Vec<String>,
         /// Files written, used for sha256 readback.
         sha_override: Option<String>,
     }
@@ -412,6 +441,11 @@ mod fake {
         /// Snapshot of all `remove_file` calls.
         pub fn removes(&self) -> Vec<String> {
             self.inner.lock().unwrap().removes.clone()
+        }
+
+        /// Snapshot of all `create_dir` calls.
+        pub fn mkdirs(&self) -> Vec<String> {
+            self.inner.lock().unwrap().mkdirs.clone()
         }
 
         /// Build a [`FakeHelperSource`] that returns the embedded bytes
@@ -488,6 +522,11 @@ mod fake {
         async fn remove_file(&self, path: &str) -> Result<(), DispatchError> {
             self.inner.lock().unwrap().removes.push(path.to_string());
             // Always succeeds (simulating best-effort ignore-not-found).
+            Ok(())
+        }
+
+        async fn create_dir(&self, path: &str) -> Result<(), DispatchError> {
+            self.inner.lock().unwrap().mkdirs.push(path.to_string());
             Ok(())
         }
     }

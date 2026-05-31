@@ -62,7 +62,14 @@ fn main() {
         )
         .unwrap();
         writeln!(&mut src, "            sha256: \"{sha}\",").unwrap();
-        writeln!(&mut src, "            size: {size},").unwrap();
+        // Format with digit separators so the generated literal passes
+        // clippy::unreadable_literal even for multi-megabyte helpers.
+        writeln!(
+            &mut src,
+            "            size: {},",
+            format_with_underscores(*size)
+        )
+        .unwrap();
         src.push_str("        },\n");
     }
     src.push_str("    ],\n");
@@ -88,6 +95,20 @@ fn helper_filename(triple: &str) -> &'static str {
     } else {
         "ordius-helper"
     }
+}
+
+fn format_with_underscores(n: usize) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        let pos_from_end = bytes.len() - 1 - i;
+        if i > 0 && pos_from_end % 3 == 2 {
+            out.push('_');
+        }
+        out.push(b as char);
+    }
+    out
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

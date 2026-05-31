@@ -85,6 +85,19 @@ async fn ssh_bootstrap_uses_home_cache_not_tmp() {
         sftp.removes().contains(&helper.env_side_path),
         "remove_file must be called on the destination before rename (SFTP v3 cannot overwrite)"
     );
+
+    // The bootstrapper must create the cache parent dirs before writing the
+    // .tmp file — on a fresh remote ~/.cache/ordius/ does not exist and SFTP
+    // create (O_CREAT) does not create parent directories.
+    let mkdirs = sftp.mkdirs();
+    assert!(
+        mkdirs.contains(&"/home/me/.cache".to_string()),
+        "expected create_dir('/home/me/.cache') before upload, got: {mkdirs:?}"
+    );
+    assert!(
+        mkdirs.contains(&"/home/me/.cache/ordius".to_string()),
+        "expected create_dir('/home/me/.cache/ordius') before upload, got: {mkdirs:?}"
+    );
 }
 
 #[test]
