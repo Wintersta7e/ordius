@@ -8,3 +8,5 @@ pub mod dispatcher;
 pub mod exec;
 pub mod host_key;
 pub mod transport;
+
+pub use dispatcher::SshDispatcher;

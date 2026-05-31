@@ -1,15 +1,14 @@
 //! SSH connection target and full dispatcher config extraction helpers.
 //!
 //! [`extract_target`] is the minimal helper used by T5 enrollment.
-//! [`extract_dispatcher_config`] is the T7 addition that pulls everything
-//! [`SshDispatcher`] / [`RusshConnector`] need from an [`EnvSpec::Ssh`].
-
-use std::sync::Arc;
+//! [`SshConfig`] pulls everything [`SshDispatcher`] / [`RusshConnector`] need
+//! from an [`EnvSpec::Ssh`]; [`SshConfig::from_spec`] is the boot-probe entry
+//! point that returns `None` for any non-SSH spec.
+//!
+//! [`SshDispatcher`]: super::dispatcher::SshDispatcher
+//! [`RusshConnector`]: super::connection::RusshConnector
 
 use crate::environment::runtime::{EnvSpec, SshAuth, SshHostKeyPin};
-use crate::secrets::Store;
-
-use super::connection::RusshConnector;
 
 /// Errors that can occur when extracting a connection target.
 #[derive(Debug)]
@@ -35,8 +34,13 @@ pub fn extract_target(spec: &EnvSpec) -> Result<(String, u16), ResolveError> {
     }
 }
 
-/// All fields needed to build a [`RusshConnector`] from an [`EnvSpec::Ssh`].
-pub struct SshDispatcherConfig {
+/// All fields [`SshDispatcher`] / [`RusshConnector`] need from an
+/// [`EnvSpec::Ssh`].
+///
+/// [`SshDispatcher`]: super::dispatcher::SshDispatcher
+/// [`RusshConnector`]: super::connection::RusshConnector
+#[derive(Debug, Clone)]
+pub struct SshConfig {
     /// SSH host name or address.
     pub host: String,
     /// SSH TCP port.
@@ -49,47 +53,28 @@ pub struct SshDispatcherConfig {
     pub host_key_pins: Vec<SshHostKeyPin>,
 }
 
-/// Extract all fields needed by [`SshDispatcher`] from an [`EnvSpec::Ssh`].
-///
-/// Returns [`ResolveError`] when `spec` is not `EnvSpec::Ssh`.
-pub fn extract_dispatcher_config(spec: &EnvSpec) -> Result<SshDispatcherConfig, ResolveError> {
-    match spec {
-        EnvSpec::Ssh {
+impl SshConfig {
+    /// Build an [`SshConfig`] from an [`EnvSpec`], returning `None` for any
+    /// variant other than [`EnvSpec::Ssh`].
+    #[must_use]
+    pub fn from_spec(spec: &EnvSpec) -> Option<Self> {
+        let EnvSpec::Ssh {
             host,
             port,
             user,
             auth,
             host_key_pins,
             ..
-        } => Ok(SshDispatcherConfig {
+        } = spec
+        else {
+            return None;
+        };
+        Some(Self {
             host: host.clone(),
             port: *port,
             user: user.clone(),
             auth: auth.clone(),
             host_key_pins: host_key_pins.clone(),
-        }),
-        _ => Err(ResolveError("spec is not an SSH environment".to_string())),
+        })
     }
-}
-
-/// Build a [`RusshConnector`] directly from an [`EnvSpec::Ssh`] and a secrets
-/// store.
-///
-/// Convenience wrapper for boot-probe and dispatcher construction. Returns
-/// [`ResolveError`] when `spec` is not `EnvSpec::Ssh`.
-pub fn build_connector(
-    env_id: &str,
-    spec: &EnvSpec,
-    secrets: Arc<Store>,
-) -> Result<RusshConnector, ResolveError> {
-    let cfg = extract_dispatcher_config(spec)?;
-    Ok(RusshConnector {
-        env_id: env_id.to_string(),
-        host: cfg.host,
-        port: cfg.port,
-        user: cfg.user,
-        auth: cfg.auth,
-        host_key_pins: cfg.host_key_pins,
-        secrets,
-    })
 }

@@ -176,11 +176,40 @@ pub async fn open_helper_exec(
     helper_path: &str,
     cmd: ProcessCmd,
 ) -> Result<SshProcess, DispatchError> {
-    let env_id = conn.id().to_string();
     let request = exec_request_from_cmd(&cmd);
     let request_json = serde_json::to_vec(&request)
         .map_err(|e| DispatchError::PlanBuild(format!("serialize exec request: {e}")))?;
     let remote_cmd = format!("{} exec --argv-json", posix_single_quote(helper_path));
+    open_command_channel(conn, &remote_cmd, request_json).await
+}
+
+/// Open a helper **probe** channel on `conn` and return a process handle.
+///
+/// Runs `<quoted-helper> probe`, writes the serialized probe plan
+/// (`ProbePlanV1` JSON) to stdin, then streams the helper's JSONL probe
+/// outcomes on stdout. Same channel/demux machinery as [`open_helper_exec`];
+/// the only differences are the remote subcommand and the stdin payload.
+pub async fn open_helper_probe(
+    conn: std::sync::Arc<SshConnection>,
+    helper_path: &str,
+    plan_json: Vec<u8>,
+) -> Result<SshProcess, DispatchError> {
+    let remote_cmd = format!("{} probe", posix_single_quote(helper_path));
+    open_command_channel(conn, &remote_cmd, plan_json).await
+}
+
+/// Shared channel plumbing: open a session, run `remote_cmd`, write `stdin`,
+/// EOF, then spawn a demux task that streams stdout/stderr + the exit status.
+///
+/// The `Handle` mutex is released as soon as the channel is open; all further
+/// channel I/O happens on the owned [`russh::Channel`], which is independently
+/// `Send + Sync`.
+async fn open_command_channel(
+    conn: std::sync::Arc<SshConnection>,
+    remote_cmd: &str,
+    stdin: Vec<u8>,
+) -> Result<SshProcess, DispatchError> {
+    let env_id = conn.id().to_string();
 
     // Open the session + exec while holding the Handle lock, then release it.
     let channel = {
@@ -188,7 +217,7 @@ pub async fn open_helper_exec(
         let map_lost = |what: &str, e: russh::Error| {
             // A channel-open / exec failure on an established session means the
             // session is gone or unusable; mark it closed so the cache opens a
-            // fresh one next time, and surface EnvLost.
+            // fresh one next time, and surface EnvUnreachable.
             conn.mark_closed();
             DispatchError::EnvUnreachable {
                 env_id: env_id.clone(),
@@ -207,7 +236,7 @@ pub async fn open_helper_exec(
         // Write the request to the remote helper's stdin, then signal EOF so the
         // helper's `read_to_end` on stdin returns and it begins executing.
         channel
-            .data_bytes(request_json)
+            .data_bytes(stdin)
             .await
             .map_err(|e| map_lost("write exec request", e))?;
         channel

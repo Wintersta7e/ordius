@@ -1,8 +1,10 @@
-//! SSH dispatcher — process spawn (T10) over the cached connection.
+//! SSH dispatcher — process spawn + resource probe over the cached connection.
 //!
-//! `Dispatcher::spawn` is wired here (T10) via the `ordius-helper exec` channel;
-//! the HTTP transport lands in T11 and boot-probe wiring in T12. The other
-//! `Dispatcher` methods stay stubbed until their owning task.
+//! `Dispatcher::spawn` runs `ordius-helper exec` over an exec channel (T10);
+//! `Dispatcher::probe`/`probe_resource` run `ordius-helper probe` and stream
+//! its JSONL outcomes (T12); `http_transport` tunnels HTTP through a local
+//! listener (T11). Workspace preparation and path translation remain deferred
+//! (compute-first).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -11,16 +13,24 @@ use async_trait::async_trait;
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
-use crate::environment::runtime::catalog::ResourceProbeOutcome;
+use std::collections::HashMap;
+
+use ordius_helper::protocol::ProbeOutcomeV1;
+
+use crate::environment::runtime::catalog::{ResourceCatalog, ResourceProbeOutcome};
 use crate::environment::runtime::dispatcher::{Dispatcher, HttpTransport};
 use crate::environment::runtime::error::DispatchError;
+use crate::environment::runtime::helper_wire::wire_outcome_to_engine;
 use crate::environment::runtime::plan::{ProbePlan, ProbeSummary};
-use crate::environment::runtime::resource::ResourceDefinition;
-use crate::environment::runtime::transport::{EnvPath, EnvProcess, ProcessCmd, WorkspaceHandle};
-use crate::environment::runtime::{EnvInfo, RunId, SshAuth, SshHostKeyPin, WorkspaceBinding};
+use crate::environment::runtime::resource::{ResourceDefinition, ResourceId};
+use crate::environment::runtime::transport::{
+    EnvPath, EnvProcess, ProcessCmd, ProcessPipe, WorkspaceHandle,
+};
+use crate::environment::runtime::{EnvInfo, RunId, WorkspaceBinding};
 use crate::secrets::Store;
 
 use super::bootstrap::{RusshSftp, SshBootstrappedHelper, SshBootstrapper};
+use super::config::SshConfig;
 use super::connection::{
     RusshConnector, SshConnection, SshConnectionCache, SshConnectionLike as _,
 };
@@ -47,11 +57,11 @@ pub struct SshDispatcher {
     pub env_info: EnvInfo,
     /// Cached, authenticated connection to the remote host.
     pub(crate) cache: Arc<SshConnectionCache<RusshConnector>>,
-    /// Lazily bootstrapped helper state. Initialised on first call to
-    /// [`bootstrap_helper_once`]; subsequent calls return the cached result.
+    /// Lazily bootstrapped helper state. Initialised on the first `spawn` or
+    /// `probe` via [`ensure_helper`]; subsequent calls return the cached result
+    /// without re-uploading.
     ///
-    /// The actual bootstrap (SFTP write + verify + rename) is deferred to T10
-    /// when `spawn` wires it into the dispatch path.
+    /// [`ensure_helper`]: Self::ensure_helper
     pub(crate) helper: OnceCell<SshBootstrappedHelper>,
     /// HTTP transport, built once and shared by clone.
     ///
@@ -62,27 +72,20 @@ pub struct SshDispatcher {
 }
 
 impl SshDispatcher {
-    /// Build a dispatcher from an environment info record and a secret store.
+    /// Build a dispatcher from an environment info record, the SSH connection
+    /// config, and a secret store.
     ///
     /// The connection is not opened here — it is opened lazily on first use by
     /// [`SshConnectionCache::connection`].
-    pub fn new(
-        env_info: EnvInfo,
-        host: String,
-        port: u16,
-        user: String,
-        auth: SshAuth,
-        host_key_pins: Vec<SshHostKeyPin>,
-        secrets: Arc<Store>,
-    ) -> Self {
+    pub fn new(env_info: EnvInfo, cfg: SshConfig, secrets: Arc<Store>) -> Self {
         let env_id = env_info.id.to_string();
         let connector = RusshConnector {
             env_id: env_id.clone(),
-            host,
-            port,
-            user,
-            auth,
-            host_key_pins,
+            host: cfg.host,
+            port: cfg.port,
+            user: cfg.user,
+            auth: cfg.auth,
+            host_key_pins: cfg.host_key_pins,
             secrets,
         };
         let cache = Arc::new(SshConnectionCache::new(connector, env_id));
@@ -97,25 +100,6 @@ impl SshDispatcher {
             helper: OnceCell::new(),
             transport,
         }
-    }
-
-    /// Bootstrap the helper over SFTP exactly once; subsequent calls return
-    /// the cached [`SshBootstrappedHelper`] without re-uploading.
-    ///
-    /// `sftp` is obtained by the caller from an open session channel.
-    /// The actual wiring into the dispatch path happens in T10.
-    #[allow(clippy::unused_self)] // T10 wires the real body; signature must stay as &self
-    pub fn bootstrap_helper_once(
-        &self,
-        sftp: RusshSftp,
-    ) -> Result<&SshBootstrappedHelper, DispatchError> {
-        // Triple detection is stubbed until T9; the full dispatch path is
-        // wired in T10.  The parameter is accepted here so the public
-        // signature is stable from T8 onward.
-        drop(sftp);
-        Err(DispatchError::NotImplemented(
-            "bootstrap_helper_once: wired in T10".into(),
-        ))
     }
 
     /// Bootstrap with an explicit triple (used from integration tests and T10).
@@ -155,9 +139,7 @@ impl SshDispatcher {
     ///
     /// The plan is serialised with the shared wire-format logic from
     /// [`crate::environment::runtime::helper_wire`] so SSH and WSL produce
-    /// identical plans.  The actual helper execution is wired in T10 once
-    /// `SshProcess` exists.
-    #[allow(dead_code)] // wired in T10
+    /// identical plans, then dispatched over the SSH connection (T12).
     async fn probe_plan_via_helper(
         &self,
         helper_path: &str,
@@ -171,24 +153,175 @@ impl SshDispatcher {
             .await
     }
 
-    /// Execute the helper binary over SSH and stream its probe outcomes.
+    /// Run `<helper> probe` over an SSH exec channel and stream its JSONL
+    /// outcomes into a [`ProbeSummary`].
     ///
-    /// Stub until T10 wires in `SshProcess`.
-    #[allow(dead_code)] // wired in T10
+    /// Delegates line-by-line parsing to [`consume_ssh_helper_stream`] and
+    /// guards against a crashed helper (no output + non-zero exit) mirroring
+    /// the WSL dispatcher's `probe_plan_via_helper` pattern.
     async fn run_helper_probe_stream(
         &self,
-        _helper_path: &str,
-        _plan: ProbePlan,
-        _plan_json: Vec<u8>,
-        _cancel: CancellationToken,
+        helper_path: &str,
+        plan: ProbePlan,
+        plan_json: Vec<u8>,
+        cancel: CancellationToken,
     ) -> Result<ProbeSummary, DispatchError> {
-        // T10 will replace this body with real SSH execution.
-        // The `async` + trivial await below keeps `clippy::unused_async` quiet
-        // while the signature is stable.
-        std::future::ready(Err(DispatchError::NotImplemented(
-            "run_helper_probe_stream: wired in T10".into(),
-        )))
-        .await
+        use tokio::io::{AsyncBufReadExt as _, BufReader};
+
+        let started = std::time::Instant::now();
+        let conn = self.connection().await?;
+        let mut proc = super::exec::open_helper_probe(conn, helper_path, plan_json).await?;
+
+        // Drain stderr in the background so a chatty helper can't back up its
+        // pipe; the demux task tolerates a dropped reader.
+        let stderr_drainer = proc.take_stderr().map(|stderr| {
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::debug!(target: "ordius::ssh::helper", "helper stderr: {line}");
+                }
+            })
+        });
+
+        let Some(stdout) = proc.take_stdout() else {
+            if let Some(h) = stderr_drainer {
+                h.abort();
+            }
+            return Err(DispatchError::HelperBootstrap(
+                "helper stdout missing".into(),
+            ));
+        };
+
+        let outcome =
+            consume_ssh_helper_stream(&mut proc, BufReader::new(stdout), &plan, &cancel).await;
+
+        // Reap the remote process so the exec channel closes cleanly.
+        // Capture exit status to detect a helper crash (no output + non-zero).
+        let exit_status = proc.wait().await;
+        if let Some(h) = stderr_drainer {
+            h.abort();
+        }
+
+        // Helper exited non-zero before emitting any outcomes — likely a crash
+        // (wrong binary for the remote arch, segfault, linker mismatch). Surface
+        // as DispatchError so the caller records the env as Unreachable instead
+        // of silently flooding the catalog with Skipped entries.
+        if !outcome.cancelled
+            && outcome.total_probed == 0
+            && !plan.defs.is_empty()
+            && let Ok(exit) = &exit_status
+            && exit.code != 0
+        {
+            return Err(DispatchError::HelperBootstrap(format!(
+                "remote helper probe exited without output (exit code {})",
+                exit.code
+            )));
+        }
+
+        let mut resources = outcome.resources;
+        // Any definition the helper didn't report on is recorded as Skipped so
+        // the catalog has an entry per requested resource.
+        for def in &plan.defs {
+            resources
+                .entry(def.id.clone())
+                .or_insert_with(|| ResourceProbeOutcome::Skipped {
+                    reason: "helper did not return an outcome".into(),
+                });
+        }
+
+        Ok(ProbeSummary {
+            catalog: ResourceCatalog {
+                env_id: plan.env_id.clone(),
+                registry_revision: plan.registry_revision,
+                probed_at: chrono::Utc::now(),
+                resources,
+            },
+            total_probed: outcome.total_probed,
+            elapsed: started.elapsed(),
+        })
+    }
+}
+
+/// Outcome of [`consume_ssh_helper_stream`].
+struct SshHelperStreamOutcome {
+    resources: HashMap<ResourceId, ResourceProbeOutcome>,
+    total_probed: usize,
+    /// `true` when the outer cancel token fired; guards the crash-detect path.
+    cancelled: bool,
+}
+
+/// Drain the JSONL stdout of a remote helper probe into a map of outcomes.
+///
+/// Each non-empty line is parsed as a [`ProbeOutcomeV1`], matched back to its
+/// definition by id, and translated through [`wire_outcome_to_engine`] with
+/// `host_direct_verified = false` (SSH is compute-first, no host-direct today).
+/// Cancellation closes the exec channel via [`EnvProcess::cancel`].
+async fn consume_ssh_helper_stream(
+    proc: &mut impl EnvProcess,
+    stdout: tokio::io::BufReader<ProcessPipe>,
+    plan: &ProbePlan,
+    cancel: &CancellationToken,
+) -> SshHelperStreamOutcome {
+    use tokio::io::AsyncBufReadExt as _;
+
+    let defs_by_id: HashMap<&str, &ResourceDefinition> = plan
+        .defs
+        .iter()
+        .map(|def| (def.id.0.as_str(), def))
+        .collect();
+    let mut resources: HashMap<ResourceId, ResourceProbeOutcome> = HashMap::new();
+    let mut total_probed = 0usize;
+    let mut cancelled = false;
+    let mut reader = stdout.lines();
+
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => {
+                drop(proc.cancel().await);
+                cancelled = true;
+                for def in &plan.defs {
+                    resources.entry(def.id.clone()).or_insert_with(|| {
+                        ResourceProbeOutcome::Skipped {
+                            reason: "probe cancelled".into(),
+                        }
+                    });
+                }
+                break;
+            },
+            line = reader.next_line() => {
+                match line {
+                    Ok(Some(line)) => {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        let Ok(wire) = serde_json::from_str::<ProbeOutcomeV1>(&line) else {
+                            continue;
+                        };
+                        if wire.version != 1 {
+                            continue;
+                        }
+                        let Some(def) = defs_by_id.get(wire.id.as_str()).copied() else {
+                            continue;
+                        };
+                        // SSH is compute-first: no host-direct route today, so
+                        // always tag HTTP endpoints as env-loopback.
+                        if resources
+                            .insert(def.id.clone(), wire_outcome_to_engine(wire.outcome, def, false))
+                            .is_none()
+                        {
+                            total_probed += 1;
+                        }
+                    },
+                    Ok(None) | Err(_) => break,
+                }
+            },
+        }
+    }
+
+    SshHelperStreamOutcome {
+        resources,
+        total_probed,
+        cancelled,
     }
 }
 
@@ -238,21 +371,56 @@ impl Dispatcher for SshDispatcher {
 
     async fn probe(
         &self,
-        _plan: ProbePlan,
-        _cancel: CancellationToken,
+        plan: ProbePlan,
+        cancel: CancellationToken,
     ) -> Result<ProbeSummary, DispatchError> {
-        Err(DispatchError::NotImplemented(
-            "SSH probe: wired in T12".into(),
-        ))
+        if cancel.is_cancelled() {
+            return Err(DispatchError::Cancelled);
+        }
+
+        // Race the helper bootstrap against cancel so a cancelled probe does not
+        // block on a cold SFTP push (which can take tens of seconds). SSH has no
+        // shell fallback (compute-first): if the helper can't be installed the
+        // env is genuinely unreachable, surfaced as Err and recorded as
+        // `Unreachable` by the boot/refresh loop.
+        let helper = tokio::select! {
+            () = cancel.cancelled() => return Err(DispatchError::Cancelled),
+            r = self.ensure_helper() => r,
+        }?;
+        let helper_path = helper.env_side_path.clone();
+        self.probe_plan_via_helper(&helper_path, plan, cancel).await
     }
 
     async fn probe_resource(
         &self,
-        _def: &ResourceDefinition,
-        _cancel: CancellationToken,
+        def: &ResourceDefinition,
+        cancel: CancellationToken,
     ) -> ResourceProbeOutcome {
-        ResourceProbeOutcome::Skipped {
-            reason: "SSH probe_resource: wired in T12".into(),
+        if cancel.is_cancelled() {
+            return ResourceProbeOutcome::Skipped {
+                reason: "probe cancelled".into(),
+            };
+        }
+        // Re-probe a single resource by running a one-def plan through the same
+        // helper stream, then lift out its outcome.
+        let id = def.id.clone();
+        let plan = ProbePlan {
+            env_id: self.env_info.id.clone(),
+            registry_revision: 0,
+            defs: vec![def.clone()],
+            per_resource_timeout: std::time::Duration::from_secs(5),
+            max_concurrency: 1,
+            overall_budget: std::time::Duration::from_secs(30),
+        };
+        match self.probe(plan, cancel).await {
+            Ok(mut summary) => summary.catalog.resources.remove(&id).unwrap_or_else(|| {
+                ResourceProbeOutcome::Skipped {
+                    reason: "helper did not return an outcome".into(),
+                }
+            }),
+            Err(e) => ResourceProbeOutcome::ProbeFailed {
+                reason: e.to_string(),
+            },
         }
     }
 

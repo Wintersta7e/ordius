@@ -31,6 +31,8 @@ use super::local::LocalDispatcher;
 use super::plan::ProbePlan;
 use super::registry::ResourceRegistry;
 use super::resource::{ResourceDefinition, ResourceId};
+use super::ssh::SshDispatcher;
+use super::ssh::config::SshConfig;
 use super::wsl::WslDispatcher;
 use crate::db::DbPool;
 
@@ -294,7 +296,7 @@ async fn drain_tasks(
 fn construct_dispatcher(
     spec: &EnvSpec,
     info: &Arc<EnvInfo>,
-    _secrets_store: Arc<crate::secrets::Store>,
+    secrets_store: Arc<crate::secrets::Store>,
 ) -> Result<Arc<dyn Dispatcher>, DispatchError> {
     match spec {
         EnvSpec::Local { .. } => Ok(Arc::new(LocalDispatcher::new((**info).clone()))),
@@ -310,9 +312,18 @@ fn construct_dispatcher(
             wsl.set_host_direct(host_direct_verifications.clone());
             Ok(Arc::new(wsl))
         },
-        EnvSpec::Ssh { .. } => Err(DispatchError::Unsupported(
-            "ssh dispatcher lands in Phase G".into(),
-        )),
+        EnvSpec::Ssh { .. } => {
+            // Construction is lazy: no socket is opened here. The session is
+            // established on first probe/spawn, so an unreachable host still
+            // registers (the probe returns `Unreachable`, handled in `run`).
+            let cfg = SshConfig::from_spec(spec)
+                .ok_or_else(|| DispatchError::Unsupported("invalid SSH spec".into()))?;
+            Ok(Arc::new(SshDispatcher::new(
+                (**info).clone(),
+                cfg,
+                secrets_store,
+            )))
+        },
         EnvSpec::Container { .. } => Err(DispatchError::Unsupported(
             "container dispatcher lands in Phase H".into(),
         )),
@@ -557,6 +568,38 @@ mod tests {
     use super::*;
     use crate::db::open;
     use tempfile::TempDir;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enabled_ssh_spec_constructs_dispatcher() {
+        keyring::use_sample_store(&std::collections::HashMap::from([("persist", "false")]))
+            .unwrap();
+        let tmp = TempDir::new().unwrap();
+        let pool = open(tmp.path().join("runs.db")).unwrap();
+        {
+            let conn = pool.get().unwrap();
+            conn.execute(
+                "INSERT INTO env_specs (id, label, enabled, spec_json, created_at, updated_at)
+                 VALUES ('ssh:devbox', 'Dev Box', 1,
+                         '{\"type\":\"ssh\",\"host\":\"127.0.0.1\",\"port\":1,\"user\":\"me\",\"auth\":{\"method\":\"password\",\"secret_ref\":\"ssh-password\"},\"host_key_pins\":[],\"resources\":[]}',
+                         0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let registry = ResourceRegistry::new();
+        let store = Arc::new(crate::secrets::Store::with_index_path(
+            tmp.path().join("secrets.json"),
+        ));
+        store.set("ssh-password", "pw").unwrap();
+
+        let outcome = run(&pool, &registry, store).await;
+        assert!(
+            outcome.entries.contains_key(&EnvId::new("ssh:devbox"))
+                || outcome.catalogs.contains_key(&EnvId::new("ssh:devbox")),
+            "SSH row should reach dispatcher construction instead of unsupported gate"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn legacy_ssh_auth_ref_row_is_disabled_for_reconfiguration() {
