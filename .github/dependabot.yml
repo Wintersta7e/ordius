@@ -1,0 +1,35 @@
+version: 2
+updates:
+  # Rust workspace dependencies.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      cargo:
+        update-types: [minor, patch]
+    ignore:
+      # Pinned to exact, API-matched versions (the plan's guessed versions
+      # don't exist); bump these by hand, not via Dependabot.
+      - dependency-name: russh
+      - dependency-name: russh-sftp
+
+  # GitHub Actions used by the workflows below.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Desktop GUI frontend (React + Vite).
+  - package-ecosystem: npm
+    directory: "/crates/desktop/ui"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      npm:
+        update-types: [minor, patch]
