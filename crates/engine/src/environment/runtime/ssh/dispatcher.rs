@@ -24,6 +24,8 @@ use super::bootstrap::{RusshSftp, SshBootstrappedHelper, SshBootstrapper};
 use super::connection::{
     RusshConnector, SshConnection, SshConnectionCache, SshConnectionLike as _,
 };
+use super::transport::RusshDirectTcpipOpener;
+use super::transport::SshHttpTransport;
 
 /// Target triple of the only helper binary we currently cross-compile and
 /// embed. SSH targets are assumed to be `x86_64` Linux; remote-arch detection
@@ -35,19 +37,28 @@ const HELPER_TRIPLE: &str = "x86_64-unknown-linux-musl";
 /// Holds one [`SshConnectionCache`] per dispatcher instance. The cache opens
 /// a single authenticated session on first use and reuses it for subsequent
 /// operations; if the session closes it reconnects once.
+///
+/// The cache is stored behind an `Arc` so that the [`RusshDirectTcpipOpener`]
+/// inside `transport` can share the same connection without duplicating state.
+/// The transport is built once in [`new`] and returned by clone from
+/// [`http_transport`], matching the `LocalDispatcher`/`WslDispatcher` pattern.
 pub struct SshDispatcher {
     /// Metadata describing the environment (id, label, state …).
     pub env_info: EnvInfo,
     /// Cached, authenticated connection to the remote host.
-    #[allow(dead_code)] // used starting T10
-    pub(crate) cache: SshConnectionCache<RusshConnector>,
+    pub(crate) cache: Arc<SshConnectionCache<RusshConnector>>,
     /// Lazily bootstrapped helper state. Initialised on first call to
     /// [`bootstrap_helper_once`]; subsequent calls return the cached result.
     ///
     /// The actual bootstrap (SFTP write + verify + rename) is deferred to T10
     /// when `spawn` wires it into the dispatch path.
-    #[allow(dead_code)] // used starting T10
     pub(crate) helper: OnceCell<SshBootstrappedHelper>,
+    /// HTTP transport, built once and shared by clone.
+    ///
+    /// Stored as `Arc<dyn HttpTransport>` so `http_transport()` can return a
+    /// trivial `Arc::clone` with no cast — matches `LocalDispatcher` /
+    /// `WslDispatcher`.
+    transport: Arc<dyn HttpTransport>,
 }
 
 impl SshDispatcher {
@@ -74,10 +85,17 @@ impl SshDispatcher {
             host_key_pins,
             secrets,
         };
+        let cache = Arc::new(SshConnectionCache::new(connector, env_id));
+        // Build the transport once; the opener shares the same cache Arc so
+        // every accepted socket reuses the same authenticated session.
+        // Stored as Arc<dyn HttpTransport> so http_transport() is a trivial clone.
+        let opener = Arc::new(RusshDirectTcpipOpener::new(Arc::clone(&cache)));
+        let transport: Arc<dyn HttpTransport> = Arc::new(SshHttpTransport::new(opener));
         Self {
             env_info,
-            cache: SshConnectionCache::new(connector, env_id),
+            cache,
             helper: OnceCell::new(),
+            transport,
         }
     }
 
@@ -246,11 +264,10 @@ impl Dispatcher for SshDispatcher {
     }
 
     fn http_transport(&self) -> Arc<dyn HttpTransport> {
-        // Wired in T11. A panic here would crash the run loop; instead return a
-        // transport whose every call yields a transport error.
-        Arc::new(UnimplementedHttpTransport {
-            env_id: self.env_info.id.to_string(),
-        })
+        // Return a clone of the pre-built transport so every caller shares the
+        // same reqwest client and listener cache — no new client or empty map on
+        // each call (matches LocalDispatcher / WslDispatcher pattern).
+        Arc::clone(&self.transport)
     }
 
     fn translate_path(&self, host_path: &Path) -> Result<EnvPath, DispatchError> {
@@ -272,50 +289,5 @@ impl Dispatcher for SshDispatcher {
         Err(DispatchError::Unsupported(
             "SSH workspace preparation is deferred (compute-first; sync not wired)".into(),
         ))
-    }
-}
-
-/// Placeholder [`HttpTransport`] returned until T11 wires the real tunnel.
-///
-/// Every method yields a transport error rather than panicking, so a misrouted
-/// HTTP node fails the node cleanly instead of crashing the run loop.
-struct UnimplementedHttpTransport {
-    env_id: String,
-}
-
-#[async_trait]
-impl HttpTransport for UnimplementedHttpTransport {
-    async fn execute(
-        &self,
-        _req: crate::environment::runtime::transport::HttpRequest,
-    ) -> Result<
-        crate::environment::runtime::transport::HttpResponse,
-        crate::environment::runtime::transport::HttpError,
-    > {
-        Err(
-            crate::environment::runtime::transport::HttpError::Transport(format!(
-                "SSH HTTP transport not wired yet ({})",
-                self.env_id
-            )),
-        )
-    }
-
-    async fn execute_stream(
-        &self,
-        _req: crate::environment::runtime::transport::HttpRequest,
-    ) -> Result<
-        crate::environment::runtime::dispatcher::ResponseStream,
-        crate::environment::runtime::transport::HttpError,
-    > {
-        Err(
-            crate::environment::runtime::transport::HttpError::Transport(format!(
-                "SSH HTTP transport not wired yet ({})",
-                self.env_id
-            )),
-        )
-    }
-
-    fn can_stream(&self, _url: &url::Url) -> bool {
-        false
     }
 }

@@ -186,6 +186,29 @@ async fn ssh_connection_cache_returns_error_when_both_attempts_closed() {
     assert_eq!(connector.connect_count(), 2);
 }
 
+// ── SSH transport URL rewrite ─────────────────────────────────────────────────
+
+#[test]
+fn ssh_transport_rewrites_url_to_local_listener() {
+    let original = "http://127.0.0.1:11434/api/version?x=1";
+    let rewritten = ordius_engine::environment::runtime::ssh::transport::rewrite_url_to_listener(
+        original, 43210,
+    )
+    .unwrap();
+
+    assert_eq!(rewritten, "http://127.0.0.1:43210/api/version?x=1");
+}
+
+#[test]
+fn ssh_transport_rewrite_rejects_missing_port() {
+    let err = ordius_engine::environment::runtime::ssh::transport::remote_authority(
+        &url::Url::parse("http://127.0.0.1/api").unwrap(),
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("port"));
+}
+
 // ── Exec-request boundary ─────────────────────────────────────────────────────
 
 #[test]
