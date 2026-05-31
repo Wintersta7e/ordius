@@ -10,9 +10,8 @@ as a directed acyclic graph. Run from the CLI or a Tauri 2 desktop GUI.
 [![Rust](https://img.shields.io/badge/rust-1.95%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Edition](https://img.shields.io/badge/edition-2024-purple)](https://doc.rust-lang.org/edition-guide/rust-2024/)
 [![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)](https://tauri.app)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#license)
-[![Status](https://img.shields.io/badge/status-WIP%20%E2%80%94%20v1.0%20in%20progress-yellow)](#roadmap)
-[![Lints](https://img.shields.io/badge/lints-clippy%20pedantic%20%2B%20nursery%20%2B%20cargo-success)](clippy.toml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Status](https://img.shields.io/badge/status-personal%20%C2%B7%20actively%20developed-brightgreen)](#status)
 
 </div>
 
@@ -20,58 +19,76 @@ as a directed acyclic graph. Run from the CLI or a Tauri 2 desktop GUI.
 
 ## Why
 
-Ordius is the workflow substrate behind the author's daily coding workflows
-— composable enough to chain agent loops + local LLMs + image generation +
-containers + shell scripts without writing one-off bash glue every time.
-Personal-scale, **local-first**, **offline-capable**, **no telemetry**.
+I built Ordius for myself — a workflow substrate to chain agent loops, local
+LLMs, image generation, containers, and shell scripts without hand-writing
+one-off bash glue every time. It's **local-first**, **offline-capable**, and
+sends **no telemetry**.
 
-The same workflows run from a terminal (`ordius-cli run my-workflow`) or
-a desktop GUI — two binaries, one shared engine crate.
+It's a personal tool, not a product — but it's open source under Apache-2.0,
+and if it looks useful to you, you're welcome to clone it and give it a try.
+There's no adoption goal and no support guarantees, but issues and PRs are read.
+
+The same workflows run from a terminal (`ordius-cli run my-workflow`) or a
+desktop GUI — two binaries, one shared engine crate.
 
 ## Status
 
-> **In active development.** Not yet usable end-to-end.
+Actively developed personal tool. The engine and CLI are implemented and
+covered by a large unit + integration test suite under strict workspace lints.
+It's still rough in places, and the workflow schema / internal APIs can shift
+between commits — treat it as a working engine you can build and run, not a
+finished, packaged app.
 
-- **v1.0** (engine + CLI) — Phase 0 (workspace + strict tooling) and
-  Phase 1 (engine types + JSON schema + workflow loader + structural
-  validation + unified error) are complete. 8 phases remain (DAG
-  scheduler, SQLite recorder, executors, templates, retries, CLI
-  surface, manifest loading).
-- **v1.1** (GUI) — design prototypes done; implementation gated on v1.0.
-- **v1.x** (container backend, daemon mode, additional triggers) —
-  architected, not yet built.
+**Implemented:**
+- Edge-activation DAG engine — branching, looping, parallel fan-out, retries,
+  timeouts, graceful cancellation
+- 16 built-in node types (see [Features](#features))
+- `ordius-cli` — `run`, `workflows`, `runs`, `nodes`, `secrets`,
+  `export` / `import`, and `daemon`
+- Tauri 2 desktop GUI — visual DAG editor, live run view, run-history browser
+- Triggers — cron schedules, file-watch, and inbound webhooks, hosted by
+  `ordius daemon`
+- Container execution via [`bollard`][bollard] (the `docker-run` node)
+- Execution environments — local, WSL, and remote SSH
+- SQLite run history, OS-keyring secrets, template substitution, NDJSON events
 
-See [`docs/plans/`](#layout) (local-only) for the canonical per-phase plan.
+**Not done yet:** end-to-end polish, packaged installers, and the
+planned items below.
 
 ## Features
 
-### v1.0 — engine + CLI (current milestone)
+### Engine + CLI
 - Edge-activation DAG scheduler with branching, looping, parallel execution
 - Per-node owned [`CancellationToken`s][cancel] (tokio-util)
 - Process-group (Unix) / Job Object (Windows) subprocess supervision
-- 8 built-in node types: `shell`, `llm`, `http`, `file`, `transform`,
-  `condition`, `checkpoint`, `delay`
+- **16 built-in node types:**
+  - *core:* `shell`, `llm`, `http`, `file`, `transform`, `condition`,
+    `checkpoint`, `delay`
+  - *control + integration:* `kv`, `notify`, `pause`, `loop_for`,
+    `wait_event`, `compose`, `parallel`, `docker-run`
 - JSON-manifest custom node types (declarative, no plugin SDK)
-- SQLite run history with `(run_id, node_id, iteration, attempt)` keying —
+- SQLite run history keyed by `(run_id, node_id, iteration, attempt)` —
   loops and retries don't overwrite each other
 - Workflows are plain JSON / YAML files, git-trackable
 - Template substitution with type coercion + secret redaction
 - OS-keyring secrets (no env-var leaks)
 - NDJSON event stream over stdout for piping to other tools
 
-### v1.1 — GUI + remaining built-ins (next milestone)
-- Tauri 2 webview shell (HTML/CSS/JS frontend, no Electron)
+### Desktop GUI
+- Tauri 2 webview shell (React + TypeScript frontend, no Electron)
 - Visual DAG editor: drag nodes from a categorised palette, wire typed ports
 - Live run view with per-node streaming output
-- Run history browser with status / date / trigger filters
-- 10 additional built-in types: `agent`, `python`, `node`, `embedding`,
-  `vision`, `image-gen`, `parse`, `variable`, `kv-store`, `notification`
-- `ordius daemon` for headless schedule + file-watch triggers
+- Run-history browser with status / date / trigger filters
 
-### v1.x and later — architected, not built
-- Container execution backend (Docker / Podman via [`bollard`][bollard])
-- Webhook triggers, WASM plugin SDK, vector-store node type
-- Workflow chaining (workflow-as-a-node)
+### Triggers & environments
+- `ordius daemon` — long-lived host for schedule + file-watch + webhook triggers
+- Cron schedules, filesystem watches, and inbound webhooks
+- Execution environments: local, WSL, and remote SSH (key/password auth,
+  host-key pinning, helper bootstrap over SFTP)
+
+### Planned / architected (not built)
+- WASM plugin SDK, vector-store node type, additional LLM provider adapters
+- Richer write-back policies for remote-environment runs
 
 ### Explicitly declined (not on the roadmap)
 - Multi-user / team mode • Cloud sync • Mobile companion • Telemetry • Marketing surface
@@ -86,8 +103,9 @@ See [`docs/plans/`](#layout) (local-only) for the canonical per-phase plan.
 | Errors | [thiserror][thiserror] | Per-module enums + top-level `EngineError` aggregator |
 | HTTP / LLM | [reqwest][reqwest] + rustls | No native-tls dep, cross-compile friendly |
 | Secrets | [keyring][keyring] | OS-native: macOS Keychain, Win Credential Vault, Secret Service |
-| CLI | [clap][clap] (derive) | Subcommands land in Phase 9 |
-| GUI (v1.1) | [Tauri 2][tauri] webview + React | Frontend prototypes in `docs/UI/` |
+| CLI | [clap][clap] (derive) | Subcommands + global flags |
+| GUI | [Tauri 2][tauri] webview + React + TypeScript | Inline styles over CSS custom properties |
+| Containers | [bollard][bollard] | Docker / Podman backend for the `docker-run` node |
 
 ## Quick start
 
@@ -96,13 +114,14 @@ See [`docs/plans/`](#layout) (local-only) for the canonical per-phase plan.
 git clone <repo-url> && cd Ordius
 cargo build --workspace
 
-# Run the gated checks
-cargo test  -p ordius-engine --lib
+# Run the checks
+cargo test   --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt    --all -- --check
 
-# CLI stub (subcommands land in Phase 9)
+# CLI
 cargo run -p ordius-cli -- --help
+cargo run -p ordius-cli -- nodes ls     # list the built-in node types
 ```
 
 Rust 1.95+ is required; the [`rust-toolchain.toml`](rust-toolchain.toml)
@@ -113,51 +132,39 @@ pin handles install via `rustup`.
 ```
 Ordius/
 ├── crates/
-│   ├── engine/        # workflow engine (library, no UI deps)
-│   ├── cli/           # ordius-cli binary (clap-based)
-│   └── desktop/       # Tauri GUI shell (lands in v1.1)
-├── Cargo.toml         # workspace deps + strict workspace.lints
+│   ├── engine/         # workflow engine (library, no UI deps)
+│   ├── cli/            # ordius-cli binary (clap-based)
+│   ├── desktop/        # Tauri 2 GUI shell
+│   └── ordius-helper/  # remote-exec helper (cross-compiled, embedded)
+├── Cargo.toml          # workspace deps + strict workspace.lints
 ├── rust-toolchain.toml
-├── rustfmt.toml       # 100-col, edition 2024, nightly intent documented
-├── clippy.toml        # MSRV 1.95, complexity thresholds, test allowances
-├── deny.toml          # cargo-deny: licenses, advisories, sources
-└── docs/              # spec, plans, UI prototypes (local-only, gitignored)
+├── rustfmt.toml        # 100-col, edition 2024
+├── clippy.toml         # MSRV 1.95, complexity thresholds, test allowances
+└── deny.toml           # cargo-deny: licenses, advisories, sources
 ```
-
-## Roadmap
-
-| Milestone | What | Status |
-|---|---|---|
-| **v1.0** | Rust `engine` crate + `ordius-cli` binary | 2/10 phases complete |
-| **v1.1** | Tauri 2 GUI shell, daemon mode, 10 more built-ins | design done, awaiting v1.0 |
-| **v1.x** | Container backend, webhook triggers, vector store | architected only |
-
-The implementation plan lives in [`docs/plans/v1.0-implementation.md`][plan]
-(local-only). 72 tasks across 10 phases, TDD-shaped, with real code in
-every step.
 
 ## Design principles
 
-1. **Easy to start.** Double-click `ordius.exe` (v1.1) or run `ordius-cli`
-   from a terminal. No daemon to configure, no port to pick.
-2. **Small core, declarative custom nodes.** 18 built-in types;
-   everything else is a JSON-manifest file dropped in `~/.ordius/node-types/`.
+1. **Easy to start.** Run `ordius-cli` from a terminal or launch the desktop
+   GUI. No daemon to configure, no port to pick.
+2. **Small core, declarative custom nodes.** 16 built-in types; everything
+   else is a JSON-manifest file dropped in the engine's node-types directory.
 3. **Correctness over cleverness.** Process groups + Job Objects for
    subprocess kill, not `taskkill /F /T` workarounds.
-4. **Inspectable.** Every run in SQLite, every node output captured,
-   every variable substitution logged. Workflows are plain text.
-5. **CLI is first-class.** Anything the GUI does, the CLI does. Built
-   for piping (NDJSON events, exit-code contract, `--json` flags).
+4. **Inspectable.** Every run in SQLite, every node output captured, every
+   variable substitution logged. Workflows are plain text.
+5. **CLI is first-class.** Anything the GUI does, the CLI does. Built for
+   piping (NDJSON events, exit-code contract, `--json` flags).
 
 ## License
 
-Apache-2.0. The `LICENSE` file is not yet committed — see deferred-items
-in `docs/plans/SESSION-HANDOFF.md`.
+[Apache-2.0](LICENSE).
 
 ---
 
-<sub>Ordius is a personal tool. No telemetry, no analytics, no growth metrics.
-Built for the author's daily use; PRs welcome but adoption is not a goal.</sub>
+<sub>Ordius is a personal tool — built for my own daily use, with no telemetry,
+analytics, or growth metrics. Not chasing adoption, but if you're interested
+you're welcome to try it.</sub>
 
 [rust]:        https://www.rust-lang.org
 [tauri]:       https://tauri.app
@@ -171,4 +178,3 @@ Built for the author's daily use; PRs welcome but adoption is not a goal.</sub>
 [clap]:        https://docs.rs/clap
 [bollard]:     https://docs.rs/bollard
 [cancel]:      https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html
-[plan]:        docs/plans/v1.0-implementation.md
