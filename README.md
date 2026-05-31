@@ -12,6 +12,12 @@ as a directed acyclic graph. Run from the CLI or a Tauri 2 desktop GUI.
 [![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)](https://tauri.app)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Status](https://img.shields.io/badge/status-personal%20%C2%B7%20actively%20developed-brightgreen)](#status)
+[![CI](https://github.com/Wintersta7e/ordius/actions/workflows/ci.yml/badge.svg)](https://github.com/Wintersta7e/ordius/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/Wintersta7e/ordius/graph/badge.svg)](https://codecov.io/gh/Wintersta7e/ordius)
+
+<br>
+
+<img src="screenshots/editor.png" alt="The Ordius visual workflow editor" width="900">
 
 </div>
 
