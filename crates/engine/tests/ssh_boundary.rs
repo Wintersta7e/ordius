@@ -186,6 +186,69 @@ async fn ssh_connection_cache_returns_error_when_both_attempts_closed() {
     assert_eq!(connector.connect_count(), 2);
 }
 
+// ── Connection-cache invalidation ────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ssh_connection_cache_invalidates_after_channel_failure() {
+    use ordius_engine::environment::runtime::ssh::connection::{
+        FakeSshConnector, SshConnectionCache, SshConnectionLike,
+    };
+
+    let connector = FakeSshConnector::new()
+        .with_connection("first", false)
+        .with_connection("second", false);
+    let cache = SshConnectionCache::new(connector.clone(), "ssh:test");
+
+    let first = cache.connection().await.unwrap();
+    assert_eq!(first.id(), "first");
+    cache.invalidate().await;
+    let second = cache.connection().await.unwrap();
+    assert_eq!(second.id(), "second");
+    assert_eq!(connector.connect_count(), 2);
+}
+
+// ── SshProcess exit-status mapping ───────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ssh_process_wait_returns_exit_status_from_channel() {
+    use ordius_engine::environment::runtime::ssh::exec::{FakeExecHandle, SshProcess};
+    use ordius_engine::environment::runtime::transport::EnvProcess;
+
+    let mut proc = SshProcess::new(
+        "ssh:test",
+        None,
+        None,
+        Box::new(FakeExecHandle::with_exit(17)),
+    );
+    let exit = proc.wait().await.unwrap();
+    assert_eq!(exit.code, 17);
+}
+
+// ── Bootstrap sha256 mismatch ─────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ssh_bootstrap_rejects_remote_sha_mismatch() {
+    use ordius_engine::environment::runtime::ssh::bootstrap::{FakeSftp, SshBootstrapper};
+
+    // `with_uploaded_sha("wrong")` — what sha256_file returns for the .tmp file.
+    // `with_embedded("x86_64-unknown-linux-musl", b"helper", "right")` — what the
+    // helper source provides as the expected sha.
+    // The bootstrapper must use the fake helper source (not ManifestHelperSource)
+    // so that artifact_for() finds the bytes.  Mirror the pattern from
+    // `ssh_bootstrap_uses_home_cache_not_tmp`.
+    let sftp = FakeSftp::new("/home/me")
+        .with_uploaded_sha("wrong")
+        .with_embedded("x86_64-unknown-linux-musl", b"helper", "right");
+    let err = SshBootstrapper::with_helper_source(sftp.clone(), sftp.helper_source())
+        .bootstrap("x86_64-unknown-linux-musl")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("sha256 mismatch"),
+        "expected 'sha256 mismatch' in error, got: {err}"
+    );
+}
+
 // ── SSH transport URL rewrite ─────────────────────────────────────────────────
 
 #[test]

@@ -357,6 +357,42 @@ async fn demux_channel(
     drop(exit_tx.send(final_exit));
 }
 
+// ── Fake exec handle (tests + testing feature) ────────────────────────────────
+
+#[cfg(any(test, feature = "testing"))]
+#[allow(missing_docs)]
+pub struct FakeExecHandle {
+    exit_code: i32,
+    cancelled: bool,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl FakeExecHandle {
+    /// Build a fake handle that will return `exit_code` from `wait_exit`.
+    pub const fn with_exit(exit_code: i32) -> Self {
+        Self {
+            exit_code,
+            cancelled: false,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+#[async_trait]
+impl SshExecHandle for FakeExecHandle {
+    async fn wait_exit(&mut self) -> Result<ProcessExit, DispatchError> {
+        Ok(ProcessExit {
+            code: self.exit_code,
+            signal: None,
+        })
+    }
+
+    async fn cancel(&mut self) -> Result<(), DispatchError> {
+        self.cancelled = true;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
