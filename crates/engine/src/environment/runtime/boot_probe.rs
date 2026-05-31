@@ -391,8 +391,8 @@ pub struct EnvSpecRow {
     /// Persisted display label (user-customised; never re-synthesised from
     /// the spec at load time).
     pub label: String,
-    /// Decoded environment spec. `None` when the row is a legacy format that
-    /// could not be migrated automatically (e.g. old `auth_ref` SSH rows).
+    /// Decoded environment spec. `None` when the row is disabled without a
+    /// parseable spec (e.g. rows disabled by `classify_row`'s invariant guard).
     pub spec: Option<EnvSpec>,
     /// `true` when the row is enabled for scheduling.
     pub enabled: bool,
@@ -401,23 +401,8 @@ pub struct EnvSpecRow {
     pub disabled_reason: Option<String>,
 }
 
-/// Returns `true` when the JSON blob looks like a pre-T4 SSH spec that
-/// uses the old `auth_ref` field instead of the current typed `auth` object.
-/// These rows cannot be parsed as the current `EnvSpec::Ssh` and must be
-/// disabled with a reconfiguration notice rather than silently dropped.
-fn is_legacy_ssh_auth_ref(json: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
-        return false;
-    };
-    value.get("type").and_then(serde_json::Value::as_str) == Some("ssh")
-        && value.get("auth").is_none()
-        && value.get("auth_ref").is_some()
-}
-
 /// Load every row from `env_specs`. Bad rows (unparseable `spec_json`) are
 /// logged + skipped — the boot probe must not panic on a corrupted file.
-/// Legacy SSH `auth_ref` rows are disabled with a reconfiguration notice
-/// rather than silently dropped, so the UI can surface them.
 fn load_specs(pool: &DbPool) -> Vec<EnvSpecRow> {
     let conn = match pool.get() {
         Ok(c) => c,
@@ -451,17 +436,6 @@ fn load_specs(pool: &DbPool) -> Vec<EnvSpecRow> {
         let Ok((id_s, label, json, enabled)) = r else {
             continue;
         };
-        if is_legacy_ssh_auth_ref(&json) {
-            tracing::warn!(env_id = %id_s, "legacy SSH auth_ref row disabled; needs reconfiguration");
-            out.push(EnvSpecRow {
-                id: EnvId::new(id_s),
-                label,
-                spec: None,
-                enabled: false,
-                disabled_reason: Some("needs SSH reconfiguration".into()),
-            });
-            continue;
-        }
         match serde_json::from_str::<EnvSpec>(&json) {
             Ok(spec) => out.push(EnvSpecRow {
                 id: EnvId::new(id_s),
@@ -483,7 +457,6 @@ fn load_specs(pool: &DbPool) -> Vec<EnvSpecRow> {
 /// Returns the full row (label + spec + enabled flag) when present so the
 /// refresh API can distinguish disabled rows (insert into
 /// `env_disabled_specs`, no probe) from absent rows (drop from all maps).
-/// Legacy SSH `auth_ref` rows are returned as disabled with `spec: None`.
 pub fn load_spec_single(pool: &DbPool, env_id: &EnvId) -> Result<Option<EnvSpecRow>, BootError> {
     let conn = pool.get().map_err(|e| BootError::Db(e.to_string()))?;
     let mut stmt = conn
@@ -498,17 +471,6 @@ pub fn load_spec_single(pool: &DbPool, env_id: &EnvId) -> Result<Option<EnvSpecR
     let label: String = row.get(0).map_err(|e| BootError::Db(e.to_string()))?;
     let json: String = row.get(1).map_err(|e| BootError::Db(e.to_string()))?;
     let enabled: i64 = row.get(2).map_err(|e| BootError::Db(e.to_string()))?;
-
-    if is_legacy_ssh_auth_ref(&json) {
-        tracing::warn!(env_id = %env_id, "legacy SSH auth_ref row disabled; needs reconfiguration");
-        return Ok(Some(EnvSpecRow {
-            id: env_id.clone(),
-            label,
-            spec: None,
-            enabled: false,
-            disabled_reason: Some("needs SSH reconfiguration".into()),
-        }));
-    }
 
     let spec: EnvSpec =
         serde_json::from_str(&json).map_err(|e| BootError::Db(format!("EnvSpec parse: {e}")))?;
@@ -599,44 +561,6 @@ mod tests {
                 || outcome.catalogs.contains_key(&EnvId::new("ssh:devbox")),
             "SSH row should reach dispatcher construction instead of unsupported gate"
         );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn legacy_ssh_auth_ref_row_is_disabled_for_reconfiguration() {
-        let tmp = TempDir::new().unwrap();
-        let pool = open(tmp.path().join("runs.db")).unwrap();
-        {
-            let conn = pool.get().unwrap();
-            conn.execute(
-                "INSERT INTO env_specs (id, label, enabled, spec_json, created_at, updated_at)
-                 VALUES ('ssh:legacy', 'Legacy SSH', 1,
-                         '{\"type\":\"ssh\",\"host\":\"devbox\",\"user\":\"me\",\"auth_ref\":\"old-secret\",\"resources\":[]}',
-                         0, 0)",
-                [],
-            )
-            .unwrap();
-        }
-
-        let registry = ResourceRegistry::new();
-        let store = Arc::new(crate::secrets::Store::with_index_path(
-            tmp.path().join("secrets.json"),
-        ));
-        let outcome = run(&pool, &registry, store).await;
-
-        assert!(!outcome.entries.contains_key(&EnvId::new("ssh:legacy")));
-        let disabled = outcome
-            .disabled_specs
-            .get(&EnvId::new("ssh:legacy"))
-            .expect("legacy ssh must be disabled");
-        assert_eq!(disabled.label, "Legacy SSH");
-        assert!(
-            disabled
-                .reason
-                .as_deref()
-                .unwrap_or("")
-                .contains("needs SSH reconfiguration")
-        );
-        assert!(disabled.spec.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
