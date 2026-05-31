@@ -1,0 +1,234 @@
+//! Gated real-SSH integration test for Phase G.
+//!
+//! Skips unless `ORDIUS_REAL_SSH_TEST=1` and `ORDIUS_TEST_SSH_HOST=user@box`
+//! (and optionally `ORDIUS_TEST_SSH_KEY=<path>`) are set.
+//!
+//! What it covers, in order:
+//! 1. TOFU enroll — connect with `HostKeyHandler::enroll`, capture the pin.
+//! 2. Dispatcher build — `SshDispatcher::new` with the captured pin.
+//! 3. Empty probe — `probe(empty plan)` must succeed and bootstrap the helper.
+//! 4. Exec — `spawn(printf real-ssh-ok)` must return `"real-ssh-ok"` on stdout.
+//! 5. Cancel — `spawn(sleep 60)` + `cancel()` must terminate promptly.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use ordius_engine::environment::runtime::dispatcher::Dispatcher;
+use ordius_engine::environment::runtime::ssh::SshDispatcher;
+use ordius_engine::environment::runtime::ssh::config::SshConfig;
+use ordius_engine::environment::runtime::ssh::host_key::HostKeyHandler;
+use ordius_engine::environment::runtime::transport::Stdio;
+use ordius_engine::environment::runtime::{
+    EnvId, EnvInfo, EnvSpec, EnvState, ProbePlan, ProcessCmd, SshAuth,
+};
+use tokio_util::sync::CancellationToken;
+
+// ── Gate ─────────────────────────────────────────────────────────────────────
+
+/// Returns `Some((user, host, port))` when the real-SSH gate is open.
+///
+/// Requires:
+/// - `ORDIUS_REAL_SSH_TEST=1`
+/// - `ORDIUS_TEST_SSH_HOST=user@host[:port]`  (port defaults to 22)
+fn real_ssh_target() -> Option<(String, String, u16)> {
+    if std::env::var("ORDIUS_REAL_SSH_TEST").ok().as_deref() != Some("1") {
+        return None;
+    }
+    let raw = std::env::var("ORDIUS_TEST_SSH_HOST").ok()?;
+    let (user, host_port) = raw.split_once('@')?;
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => (h.to_string(), p.parse().ok()?),
+        _ => (host_port.to_string(), 22),
+    };
+    Some((user.to_string(), host, port))
+}
+
+// ── Test ──────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn real_ssh_probe_exec_and_cancel() {
+    let Some((user, host, port)) = real_ssh_target() else {
+        eprintln!(
+            "skipping real SSH test; set ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"
+        );
+        return;
+    };
+
+    // ── Keyring + secret store ────────────────────────────────────────────────
+    keyring::use_sample_store(&HashMap::from([("persist", "false")])).unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(ordius_engine::Store::with_index_path(
+        tmp.path().join("secrets.json"),
+    ));
+
+    // ── Resolve key path ──────────────────────────────────────────────────────
+    let key_path = std::env::var("ORDIUS_TEST_SSH_KEY").unwrap_or_else(|_| {
+        format!(
+            "{}/.ssh/id_ed25519",
+            std::env::var("HOME").expect("HOME not set")
+        )
+    });
+    let auth = SshAuth::KeyFile {
+        path: key_path,
+        passphrase_ref: None,
+    };
+
+    // ── Step 1: TOFU enroll — capture the host key via an enroll connect ──────
+    //
+    // `RusshConnector` uses `HostKeyHandler::pinned(pins)` and rejects any key
+    // not matching a pin.  With `host_key_pins: vec![]` the pinned handler
+    // would reject every key, so we must enroll first.
+    //
+    // Mirror the pattern from `Engine::test_ssh_enrollment` and
+    // `crates/engine/examples/ssh_spike.rs`: open with `HostKeyHandler::enroll`,
+    // read the captured key, disconnect, then build a real pin.
+    let pin = {
+        use ordius_engine::environment::runtime::ssh::auth::{
+            authenticate_session, resolve_auth_material,
+        };
+
+        let resolved = resolve_auth_material(&store, &auth).expect("resolve auth material");
+
+        let enroll_handler = HostKeyHandler::enroll();
+        let captured_arc = enroll_handler.captured_key();
+
+        let config = russh::client::Config {
+            inactivity_timeout: Some(Duration::from_secs(30)),
+            ..Default::default()
+        };
+
+        let mut session = tokio::time::timeout(
+            Duration::from_secs(15),
+            russh::client::connect(Arc::new(config), (host.as_str(), port), enroll_handler),
+        )
+        .await
+        .expect("enroll connect timed out")
+        .expect("enroll connect failed");
+
+        authenticate_session(&mut session, &user, resolved)
+            .await
+            .expect("enroll auth failed");
+
+        // Grab the key the handler captured during the handshake.
+        let presented = captured_arc
+            .lock()
+            .await
+            .take()
+            .expect("HostKeyHandler::enroll must capture the server key");
+
+        // Disconnect cleanly before re-connecting through the dispatcher.
+        drop(
+            session
+                .disconnect(russh::Disconnect::ByApplication, "enroll done", "en")
+                .await,
+        );
+
+        presented.to_pin(chrono::Utc::now())
+    };
+
+    // ── Step 2: Build EnvSpec + SshDispatcher with the pinned key ────────────
+    let spec = EnvSpec::Ssh {
+        host: host.clone(),
+        port,
+        user: user.clone(),
+        auth: auth.clone(),
+        host_key_pins: vec![pin],
+        resources: Vec::new(),
+    };
+    let info = EnvInfo {
+        id: EnvId::ssh("real-test"),
+        label: "Real SSH Test".into(),
+        spec: spec.clone(),
+        state: EnvState::Probing,
+        enabled: true,
+    };
+    let cfg =
+        SshConfig::from_spec(&spec).expect("SshConfig::from_spec must return Some for SSH spec");
+    let dispatcher = SshDispatcher::new(info, cfg, Arc::clone(&store));
+
+    // ── Step 3: Empty probe (also bootstraps the helper) ─────────────────────
+    //
+    // An empty plan has `defs: vec![]` so `total_probed == 0`, but the probe
+    // path still runs `ensure_helper` which SFTP-uploads the binary.  If this
+    // succeeds the connection + bootstrap are working end-to-end.
+    let probe = dispatcher
+        .probe(
+            ProbePlan {
+                env_id: EnvId::ssh("real-test"),
+                registry_revision: 0,
+                defs: Vec::new(),
+                per_resource_timeout: Duration::from_secs(5),
+                max_concurrency: 1,
+                overall_budget: Duration::from_secs(30),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("empty probe must succeed after connect + bootstrap");
+
+    assert_eq!(probe.total_probed, 0, "empty plan: no resources probed");
+
+    // ── Step 4: Exec — printf real-ssh-ok ────────────────────────────────────
+    let mut proc = dispatcher
+        .spawn(ProcessCmd {
+            program: "sh".into(),
+            args: vec!["-c".into(), "printf real-ssh-ok".into()],
+            env: HashMap::new(),
+            cwd: None,
+            stdin: None,
+            stdout: Stdio::Piped,
+            stderr: Stdio::Piped,
+        })
+        .await
+        .expect("spawn must succeed");
+
+    let mut stdout = String::new();
+    if let Some(pipe) = proc.take_stdout() {
+        use tokio::io::AsyncReadExt as _;
+        tokio::io::BufReader::new(pipe)
+            .read_to_string(&mut stdout)
+            .await
+            .expect("read stdout");
+    }
+    let exit = proc.wait().await.expect("wait");
+
+    assert_eq!(stdout, "real-ssh-ok", "exec stdout must match");
+    assert_eq!(exit.code, 0, "exec exit code must be 0");
+
+    // ── Step 5: Cancel — sleep 60 must terminate promptly ────────────────────
+    //
+    // Verifies T10's channel-close cancel: sshd receives SIGHUP when the
+    // channel closes, which the remote helper's signal-forwarder (T3)
+    // translates into a SIGKILL on the remote child group.
+    let mut long_proc = dispatcher
+        .spawn(ProcessCmd {
+            program: "sh".into(),
+            args: vec!["-c".into(), "sleep 60".into()],
+            env: HashMap::new(),
+            cwd: None,
+            stdin: None,
+            stdout: Stdio::Piped,
+            stderr: Stdio::Piped,
+        })
+        .await
+        .expect("spawn sleep must succeed");
+
+    // Give the remote sleep time to start.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let cancel_start = std::time::Instant::now();
+    long_proc.cancel().await.expect("cancel");
+    let cancel_exit = long_proc.wait().await.expect("wait after cancel");
+    let cancel_elapsed = cancel_start.elapsed();
+
+    assert!(
+        cancel_elapsed < Duration::from_secs(15),
+        "cancel must be prompt — elapsed: {cancel_elapsed:?}"
+    );
+    assert!(
+        cancel_exit.code != 0 || cancel_exit.signal.is_some(),
+        "cancelled process must not exit with code 0 and no signal, got: {cancel_exit:?}"
+    );
+}
