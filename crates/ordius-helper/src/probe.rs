@@ -124,11 +124,11 @@ fn probe_http(
         return probe_http_liveness(bases);
     }
 
-    let mut builder = ureq::AgentBuilder::new();
-    if let Some(timeout) = timeout {
-        builder = builder.timeout(timeout);
-    }
-    let agent = builder.build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(timeout)
+        .build()
+        .into();
     let mut any_timeout = false;
     let mut last_err: Option<String> = None;
 
@@ -138,26 +138,24 @@ fn probe_http(
 
         for route in routes {
             let url = format!("{}{}", base.trim_end_matches('/'), route.path);
-            let req = match route.method {
-                HttpProbeMethodV1::Get => agent.get(&url),
-                HttpProbeMethodV1::Head => agent.head(&url),
-                HttpProbeMethodV1::Post => agent.post(&url),
+            // `http_status_as_error(false)` makes ureq return every HTTP
+            // response (2xx-5xx) as `Ok`, so `expect_status` is consulted
+            // uniformly — a route declaring `expect_status: [401]` accepts the
+            // 401 path rather than classifying it as `ProbeFailed`.
+            let result = match route.method {
+                HttpProbeMethodV1::Get => agent.get(&url).call(),
+                HttpProbeMethodV1::Head => agent.head(&url).call(),
+                HttpProbeMethodV1::Post => agent.post(&url).send_empty(),
             };
-
-            // ureq surfaces non-2xx as `Err(Status(code, resp))` rather than `Ok`.
-            // Normalize both arms into `(status, resp_opt)` so `expect_status`
-            // is consulted uniformly — a route declaring `expect_status: [401]`
-            // must accept the 401 path, not classify it as `ProbeFailed`.
-            let (status, resp_opt) = match req.call() {
-                Ok(resp) => (resp.status(), Some(resp)),
+            let (status, resp_opt) = match result {
+                Ok(resp) => (resp.status().as_u16(), Some(resp)),
                 Err(err) if is_ureq_timeout(&err) => {
                     any_timeout = true;
                     continue;
                 },
-                Err(ureq::Error::Status(code, resp)) => (code, Some(resp)),
-                Err(ureq::Error::Transport(t)) => {
+                Err(err) => {
                     base_transport_failed = true;
-                    last_err = Some(format!("transport error: {t}"));
+                    last_err = Some(format!("transport error: {err}"));
                     continue;
                 },
             };
@@ -166,6 +164,7 @@ fn probe_http(
                 if let Some(resp) = resp_opt {
                     let mut body = String::new();
                     match resp
+                        .into_body()
                         .into_reader()
                         .take(MAX_PROBE_BODY_BYTES)
                         .read_to_string(&mut body)
@@ -235,13 +234,18 @@ fn probe_http(
 fn probe_http_liveness(bases: &[String]) -> ProbeOutcomeBodyV1 {
     const LIVENESS_TIMEOUT: Duration = Duration::from_millis(250);
 
-    let agent = ureq::AgentBuilder::new().timeout(LIVENESS_TIMEOUT).build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(LIVENESS_TIMEOUT))
+        .build()
+        .into();
     let mut any_timeout = false;
 
     for base in bases {
         let url = format!("{}/", base.trim_end_matches('/'));
         match agent.head(&url).call() {
-            Ok(_) | Err(ureq::Error::Status(_, _)) => {
+            // Any HTTP response (2xx-5xx) proves the port answered.
+            Ok(_) => {
                 return ProbeOutcomeBodyV1::Found(ProbeDetailV1::HttpEndpoint {
                     base_url: base.clone(),
                     proven_routes: Vec::new(),
@@ -250,7 +254,7 @@ fn probe_http_liveness(bases: &[String]) -> ProbeOutcomeBodyV1 {
             Err(err) if is_ureq_timeout(&err) => {
                 any_timeout = true;
             },
-            Err(ureq::Error::Transport(_)) => {
+            Err(_) => {
                 // Connection refused / DNS / etc. — try the next base.
             },
         }
@@ -538,10 +542,8 @@ fn overall_elapsed(started: Instant, overall_budget: Option<Duration>) -> bool {
     overall_budget.is_some_and(|budget| started.elapsed() >= budget)
 }
 
-fn is_ureq_timeout(err: &ureq::Error) -> bool {
-    std::error::Error::source(err)
-        .and_then(|source| source.downcast_ref::<std::io::Error>())
-        .is_some_and(|source| source.kind() == std::io::ErrorKind::TimedOut)
+const fn is_ureq_timeout(err: &ureq::Error) -> bool {
+    matches!(err, ureq::Error::Timeout(_))
 }
 
 /// Tiny regex shim — engine pulls in `regex 1.x` via workspace deps; the

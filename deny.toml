@@ -56,11 +56,4 @@ yanked = "deny"
 # Only fail on unmaintained crates we depend on *directly*. Tauri's GTK Linux
 # backend drags in ~17 unmaintained transitive crates we can't do anything about.
 unmaintained = "workspace"
-ignore = [
-  # rustls-webpki 0.101.7: cert name-constraint handling + a CRL-parse panic.
-  # Pulled in only by ureq 2's bundled old rustls (reqwest already resolves the
-  # patched rustls-webpki 0.103). Real fix = upgrade ureq — tracked separately.
-  "RUSTSEC-2026-0098",
-  "RUSTSEC-2026-0099",
-  "RUSTSEC-2026-0104",
-]
+ignore = []
