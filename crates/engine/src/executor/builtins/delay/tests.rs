@@ -47,7 +47,9 @@ async fn delay_cancels_promptly() {
     cancel.cancel();
     let start_wait = Instant::now();
     let res = handle.await.unwrap();
-    assert!(start_wait.elapsed() < Duration::from_millis(500));
+    // Generous bound: the point is it returns long before the 60s delay,
+    // not a tight latency SLA — a 500ms bound flakes on loaded CI runners.
+    assert!(start_wait.elapsed() < Duration::from_secs(5));
     assert!(matches!(res, Err(NodeError::Cancelled)));
 }
 
