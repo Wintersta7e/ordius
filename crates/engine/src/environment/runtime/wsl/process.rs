@@ -88,12 +88,14 @@ async fn drain_and_wait(
 
     let work = async {
         if let (Some(bytes), Some(mut stdin)) = (stdin_bytes, stdin_taken) {
-            stdin
-                .write_all(&bytes)
-                .await
-                .map_err(|e| WslExecError::Io(format!("write stdin: {e}")))?;
             // BrokenPipe just means the child closed stdin early; that is
-            // legitimate (the child may have already finished consuming).
+            // legitimate (the child may have already finished consuming) —
+            // tolerate it on both the write and the shutdown.
+            if let Err(e) = stdin.write_all(&bytes).await
+                && e.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                return Err(WslExecError::Io(format!("write stdin: {e}")));
+            }
             if let Err(e) = stdin.shutdown().await
                 && e.kind() != std::io::ErrorKind::BrokenPipe
             {
