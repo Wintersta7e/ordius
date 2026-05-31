@@ -56,7 +56,7 @@ russh-sftp = { workspace = true }
 sha2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["process", "signal"] }
+nix = { version = "0.31", features = ["process", "signal"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
