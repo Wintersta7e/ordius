@@ -19,6 +19,7 @@ use ordius_engine::environment::runtime::ssh::SshDispatcher;
 use ordius_engine::environment::runtime::ssh::config::SshConfig;
 use ordius_engine::environment::runtime::ssh::host_key::HostKeyHandler;
 use ordius_engine::environment::runtime::transport::Stdio;
+use ordius_engine::environment::runtime::workspace::transport::WorkspaceTransportFactory as _;
 use ordius_engine::environment::runtime::{
     EnvId, EnvInfo, EnvSpec, EnvState, ProbePlan, ProcessCmd, SshAuth,
 };
@@ -231,4 +232,140 @@ async fn real_ssh_probe_exec_and_cancel() {
         cancel_exit.code != 0 || cancel_exit.signal.is_some(),
         "cancelled process must not exit with code 0 and no signal, got: {cancel_exit:?}"
     );
+}
+
+// ── Workspace transport round-trip ────────────────────────────────────────────
+
+/// Build an `SshDispatcher` from the real-SSH gate env vars.
+///
+/// Mirrors the enroll → pin → build pattern in `real_ssh_probe_exec_and_cancel`
+/// so this test exercises the same code path independently.
+async fn build_dispatcher_for_transport_test() -> Option<SshDispatcher> {
+    let (user, host, port) = real_ssh_target()?;
+
+    keyring::use_sample_store(&std::collections::HashMap::from([("persist", "false")])).unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(ordius_engine::Store::with_index_path(
+        tmp.path().join("secrets.json"),
+    ));
+
+    let key_path = std::env::var("ORDIUS_TEST_SSH_KEY").unwrap_or_else(|_| {
+        format!(
+            "{}/.ssh/id_ed25519",
+            std::env::var("HOME").expect("HOME not set")
+        )
+    });
+    let auth = SshAuth::KeyFile {
+        path: key_path,
+        passphrase_ref: None,
+    };
+
+    // TOFU enroll
+    let pin = {
+        use ordius_engine::environment::runtime::ssh::auth::{
+            authenticate_session, resolve_auth_material,
+        };
+        let resolved = resolve_auth_material(&store, &auth).expect("resolve auth material");
+        let enroll_handler = HostKeyHandler::enroll();
+        let captured_arc = enroll_handler.captured_key();
+        let config = russh::client::Config {
+            inactivity_timeout: Some(Duration::from_secs(30)),
+            ..Default::default()
+        };
+        let mut session = tokio::time::timeout(
+            Duration::from_secs(15),
+            russh::client::connect(Arc::new(config), (host.as_str(), port), enroll_handler),
+        )
+        .await
+        .expect("enroll connect timed out")
+        .expect("enroll connect failed");
+        authenticate_session(&mut session, &user, resolved)
+            .await
+            .expect("enroll auth failed");
+        let presented = captured_arc
+            .lock()
+            .await
+            .take()
+            .expect("HostKeyHandler::enroll must capture the server key");
+        drop(
+            session
+                .disconnect(russh::Disconnect::ByApplication, "enroll done", "en")
+                .await,
+        );
+        presented.to_pin(chrono::Utc::now())
+    };
+
+    let spec = EnvSpec::Ssh {
+        host: host.clone(),
+        port,
+        user,
+        auth,
+        host_key_pins: vec![pin],
+        resources: Vec::new(),
+    };
+    let info = EnvInfo {
+        id: EnvId::ssh("transport-test"),
+        label: "Transport Test".into(),
+        spec: spec.clone(),
+        state: EnvState::Probing,
+        enabled: true,
+    };
+    let cfg = SshConfig::from_spec(&spec).expect("SshConfig from spec");
+    Some(SshDispatcher::new(info, cfg, store))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "gated: requires ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"]
+async fn real_ssh_workspace_transport_round_trip() {
+    let Some(dispatcher) = build_dispatcher_for_transport_test().await else {
+        eprintln!(
+            "skipping workspace transport test; set ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"
+        );
+        return;
+    };
+
+    let factory = dispatcher.sftp_transport_factory();
+    let t = factory.open().await.expect("open sftp transport");
+
+    // mkdir (with parent creation)
+    t.mkdir(".cache/ordius/h1-test").await.unwrap();
+
+    // upload + download
+    t.upload_file(".cache/ordius/h1-test/x.txt", b"phase-h1")
+        .await
+        .unwrap();
+    assert_eq!(
+        t.download_file(".cache/ordius/h1-test/x.txt")
+            .await
+            .unwrap(),
+        b"phase-h1"
+    );
+
+    // list_tree
+    let listing = t.list_tree(".cache/ordius/h1-test").await.unwrap();
+    assert!(
+        listing.iter().any(|m| m.rel_path.ends_with("x.txt")),
+        "listing must include x.txt; got: {listing:?}"
+    );
+
+    // stat
+    let md = t
+        .stat(".cache/ordius/h1-test/x.txt")
+        .await
+        .unwrap()
+        .expect("stat must find the file");
+    assert_eq!(md.size, 8, "size must be 8 bytes");
+
+    // stat non-existent → None
+    assert!(
+        t.stat(".cache/ordius/h1-test/no-such-file")
+            .await
+            .unwrap()
+            .is_none(),
+        "stat of missing path must return None"
+    );
+
+    // cleanup
+    t.remove_file(".cache/ordius/h1-test/x.txt").await.unwrap();
+    t.remove_dir(".cache/ordius/h1-test").await.unwrap();
 }

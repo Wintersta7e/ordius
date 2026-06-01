@@ -67,6 +67,14 @@ windows = { version = "0.62", features = [
   "Win32_System_Diagnostics_ToolHelp",
 ] }
 
+[[test]]
+name = "ssh_boundary"
+required-features = ["testing"]
+
+[[test]]
+name = "ssh_real_dispatcher"
+required-features = ["testing"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }

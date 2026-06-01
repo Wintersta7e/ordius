@@ -100,6 +100,19 @@ impl SshDispatcher {
         }
     }
 
+    /// Build an [`SshSftpTransportFactory`] that opens SFTP sessions over this
+    /// dispatcher's cached connection.
+    ///
+    /// Gated on the `testing` feature so integration tests can exercise the
+    /// transport without exposing the internal `cache` field.
+    #[cfg(feature = "testing")]
+    pub fn sftp_transport_factory(&self) -> super::workspace::SshSftpTransportFactory {
+        super::workspace::SshSftpTransportFactory::new(
+            Arc::clone(&self.cache),
+            self.env_info.id.to_string(),
+        )
+    }
+
     /// Bootstrap with an explicit triple (used from integration tests and T10).
     #[allow(dead_code)] // used starting T10
     pub(crate) async fn bootstrap_helper_with_triple(
@@ -323,12 +336,17 @@ async fn consume_ssh_helper_stream(
     }
 }
 
-/// Open an SFTP subsystem channel on `conn` and wrap it in the `SftpOps` adapter.
+/// Open an SFTP subsystem channel on `conn` and return the raw `SftpSession`.
 ///
 /// Holds the `Handle` lock only long enough to open the session channel and
-/// request the `sftp` subsystem; the resulting stream is owned by the returned
-/// [`RusshSftp`], so the lock is released before any SFTP I/O.
-async fn open_sftp(conn: &SshConnection) -> Result<RusshSftp, DispatchError> {
+/// request the `sftp` subsystem; the lock is released before the SFTP
+/// handshake so the caller can do I/O without holding it.
+///
+/// Extracted from `open_sftp` so both the bootstrap path and the workspace
+/// transport factory can share the channel-open logic.
+pub(crate) async fn open_sftp_session(
+    conn: &SshConnection,
+) -> Result<russh_sftp::client::SftpSession, DispatchError> {
     let map_err = |what: &str, e: russh::Error| {
         conn.mark_closed();
         DispatchError::EnvUnreachable {
@@ -353,11 +371,16 @@ async fn open_sftp(conn: &SshConnection) -> Result<RusshSftp, DispatchError> {
         channel.into_stream()
     };
 
-    let session = russh_sftp::client::SftpSession::new(stream)
+    russh_sftp::client::SftpSession::new(stream)
         .await
         .map_err(|e| {
             DispatchError::HelperBootstrap(format!("open sftp session on {}: {e}", conn.id()))
-        })?;
+        })
+}
+
+/// Open an SFTP subsystem channel on `conn` and wrap it in the `SftpOps` adapter.
+async fn open_sftp(conn: &SshConnection) -> Result<RusshSftp, DispatchError> {
+    let session = open_sftp_session(conn).await?;
     Ok(RusshSftp::new(session))
 }
 
