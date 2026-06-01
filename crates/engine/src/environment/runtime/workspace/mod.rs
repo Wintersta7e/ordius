@@ -1,5 +1,7 @@
 /// Workspace sync manager skeleton.
 pub mod manager;
+/// Upload safety helpers (ignore rules, caps, walk, manifest).
+pub mod safety;
 /// Workspace transport traits and implementations.
 pub mod transport;
 pub use manager::{RunOutcome, WorkspaceManager};
