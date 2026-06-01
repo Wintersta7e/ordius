@@ -69,6 +69,7 @@ impl NodeExecutor for ComposeExecutor {
                 Some(ctx.workspace.clone()),
                 "compose-",
                 Arc::clone(&ctx.run_snapshot),
+                Arc::clone(&ctx.workspace_manager),
             )
             .await
             .map_err(|e| match e {

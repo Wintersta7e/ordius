@@ -16,6 +16,7 @@
 //! `workflow:done` / `workflow:error` / `workflow:stopped`.
 
 use crate::emitter::Emitter;
+use crate::environment::runtime::workspace::WorkspaceManager;
 use crate::events::{EventType, RunEvent};
 use crate::executor::builtins::condition::NODE_TYPE_ID as CONDITION_NODE_TYPE_ID;
 use crate::executor::{Dispatcher, NodeError, NodeExecutor, RunContext, wrap_process_env};
@@ -260,6 +261,7 @@ impl Engine {
         let run_id = rec.run_id.clone();
         let engine = Arc::clone(self);
         let snap_run_id = rec.run_id.clone();
+        let workspace_manager = Arc::new(WorkspaceManager::new());
         let join = tokio::spawn(async move {
             // RAII guard: removes the `run_snapshots` entry on Drop, so
             // a panicking run loop or `?`-propagation also cleans up.
@@ -278,6 +280,7 @@ impl Engine {
                     auto_resume_checkpoints,
                     0,
                     run_snapshot,
+                    workspace_manager,
                 )
                 .await
                 .map(|(summary, _outputs)| summary);
@@ -356,6 +359,7 @@ impl Engine {
         workspace_override: Option<PathBuf>,
         scratch_prefix: &str,
         parent_snapshot: Arc<crate::environment::runtime::RunSnapshot>,
+        workspace_manager: Arc<WorkspaceManager>,
     ) -> Result<(RunSummary, HashMap<(String, String), PortValue>)> {
         crate::validation::validate(&child_wf)?;
 
@@ -425,6 +429,7 @@ impl Engine {
             false,
             compose_depth,
             parent_snapshot,
+            workspace_manager,
         )
         .await
     }
@@ -456,6 +461,7 @@ impl Engine {
         auto_resume: bool,
         compose_depth: u32,
         run_snapshot: Arc<crate::environment::runtime::RunSnapshot>,
+        workspace_manager: Arc<WorkspaceManager>,
     ) -> Result<(RunSummary, HashMap<(String, String), PortValue>)> {
         let mut upstream_outputs: HashMap<(String, String), PortValue> = HashMap::new();
         let mut iterations: HashMap<String, u32> = HashMap::new();
@@ -582,6 +588,7 @@ impl Engine {
                     iteration,
                     attempt: std::sync::atomic::AtomicU32::new(1),
                     auto_resume,
+                    workspace_manager: Arc::clone(&workspace_manager),
                 };
 
                 sched.start_node(&node.id);

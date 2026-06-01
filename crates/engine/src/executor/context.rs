@@ -77,6 +77,10 @@ pub struct RunContext {
     /// state cannot mutate the resources visible to in-flight nodes.
     /// Cloned cheaply (Arc per field) into every executor call.
     pub run_snapshot: Arc<crate::environment::runtime::RunSnapshot>,
+    /// Run-tree-shared workspace sync manager. Created once per top-level run; the
+    /// same `Arc` is cloned into every child-workflow context so compose/parallel
+    /// children share prepared state and (later) a single teardown owner.
+    pub workspace_manager: std::sync::Arc<crate::environment::runtime::workspace::WorkspaceManager>,
     /// Weak handle back to the engine — built-ins that need to
     /// invoke sub-workflows (`compose`, `parallel`) upgrade and call
     /// `Engine::run_child_workflow`. Weak so the per-node context

@@ -144,6 +144,7 @@ impl NodeExecutor for ParallelExecutor {
                 next_depth,
                 &ctx.workspace,
                 &ctx.run_snapshot,
+                &ctx.workspace_manager,
             );
             next_index += 1;
         }
@@ -214,6 +215,7 @@ impl NodeExecutor for ParallelExecutor {
                     next_depth,
                     &ctx.workspace,
                     &ctx.run_snapshot,
+                    &ctx.workspace_manager,
                 );
                 next_index += 1;
             }
@@ -266,11 +268,13 @@ fn spawn_one(
     next_depth: u32,
     workspace: &std::path::Path,
     parent_snapshot: &Arc<crate::environment::runtime::RunSnapshot>,
+    workspace_manager: &Arc<crate::environment::runtime::workspace::WorkspaceManager>,
 ) {
     let item = items[index].clone();
     let engine = Arc::clone(engine);
     let workspace = workspace.to_path_buf();
     let parent_snapshot = Arc::clone(parent_snapshot);
+    let workspace_manager = Arc::clone(workspace_manager);
     let mut vars = base_vars.clone();
     let item_str = match &item {
         serde_json::Value::String(s) => s.clone(),
@@ -289,6 +293,7 @@ fn spawn_one(
                 Some(workspace),
                 "parallel-",
                 parent_snapshot,
+                workspace_manager,
             )
             .await;
         match res {

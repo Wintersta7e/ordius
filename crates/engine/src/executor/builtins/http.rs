@@ -709,6 +709,9 @@ mod tests {
             iteration: 1,
             attempt: AtomicU32::new(1),
             auto_resume: false,
+            workspace_manager: std::sync::Arc::new(
+                crate::environment::runtime::workspace::WorkspaceManager::new(),
+            ),
         };
         (engine, ctx, dir)
     }
@@ -897,6 +900,9 @@ mod tests {
             iteration: 1,
             attempt: AtomicU32::new(1),
             auto_resume: false,
+            workspace_manager: std::sync::Arc::new(
+                crate::environment::runtime::workspace::WorkspaceManager::new(),
+            ),
         };
         (ctx, dir)
     }

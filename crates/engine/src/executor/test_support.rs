@@ -101,6 +101,9 @@ pub(super) fn make_ctx() -> (RunContext, broadcast::Receiver<RunEvent>, TempDir)
         iteration: 1,
         attempt: AtomicU32::new(1),
         auto_resume: false,
+        workspace_manager: std::sync::Arc::new(
+            crate::environment::runtime::workspace::WorkspaceManager::new(),
+        ),
     };
     (ctx, rx, dir)
 }

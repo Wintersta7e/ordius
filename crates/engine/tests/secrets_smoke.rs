@@ -100,6 +100,9 @@ async fn template_resolves_secret_and_redacts_in_event_log() {
         iteration: 1,
         attempt: std::sync::atomic::AtomicU32::new(1),
         auto_resume: false,
+        workspace_manager: std::sync::Arc::new(
+            ordius_engine::environment::runtime::workspace::WorkspaceManager::new(),
+        ),
     };
 
     let executor = InProcessExecutor::new();
