@@ -1,0 +1,304 @@
+//! Transport seam for workspace file sync. Separate from `ssh::bootstrap::SftpOps`
+//! (helper-bootstrap-specific). Object-safe; opened per phase by a factory.
+
+use async_trait::async_trait;
+
+use super::super::error::DispatchError;
+
+// ── Supporting types ──────────────────────────────────────────────────────────
+
+/// Whether a filesystem entry is a regular file, directory, or symbolic link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    /// Regular file.
+    File,
+    /// Directory.
+    Dir,
+    /// Symbolic link (not followed).
+    Symlink,
+}
+
+/// Lightweight metadata for a single filesystem entry returned by
+/// [`WorkspaceTransport::list_tree`] and [`WorkspaceTransport::stat`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileMeta {
+    /// Path relative to the workspace root passed to the originating call.
+    pub rel_path: String,
+    /// Whether this entry is a file, directory, or symlink.
+    pub kind: FileKind,
+    /// Size in bytes. Zero for directories.
+    pub size: u64,
+    /// Unix permission bits (e.g. `0o644`). Zero when unavailable.
+    pub mode: u32,
+}
+
+// ── Factory trait ─────────────────────────────────────────────────────────────
+
+/// Opens a fresh [`WorkspaceTransport`] per reconcile phase.
+///
+/// A single SFTP/connection session must not be held for an entire run because
+/// idle sessions can time out. Callers request a new transport at the start of
+/// each sync phase and drop it when done. Object-safe via `Arc<dyn ..>`.
+#[async_trait]
+pub trait WorkspaceTransportFactory: Send + Sync {
+    /// Open a fresh transport session for one reconcile phase.
+    async fn open(&self) -> Result<Box<dyn WorkspaceTransport>, DispatchError>;
+}
+
+// ── Transport trait ───────────────────────────────────────────────────────────
+
+/// File operations against one environment's filesystem.
+///
+/// Paths are relative to the env-side workspace root the caller resolved.
+/// Implementations need not be `Clone` — the factory reopens as needed.
+#[async_trait]
+pub trait WorkspaceTransport: Send {
+    /// Create a directory (and parents) at `rel`. No-op if it already exists.
+    async fn mkdir(&self, rel: &str) -> Result<(), DispatchError>;
+
+    /// Write `bytes` to the file at `rel`, creating or replacing it.
+    async fn upload_file(&self, rel: &str, bytes: &[u8]) -> Result<(), DispatchError>;
+
+    /// Read and return the full contents of the file at `rel`.
+    async fn download_file(&self, rel: &str) -> Result<Vec<u8>, DispatchError>;
+
+    /// Recursive listing rooted at `rel` (`""` = root).
+    /// Directories and symlinks are included alongside regular files.
+    async fn list_tree(&self, rel: &str) -> Result<Vec<FileMeta>, DispatchError>;
+
+    /// Return metadata for `rel`, or `None` if the path does not exist.
+    /// Does not follow symlinks — a symlink is reported as [`FileKind::Symlink`].
+    async fn stat(&self, rel: &str) -> Result<Option<FileMeta>, DispatchError>;
+
+    /// Return the target of the symlink at `rel`.
+    async fn read_link(&self, rel: &str) -> Result<String, DispatchError>;
+
+    /// Rename / move `from` to `to` (atomic on the same filesystem).
+    async fn rename(&self, from: &str, to: &str) -> Result<(), DispatchError>;
+
+    /// Remove the regular file at `rel`.
+    async fn remove_file(&self, rel: &str) -> Result<(), DispatchError>;
+
+    /// Remove the (empty) directory at `rel`.
+    async fn remove_dir(&self, rel: &str) -> Result<(), DispatchError>;
+
+    /// Set Unix permission bits on `rel`.
+    async fn set_permissions(&self, rel: &str, mode: u32) -> Result<(), DispatchError>;
+}
+
+// ── In-memory fake ────────────────────────────────────────────────────────────
+
+/// In-memory `WorkspaceTransport` for unit tests.
+///
+/// Backed by a shared `Arc<Mutex<..>>` so clones share the same state.
+/// `mkdir` records a dir entry; `upload_file` records bytes; `list_tree`
+/// returns all entries whose `rel_path` is rooted under the given prefix;
+/// `set_permissions` records the mode but is otherwise a no-op;
+/// `read_link` always returns `DispatchError::Unsupported`.
+///
+/// Gated on `#[cfg(any(test, feature = "testing"))]` to match the existing
+/// fake convention in `fake.rs`.
+#[cfg(any(test, feature = "testing"))]
+mod fake_impl {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use parking_lot::Mutex;
+
+    use super::{DispatchError, FileKind, FileMeta, WorkspaceTransport};
+
+    #[derive(Debug, Default, Clone)]
+    struct FakeFs {
+        /// file path → contents
+        files: BTreeMap<String, Vec<u8>>,
+        /// file path → mode
+        modes: BTreeMap<String, u32>,
+        /// explicit dir entries (mkdir)
+        dirs: BTreeSet<String>,
+    }
+
+    /// In-memory fake for [`WorkspaceTransport`]. Clones share state.
+    #[derive(Debug, Clone, Default)]
+    pub struct FakeWorkspaceTransport {
+        inner: Arc<Mutex<FakeFs>>,
+    }
+
+    #[async_trait]
+    impl WorkspaceTransport for FakeWorkspaceTransport {
+        async fn mkdir(&self, rel: &str) -> Result<(), DispatchError> {
+            self.inner.lock().dirs.insert(rel.to_owned());
+            Ok(())
+        }
+
+        async fn upload_file(&self, rel: &str, bytes: &[u8]) -> Result<(), DispatchError> {
+            let mut fs = self.inner.lock();
+            // Ensure parent dir entries exist implicitly.
+            if let Some(parent) = rel.rsplit_once('/').map(|(p, _)| p) {
+                fs.dirs.insert(parent.to_owned());
+            }
+            fs.files.insert(rel.to_owned(), bytes.to_vec());
+            drop(fs);
+            Ok(())
+        }
+
+        async fn download_file(&self, rel: &str) -> Result<Vec<u8>, DispatchError> {
+            self.inner.lock().files.get(rel).cloned().ok_or_else(|| {
+                DispatchError::WorkspaceUnavailable {
+                    env_id: "fake".into(),
+                    reason: format!("file not found: {rel}"),
+                }
+            })
+        }
+
+        async fn list_tree(&self, rel: &str) -> Result<Vec<FileMeta>, DispatchError> {
+            let prefix = if rel.is_empty() {
+                String::new()
+            } else {
+                format!("{rel}/")
+            };
+
+            let mut entries: Vec<FileMeta> = Vec::new();
+
+            {
+                let fs = self.inner.lock();
+                for path in &fs.dirs {
+                    if rel.is_empty() || path == rel || path.starts_with(&prefix) {
+                        entries.push(FileMeta {
+                            rel_path: path.clone(),
+                            kind: FileKind::Dir,
+                            size: 0,
+                            mode: *fs.modes.get(path).unwrap_or(&0o755),
+                        });
+                    }
+                }
+                for (path, data) in &fs.files {
+                    if rel.is_empty() || path.starts_with(&prefix) {
+                        entries.push(FileMeta {
+                            rel_path: path.clone(),
+                            kind: FileKind::File,
+                            size: data.len() as u64,
+                            mode: *fs.modes.get(path).unwrap_or(&0o644),
+                        });
+                    }
+                }
+            }
+
+            Ok(entries)
+        }
+
+        async fn stat(&self, rel: &str) -> Result<Option<FileMeta>, DispatchError> {
+            let fs = self.inner.lock();
+            let result = fs.files.get(rel).map_or_else(
+                || {
+                    fs.dirs.contains(rel).then(|| FileMeta {
+                        rel_path: rel.to_owned(),
+                        kind: FileKind::Dir,
+                        size: 0,
+                        mode: *fs.modes.get(rel).unwrap_or(&0o755),
+                    })
+                },
+                |data| {
+                    Some(FileMeta {
+                        rel_path: rel.to_owned(),
+                        kind: FileKind::File,
+                        size: data.len() as u64,
+                        mode: *fs.modes.get(rel).unwrap_or(&0o644),
+                    })
+                },
+            );
+            drop(fs);
+            Ok(result)
+        }
+
+        async fn read_link(&self, rel: &str) -> Result<String, DispatchError> {
+            Err(DispatchError::Unsupported(format!(
+                "FakeWorkspaceTransport does not support symlinks (read_link: {rel})"
+            )))
+        }
+
+        async fn rename(&self, from: &str, to: &str) -> Result<(), DispatchError> {
+            let mut fs = self.inner.lock();
+            if let Some(data) = fs.files.remove(from) {
+                fs.files.insert(to.to_owned(), data);
+                if let Some(mode) = fs.modes.remove(from) {
+                    fs.modes.insert(to.to_owned(), mode);
+                }
+                drop(fs);
+                return Ok(());
+            }
+            if fs.dirs.remove(from) {
+                fs.dirs.insert(to.to_owned());
+                drop(fs);
+                return Ok(());
+            }
+            drop(fs);
+            Err(DispatchError::WorkspaceUnavailable {
+                env_id: "fake".into(),
+                reason: format!("rename source not found: {from}"),
+            })
+        }
+
+        async fn remove_file(&self, rel: &str) -> Result<(), DispatchError> {
+            let mut fs = self.inner.lock();
+            fs.files
+                .remove(rel)
+                .ok_or_else(|| DispatchError::WorkspaceUnavailable {
+                    env_id: "fake".into(),
+                    reason: format!("file not found: {rel}"),
+                })?;
+            fs.modes.remove(rel);
+            drop(fs);
+            Ok(())
+        }
+
+        async fn remove_dir(&self, rel: &str) -> Result<(), DispatchError> {
+            let mut fs = self.inner.lock();
+            if fs.dirs.remove(rel) {
+                fs.modes.remove(rel);
+                drop(fs);
+                Ok(())
+            } else {
+                drop(fs);
+                Err(DispatchError::WorkspaceUnavailable {
+                    env_id: "fake".into(),
+                    reason: format!("dir not found: {rel}"),
+                })
+            }
+        }
+
+        async fn set_permissions(&self, rel: &str, mode: u32) -> Result<(), DispatchError> {
+            self.inner.lock().modes.insert(rel.to_owned(), mode);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+pub use fake_impl::FakeWorkspaceTransport;
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fake_transport_round_trip() {
+        let t = FakeWorkspaceTransport::default();
+        t.mkdir("a").await.unwrap();
+        t.upload_file("a/f.txt", b"hello").await.unwrap();
+        let got = t.download_file("a/f.txt").await.unwrap();
+        assert_eq!(got, b"hello");
+        let listing = t.list_tree("a").await.unwrap();
+        assert!(
+            listing
+                .iter()
+                .any(|m| m.rel_path == "a/f.txt" && m.kind == FileKind::File)
+        );
+        let md = t.stat("a/f.txt").await.unwrap().unwrap();
+        assert_eq!(md.size, 5);
+        t.remove_file("a/f.txt").await.unwrap();
+        assert!(t.stat("a/f.txt").await.unwrap().is_none());
+    }
+}

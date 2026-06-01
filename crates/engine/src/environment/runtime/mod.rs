@@ -29,6 +29,8 @@ pub mod ssh;
 pub mod transport;
 pub mod user_file;
 pub mod workflow_scope;
+/// Workspace file-sync transport traits, supporting types, and test fake.
+pub mod workspace;
 pub mod wsl;
 
 /// Test-support fixtures (requires `features = ["testing"]` or `#[cfg(test)]`).
