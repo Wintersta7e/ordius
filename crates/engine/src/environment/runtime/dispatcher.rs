@@ -52,6 +52,15 @@ pub trait Dispatcher: Send + Sync {
     /// `Arc<dyn HttpTransport>` keeps the trait object-safe.
     fn http_transport(&self) -> Arc<dyn HttpTransport>;
 
+    /// Factory for this env's workspace file transport, or `None` if the env
+    /// shares the host filesystem (Local/WSL) and needs no transfer.
+    ///
+    /// Only SSH overrides this; all other dispatchers return `None` via the
+    /// default implementation.
+    fn workspace_transport(&self) -> Option<Arc<dyn super::workspace::WorkspaceTransportFactory>> {
+        None
+    }
+
     /// Translate a host-side `Path` to an env-local `EnvPath`.
     /// For `Local` this is an identity; for WSL it maps `/mnt/...`.
     fn translate_path(&self, host_path: &Path) -> Result<EnvPath, DispatchError>;

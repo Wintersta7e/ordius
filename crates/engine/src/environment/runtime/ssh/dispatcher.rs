@@ -100,19 +100,6 @@ impl SshDispatcher {
         }
     }
 
-    /// Build an [`SshSftpTransportFactory`] that opens SFTP sessions over this
-    /// dispatcher's cached connection.
-    ///
-    /// Gated on the `testing` feature so integration tests can exercise the
-    /// transport without exposing the internal `cache` field.
-    #[cfg(feature = "testing")]
-    pub fn sftp_transport_factory(&self) -> super::workspace::SshSftpTransportFactory {
-        super::workspace::SshSftpTransportFactory::new(
-            Arc::clone(&self.cache),
-            self.env_info.id.to_string(),
-        )
-    }
-
     /// Bootstrap with an explicit triple (used from integration tests and T10).
     #[allow(dead_code)] // used starting T10
     pub(crate) async fn bootstrap_helper_with_triple(
@@ -459,6 +446,18 @@ impl Dispatcher for SshDispatcher {
         Arc::clone(&self.transport)
     }
 
+    fn workspace_transport(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::environment::runtime::workspace::WorkspaceTransportFactory>>
+    {
+        Some(std::sync::Arc::new(
+            super::workspace::SshSftpTransportFactory::new(
+                Arc::clone(&self.cache),
+                self.env_info.id.to_string(),
+            ),
+        ))
+    }
+
     fn translate_path(&self, host_path: &Path) -> Result<EnvPath, DispatchError> {
         // Remote hosts share no filesystem with the host; path translation is a
         // workspace-sync concern deferred past T10.
@@ -467,5 +466,83 @@ impl Dispatcher for SshDispatcher {
             reason: "SSH path translation is deferred (compute-first; workspace sync not wired)"
                 .into(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use crate::environment::runtime::dispatcher::Dispatcher as _;
+    use crate::environment::runtime::env::{EnvId, EnvInfo, EnvSpec, EnvState};
+    use crate::environment::runtime::fake::FakeRemoteDispatcher;
+    use crate::secrets::Store;
+
+    use super::super::config::SshConfig;
+    use super::SshDispatcher;
+    use crate::environment::runtime::SshAuth;
+
+    fn fake_info(label: &str) -> EnvInfo {
+        EnvInfo {
+            id: EnvId::new(format!("fake:{label}")),
+            label: label.into(),
+            spec: EnvSpec::Local {
+                resources: vec![],
+                host_direct_verifications: HashMap::default(),
+            },
+            state: EnvState::Reachable,
+            enabled: true,
+        }
+    }
+
+    /// Build a minimal `SshDispatcher` without opening any connection.
+    ///
+    /// `SshDispatcher::new` is lazy — the actual TCP connect happens on first
+    /// use, so this is safe in a unit test.
+    fn make_ssh_dispatcher() -> SshDispatcher {
+        // Use `keyring`'s in-memory sample store so the unit test doesn't
+        // touch the OS keychain.
+        drop(keyring::use_sample_store(&std::collections::HashMap::from(
+            [("persist", "false")],
+        )));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(Store::with_index_path(tmp.path().join("secrets.json")));
+
+        let auth = SshAuth::Password {
+            secret_ref: crate::environment::runtime::env::SecretRef("test-pw".into()),
+        };
+        let spec = crate::environment::runtime::EnvSpec::Ssh {
+            host: "127.0.0.1".into(),
+            port: 22,
+            user: "test".into(),
+            auth,
+            host_key_pins: vec![],
+            resources: vec![],
+        };
+        let info = EnvInfo {
+            id: EnvId::ssh("unit-test"),
+            label: "unit test ssh".into(),
+            spec: spec.clone(),
+            state: crate::environment::runtime::EnvState::Probing,
+            enabled: true,
+        };
+        let cfg = SshConfig::from_spec(&spec).expect("SshConfig from ssh spec");
+        SshDispatcher::new(info, cfg, store)
+    }
+
+    #[tokio::test]
+    async fn ssh_exposes_workspace_transport_others_do_not() {
+        let ssh = make_ssh_dispatcher();
+        assert!(
+            ssh.workspace_transport().is_some(),
+            "SshDispatcher must return Some from workspace_transport()"
+        );
+
+        let fake = FakeRemoteDispatcher::new(fake_info("x"));
+        assert!(
+            fake.workspace_transport().is_none(),
+            "FakeRemoteDispatcher must return None from workspace_transport()"
+        );
     }
 }

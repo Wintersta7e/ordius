@@ -19,7 +19,6 @@ use ordius_engine::environment::runtime::ssh::SshDispatcher;
 use ordius_engine::environment::runtime::ssh::config::SshConfig;
 use ordius_engine::environment::runtime::ssh::host_key::HostKeyHandler;
 use ordius_engine::environment::runtime::transport::Stdio;
-use ordius_engine::environment::runtime::workspace::transport::WorkspaceTransportFactory as _;
 use ordius_engine::environment::runtime::{
     EnvId, EnvInfo, EnvSpec, EnvState, ProbePlan, ProcessCmd, SshAuth,
 };
@@ -324,7 +323,9 @@ async fn real_ssh_workspace_transport_round_trip() {
         return;
     };
 
-    let factory = dispatcher.sftp_transport_factory();
+    let factory = dispatcher
+        .workspace_transport()
+        .expect("SshDispatcher must expose a workspace transport");
     let t = factory.open().await.expect("open sftp transport");
 
     // mkdir (with parent creation)
