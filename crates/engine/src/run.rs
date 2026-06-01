@@ -16,7 +16,7 @@
 //! `workflow:done` / `workflow:error` / `workflow:stopped`.
 
 use crate::emitter::Emitter;
-use crate::environment::runtime::workspace::WorkspaceManager;
+use crate::environment::runtime::workspace::{RunOutcome, WorkspaceManager};
 use crate::events::{EventType, RunEvent};
 use crate::executor::builtins::condition::NODE_TYPE_ID as CONDITION_NODE_TYPE_ID;
 use crate::executor::{Dispatcher, NodeError, NodeExecutor, RunContext, wrap_process_env};
@@ -24,6 +24,7 @@ use crate::recorder::{NodeRunRow, RunRecorder};
 use crate::scheduler::Scheduler;
 use crate::types::{BackoffStrategy, EdgeType, PortValue, RetryOn, RetryPolicy, Workflow};
 use crate::{Engine, EngineError, Result};
+use futures::FutureExt; // `catch_unwind` on the run-loop future
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,6 +45,15 @@ pub struct RunSummary {
     pub status: String,
     /// Number of `node_runs` rows persisted across the run.
     pub node_runs: usize,
+}
+
+/// Map a terminal `RunSummary::status` to a [`RunOutcome`].
+fn outcome_from_status(status: &str) -> RunOutcome {
+    match status {
+        "stopped" => RunOutcome::CancelledByUser,
+        "done" => RunOutcome::Completed,
+        _ => RunOutcome::Failed,
+    }
 }
 
 /// RAII guard that drops the run's entry from `Engine::run_snapshots`
@@ -78,6 +88,10 @@ pub struct RunHandle {
     /// Task handle for the run loop. Awaiting it surfaces the
     /// `RunSummary` (or a join error if the task panicked).
     pub join: tokio::task::JoinHandle<Result<RunSummary>>,
+    /// Test-only seam: the run's `WorkspaceManager`, so tests can
+    /// observe the `RunOutcome` handed to `teardown_all` after join.
+    #[cfg(any(test, feature = "testing"))]
+    pub workspace_manager: Arc<WorkspaceManager>,
 }
 
 impl Engine {
@@ -262,6 +276,13 @@ impl Engine {
         let engine = Arc::clone(self);
         let snap_run_id = rec.run_id.clone();
         let workspace_manager = Arc::new(WorkspaceManager::new());
+        // Clones for the teardown path: the manager (moved into the run
+        // loop) and the cancel token (used to classify a panic that
+        // unwinds before a `RunSummary` is produced).
+        let wm_teardown = Arc::clone(&workspace_manager);
+        let cancel_for_outcome = cancel.clone();
+        #[cfg(any(test, feature = "testing"))]
+        let wm_handle = Arc::clone(&workspace_manager);
         let join = tokio::spawn(async move {
             // RAII guard: removes the `run_snapshots` entry on Drop, so
             // a panicking run loop or `?`-propagation also cleans up.
@@ -269,21 +290,42 @@ impl Engine {
                 engine: Arc::clone(&engine),
                 run_id: snap_run_id,
             };
-            let res = engine
-                .run_loop_inner(
-                    wf,
-                    rec.clone(),
-                    em,
-                    workspace,
-                    variables,
-                    cancel,
-                    auto_resume_checkpoints,
-                    0,
-                    run_snapshot,
-                    workspace_manager,
-                )
-                .await
-                .map(|(summary, _outputs)| summary);
+            // Run the loop under `catch_unwind` so teardown fires on a
+            // panic too. `AssertUnwindSafe` is sound here: on a panic we
+            // re-`resume_unwind` rather than observing the (possibly
+            // inconsistent) captured state, so behaviour is unchanged.
+            let caught = std::panic::AssertUnwindSafe(engine.run_loop_inner(
+                wf,
+                rec.clone(),
+                em,
+                workspace,
+                variables,
+                cancel,
+                auto_resume_checkpoints,
+                0,
+                run_snapshot,
+                workspace_manager,
+            ))
+            .catch_unwind()
+            .await;
+
+            // Classify the outcome for teardown, then run teardown
+            // BEFORE the sender/token/lock cleanup. In this task
+            // `teardown_all` is a no-op stub, so net behaviour is
+            // unchanged.
+            let outcome = match &caught {
+                Ok(Ok((summary, _outputs))) => outcome_from_status(&summary.status),
+                Ok(Err(_)) => RunOutcome::Failed,
+                Err(_) => {
+                    if cancel_for_outcome.is_cancelled() {
+                        RunOutcome::CancelledByUser
+                    } else {
+                        RunOutcome::Failed
+                    }
+                },
+            };
+            wm_teardown.teardown_all(outcome).await;
+
             engine
                 .run_senders
                 .lock()
@@ -294,15 +336,22 @@ impl Engine {
                 .lock()
                 .expect("engine run_tokens mutex poisoned")
                 .remove(&rec.run_id);
-            let release = rec.release_lock();
-            drop(release);
-            res
+            drop(rec.release_lock());
+
+            // Re-propagate a panic so the join handle still reports it;
+            // otherwise hand back the run loop's `Result<RunSummary>`.
+            match caught {
+                Ok(res) => res.map(|(summary, _outputs)| summary),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
         });
 
         Ok(RunHandle {
             run_id,
             event_rx: rx,
             join,
+            #[cfg(any(test, feature = "testing"))]
+            workspace_manager: wm_handle,
         })
     }
 
@@ -1866,6 +1915,74 @@ mod tests {
         );
         let summary = handle.join.await.expect("join").expect("run ok");
         assert_eq!(summary.status, "stopped");
+    }
+
+    /// A clean run drives `WorkspaceManager::teardown_all` with
+    /// `RunOutcome::Completed`. Observed via the test-only
+    /// `last_outcome` seam, exposed on the handle under `cfg(test)`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn teardown_records_completed_outcome_on_clean_run() {
+        let dir = TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+        let wf = Arc::new(minimal_workflow());
+
+        let handle = engine
+            .start_run(wf, HashMap::new(), "test", false, None)
+            .expect("start_run");
+        let manager = Arc::clone(&handle.workspace_manager);
+        let summary = handle.join.await.expect("join").expect("run ok");
+        assert_eq!(summary.status, "done");
+        assert_eq!(
+            *manager.last_outcome.lock().unwrap(),
+            Some(RunOutcome::Completed),
+        );
+    }
+
+    /// A user-cancelled run drives `teardown_all` with
+    /// `RunOutcome::CancelledByUser`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn teardown_records_cancelled_outcome_on_cancel() {
+        let dir = TempDir::new().unwrap();
+        let engine = Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+
+        // Long delay so cancellation arrives before it finishes.
+        let wf = Arc::new(Workflow {
+            id: "wf_cancel_outcome".into(),
+            name: "cancel".into(),
+            schema_version: 1,
+            created_at: None,
+            updated_at: None,
+            variables: HashMap::new(),
+            triggers: vec![],
+            nodes: vec![Node {
+                id: "slow".into(),
+                ty: "delay".into(),
+                name: String::new(),
+                config: HashMap::from([("ms".into(), serde_json::json!(5_000))]),
+                pos: Pos::default(),
+                timeout_ms: None,
+                retry: None,
+                continue_on_error: false,
+                target_env: None,
+            }],
+            edges: vec![],
+            resources: vec![],
+            default_env: None,
+        });
+
+        let handle = engine
+            .start_run(wf, HashMap::new(), "test", false, None)
+            .expect("start_run");
+        let run_id = handle.run_id.clone();
+        let manager = Arc::clone(&handle.workspace_manager);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(engine.cancel_run(&run_id), "cancel_run should find the run");
+        let summary = handle.join.await.expect("join").expect("run ok");
+        assert_eq!(summary.status, "stopped");
+        assert_eq!(
+            *manager.last_outcome.lock().unwrap(),
+            Some(RunOutcome::CancelledByUser),
+        );
     }
 
     /// Regression test for the bug Codex flagged: a per-attempt
