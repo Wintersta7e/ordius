@@ -518,6 +518,7 @@ mod tests {
             user: "test".into(),
             auth,
             host_key_pins: vec![],
+            workspace_binding: crate::environment::runtime::env::WorkspaceBinding::Unsupported,
             resources: vec![],
         };
         let info = EnvInfo {

@@ -20,7 +20,7 @@ use ordius_engine::environment::runtime::ssh::config::SshConfig;
 use ordius_engine::environment::runtime::ssh::host_key::HostKeyHandler;
 use ordius_engine::environment::runtime::transport::Stdio;
 use ordius_engine::environment::runtime::{
-    EnvId, EnvInfo, EnvSpec, EnvState, ProbePlan, ProcessCmd, SshAuth,
+    EnvId, EnvInfo, EnvSpec, EnvState, ProbePlan, ProcessCmd, SshAuth, WorkspaceBinding,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -135,6 +135,7 @@ async fn real_ssh_probe_exec_and_cancel() {
         user: user.clone(),
         auth: auth.clone(),
         host_key_pins: vec![pin],
+        workspace_binding: WorkspaceBinding::Unsupported,
         resources: Vec::new(),
     };
     let info = EnvInfo {
@@ -300,6 +301,7 @@ async fn build_dispatcher_for_transport_test() -> Option<SshDispatcher> {
         user,
         auth,
         host_key_pins: vec![pin],
+        workspace_binding: WorkspaceBinding::Unsupported,
         resources: Vec::new(),
     };
     let info = EnvInfo {

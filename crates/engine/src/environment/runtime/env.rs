@@ -133,6 +133,11 @@ pub const fn default_ssh_port() -> u16 {
     22
 }
 
+/// Default workspace binding for SSH environments: no sync until explicitly configured.
+const fn default_ssh_workspace_binding() -> WorkspaceBinding {
+    WorkspaceBinding::Unsupported
+}
+
 /// Newtype for a run id, kept here so `env.rs` does not depend on `run.rs`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RunId(
@@ -209,6 +214,11 @@ pub enum EnvSpec {
         /// Inline TOFU host-key pins.
         #[serde(default)]
         host_key_pins: Vec<SshHostKeyPin>,
+        /// Workspace binding strategy for the SSH environment. Defaults to
+        /// `Unsupported` (no sync) so existing specs keep today's behavior;
+        /// opt in with `Sync { strategy: Sftp, .. }`.
+        #[serde(default = "default_ssh_workspace_binding")]
+        workspace_binding: WorkspaceBinding,
         /// Resources scoped to this environment.
         #[serde(default)]
         resources: Vec<ResourceDefinition>,
@@ -450,6 +460,7 @@ mod tests {
             user,
             auth,
             host_key_pins,
+            workspace_binding,
             resources,
         } = spec
         else {
@@ -466,6 +477,7 @@ mod tests {
             } if name == "ssh-devbox-password"
         ));
         assert!(host_key_pins.is_empty());
+        assert_eq!(workspace_binding, WorkspaceBinding::Unsupported);
         assert!(resources.is_empty());
     }
 
@@ -531,5 +543,45 @@ mod tests {
         };
         assert!(matches!(pol, WriteBackPolicy::SafeOrDiverge { .. }));
         drop(serde_json::to_string(&pol).unwrap());
+    }
+
+    #[test]
+    fn ssh_spec_without_workspace_binding_defaults_to_unsupported() {
+        let json = r#"{
+            "type":"ssh",
+            "host":"h",
+            "user":"u",
+            "auth":{"method":"agent"}
+        }"#;
+        let spec: EnvSpec = serde_json::from_str(json).unwrap();
+        match spec {
+            EnvSpec::Ssh {
+                workspace_binding, ..
+            } => assert_eq!(workspace_binding, WorkspaceBinding::Unsupported),
+            _ => panic!("expected Ssh"),
+        }
+    }
+
+    #[test]
+    fn ssh_spec_round_trips_sync_binding() {
+        let spec = EnvSpec::Ssh {
+            host: "remote.example.com".into(),
+            port: 22,
+            user: "dev".into(),
+            auth: SshAuth::Agent {
+                public_key_path: None,
+                fingerprint: None,
+            },
+            host_key_pins: vec![],
+            workspace_binding: WorkspaceBinding::Sync {
+                env_path_template: "/home/dev/ws/{{workflow_id}}".into(),
+                strategy: SyncStrategy::Sftp,
+                write_back: WriteBackPolicy::Force { ignore: vec![] },
+            },
+            resources: vec![],
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: EnvSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(spec, back);
     }
 }

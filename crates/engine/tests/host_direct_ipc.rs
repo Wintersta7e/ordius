@@ -18,7 +18,7 @@ use ordius_engine::environment::runtime::boot_probe::load_spec_single;
 use ordius_engine::environment::runtime::{
     ApiFlavor, Capability, EnvId, EnvSpec, HostDirectMethod, HostDirectVerification,
     HttpProbeMethod, HttpProbeRoute, ProbeSpec, ResourceDefinition, ResourceId, ResourceKind,
-    SecretRef, SshAuth,
+    SecretRef, SshAuth, WorkspaceBinding,
 };
 use tokio::time::timeout;
 use wiremock::matchers::{method, path};
@@ -267,6 +267,7 @@ async fn enable_host_direct_ssh_kind_rejects() {
                     secret_ref: SecretRef("ssh-test".into()),
                 },
                 host_key_pins: vec![],
+                workspace_binding: WorkspaceBinding::Unsupported,
                 resources: vec![],
             },
         )
