@@ -250,35 +250,6 @@ impl std::fmt::Display for EnvPath {
     }
 }
 
-/// RAII handle returned from `Dispatcher::prepare_workspace`.
-///
-/// Dropping the handle triggers the teardown closure, which may perform
-/// operations such as rsync write-back for SSH environments or unmounting
-/// bind-mount overlays for container environments.
-pub struct WorkspaceHandle {
-    /// The path on the env side where the workspace is available.
-    pub env_path: EnvPath,
-    /// Optional teardown closure. Runs exactly once on drop.
-    pub teardown: Option<Box<dyn FnOnce() + Send>>,
-}
-
-impl std::fmt::Debug for WorkspaceHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WorkspaceHandle")
-            .field("env_path", &self.env_path)
-            .field("teardown", &self.teardown.as_ref().map(|_| "<fn>"))
-            .finish()
-    }
-}
-
-impl Drop for WorkspaceHandle {
-    fn drop(&mut self) {
-        if let Some(td) = self.teardown.take() {
-            td();
-        }
-    }
-}
-
 /// Execute an `HttpRequest` against a shared `reqwest::Client`.
 ///
 /// Used by `LocalHttpTransport` and by `WslHttpTransport`'s
@@ -469,21 +440,5 @@ mod tests {
     fn env_path_displays_inner() {
         let p = EnvPath::new("/home/user");
         assert_eq!(p.as_str(), "/home/user");
-    }
-
-    #[test]
-    fn workspace_handle_drop_fires_teardown() {
-        use std::sync::{Arc, Mutex};
-        let fired = Arc::new(Mutex::new(false));
-        let fired_clone = Arc::clone(&fired);
-        {
-            let _handle = WorkspaceHandle {
-                env_path: EnvPath::new("/tmp/ws"),
-                teardown: Some(Box::new(move || {
-                    *fired_clone.lock().unwrap() = true;
-                })),
-            };
-        }
-        assert!(*fired.lock().unwrap(), "teardown should have fired on drop");
     }
 }

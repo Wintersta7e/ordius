@@ -12,13 +12,13 @@ use super::catalog::{
     ProvenRoute, ResourceCatalog, ResourceDetail, ResourceProbeOutcome, RouteOrigin,
 };
 use super::dispatcher::{Dispatcher, HttpTransport, ResponseStream};
-use super::env::{EnvInfo, RunId, WorkspaceBinding};
+use super::env::EnvInfo;
 use super::error::DispatchError;
 use super::plan::{ProbePlan, ProbeSummary};
 use super::resource::{HttpProbeMethod, HttpProbeRoute, ProbeSpec, ResourceDefinition};
 use super::transport::{
     EnvPath, HttpError, HttpMethod, HttpRequest, HttpResponse, LocalProcess, ProcessCmd,
-    Stdio as ProcessStdio, WorkspaceHandle,
+    Stdio as ProcessStdio,
 };
 
 const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -85,8 +85,6 @@ impl HttpTransport for LocalHttpTransport {
 /// access, direct network loopback, host `PATH`.
 ///
 /// `translate_path` is the identity — host paths are already env paths.
-/// `prepare_workspace` accepts only `WorkspaceBinding::Shared`; other
-/// bindings (`Translated`, `BindMount`, `Sync`) have no meaning on the local env.
 #[derive(Debug)]
 pub struct LocalDispatcher {
     /// Metadata about this environment (id, label, spec, state).
@@ -248,26 +246,6 @@ impl Dispatcher for LocalDispatcher {
     /// Identity translation: the local env shares the host filesystem.
     fn translate_path(&self, host_path: &Path) -> Result<EnvPath, DispatchError> {
         Ok(EnvPath::new(host_path.to_string_lossy().into_owned()))
-    }
-
-    /// For `WorkspaceBinding::Shared` the env path equals the host path and
-    /// no teardown is needed. Any other binding is unsupported on the local env.
-    async fn prepare_workspace(
-        &self,
-        workspace_host: &Path,
-        binding: &WorkspaceBinding,
-        _run_id: &RunId,
-    ) -> Result<WorkspaceHandle, DispatchError> {
-        match binding {
-            WorkspaceBinding::Shared => Ok(WorkspaceHandle {
-                env_path: EnvPath::new(workspace_host.to_string_lossy().into_owned()),
-                teardown: None,
-            }),
-            other => Err(DispatchError::WorkspaceUnavailable {
-                env_id: self.info.id.to_string(),
-                reason: format!("LocalDispatcher only supports Shared binding, got {other:?}"),
-            }),
-        }
     }
 }
 
@@ -647,17 +625,6 @@ mod tests {
         let host = PathBuf::from("/some/path");
         let env_path = d.translate_path(&host).expect("ok");
         assert_eq!(env_path.as_str(), "/some/path");
-    }
-
-    #[tokio::test]
-    async fn local_prepare_workspace_shared_is_noop() {
-        let d = LocalDispatcher::new(local_info());
-        let host = PathBuf::from("/workspaces/wf");
-        let handle = d
-            .prepare_workspace(&host, &WorkspaceBinding::Shared, &RunId("r1".into()))
-            .await
-            .expect("ok");
-        assert_eq!(handle.env_path.as_str(), "/workspaces/wf");
     }
 
     #[tokio::test]

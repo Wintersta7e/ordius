@@ -26,13 +26,11 @@ use super::catalog::{
     ProvenRoute, ResourceCatalog, ResourceDetail, ResourceProbeOutcome, RouteOrigin,
 };
 use super::dispatcher::{Dispatcher, HttpTransport, ResponseStream};
-use super::env::{EnvInfo, RunId, WorkspaceBinding};
+use super::env::EnvInfo;
 use super::error::DispatchError;
 use super::plan::{ProbePlan, ProbeSummary};
 use super::resource::{Capability, ProbeSpec, ResourceDefinition, ResourceId};
-use super::transport::{
-    EnvPath, HttpError, HttpRequest, HttpResponse, ProcessCmd, WorkspaceHandle,
-};
+use super::transport::{EnvPath, HttpError, HttpRequest, HttpResponse, ProcessCmd};
 
 // ── FakeResource ─────────────────────────────────────────────────────────────
 
@@ -233,35 +231,6 @@ impl Dispatcher for FakeRemoteDispatcher {
             "/fake/{}",
             host_path.to_string_lossy().trim_start_matches('/'),
         )))
-    }
-
-    /// Supports `Translated` and `BindMount` workspace bindings only.
-    ///
-    /// Other bindings return `WorkspaceUnavailable` — those require real
-    /// network I/O (`Sync`) or are meaningless for a fake (`Shared`).
-    async fn prepare_workspace(
-        &self,
-        workspace_host: &Path,
-        binding: &WorkspaceBinding,
-        run_id: &RunId,
-    ) -> Result<WorkspaceHandle, DispatchError> {
-        match binding {
-            WorkspaceBinding::Translated => Ok(WorkspaceHandle {
-                env_path: self.translate_path(workspace_host)?,
-                teardown: None,
-            }),
-            WorkspaceBinding::BindMount { env_path } => Ok(WorkspaceHandle {
-                // "{run_id}" is a template placeholder in the stored string,
-                // not a Rust format argument — suppress the lint.
-                #[allow(clippy::literal_string_with_formatting_args)]
-                env_path: EnvPath::new(env_path.replace("{run_id}", &run_id.0)),
-                teardown: None,
-            }),
-            other => Err(DispatchError::WorkspaceUnavailable {
-                env_id: self.info.id.to_string(),
-                reason: format!("FakeRemoteDispatcher does not support {other:?}"),
-            }),
-        }
     }
 }
 

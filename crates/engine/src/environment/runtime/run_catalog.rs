@@ -362,7 +362,7 @@ mod singleflight_tests {
         ResourceCatalog, ResourceDetail, ResourceProbeOutcome, RouteOrigin,
     };
     use super::super::dispatcher::{Dispatcher, HttpTransport};
-    use super::super::env::{EnvId, EnvInfo, EnvSpec, EnvState, RunId, WorkspaceBinding};
+    use super::super::env::{EnvId, EnvInfo, EnvSpec, EnvState};
     use super::super::error::DispatchError;
     use super::super::fake::{FakeHttpTransport, FakeRemoteDispatcher, FakeResource};
     use super::super::plan::{ProbePlan, ProbeSummary};
@@ -370,7 +370,7 @@ mod singleflight_tests {
         ApiFlavor, Capability, HttpProbeMethod, HttpProbeRoute, ProbeSpec, ResourceDefinition,
         ResourceId, ResourceKind,
     };
-    use super::super::transport::{EnvPath, ProcessCmd, WorkspaceHandle};
+    use super::super::transport::{EnvPath, ProcessCmd};
     use super::RunCatalog;
 
     fn local_info() -> EnvInfo {
@@ -487,15 +487,6 @@ mod singleflight_tests {
 
         fn translate_path(&self, _host_path: &Path) -> Result<EnvPath, DispatchError> {
             unimplemented!("GatedDispatcher::translate_path is not used by singleflight tests")
-        }
-
-        async fn prepare_workspace(
-            &self,
-            _workspace_host: &Path,
-            _binding: &WorkspaceBinding,
-            _run_id: &RunId,
-        ) -> Result<WorkspaceHandle, DispatchError> {
-            unimplemented!("GatedDispatcher::prepare_workspace is not used by singleflight tests")
         }
     }
 

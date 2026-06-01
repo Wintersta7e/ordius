@@ -15,12 +15,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::environment::runtime::catalog::{ResourceCatalog, ResourceProbeOutcome};
 use crate::environment::runtime::dispatcher::{Dispatcher, HttpTransport};
-use crate::environment::runtime::env::{EnvInfo, HostDirectVerification, RunId, WorkspaceBinding};
+use crate::environment::runtime::env::{EnvInfo, HostDirectVerification};
 use crate::environment::runtime::error::DispatchError;
 use crate::environment::runtime::plan::{ProbePlan, ProbeSummary};
 use crate::environment::runtime::resource::{ProbeSpec, ResourceDefinition, ResourceId};
 use crate::environment::runtime::transport::{
-    EnvPath, LocalProcess, ProcessCmd, Stdio as ProcessStdio, WorkspaceHandle,
+    EnvPath, LocalProcess, ProcessCmd, Stdio as ProcessStdio,
 };
 
 use super::bootstrap::BootstrappedHelper;
@@ -654,35 +654,6 @@ impl Dispatcher for WslDispatcher {
     fn translate_path(&self, host_path: &Path) -> Result<EnvPath, DispatchError> {
         super::path::translate_path(&self.distro_name, host_path)
     }
-
-    async fn prepare_workspace(
-        &self,
-        workspace_host: &Path,
-        binding: &WorkspaceBinding,
-        _run_id: &RunId,
-    ) -> Result<WorkspaceHandle, DispatchError> {
-        match binding {
-            WorkspaceBinding::Translated => {
-                let env_path = super::path::translate_path(&self.distro_name, workspace_host)?;
-                Ok(WorkspaceHandle {
-                    env_path,
-                    teardown: None,
-                })
-            },
-            WorkspaceBinding::Shared => Err(DispatchError::Unsupported(
-                "WSL distros cannot use Shared binding (host filesystem differs)".into(),
-            )),
-            WorkspaceBinding::BindMount { .. } => Err(DispatchError::Unsupported(
-                "BindMount binding is container-only".into(),
-            )),
-            WorkspaceBinding::Sync { .. } => Err(DispatchError::Unsupported(
-                "Sync binding is SSH-only (Phase G)".into(),
-            )),
-            WorkspaceBinding::Unsupported => Err(DispatchError::Unsupported(
-                "workspace binding declared Unsupported".into(),
-            )),
-        }
-    }
 }
 
 fn probe_timeout_ms(def: &ResourceDefinition) -> u64 {
@@ -759,49 +730,6 @@ mod tests {
         assert_eq!(d.info().id.as_str(), "wsl:Ubuntu");
         // Exercise the trait-bound check so the helper isn't dead code.
         assert_dispatcher_impl(&d);
-    }
-
-    #[tokio::test]
-    async fn translated_binding_returns_mapped_path() {
-        let d = WslDispatcher::new(info("Ubuntu"), "Ubuntu");
-        let host = std::path::PathBuf::from(r"C:\Users\me\runs\abc");
-        let run = crate::environment::runtime::env::RunId("abc".into());
-        let handle = d
-            .prepare_workspace(&host, &WorkspaceBinding::Translated, &run)
-            .await
-            .unwrap();
-        assert_eq!(handle.env_path.as_str(), "/mnt/c/Users/me/runs/abc");
-        drop(handle);
-    }
-
-    #[tokio::test]
-    async fn shared_binding_errors_on_wsl() {
-        let d = WslDispatcher::new(info("Ubuntu"), "Ubuntu");
-        let host = std::path::PathBuf::from(r"C:\Users\me\runs\abc");
-        let run = crate::environment::runtime::env::RunId("abc".into());
-        let err = d
-            .prepare_workspace(&host, &WorkspaceBinding::Shared, &run)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, DispatchError::Unsupported(_)));
-    }
-
-    #[tokio::test]
-    async fn bind_mount_binding_errors_on_wsl() {
-        let d = WslDispatcher::new(info("Ubuntu"), "Ubuntu");
-        let host = std::path::PathBuf::from(r"C:\x");
-        let run = crate::environment::runtime::env::RunId("a".into());
-        let err = d
-            .prepare_workspace(
-                &host,
-                &WorkspaceBinding::BindMount {
-                    env_path: "/work".into(),
-                },
-                &run,
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, DispatchError::Unsupported(_)));
     }
 
     #[test]

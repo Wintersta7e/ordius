@@ -17,16 +17,14 @@ use std::collections::HashMap;
 
 use ordius_helper::protocol::ProbeOutcomeV1;
 
+use crate::environment::runtime::EnvInfo;
 use crate::environment::runtime::catalog::{ResourceCatalog, ResourceProbeOutcome};
 use crate::environment::runtime::dispatcher::{Dispatcher, HttpTransport};
 use crate::environment::runtime::error::DispatchError;
 use crate::environment::runtime::helper_wire::wire_outcome_to_engine;
 use crate::environment::runtime::plan::{ProbePlan, ProbeSummary};
 use crate::environment::runtime::resource::{ResourceDefinition, ResourceId};
-use crate::environment::runtime::transport::{
-    EnvPath, EnvProcess, ProcessCmd, ProcessPipe, WorkspaceHandle,
-};
-use crate::environment::runtime::{EnvInfo, RunId, WorkspaceBinding};
+use crate::environment::runtime::transport::{EnvPath, EnvProcess, ProcessCmd, ProcessPipe};
 use crate::secrets::Store;
 
 use super::bootstrap::{RusshSftp, SshBootstrappedHelper, SshBootstrapper};
@@ -446,16 +444,5 @@ impl Dispatcher for SshDispatcher {
             reason: "SSH path translation is deferred (compute-first; workspace sync not wired)"
                 .into(),
         })
-    }
-
-    async fn prepare_workspace(
-        &self,
-        _workspace_host: &Path,
-        _binding: &WorkspaceBinding,
-        _run_id: &RunId,
-    ) -> Result<WorkspaceHandle, DispatchError> {
-        Err(DispatchError::Unsupported(
-            "SSH workspace preparation is deferred (compute-first; sync not wired)".into(),
-        ))
     }
 }

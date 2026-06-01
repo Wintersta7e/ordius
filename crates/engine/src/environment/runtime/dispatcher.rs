@@ -11,13 +11,11 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::catalog::ResourceProbeOutcome;
-use super::env::{EnvInfo, RunId, WorkspaceBinding};
+use super::env::EnvInfo;
 use super::error::DispatchError;
 use super::plan::{ProbePlan, ProbeSummary};
 use super::resource::ResourceDefinition;
-use super::transport::{
-    EnvPath, EnvProcess, HttpError, HttpRequest, HttpResponse, ProcessCmd, WorkspaceHandle,
-};
+use super::transport::{EnvPath, EnvProcess, HttpError, HttpRequest, HttpResponse, ProcessCmd};
 
 /// Async object-safe trait implemented by every env type.
 /// Callers hold `Arc<dyn Dispatcher>` and never need to know the concrete type.
@@ -57,16 +55,6 @@ pub trait Dispatcher: Send + Sync {
     /// Translate a host-side `Path` to an env-local `EnvPath`.
     /// For `Local` this is an identity; for WSL it maps `/mnt/...`.
     fn translate_path(&self, host_path: &Path) -> Result<EnvPath, DispatchError>;
-
-    /// Prepare the workflow workspace inside this environment according to
-    /// the declared `WorkspaceBinding`. Returns a handle whose `Drop`
-    /// fires any required teardown (e.g. rsync write-back for SSH).
-    async fn prepare_workspace(
-        &self,
-        workspace_host: &Path,
-        binding: &WorkspaceBinding,
-        run_id: &RunId,
-    ) -> Result<WorkspaceHandle, DispatchError>;
 }
 
 /// Stream of response body chunks. A top-level type alias so `LocalDispatcher`

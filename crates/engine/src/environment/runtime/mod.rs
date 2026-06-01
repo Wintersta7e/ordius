@@ -66,11 +66,8 @@ pub use plan::{ProbePlan, ProbeSummary};
 
 // ── Transport primitives ─────────────────────────────────────────────────────
 
-/// HTTP request/response/error, argv-only `ProcessCmd`, `EnvPath` newtype,
-/// and `WorkspaceHandle` (drop-fires teardown).
-pub use transport::{
-    EnvPath, HttpError, HttpMethod, HttpRequest, HttpResponse, ProcessCmd, WorkspaceHandle,
-};
+/// HTTP request/response/error, argv-only `ProcessCmd`, `EnvPath` newtype.
+pub use transport::{EnvPath, HttpError, HttpMethod, HttpRequest, HttpResponse, ProcessCmd};
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 

@@ -9,8 +9,8 @@ use thiserror::Error;
 
 /// Error raised when dispatching a node to a named environment.
 ///
-/// Variants map 1-to-1 to failure modes in `Dispatcher::dispatch` and
-/// `Dispatcher::prepare_workspace`. Wired into `EngineError::Dispatch`
+/// Variants map 1-to-1 to failure modes at dispatch time (spawn, path
+/// translation, workspace, resource lookup). Wired into `EngineError::Dispatch`
 /// via `#[from]`.
 #[derive(Debug, Error)]
 pub enum DispatchError {
