@@ -372,3 +372,91 @@ async fn real_ssh_workspace_transport_round_trip() {
     t.remove_file(".cache/ordius/h1-test/x.txt").await.unwrap();
     t.remove_dir(".cache/ordius/h1-test").await.unwrap();
 }
+
+// ── Ephemeral workspace upload ────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "gated: requires ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"]
+async fn real_ssh_ephemeral_upload_makes_files_visible() {
+    let Some(dispatcher) = build_dispatcher_for_transport_test().await else {
+        eprintln!(
+            "skipping ephemeral upload test; set ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"
+        );
+        return;
+    };
+
+    // Build a temporary host workspace: a.txt, sub/b.txt, .git/HEAD, .env
+    let tmp = tempfile::TempDir::new().unwrap();
+    let host_ws = tmp.path();
+    std::fs::write(host_ws.join("a.txt"), b"hello-a").unwrap();
+    std::fs::create_dir(host_ws.join("sub")).unwrap();
+    std::fs::write(host_ws.join("sub").join("b.txt"), b"hello-b").unwrap();
+    std::fs::create_dir(host_ws.join(".git")).unwrap();
+    std::fs::write(host_ws.join(".git").join("HEAD"), b"ref: refs/heads/main").unwrap();
+    std::fs::write(host_ws.join(".env"), b"SECRET=x").unwrap();
+
+    let mgr = ordius_engine::environment::runtime::workspace::WorkspaceManager::new();
+    let run = ordius_engine::environment::runtime::workspace::RunScope {
+        run_id: "h2t2",
+        workflow_id: "wf-test",
+        workflow_name: "Upload Test",
+        started_at_iso: "2026-01-01T00:00:00Z",
+    };
+    let binding = ordius_engine::environment::runtime::env::WorkspaceBinding::Sync {
+        env_path_template: "/tmp/ordius-{{run.id}}".into(),
+        strategy: ordius_engine::environment::runtime::env::SyncStrategy::Sftp,
+        write_back: ordius_engine::environment::runtime::env::WriteBackPolicy::None,
+    };
+
+    let cwd = mgr
+        .resolve_cwd(&dispatcher, &binding, host_ws, &run)
+        .await
+        .expect("resolve_cwd must succeed");
+
+    assert_eq!(
+        cwd.as_str(),
+        "/tmp/ordius-h2t2",
+        "env-side root must match template expansion"
+    );
+
+    // Verify uploaded files via a fresh transport session.
+    let factory = dispatcher
+        .workspace_transport()
+        .expect("SshDispatcher must expose workspace transport");
+    let t = factory.open().await.expect("open sftp transport");
+
+    // a.txt must exist with correct content.
+    let got_a = t
+        .download_file("/tmp/ordius-h2t2/a.txt")
+        .await
+        .expect("a.txt must be present");
+    assert_eq!(got_a, b"hello-a", "a.txt content mismatch");
+
+    // sub/b.txt must exist with correct content.
+    let got_b = t
+        .download_file("/tmp/ordius-h2t2/sub/b.txt")
+        .await
+        .expect("sub/b.txt must be present");
+    assert_eq!(got_b, b"hello-b", "sub/b.txt content mismatch");
+
+    // .git/HEAD must NOT have been uploaded (default ignore).
+    assert!(
+        t.stat("/tmp/ordius-h2t2/.git/HEAD")
+            .await
+            .unwrap()
+            .is_none(),
+        ".git/HEAD must not be uploaded"
+    );
+
+    // .env must NOT have been uploaded (default ignore).
+    assert!(
+        t.stat("/tmp/ordius-h2t2/.env").await.unwrap().is_none(),
+        ".env must not be uploaded"
+    );
+
+    // cleanup
+    t.remove_file("/tmp/ordius-h2t2/a.txt").await.unwrap();
+    t.remove_file("/tmp/ordius-h2t2/sub/b.txt").await.unwrap();
+    drop(t.remove_dir("/tmp/ordius-h2t2/sub").await);
+    drop(t.remove_dir("/tmp/ordius-h2t2").await);
+}

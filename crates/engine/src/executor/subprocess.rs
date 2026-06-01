@@ -111,9 +111,15 @@ impl NodeExecutor for SubprocessExecutor {
             })?
             .clone();
         let binding = ctx.run_snapshot.workspace_binding(&effective_env);
+        let run_scope = crate::environment::runtime::workspace::RunScope {
+            run_id: &ctx.run_id,
+            workflow_id: &ctx.workflow_id,
+            workflow_name: &ctx.workflow_name,
+            started_at_iso: &ctx.started_at_iso,
+        };
         let cwd = ctx
             .workspace_manager
-            .resolve_cwd(dispatcher.as_ref(), &binding, &ctx.workspace)
+            .resolve_cwd(dispatcher.as_ref(), &binding, &ctx.workspace, &run_scope)
             .await
             .map_err(|e| {
                 NodeError::Config(format!(

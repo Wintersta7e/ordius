@@ -113,10 +113,18 @@ impl WorkspaceTransport for SshSftpTransport {
         // `create_dir` returns an error if the directory already exists, so we
         // check existence first and only create when absent.  Real errors
         // (permission denied, I/O failure, etc.) are propagated.
+        //
+        // Preserve a leading `/` so absolute paths round-trip correctly through
+        // the SFTP session (which interprets them as server-absolute paths).
+        let absolute = rel.starts_with('/');
         let parts: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
-        let mut so_far = String::new();
+        let mut so_far = if absolute {
+            String::from("/")
+        } else {
+            String::new()
+        };
         for part in &parts {
-            if !so_far.is_empty() {
+            if !so_far.is_empty() && !so_far.ends_with('/') {
                 so_far.push('/');
             }
             so_far.push_str(part);
