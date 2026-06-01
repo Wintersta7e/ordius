@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::dispatcher::Dispatcher;
-use super::env::{EnvId, EnvSpec, WorkflowId};
+use super::env::{EnvId, EnvSpec, WorkflowId, WorkspaceBinding};
 use super::registry::RegistryInner;
 use super::run_catalog::RunCatalog;
 
@@ -64,5 +64,29 @@ impl RunSnapshot {
     #[must_use]
     pub fn spec_for(&self, env: &EnvId) -> Option<&EnvSpec> {
         self.specs.get(env)
+    }
+
+    /// Return the workspace binding for an env in scope.
+    ///
+    /// - `Local`     → [`WorkspaceBinding::Shared`] (same FS, no translation needed)
+    /// - `WslDistro` → [`WorkspaceBinding::Translated`] (`translate_path` maps `/mnt/c/…`)
+    /// - `Ssh`       → the `workspace_binding` field from the spec
+    /// - `Container` → the `workspace_binding` field from the spec
+    /// - env not found → [`WorkspaceBinding::Unsupported`]
+    #[must_use]
+    pub fn workspace_binding(&self, env: &EnvId) -> WorkspaceBinding {
+        match self.specs.get(env) {
+            Some(EnvSpec::Local { .. }) => WorkspaceBinding::Shared,
+            Some(EnvSpec::WslDistro { .. }) => WorkspaceBinding::Translated,
+            Some(
+                EnvSpec::Ssh {
+                    workspace_binding, ..
+                }
+                | EnvSpec::Container {
+                    workspace_binding, ..
+                },
+            ) => workspace_binding.clone(),
+            None => WorkspaceBinding::Unsupported,
+        }
     }
 }

@@ -110,13 +110,18 @@ impl NodeExecutor for SubprocessExecutor {
                 ))
             })?
             .clone();
-        let cwd = dispatcher.translate_path(&ctx.workspace).map_err(|e| {
-            NodeError::Config(format!(
-                "shell: env '{}' cannot translate workspace path '{}': {e}",
-                effective_env.as_str(),
-                ctx.workspace.display(),
-            ))
-        })?;
+        let binding = ctx.run_snapshot.workspace_binding(&effective_env);
+        let cwd = ctx
+            .workspace_manager
+            .resolve_cwd(dispatcher.as_ref(), &binding, &ctx.workspace)
+            .await
+            .map_err(|e| {
+                NodeError::Config(format!(
+                    "shell: env '{}' cannot resolve workspace cwd '{}': {e}",
+                    effective_env.as_str(),
+                    ctx.workspace.display(),
+                ))
+            })?;
 
         let process_cmd = ProcessCmd {
             program: program.clone(),
