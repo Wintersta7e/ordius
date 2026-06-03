@@ -140,6 +140,23 @@ pub enum EngineError {
         /// `local`, `wsl`, `ssh`, `container`).
         spec_kind: &'static str,
     },
+    /// An [`add_env`](crate::Engine::add_env) call paired an SSH env with a
+    /// workspace binding it cannot honour. SSH reaches the workspace over SFTP,
+    /// so `Shared`/`Translated` bindings — which assume the host path is
+    /// directly visible or deterministically translatable inside the env — are
+    /// meaningless. Use `Sync` (upload/sync) or `Unsupported` (no workspace).
+    /// Caught at the writer boundary so the boot probe never builds an SSH
+    /// dispatcher with an impossible binding.
+    #[error(
+        "env id '{id}': SSH environments cannot use a '{binding}' workspace binding; \
+         use 'sync' or 'unsupported'"
+    )]
+    EnvWorkspaceBindingUnsupported {
+        /// Offending env id.
+        id: String,
+        /// The rejected binding kind (`shared` or `translated`).
+        binding: &'static str,
+    },
     /// A writer (typically [`set_env_enabled`](crate::Engine::set_env_enabled))
     /// tried to disable a row the engine cannot run without. Today this only
     /// applies to the canonical Local env — every workflow's `default_env`

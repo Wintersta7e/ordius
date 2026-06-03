@@ -647,6 +647,7 @@ impl Engine {
         spec: environment::runtime::EnvSpec,
     ) -> Result<()> {
         validate_id_spec_kind(&id, &spec)?;
+        validate_workspace_binding(&id, &spec)?;
         let _guard = self.env_refresh_lock.lock().await;
         let spec_json =
             serde_json::to_string(&spec).map_err(|e| EngineError::Db(format!("EnvSpec: {e}")))?;
@@ -1377,6 +1378,41 @@ fn validate_id_spec_kind(
     Err(mismatch())
 }
 
+/// Reject workspace bindings an env variant cannot honour.
+///
+/// SSH environments reach the workspace over SFTP, so `Shared`/`Translated`
+/// bindings — which assume the host path is directly visible or
+/// deterministically translatable inside the env — are meaningless; an SSH env
+/// uses `Sync` (upload) or `Unsupported` (no workspace). Caught at
+/// [`Engine::add_env`] so the boot probe never builds an SSH dispatcher with an
+/// impossible binding.
+fn validate_workspace_binding(
+    id: &environment::runtime::EnvId,
+    spec: &environment::runtime::EnvSpec,
+) -> Result<()> {
+    use environment::runtime::{EnvSpec, WorkspaceBinding};
+
+    if let EnvSpec::Ssh {
+        workspace_binding, ..
+    } = spec
+    {
+        let rejected = match workspace_binding {
+            WorkspaceBinding::Shared => Some("shared"),
+            WorkspaceBinding::Translated => Some("translated"),
+            WorkspaceBinding::BindMount { .. }
+            | WorkspaceBinding::Sync { .. }
+            | WorkspaceBinding::Unsupported => None,
+        };
+        if let Some(binding) = rejected {
+            return Err(EngineError::EnvWorkspaceBindingUnsupported {
+                id: id.as_str().to_string(),
+                binding,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Background refresh body for `RefreshPending::Full`. Re-probes every env
 /// in the DB; CAS-commits the result against `epoch_before` so a concurrent
 /// `refresh_environment` write that ran during the probe drops this result
@@ -1503,6 +1539,76 @@ mod engine_tests {
         }
         assert!(eng.subscribe_run("nope").is_none());
         assert!(!eng.cancel_run("nope"));
+    }
+
+    // ── H2-T4: SSH workspace-binding validation ──────────────────────────────
+
+    fn sync_binding() -> environment::runtime::WorkspaceBinding {
+        environment::runtime::WorkspaceBinding::Sync {
+            env_path_template: "/tmp/ordius-{{run.id}}".into(),
+            strategy: environment::runtime::SyncStrategy::Sftp,
+            write_back: environment::runtime::WriteBackPolicy::None,
+        }
+    }
+
+    fn ssh_spec(binding: environment::runtime::WorkspaceBinding) -> environment::runtime::EnvSpec {
+        environment::runtime::EnvSpec::Ssh {
+            host: "example.test".into(),
+            port: 22,
+            user: "u".into(),
+            auth: environment::runtime::SshAuth::KeyFile {
+                path: "/nonexistent/key".into(),
+                passphrase_ref: None,
+            },
+            host_key_pins: vec![],
+            workspace_binding: binding,
+            resources: vec![],
+        }
+    }
+
+    #[test]
+    fn validate_workspace_binding_restricts_ssh_only() {
+        use environment::runtime::{EnvId, EnvSpec, WorkspaceBinding};
+
+        let ssh = EnvId::ssh("box");
+        for binding in [WorkspaceBinding::Shared, WorkspaceBinding::Translated] {
+            let err = validate_workspace_binding(&ssh, &ssh_spec(binding)).unwrap_err();
+            assert!(
+                matches!(err, EngineError::EnvWorkspaceBindingUnsupported { .. }),
+                "SSH binding must be rejected, got {err:?}"
+            );
+        }
+        validate_workspace_binding(&ssh, &ssh_spec(sync_binding())).expect("SSH Sync ok");
+        validate_workspace_binding(&ssh, &ssh_spec(WorkspaceBinding::Unsupported))
+            .expect("SSH Unsupported ok");
+
+        // Non-SSH specs are not restricted by this check.
+        let local = EnvSpec::Local {
+            resources: vec![],
+            host_direct_verifications: std::collections::HashMap::new(),
+        };
+        validate_workspace_binding(&EnvId::local(), &local).expect("Local ok");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn add_env_rejects_ssh_shared_binding() {
+        use environment::runtime::{EnvId, WorkspaceBinding};
+
+        let dir = TempDir::new().unwrap();
+        let engine = std::sync::Arc::new(Engine::new(dir.path().to_path_buf()).await.unwrap());
+        let err = engine
+            .add_env(
+                EnvId::ssh("box"),
+                "SSH Box".into(),
+                true,
+                ssh_spec(WorkspaceBinding::Shared),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::EnvWorkspaceBindingUnsupported { .. }),
+            "add_env must reject SSH+Shared, got {err:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
