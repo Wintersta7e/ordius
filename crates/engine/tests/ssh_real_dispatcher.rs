@@ -620,3 +620,163 @@ async fn real_ssh_force_writeback_and_ephemeral_cleanup() {
         );
     }
 }
+
+// ── End-to-end: run a shell node on the remote, write its output back ──────────
+
+/// Drives the whole H2 path through the executor (not just the manager): a shell
+/// node targeting an SSH env with an ephemeral `Sync{Force}` binding uploads the
+/// (empty) host workspace, runs `echo … > result.txt` in the synced remote cwd,
+/// and after `teardown_all` the output lands in the host workspace and the
+/// remote root is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "gated: requires ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"]
+#[allow(clippy::too_many_lines)]
+async fn real_ssh_run_uploads_runs_and_writes_back() {
+    use ordius_engine::checkpoints::CheckpointRegistry;
+    use ordius_engine::db::open;
+    use ordius_engine::emitter::Emitter;
+    use ordius_engine::environment::runtime::env::{
+        EnvSpec, SyncStrategy, WorkspaceBinding, WriteBackPolicy,
+    };
+    use ordius_engine::environment::runtime::workspace::{RunOutcome, WorkspaceManager};
+    use ordius_engine::environment::runtime::{ResourceRegistry, RunSnapshot, WorkflowId};
+    use ordius_engine::executor::{NodeExecutor, RunContext, SubprocessExecutor, wrap_process_env};
+    use ordius_engine::recorder::RunRecorder;
+    use ordius_engine::registry::Registry;
+    use ordius_engine::types::{Node, Pos, Workflow};
+
+    let Some(ssh) = build_dispatcher_for_transport_test().await else {
+        eprintln!(
+            "skipping e2e run test; set ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"
+        );
+        return;
+    };
+    let ssh_id = ssh.info().id.clone();
+    let dispatcher: Arc<dyn Dispatcher> = Arc::new(ssh);
+
+    // Empty host workspace; the SSH env binds with an ephemeral Sync{Force}.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let host_ws = tmp.path().to_path_buf();
+
+    // Only `workspace_binding` is read from this spec by RunSnapshot; the
+    // connection details live on the real dispatcher, so the rest are
+    // placeholders.
+    let spec = EnvSpec::Ssh {
+        host: "unused".into(),
+        port: 22,
+        user: "unused".into(),
+        auth: SshAuth::KeyFile {
+            path: "/unused".into(),
+            passphrase_ref: None,
+        },
+        host_key_pins: vec![],
+        workspace_binding: WorkspaceBinding::Sync {
+            env_path_template: "/tmp/ordius-e2e-{{run.id}}".into(),
+            strategy: SyncStrategy::Sftp,
+            write_back: WriteBackPolicy::Force { ignore: vec![] },
+        },
+        resources: vec![],
+    };
+
+    let mut dispatchers: HashMap<EnvId, Arc<dyn Dispatcher>> = HashMap::new();
+    dispatchers.insert(ssh_id.clone(), Arc::clone(&dispatcher));
+    let mut specs: HashMap<EnvId, EnvSpec> = HashMap::new();
+    specs.insert(ssh_id.clone(), spec);
+
+    let wf = Workflow {
+        id: "ssh-e2e".into(),
+        name: "SSH E2E".into(),
+        schema_version: 1,
+        created_at: None,
+        updated_at: None,
+        variables: HashMap::new(),
+        triggers: vec![],
+        nodes: vec![Node {
+            id: "run".into(),
+            ty: "shell".into(),
+            name: "run".into(),
+            config: HashMap::from([(
+                "command".into(),
+                serde_json::json!("echo synced-ok > result.txt"),
+            )]),
+            pos: Pos::default(),
+            timeout_ms: None,
+            retry: None,
+            continue_on_error: false,
+            target_env: Some(ssh_id.clone()),
+        }],
+        edges: vec![],
+        resources: vec![],
+        default_env: None,
+    };
+
+    let pool = open(tmp.path().join("t.db")).unwrap();
+    let rec =
+        Arc::new(RunRecorder::start(pool.clone(), &wf, "{}", &HashMap::new(), "test").unwrap());
+    let (em, _rx) = Emitter::new(rec.clone());
+    let em = Arc::new(em);
+
+    let run_snapshot = Arc::new(RunSnapshot {
+        run_id: rec.run_id.clone(),
+        workflow_id: WorkflowId(wf.id.clone()),
+        default_env: ssh_id.clone(),
+        registry: ResourceRegistry::new().snapshot(),
+        dispatchers: Arc::new(dispatchers),
+        catalogs: Arc::new(HashMap::new()),
+        specs: Arc::new(specs),
+    });
+
+    let wm = Arc::new(WorkspaceManager::new());
+    let ctx = RunContext {
+        run_id: rec.run_id.clone(),
+        workflow_id: wf.id.clone(),
+        workflow_name: wf.name.clone(),
+        started_at_iso: "2026-01-01T00:00:00Z".into(),
+        workspace: host_ws.clone(),
+        variables: HashMap::new(),
+        recorder: rec.clone(),
+        emitter: em.clone(),
+        secrets_store: None,
+        env: wrap_process_env(),
+        current_inputs: HashMap::new(),
+        upstream_outputs: HashMap::new(),
+        checkpoints: Arc::new(CheckpointRegistry::new()),
+        events: Arc::new(ordius_engine::events_registry::EventRegistry::new()),
+        run_snapshot,
+        engine: std::sync::Weak::new(),
+        compose_depth: 0,
+        iteration: 1,
+        attempt: std::sync::atomic::AtomicU32::new(1),
+        auto_resume: false,
+        workspace_manager: Arc::clone(&wm),
+    };
+
+    // Run the shell node through the real executor → resolve_cwd uploads the
+    // workspace and the command runs in the synced remote cwd.
+    let reg = Registry::with_v1_0_builtins();
+    let nt = reg.get("shell").expect("shell built-in registered");
+    SubprocessExecutor
+        .run(&wf.nodes[0], &nt, &ctx, CancellationToken::new())
+        .await
+        .expect("shell node runs on the remote");
+
+    // Teardown writes the remote-created file back and deletes the root.
+    wm.teardown_all(RunOutcome::Completed).await;
+
+    let got = std::fs::read_to_string(host_ws.join("result.txt"))
+        .expect("result.txt must be written back to the host workspace");
+    assert!(got.contains("synced-ok"), "unexpected content: {got:?}");
+
+    // The ephemeral root (named from the run id) is gone.
+    let root = format!("/tmp/ordius-e2e-{}", rec.run_id);
+    let t = dispatcher
+        .workspace_transport()
+        .unwrap()
+        .open()
+        .await
+        .unwrap();
+    assert!(
+        t.stat(&root).await.unwrap().is_none(),
+        "remote ephemeral root must be deleted"
+    );
+}
