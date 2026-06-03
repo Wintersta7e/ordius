@@ -3,16 +3,17 @@
 /// H1: `resolve_cwd` delegated to `dispatcher.translate_path` for all
 /// bindings (behaviour unchanged for Local/WSL/BindMount/Shared/Translated).
 ///
-/// H2-T2 (this file): `WorkspaceBinding::Sync` with `SyncStrategy::Sftp`
-/// and a `{{run.id}}`-containing template is now handled — ephemeral upload
-/// via SFTP, singleflight-serialised per `(EnvId, host_ws)` key so parallel
-/// nodes on the same env share one upload.
+/// H2-T2: `WorkspaceBinding::Sync` with `SyncStrategy::Sftp` and a
+/// `{{run.id}}`-containing template is handled — ephemeral upload via SFTP,
+/// singleflight-serialised per `(EnvId, host_ws)` key so parallel nodes on
+/// the same env share one upload.
+///
+/// H2-T3: `teardown_all` writes changed/new files back to the host
+/// (`None`/`Force`, skipped on user cancel) and deletes the ephemeral root.
 ///
 /// Not yet implemented (deferred):
 /// - Persistent workspace reuse (template without `{{run.id}}`).
-/// - `SafeOrDiverge` write-back.
-/// - Teardown / write-back body (`teardown_all` remains a no-op stub; the
-///   prepared map it will read is tracked in `self.prepared`).
+/// - `SafeOrDiverge` write-back (rejected upstream in `resolve_cwd`).
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -26,6 +27,7 @@ use crate::environment::runtime::error::DispatchError;
 use crate::environment::runtime::transport::EnvPath;
 
 use super::safety;
+use super::transport::{FileKind, WorkspaceTransportFactory};
 
 // ── Type aliases ──────────────────────────────────────────────────────────────
 
@@ -65,15 +67,16 @@ struct PreparedWorkspace {
     /// Absolute env-side root that was created and populated.
     env_side_root: String,
     lifecycle: Lifecycle,
-    /// Policy the caller specified; stored so teardown can branch on it.
-    #[allow(dead_code)] // used by H2-T3 teardown
+    /// Policy the caller specified; teardown branches on it for write-back.
     write_back: WriteBackPolicy,
-    /// Manifest of every file that was uploaded.
-    #[allow(dead_code)] // used by H2-T3 write-back conflict detection
+    /// Manifest of every file that was uploaded. Teardown diffs the env-side
+    /// tree against it to find files the run changed or created.
     upload_manifest: safety::Manifest,
-    /// Host workspace path; redundant with the map key but handy for logs.
-    #[allow(dead_code)]
+    /// Host workspace path; write-back targets are resolved relative to it.
     host_ws: PathBuf,
+    /// Factory used to reopen a transport for write-back + ephemeral delete.
+    /// Captured at upload time so teardown needs no `Dispatcher` handle.
+    transport_factory: Arc<dyn WorkspaceTransportFactory>,
 }
 
 // ── Run scope ─────────────────────────────────────────────────────────────────
@@ -282,24 +285,184 @@ impl WorkspaceManager {
             write_back,
             upload_manifest,
             host_ws: host_ws.to_path_buf(),
+            transport_factory: factory,
         }))
     }
 
     /// Tear down every workspace prepared during the run.
     ///
-    /// Fires on every run-loop exit path (success, error, or panic),
-    /// before the engine's sender/token/lock cleanup. H2-T3 fills the
-    /// body (write-back on `None`/`Force`, ephemeral delete); for now
-    /// this is a no-op so net behaviour is unchanged.
-    // `async` is required by the public contract; real awaits arrive in H2-T3.
-    #[allow(clippy::unused_async)]
+    /// Fires on every run-loop exit path (success, error, or panic), before the
+    /// engine's sender/token/lock cleanup. For each prepared workspace it writes
+    /// changed files back to the host (per [`WriteBackPolicy`], skipped entirely
+    /// on user cancel) and deletes the ephemeral env-side root.
+    ///
+    /// Best-effort and panic-free: per-env errors are logged and swallowed so a
+    /// failure on one workspace never aborts cleanup of the others nor unwinds
+    /// into the run-loop teardown path.
     pub async fn teardown_all(&self, outcome: RunOutcome) {
         #[cfg(any(test, feature = "testing"))]
         {
             *self.last_outcome.lock().unwrap() = Some(outcome);
         }
-        // Avoid an unused-binding warning in non-testing builds.
-        let _ = outcome;
+
+        // Drain the map — teardown owns these entries; nothing reads `prepared`
+        // after the run loop exits. Skip cells whose upload never completed.
+        let prepared: Vec<Arc<PreparedWorkspace>> = {
+            let mut map = self.prepared.lock().await;
+            std::mem::take(&mut *map)
+                .into_values()
+                .filter_map(|cell| cell.get().cloned())
+                .collect()
+        };
+
+        for pw in prepared {
+            if let Err(e) = teardown_one(&pw, outcome).await {
+                tracing::warn!(
+                    env_root = %pw.env_side_root,
+                    error = %e,
+                    "workspace teardown failed; continuing (best-effort)"
+                );
+            }
+        }
+    }
+}
+
+// ── Teardown helpers ──────────────────────────────────────────────────────────
+
+/// Write back (unless user-cancelled) then delete the ephemeral root for one
+/// prepared workspace. Cleanup is attempted even if write-back fails; the first
+/// error encountered is returned for the caller to log.
+async fn teardown_one(pw: &PreparedWorkspace, outcome: RunOutcome) -> Result<(), DispatchError> {
+    // Write-back is skipped entirely on user cancellation.
+    let write_res = if outcome == RunOutcome::CancelledByUser {
+        Ok(())
+    } else {
+        write_back(pw).await
+    };
+
+    // Ephemeral cleanup always runs — even on cancel or after a write-back error.
+    let cleanup_res = if pw.lifecycle == Lifecycle::Ephemeral {
+        remove_tree(pw.transport_factory.as_ref(), &pw.env_side_root).await
+    } else {
+        Ok(())
+    };
+
+    // Surface the first error (write-back takes precedence), but only after
+    // cleanup has been attempted.
+    write_res.and(cleanup_res)
+}
+
+/// Copy env-side files the run changed or created back into the host workspace.
+///
+/// `Force` writes back any file absent from the upload manifest or whose content
+/// hash differs from it, honouring the policy's ignore globs. `None` is a no-op.
+/// `SafeOrDiverge` cannot reach teardown (`resolve_cwd` rejects it before upload);
+/// it is treated defensively as "no write-back".
+///
+/// Ignore globs use single-segment `*` semantics (see `safety::should_ignore`):
+/// `*.log` matches `debug.log` but not `logs/debug.log` — use `**/*.log` for
+/// nested matches.
+async fn write_back(pw: &PreparedWorkspace) -> Result<(), DispatchError> {
+    let ignore = match &pw.write_back {
+        WriteBackPolicy::Force { ignore } => ignore.as_slice(),
+        WriteBackPolicy::None | WriteBackPolicy::SafeOrDiverge { .. } => return Ok(()),
+    };
+
+    // A fresh transport per sync phase (the factory's documented contract).
+    let t = pw.transport_factory.open().await?;
+    let prefix = format!("{}/", pw.env_side_root);
+
+    for entry in t.list_tree(&pw.env_side_root).await? {
+        if entry.kind != FileKind::File {
+            continue;
+        }
+        // Map the absolute env-side path back to a host-relative path.
+        let Some(rel) = entry.rel_path.strip_prefix(&prefix) else {
+            continue; // defensive: listing returned a path outside the root
+        };
+        if safety::should_ignore(rel, ignore) {
+            continue;
+        }
+
+        let bytes = t.download_file(&entry.rel_path).await?;
+
+        // Changed = absent from the upload manifest, or content hash differs.
+        let changed = pw
+            .upload_manifest
+            .get(rel)
+            .is_none_or(|meta| meta.sha256_hex != safety::sha256_hex(&bytes));
+        if changed {
+            write_host_file_atomic(&pw.host_ws, rel, &bytes)?;
+        }
+    }
+    Ok(())
+}
+
+/// Recursively remove `root` and everything under it via the transport: files
+/// first, then directories deepest-first, then the root itself.
+async fn remove_tree(
+    factory: &dyn WorkspaceTransportFactory,
+    root: &str,
+) -> Result<(), DispatchError> {
+    let t = factory.open().await?;
+    let entries = t.list_tree(root).await?;
+
+    // Remove every non-directory entry (regular files, symlinks) first.
+    for entry in &entries {
+        if entry.kind != FileKind::Dir {
+            t.remove_file(&entry.rel_path).await?;
+        }
+    }
+
+    // Collect directories from the listing plus the root itself, dedup, and
+    // remove deepest-first so each is empty when removed. Including `root`
+    // explicitly covers transports whose `list_tree` lists only the contents of
+    // `root` (the real SFTP transport) rather than `root` itself.
+    let mut dirs: Vec<String> = entries
+        .into_iter()
+        .filter(|e| e.kind == FileKind::Dir)
+        .map(|e| e.rel_path)
+        .collect();
+    dirs.push(root.to_string());
+    dirs.sort_unstable();
+    dirs.dedup();
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.len())); // deepest (longest) path first
+    for dir in dirs {
+        t.remove_dir(&dir).await?;
+    }
+    Ok(())
+}
+
+/// Write `bytes` to `host_ws/rel` via a temp sibling + atomic rename, creating
+/// parent directories as needed.
+fn write_host_file_atomic(host_ws: &Path, rel: &str, bytes: &[u8]) -> Result<(), DispatchError> {
+    let target = host_ws.join(rel);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| host_io_err(parent, "create parent dir", &e))?;
+    }
+    let tmp = tmp_sibling(&target);
+    std::fs::write(&tmp, bytes).map_err(|e| host_io_err(&tmp, "write temp file", &e))?;
+    std::fs::rename(&tmp, &target).map_err(|e| host_io_err(&target, "rename into place", &e))?;
+    Ok(())
+}
+
+/// A sibling temp path next to `target` (same directory → atomic rename).
+fn tmp_sibling(target: &Path) -> PathBuf {
+    let mut name = target
+        .file_name()
+        .map_or_else(|| std::ffi::OsString::from("ordius-wb"), ToOwned::to_owned);
+    name.push(".ordius-wb.tmp");
+    target
+        .parent()
+        .map_or_else(|| PathBuf::from(&name), |p| p.join(&name))
+}
+
+/// Map a host-side I/O error during write-back to a `DispatchError`.
+fn host_io_err(path: &Path, op: &str, e: &std::io::Error) -> DispatchError {
+    DispatchError::WorkspaceUnavailable {
+        env_id: "<host>".into(),
+        reason: format!("write-back {op} `{}`: {e}", path.display()),
     }
 }
 
@@ -358,6 +521,13 @@ mod tests {
     use crate::environment::runtime::local::LocalDispatcher;
     use std::collections::HashMap;
     use std::path::Path;
+
+    use super::super::safety::{FileEntry, Manifest, hash_file};
+    use super::super::transport::{
+        FakeWorkspaceTransport, FakeWorkspaceTransportFactory, WorkspaceTransport,
+    };
+    use std::sync::Arc;
+    use tokio::sync::OnceCell;
 
     fn local_info() -> EnvInfo {
         EnvInfo {
@@ -526,6 +696,212 @@ mod tests {
         assert!(
             !template.contains("{{run_id}}"),
             "sanity: template must not contain the underscore form"
+        );
+    }
+
+    // ── teardown_all ──────────────────────────────────────────────────────────
+
+    /// Build a manager whose `prepared` map holds one ephemeral entry rooted at
+    /// `root` with the given `write_back` policy and `manifest`, backed by a
+    /// fresh fake transport. Returns the manager plus a state-sharing handle to
+    /// the fake so the test can seed "remote" changes and assert post-teardown.
+    async fn manager_with_prepared(
+        root: &str,
+        host_ws: &Path,
+        write_back: WriteBackPolicy,
+        manifest: Manifest,
+    ) -> (WorkspaceManager, FakeWorkspaceTransport) {
+        let fake = FakeWorkspaceTransport::default();
+        let pw = PreparedWorkspace {
+            env_side_root: root.to_string(),
+            lifecycle: Lifecycle::Ephemeral,
+            write_back,
+            upload_manifest: manifest,
+            host_ws: host_ws.to_path_buf(),
+            transport_factory: Arc::new(FakeWorkspaceTransportFactory::new(fake.clone())),
+        };
+        let cell = OnceCell::new();
+        cell.set(Arc::new(pw)).expect("seed prepared cell");
+        let mgr = WorkspaceManager::new();
+        mgr.prepared.lock().await.insert(
+            (EnvId::ssh("h2-teardown"), host_ws.to_path_buf()),
+            Arc::new(cell),
+        );
+        (mgr, fake)
+    }
+
+    /// A one-file manifest at `rel` recording the current on-disk hash of
+    /// `host_ws/rel` — i.e. "this is what we uploaded".
+    fn manifest_of(host_ws: &Path, rel: &str) -> Manifest {
+        let abs = host_ws.join(rel);
+        let size = std::fs::metadata(&abs).unwrap().len();
+        let mut m = Manifest::new();
+        m.insert(
+            rel.to_string(),
+            FileEntry {
+                sha256_hex: hash_file(&abs).unwrap(),
+                size,
+                mode: 0o644,
+            },
+        );
+        m
+    }
+
+    /// Force write-back on a clean completion copies changed + new env-side
+    /// files into the host workspace, then deletes the ephemeral root.
+    #[tokio::test]
+    async fn teardown_force_completed_writes_back_and_deletes_root() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"original").unwrap();
+
+        let root = "/tmp/ordius-wb-done";
+        let (mgr, fake) = manager_with_prepared(
+            root,
+            host_ws,
+            WriteBackPolicy::Force { ignore: vec![] },
+            manifest_of(host_ws, "a.txt"),
+        )
+        .await;
+
+        // Simulate the run: modify a.txt and create new.txt on the remote.
+        fake.upload_file(&format!("{root}/a.txt"), b"modified")
+            .await
+            .unwrap();
+        fake.upload_file(&format!("{root}/sub/new.txt"), b"created")
+            .await
+            .unwrap();
+
+        mgr.teardown_all(RunOutcome::Completed).await;
+
+        // Changed + new files are written back to the host.
+        assert_eq!(
+            std::fs::read(host_ws.join("a.txt")).unwrap(),
+            b"modified",
+            "changed file must be written back"
+        );
+        assert_eq!(
+            std::fs::read(host_ws.join("sub").join("new.txt")).unwrap(),
+            b"created",
+            "new file (with new parent dir) must be written back"
+        );
+
+        // Ephemeral root is gone.
+        assert!(
+            fake.stat(&format!("{root}/a.txt")).await.unwrap().is_none(),
+            "remote file must be deleted"
+        );
+        assert!(
+            fake.stat(root).await.unwrap().is_none(),
+            "ephemeral root dir must be deleted"
+        );
+    }
+
+    /// User cancellation skips write-back entirely but STILL deletes the
+    /// ephemeral root (cleanup is unconditional).
+    #[tokio::test]
+    async fn teardown_force_cancelled_skips_writeback_but_deletes_root() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"original").unwrap();
+
+        let root = "/tmp/ordius-wb-cancel";
+        let (mgr, fake) = manager_with_prepared(
+            root,
+            host_ws,
+            WriteBackPolicy::Force { ignore: vec![] },
+            manifest_of(host_ws, "a.txt"),
+        )
+        .await;
+
+        fake.upload_file(&format!("{root}/a.txt"), b"modified")
+            .await
+            .unwrap();
+
+        mgr.teardown_all(RunOutcome::CancelledByUser).await;
+
+        // Write-back skipped: host file is untouched.
+        assert_eq!(
+            std::fs::read(host_ws.join("a.txt")).unwrap(),
+            b"original",
+            "user cancel must skip write-back"
+        );
+        // Cleanup still happens.
+        assert!(
+            fake.stat(root).await.unwrap().is_none(),
+            "ephemeral root must be deleted even on cancel"
+        );
+    }
+
+    /// `WriteBackPolicy::None` performs no write-back even on clean completion,
+    /// but the ephemeral root is still deleted.
+    #[tokio::test]
+    async fn teardown_none_completed_skips_writeback_but_deletes_root() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"original").unwrap();
+
+        let root = "/tmp/ordius-wb-none";
+        let (mgr, fake) = manager_with_prepared(
+            root,
+            host_ws,
+            WriteBackPolicy::None,
+            manifest_of(host_ws, "a.txt"),
+        )
+        .await;
+
+        fake.upload_file(&format!("{root}/a.txt"), b"modified")
+            .await
+            .unwrap();
+
+        mgr.teardown_all(RunOutcome::Completed).await;
+
+        assert_eq!(
+            std::fs::read(host_ws.join("a.txt")).unwrap(),
+            b"original",
+            "None policy must not write back"
+        );
+        assert!(
+            fake.stat(root).await.unwrap().is_none(),
+            "ephemeral root must still be deleted under None policy"
+        );
+    }
+
+    /// Force write-back honours the policy's ignore globs: an ignored env-side
+    /// file is not copied back, but a non-ignored sibling is.
+    #[tokio::test]
+    async fn teardown_force_respects_ignore_globs() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+
+        let root = "/tmp/ordius-wb-ignore";
+        let (mgr, fake) = manager_with_prepared(
+            root,
+            host_ws,
+            WriteBackPolicy::Force {
+                ignore: vec!["*.log".into()],
+            },
+            Manifest::new(), // empty manifest: every env-side file counts as new
+        )
+        .await;
+
+        fake.upload_file(&format!("{root}/data.txt"), b"keep")
+            .await
+            .unwrap();
+        fake.upload_file(&format!("{root}/debug.log"), b"noise")
+            .await
+            .unwrap();
+
+        mgr.teardown_all(RunOutcome::Completed).await;
+
+        assert_eq!(
+            std::fs::read(host_ws.join("data.txt")).unwrap(),
+            b"keep",
+            "non-ignored new file must be written back"
+        );
+        assert!(
+            !host_ws.join("debug.log").exists(),
+            "ignored *.log file must not be written back"
         );
     }
 }

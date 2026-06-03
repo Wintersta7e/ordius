@@ -233,9 +233,9 @@ impl WorkspaceTransport for SshSftpTransport {
     }
 }
 
-/// Recursive tree walk: reads `dir` and appends `FileMeta` entries for every
-/// entry (including the dir itself), descending into subdirectories without
-/// following symlinks.
+/// Recursive tree walk: reads `dir` and appends a `FileMeta` for every entry
+/// *within* `dir` (the directory itself is not listed), descending into
+/// subdirectories without following symlinks.
 async fn list_tree_recursive(
     session: &SftpSession,
     dir: &str,

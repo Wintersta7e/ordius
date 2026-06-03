@@ -62,8 +62,11 @@ pub trait WorkspaceTransport: Send {
     /// Read and return the full contents of the file at `rel`.
     async fn download_file(&self, rel: &str) -> Result<Vec<u8>, DispatchError>;
 
-    /// Recursive listing rooted at `rel` (`""` = root).
-    /// Directories and symlinks are included alongside regular files.
+    /// Recursive listing of the entries under `rel` (`""` = root).
+    /// Directories and symlinks are included alongside regular files. Whether
+    /// `rel` itself appears in the result is implementation-defined (the SFTP
+    /// transport lists contents only; the in-memory fake includes the root) —
+    /// callers must not rely on its presence or absence.
     async fn list_tree(&self, rel: &str) -> Result<Vec<FileMeta>, DispatchError>;
 
     /// Return metadata for `rel`, or `None` if the path does not exist.
@@ -106,7 +109,7 @@ mod fake_impl {
     use async_trait::async_trait;
     use parking_lot::Mutex;
 
-    use super::{DispatchError, FileKind, FileMeta, WorkspaceTransport};
+    use super::{DispatchError, FileKind, FileMeta, WorkspaceTransport, WorkspaceTransportFactory};
 
     #[derive(Debug, Default, Clone)]
     struct FakeFs {
@@ -272,10 +275,35 @@ mod fake_impl {
             Ok(())
         }
     }
+
+    /// Factory that hands out state-sharing clones of one [`FakeWorkspaceTransport`].
+    ///
+    /// Each `open()` returns a clone backed by the same `Arc<Mutex<FakeFs>>`, so
+    /// files written through one transport are visible through the next — the
+    /// behaviour a real per-phase reconnect needs for upload-then-teardown tests.
+    #[derive(Debug, Clone, Default)]
+    pub struct FakeWorkspaceTransportFactory {
+        transport: FakeWorkspaceTransport,
+    }
+
+    impl FakeWorkspaceTransportFactory {
+        /// Wrap an existing transport, letting the caller keep a state-sharing handle.
+        #[must_use]
+        pub const fn new(transport: FakeWorkspaceTransport) -> Self {
+            Self { transport }
+        }
+    }
+
+    #[async_trait]
+    impl WorkspaceTransportFactory for FakeWorkspaceTransportFactory {
+        async fn open(&self) -> Result<Box<dyn WorkspaceTransport>, DispatchError> {
+            Ok(Box::new(self.transport.clone()))
+        }
+    }
 }
 
 #[cfg(any(test, feature = "testing"))]
-pub use fake_impl::FakeWorkspaceTransport;
+pub use fake_impl::{FakeWorkspaceTransport, FakeWorkspaceTransportFactory};
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

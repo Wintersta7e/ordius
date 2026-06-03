@@ -310,9 +310,9 @@ impl Engine {
             .await;
 
             // Classify the outcome for teardown, then run teardown
-            // BEFORE the sender/token/lock cleanup. In this task
-            // `teardown_all` is a no-op stub, so net behaviour is
-            // unchanged.
+            // (workspace write-back + ephemeral cleanup) BEFORE the
+            // sender/token/lock cleanup. `teardown_all` is best-effort
+            // and panic-free.
             let outcome = match &caught {
                 Ok(Ok((summary, _outputs))) => outcome_from_status(&summary.status),
                 Ok(Err(_)) => RunOutcome::Failed,

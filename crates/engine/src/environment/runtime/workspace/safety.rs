@@ -377,22 +377,27 @@ pub struct FileEntry {
 /// Manifest: maps forward-slash relative path → [`FileEntry`].
 pub type Manifest = HashMap<String, FileEntry>;
 
-/// Hash the file at `abs` and return a lowercase hex SHA-256 string.
-pub fn hash_file(abs: &Path) -> Result<String, DispatchError> {
-    let bytes = std::fs::read(abs).map_err(|e| DispatchError::WorkspaceUnavailable {
-        env_id: "<host>".into(),
-        reason: format!("read `{}` for hashing: {e}", abs.display()),
-    })?;
-
+/// Lowercase hex SHA-256 of `bytes`.
+#[must_use]
+pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    hasher.update(bytes);
     let digest = hasher.finalize();
 
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in &digest {
         write!(&mut hex, "{:02x}", *byte).unwrap();
     }
-    Ok(hex)
+    hex
+}
+
+/// Hash the file at `abs` and return a lowercase hex SHA-256 string.
+pub fn hash_file(abs: &Path) -> Result<String, DispatchError> {
+    let bytes = std::fs::read(abs).map_err(|e| DispatchError::WorkspaceUnavailable {
+        env_id: "<host>".into(),
+        reason: format!("read `{}` for hashing: {e}", abs.display()),
+    })?;
+    Ok(sha256_hex(&bytes))
 }
 
 /// Hash every entry in `entries` and return a [`Manifest`].

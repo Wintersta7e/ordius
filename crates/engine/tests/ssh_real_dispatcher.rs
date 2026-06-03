@@ -460,3 +460,163 @@ async fn real_ssh_ephemeral_upload_makes_files_visible() {
     drop(t.remove_dir("/tmp/ordius-h2t2/sub").await);
     drop(t.remove_dir("/tmp/ordius-h2t2").await);
 }
+
+// ── Force write-back + ephemeral cleanup ──────────────────────────────────────
+
+/// End-to-end teardown over real SFTP: upload (Force) → simulate the run
+/// changing + creating files → `teardown_all` writes changes back to the host
+/// and deletes the ephemeral root. User-cancel skips write-back but still
+/// deletes the root.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "gated: requires ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"]
+#[allow(clippy::too_many_lines)]
+async fn real_ssh_force_writeback_and_ephemeral_cleanup() {
+    use ordius_engine::environment::runtime::env::{SyncStrategy, WriteBackPolicy};
+    use ordius_engine::environment::runtime::workspace::{RunOutcome, RunScope, WorkspaceManager};
+
+    let Some(dispatcher) = build_dispatcher_for_transport_test().await else {
+        eprintln!(
+            "skipping force write-back test; set ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"
+        );
+        return;
+    };
+
+    let force = || WorkspaceBinding::Sync {
+        env_path_template: "/tmp/ordius-wb-{{run.id}}".into(),
+        strategy: SyncStrategy::Sftp,
+        write_back: WriteBackPolicy::Force { ignore: Vec::new() },
+    };
+
+    // Unique per-invocation run ids so re-runs never collide with leftover
+    // remote state (production uses a unique run.id for the same reason).
+    let uniq = |label: &str| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{label}-{}-{nanos}", std::process::id())
+    };
+
+    // ── Case 1: clean completion → write back changed + new files, delete root ──
+    {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let host_ws = tmp.path();
+        std::fs::write(host_ws.join("a.txt"), b"original").unwrap();
+
+        let mgr = WorkspaceManager::new();
+        let rid = uniq("h2t3done");
+        let run = RunScope {
+            run_id: &rid,
+            workflow_id: "wf-wb",
+            workflow_name: "Writeback Test",
+            started_at_iso: "2026-01-01T00:00:00Z",
+        };
+        let root = mgr
+            .resolve_cwd(&dispatcher, &force(), host_ws, &run)
+            .await
+            .expect("resolve_cwd uploads")
+            .as_str()
+            .to_string();
+        assert!(
+            root.starts_with("/tmp/ordius-wb-h2t3done-"),
+            "root must reflect the unique run id; got {root}"
+        );
+
+        // Simulate the run: modify a.txt and create sub/new.txt on the remote.
+        let t = dispatcher
+            .workspace_transport()
+            .unwrap()
+            .open()
+            .await
+            .unwrap();
+        // A real run rewrites file contents in place; SFTP rename can't
+        // overwrite an existing path, so remove then re-upload to reach the
+        // "modified" state this test needs.
+        t.remove_file(&format!("{root}/a.txt")).await.unwrap();
+        t.upload_file(&format!("{root}/a.txt"), b"modified")
+            .await
+            .unwrap();
+        t.upload_file(&format!("{root}/sub/new.txt"), b"created")
+            .await
+            .unwrap();
+        drop(t);
+
+        mgr.teardown_all(RunOutcome::Completed).await;
+
+        // Changed + new files are written back to the host.
+        assert_eq!(std::fs::read(host_ws.join("a.txt")).unwrap(), b"modified");
+        assert_eq!(
+            std::fs::read(host_ws.join("sub").join("new.txt")).unwrap(),
+            b"created"
+        );
+
+        // Ephemeral root is deleted.
+        let t = dispatcher
+            .workspace_transport()
+            .unwrap()
+            .open()
+            .await
+            .unwrap();
+        assert!(
+            t.stat(&format!("{root}/a.txt")).await.unwrap().is_none(),
+            "remote file must be gone"
+        );
+        assert!(
+            t.stat(&root).await.unwrap().is_none(),
+            "remote root must be gone"
+        );
+    }
+
+    // ── Case 2: user cancel → skip write-back, still delete root ──
+    {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let host_ws = tmp.path();
+        std::fs::write(host_ws.join("a.txt"), b"original").unwrap();
+
+        let mgr = WorkspaceManager::new();
+        let rid = uniq("h2t3cancel");
+        let run = RunScope {
+            run_id: &rid,
+            workflow_id: "wf-wb",
+            workflow_name: "Writeback Test",
+            started_at_iso: "2026-01-01T00:00:00Z",
+        };
+        let root = mgr
+            .resolve_cwd(&dispatcher, &force(), host_ws, &run)
+            .await
+            .expect("resolve_cwd uploads")
+            .as_str()
+            .to_string();
+
+        let t = dispatcher
+            .workspace_transport()
+            .unwrap()
+            .open()
+            .await
+            .unwrap();
+        // A real run rewrites file contents in place; SFTP rename can't
+        // overwrite an existing path, so remove then re-upload to reach the
+        // "modified" state this test needs.
+        t.remove_file(&format!("{root}/a.txt")).await.unwrap();
+        t.upload_file(&format!("{root}/a.txt"), b"modified")
+            .await
+            .unwrap();
+        drop(t);
+
+        mgr.teardown_all(RunOutcome::CancelledByUser).await;
+
+        // Write-back skipped: host file untouched.
+        assert_eq!(std::fs::read(host_ws.join("a.txt")).unwrap(), b"original");
+        // Cleanup still happened.
+        let t = dispatcher
+            .workspace_transport()
+            .unwrap()
+            .open()
+            .await
+            .unwrap();
+        assert!(
+            t.stat(&root).await.unwrap().is_none(),
+            "remote root must be gone even after cancel"
+        );
+    }
+}

@@ -8,4 +8,4 @@ pub use manager::{RunOutcome, RunScope, WorkspaceManager};
 pub use transport::{FileKind, FileMeta, WorkspaceTransport, WorkspaceTransportFactory};
 
 #[cfg(any(test, feature = "testing"))]
-pub use transport::FakeWorkspaceTransport;
+pub use transport::{FakeWorkspaceTransport, FakeWorkspaceTransportFactory};
