@@ -56,6 +56,20 @@ fn outcome_from_status(status: &str) -> RunOutcome {
     }
 }
 
+/// Run workspace teardown, isolating any panic from a transport dependency so
+/// it cannot skip the run's sender/token/lock cleanup (which would leak the
+/// workflow lock). `teardown_all` is panic-free by contract; this is
+/// belt-and-suspenders for the cleanup path.
+async fn isolate_teardown(wm: Arc<WorkspaceManager>, outcome: RunOutcome, run_id: &str) {
+    if std::panic::AssertUnwindSafe(wm.teardown_all(outcome))
+        .catch_unwind()
+        .await
+        .is_err()
+    {
+        tracing::error!(run_id, "workspace teardown panicked; continued run cleanup");
+    }
+}
+
 /// RAII guard that drops the run's entry from `Engine::run_snapshots`
 /// when the spawned run task returns or unwinds.
 ///
@@ -324,7 +338,7 @@ impl Engine {
                     }
                 },
             };
-            wm_teardown.teardown_all(outcome).await;
+            isolate_teardown(wm_teardown, outcome, &rec.run_id).await;
 
             engine
                 .run_senders
