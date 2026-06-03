@@ -11,16 +11,17 @@
 //! - `reconcile_out` (remote→host, after the final attempt): writes changed/new
 //!   files back and propagates remote deletions (`None`/`Force`), advancing the
 //!   baseline. Skipped only on a genuine user cancel.
-//! - `teardown_all`: a write-back safety net for runs that panic between
-//!   `reconcile_in` and `reconcile_out` (non-user-cancel only) plus ephemeral
-//!   root deletion.
+//! - `teardown_all`: a `Force`-only write-back safety net for runs that panic
+//!   between `reconcile_in` and `reconcile_out` (non-user-cancel only) plus
+//!   deletion of every ephemeral root tracked during the run.
 //!
 //! Same-key concurrency is serialised by a per-key execution lease the run loop
 //! holds across a node's reconcile cycle.
 //!
 //! Not yet implemented (deferred):
 //! - Persistent workspace reuse (template without `{{run.id}}`) — H5.
-//! - `SafeOrDiverge` write-back (rejected in `reconcile_out`) — next phase.
+//! - `SafeOrDiverge` write-back (rejected in `reconcile_in`, before any upload)
+//!   — next phase.
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -134,7 +135,6 @@ pub struct RunScope<'a> {
 /// Holds the per-key execution leases and the per-key reconcile [`WorkspaceState`]
 /// (populated by `reconcile_in`, drained by `teardown_all`). Each map's `parking_lot`
 /// lock is only held long enough to read/insert an entry — never across transport I/O.
-#[derive(Debug)]
 pub struct WorkspaceManager {
     /// Per-key execution lease registry.  The `parking_lot` (sync) map lock is
     /// only held long enough to clone the `Arc`; the async `tokio::sync::Mutex`
@@ -145,6 +145,16 @@ pub struct WorkspaceManager {
     /// Populated by `reconcile_in` and consumed by `reconcile_out`.
     state: SyncMutex<HashMap<WorkspaceKey, WorkspaceState>>,
 
+    /// Every ephemeral env-side root created this run, keyed by root → factory.
+    ///
+    /// `state` is keyed by `(EnvId, host_ws)`, so `parallel`/`compose` children
+    /// that inherit the parent `host_ws` but run under distinct `run_id`s collapse
+    /// onto one `state` entry — each `reconcile_in` overwrites the prior. This map
+    /// records *every* distinct ephemeral root so `teardown_all` deletes them all,
+    /// not just the last; using the root string as the key dedups `loop_for`'s
+    /// repeated same-root inserts.
+    ephemeral_roots: SyncMutex<HashMap<String, Arc<dyn WorkspaceTransportFactory>>>,
+
     /// Test-only seam: records the last [`RunOutcome`] passed to
     /// [`Self::teardown_all`]. Lets run-loop tests observe that
     /// teardown fired with the correct outcome on every exit path.
@@ -152,11 +162,23 @@ pub struct WorkspaceManager {
     pub last_outcome: std::sync::Mutex<Option<RunOutcome>>,
 }
 
+impl std::fmt::Debug for WorkspaceManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `ephemeral_roots`' factory values are not `Debug`; report a count.
+        f.debug_struct("WorkspaceManager")
+            .field("leases", &self.leases)
+            .field("state", &self.state)
+            .field("ephemeral_roots_len", &self.ephemeral_roots.lock().len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for WorkspaceManager {
     fn default() -> Self {
         Self {
             leases: SyncMutex::new(HashMap::new()),
             state: SyncMutex::new(HashMap::new()),
+            ephemeral_roots: SyncMutex::new(HashMap::new()),
             #[cfg(any(test, feature = "testing"))]
             last_outcome: std::sync::Mutex::new(None),
         }
@@ -198,8 +220,9 @@ impl WorkspaceManager {
     ///
     /// Fires on every run-loop exit path (success, error, or panic), before the
     /// engine's sender/token/lock cleanup. For each prepared workspace it writes
-    /// changed files back to the host (per [`WriteBackPolicy`], skipped entirely
-    /// on user cancel) and deletes the ephemeral env-side root.
+    /// changed files back to the host (only for [`WriteBackPolicy::Force`],
+    /// skipped entirely on user cancel) and deletes every tracked ephemeral
+    /// env-side root (not just the last per key).
     ///
     /// Best-effort and panic-free: per-env errors are logged and swallowed so a
     /// failure on one workspace never aborts cleanup of the others nor unwinds
@@ -218,44 +241,43 @@ impl WorkspaceManager {
                 .collect()
         };
 
+        // Write-back safety net: a node may have panicked between reconcile_in
+        // and reconcile_out, leaving changes unwritten. Fire the write-back ONLY
+        // for `Force` — `None` never writes back, and `SafeOrDiverge` is rejected
+        // up front by `reconcile_in` (so it can never reach here, and must never
+        // be force-written). User cancel skips entirely. No-op when reconcile_out
+        // already advanced the baseline.
         for (key, s) in states {
-            // A node may have panicked between reconcile_in and reconcile_out,
-            // leaving changes unwritten. On any non-user-cancel outcome, write
-            // back the remaining delta (no-op when reconcile_out already advanced
-            // the baseline). User cancel deliberately skips.
             if outcome != RunOutcome::CancelledByUser
-                && !matches!(s.write_back, WriteBackPolicy::None)
-            {
-                let ignore = match &s.write_back {
-                    WriteBackPolicy::Force { ignore } => ignore.clone(),
-                    // SafeOrDiverge can't reach H3 (reconcile_out rejects it).
-                    _ => Vec::new(),
-                };
-                if let Err(e) = write_back_delta(
+                && let WriteBackPolicy::Force { ignore } = &s.write_back
+                && let Err(e) = write_back_delta(
                     &s.transport_factory,
                     &s.env_side_root,
                     &key.1,
                     &s.last_remote_manifest,
-                    &ignore,
+                    ignore,
                 )
                 .await
-                {
-                    tracing::warn!(
-                        env_root = %s.env_side_root,
-                        error = %e,
-                        "teardown write-back failed"
-                    );
-                }
-            }
-
-            if s.lifecycle == Lifecycle::Ephemeral
-                && let Err(e) = remove_tree(s.transport_factory.as_ref(), &s.env_side_root).await
             {
                 tracing::warn!(
                     env_root = %s.env_side_root,
                     error = %e,
-                    "ephemeral teardown failed"
+                    "teardown write-back failed"
                 );
+            }
+        }
+
+        // Ephemeral cleanup: delete *every* root recorded this run, not just the
+        // last per key. parallel/compose children share host_ws (one `state`
+        // entry) but each gets its own run-id root — all are tracked here.
+        let roots: Vec<(String, Arc<dyn WorkspaceTransportFactory>)> = {
+            std::mem::take(&mut *self.ephemeral_roots.lock())
+                .into_iter()
+                .collect()
+        };
+        for (root, factory) in roots {
+            if let Err(e) = remove_tree(factory.as_ref(), &root).await {
+                tracing::warn!(env_root = %root, error = %e, "ephemeral teardown failed");
             }
         }
     }
@@ -291,6 +313,16 @@ impl WorkspaceManager {
         let Some((tmpl, write_back)) = sync_params(binding)? else {
             return dispatcher.translate_path(host_ws);
         };
+
+        // SafeOrDiverge write-back is deferred to a later phase. Reject it BEFORE
+        // any upload (restoring the pre-H3 `resolve_cwd` gate): the node fails
+        // before running and no `WorkspaceState` is stored, so the `teardown_all`
+        // safety net can never force-write it.
+        if matches!(write_back, WriteBackPolicy::SafeOrDiverge { .. }) {
+            return Err(DispatchError::Unsupported(
+                "SafeOrDiverge write-back is deferred to a later phase".into(),
+            ));
+        }
 
         let root = expand_env_root(tmpl, run, host_ws)?;
         let lifecycle = lifecycle_of(tmpl)?; // Persistent => Err(Unsupported) (H5)
@@ -331,6 +363,17 @@ impl WorkspaceManager {
             );
         }
 
+        // Record the ephemeral root so teardown deletes *every* root for this key,
+        // not just the last (parallel/compose children share host_ws but get
+        // distinct run-id roots — the `state` entry above only keeps the latest).
+        // The reset succeeded, so the root really exists on the remote. Sync
+        // insert; the guard drops before the return — no await held.
+        if lifecycle == Lifecycle::Ephemeral {
+            self.ephemeral_roots
+                .lock()
+                .insert(root.clone(), Arc::clone(&factory));
+        }
+
         Ok(EnvPath::new(root))
     }
 
@@ -343,8 +386,9 @@ impl WorkspaceManager {
     ///
     /// A no-op when the binding needs no sync, when no [`WorkspaceState`] exists
     /// for the key (e.g. `reconcile_in` was never called / already torn down),
-    /// or when the policy is [`WriteBackPolicy::None`]. `SafeOrDiverge` is
-    /// deferred and returns `Err(Unsupported)`.
+    /// or when the policy is [`WriteBackPolicy::None`]. `SafeOrDiverge` is now
+    /// rejected earlier by [`Self::reconcile_in`] (before any upload, so no state
+    /// is stored) — the arm here is defensive and unreachable.
     ///
     /// # Concurrency
     ///
@@ -381,6 +425,8 @@ impl WorkspaceManager {
         let ignore = match &write_back {
             WriteBackPolicy::None => return Ok(()),
             WriteBackPolicy::Force { ignore } => ignore.clone(),
+            // Defensive + unreachable: reconcile_in rejects SafeOrDiverge before
+            // storing any state, so no SafeOrDiverge state can reach here.
             WriteBackPolicy::SafeOrDiverge { .. } => {
                 return Err(DispatchError::Unsupported(
                     "SafeOrDiverge write-back is deferred to a later phase".into(),
@@ -1080,6 +1126,73 @@ mod tests {
         );
     }
 
+    /// `parallel`/`compose` children inherit the parent `host_ws` but run under
+    /// distinct `run_id`s → distinct ephemeral roots that collapse onto a single
+    /// `(EnvId, host_ws)` `state` entry (each `reconcile_in` overwrites the
+    /// prior). Teardown must still delete EVERY tracked root, not just the last.
+    #[tokio::test]
+    async fn teardown_deletes_all_ephemeral_roots_for_same_key() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"host-a").unwrap();
+
+        // One manager + one dispatcher/fake — both reconcile_ins hit the same
+        // "remote", as a real parent + child would share an SSH env.
+        let (d, fake) = ssh_dispatcher_with_fake("multi-root");
+        let mgr = WorkspaceManager::new();
+        let binding = sftp_binding("/tmp/ordius-multi-{{run.id}}", WriteBackPolicy::None);
+
+        // Two distinct run ids → two distinct ephemeral roots, same host_ws.
+        let run_a = RunScope {
+            run_id: "run-a",
+            workflow_id: "wf1",
+            workflow_name: "Test Workflow",
+            started_at_iso: "2026-01-01T00:00:00Z",
+        };
+        let run_b = RunScope {
+            run_id: "run-b",
+            workflow_id: "wf1",
+            workflow_name: "Test Workflow",
+            started_at_iso: "2026-01-01T00:00:00Z",
+        };
+
+        let root_a = mgr
+            .reconcile_in(&d, &binding, host_ws, &run_a)
+            .await
+            .expect("first reconcile_in")
+            .as_str()
+            .to_string();
+        let root_b = mgr
+            .reconcile_in(&d, &binding, host_ws, &run_b)
+            .await
+            .expect("second reconcile_in")
+            .as_str()
+            .to_string();
+
+        assert_ne!(root_a, root_b, "distinct run ids must yield distinct roots");
+        // Both roots exist on the remote after the two reconcile_ins.
+        assert!(
+            fake.stat(&root_a).await.unwrap().is_some(),
+            "root A must exist before teardown"
+        );
+        assert!(
+            fake.stat(&root_b).await.unwrap().is_some(),
+            "root B must exist before teardown"
+        );
+
+        mgr.teardown_all(RunOutcome::Completed).await;
+
+        // BOTH roots are gone — not just the last (`state` only kept root B).
+        assert!(
+            fake.stat(&root_a).await.unwrap().is_none(),
+            "root A must be deleted by teardown (would leak before the fix)"
+        );
+        assert!(
+            fake.stat(&root_b).await.unwrap().is_none(),
+            "root B must be deleted by teardown"
+        );
+    }
+
     // ── WorkspaceExecutionLease ───────────────────────────────────────────────
 
     /// Same key blocks; distinct key does not.
@@ -1612,15 +1725,18 @@ mod tests {
             .expect("shared reconcile_out is a no-op");
     }
 
-    /// `SafeOrDiverge` write-back is deferred to a later phase: `reconcile_out`
-    /// is the gate that rejects it (replacing the old `resolve_cwd` guard).
+    /// `SafeOrDiverge` write-back is deferred to a later phase: `reconcile_in`
+    /// is the gate that rejects it BEFORE any upload (restoring the pre-H3
+    /// `resolve_cwd` behaviour). The node fails before running and before any
+    /// `WorkspaceState` is stored, so `teardown_all` can never force-write a
+    /// `SafeOrDiverge` binding — the data-integrity property.
     #[tokio::test]
-    async fn reconcile_out_safe_or_diverge_unsupported() {
+    async fn reconcile_in_rejects_safe_or_diverge() {
         let host = tempfile::TempDir::new().unwrap();
         let host_ws = host.path();
         std::fs::write(host_ws.join("a.txt"), b"host-a").unwrap();
 
-        let (d, _fake) = ssh_dispatcher_with_fake("safe-or-diverge");
+        let (d, fake) = ssh_dispatcher_with_fake("safe-or-diverge");
         let mgr = WorkspaceManager::new();
         let binding = sftp_binding(
             "/tmp/ordius-{{run.id}}",
@@ -1631,15 +1747,27 @@ mod tests {
             },
         );
 
-        // reconcile_in seeds state (SafeOrDiverge is NOT rejected here).
-        mgr.reconcile_in(&d, &binding, host_ws, &sample_run())
+        // reconcile_in rejects SafeOrDiverge before any upload.
+        let err = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
             .await
-            .expect("reconcile_in accepts SafeOrDiverge (gate is reconcile_out)");
-
-        let err = mgr.reconcile_out(&d, &binding, host_ws).await.unwrap_err();
+            .unwrap_err();
         assert!(
             err.to_string().contains("SafeOrDiverge"),
             "expected SafeOrDiverge error; got: {err}"
+        );
+
+        // No state was stored: nothing was uploaded to the remote, and a
+        // subsequent teardown is a no-op (cannot force-write a rejected binding).
+        assert!(
+            fake.stat("/tmp/ordius-r1").await.unwrap().is_none(),
+            "no remote root must be created when reconcile_in rejects the binding"
+        );
+        mgr.teardown_all(RunOutcome::Failed).await;
+        assert_eq!(
+            std::fs::read(host_ws.join("a.txt")).unwrap(),
+            b"host-a",
+            "teardown must not write anything back for a rejected SafeOrDiverge binding"
         );
     }
 }

@@ -813,7 +813,7 @@ impl Engine {
 /// `reconcile_in` reset before each attempt (records `ctx.env_cwd`), and a
 /// `reconcile_out` write-back after the final attempt. Non-`Sync`/non-`Subprocess`
 /// nodes take no lease and `reconcile_in` degrades to a plain `translate_path`.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_with_retry(
     dispatcher: &Dispatcher,
     recorder: &RunRecorder,
@@ -841,6 +841,12 @@ async fn run_with_retry(
     let synced = is_subprocess && matches!(binding, WorkspaceBinding::Sync { .. });
     // Held across every attempt + the post-loop `reconcile_out`; dropped on
     // each `return`. `None` (no lease) for non-synced nodes.
+    //
+    // The lease key `(effective_env, ctx.workspace)` matches the `WorkspaceState`
+    // key (which `reconcile_in` builds as `(dispatcher.info().id, host_ws)`) only
+    // because `ctx.run_snapshot.dispatcher(effective_env).info().id == effective_env`
+    // — the snapshot maps each EnvId to a dispatcher reporting that same id. The
+    // lease and the per-key state therefore serialise on the same key.
     let _lease = if synced {
         Some(
             ctx.workspace_manager
@@ -946,6 +952,16 @@ async fn run_with_retry(
         tokio::select! {
             () = tokio::time::sleep(delay) => {}
             () = cancel.cancelled() => {
+                // A fail-fast/timeout (local or group cancel, NOT a user cancel)
+                // during the retry backoff still ends the node — but it must write
+                // the remote delta back first, exactly like the final-attempt path
+                // above. ONLY a genuine user cancel (`ctx.run_cancel`) skips.
+                if synced
+                    && !ctx.run_cancel.is_cancelled()
+                    && let Err(e) = reconcile_out_final(ctx, &binding, &effective_env).await
+                {
+                    return Ok((Err(e), attempt, started_at, finished_at));
+                }
                 return Ok((Err(NodeError::Cancelled), attempt, started_at, finished_at));
             }
         }
