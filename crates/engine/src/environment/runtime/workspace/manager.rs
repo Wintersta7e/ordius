@@ -258,7 +258,7 @@ impl WorkspaceManager {
         // teardown never sees the root. Clean it up best-effort here before
         // propagating, otherwise the ephemeral dir leaks on the remote.
         t.mkdir(env_side_root).await?;
-        match upload_files(dispatcher, t, env_side_root, host_ws).await {
+        match upload_files(t, env_side_root, host_ws).await {
             Ok(upload_manifest) => Ok(Arc::new(PreparedWorkspace {
                 env_side_root: env_side_root.to_string(),
                 lifecycle,
@@ -331,25 +331,18 @@ impl WorkspaceManager {
 /// content for "changed" and clobber the newer host file. Consumes the
 /// transport; the caller `mkdir`s the root first and cleans up on error.
 async fn upload_files(
-    dispatcher: &dyn Dispatcher,
     t: Box<dyn WorkspaceTransport>,
     env_side_root: &str,
     host_ws: &Path,
 ) -> Result<safety::Manifest, DispatchError> {
     let entries = safety::walk_workspace(host_ws)?;
 
-    // Enforce caps BEFORE any bytes leave the host.
+    // Account caps against the bytes ACTUALLY read (bounded), not the walk's
+    // stale stat — a file that grew since the walk can't bypass the cap.
     let mut tracker = safety::CapTracker::new(safety::UploadCaps::default());
-    for entry in &entries {
-        tracker.add(entry.size)?;
-    }
-
     let mut manifest = safety::Manifest::new();
     for entry in &entries {
-        let bytes = std::fs::read(&entry.abs).map_err(|e| DispatchError::WorkspaceUnavailable {
-            env_id: dispatcher.info().id.as_str().to_owned(),
-            reason: format!("read `{}` for upload: {e}", entry.abs.display()),
-        })?;
+        let bytes = safety::read_within_caps(&entry.abs, &mut tracker)?;
         let remote_path = format!("{env_side_root}/{}", entry.rel_path);
         t.upload_file(&remote_path, &bytes).await?;
         manifest.insert(

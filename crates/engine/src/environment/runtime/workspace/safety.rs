@@ -1,6 +1,7 @@
 //! Workspace upload safety helpers.
 //!
-//! Pure, synchronous, no-I/O (except `walk_workspace` and `hash_file`).
+//! Pure, synchronous, no-I/O (except `walk_workspace`, `hash_file`, and
+//! `read_within_caps`).
 //! Used by the workspace sync manager to validate roots, filter paths,
 //! enforce caps, and build per-file manifests before any bytes leave the host.
 
@@ -288,6 +289,37 @@ impl CapTracker {
     pub const fn total_files(&self) -> usize {
         self.total_files
     }
+
+    /// Bytes still allowed before `max_bytes` is exceeded.
+    pub const fn remaining_bytes(&self) -> u64 {
+        self.caps.max_bytes.saturating_sub(self.total_bytes)
+    }
+}
+
+/// Read `abs` bounded by the tracker's remaining byte budget, then account the
+/// ACTUAL bytes read against `tracker`.
+///
+/// Enforcing the cap on the bytes actually read (not stale walk metadata)
+/// closes a TOCTOU: a file that grew between the walk and the read cannot blow
+/// past `max_bytes` or OOM the host — at most `remaining + 1` bytes are read,
+/// and `tracker.add` then rejects the file if it exceeds the budget.
+pub fn read_within_caps(abs: &Path, tracker: &mut CapTracker) -> Result<Vec<u8>, DispatchError> {
+    use std::io::Read as _;
+
+    let limit = tracker.remaining_bytes().saturating_add(1);
+    let file = std::fs::File::open(abs).map_err(|e| DispatchError::WorkspaceUnavailable {
+        env_id: "<host>".into(),
+        reason: format!("open `{}` for upload: {e}", abs.display()),
+    })?;
+    let mut buf = Vec::new();
+    file.take(limit)
+        .read_to_end(&mut buf)
+        .map_err(|e| DispatchError::WorkspaceUnavailable {
+            env_id: "<host>".into(),
+            reason: format!("read `{}` for upload: {e}", abs.display()),
+        })?;
+    tracker.add(buf.len() as u64)?;
+    Ok(buf)
 }
 
 // ── 4. Workspace walk ─────────────────────────────────────────────────────────
@@ -595,6 +627,38 @@ mod tests {
         let mut t = CapTracker::new(caps);
         t.add(8).unwrap();
         let err = t.add(4).unwrap_err();
+        assert!(err.to_string().contains("max_bytes"), "got: {err}");
+    }
+
+    // ── read_within_caps ──
+
+    #[test]
+    fn read_within_caps_returns_bytes_within_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("ok.bin");
+        std::fs::write(&p, b"hello").unwrap();
+        let mut t = CapTracker::new(UploadCaps {
+            max_bytes: 100,
+            max_files: 100,
+        });
+        let bytes = read_within_caps(&p, &mut t).unwrap();
+        assert_eq!(bytes, b"hello");
+        assert_eq!(t.total_bytes(), 5);
+        assert_eq!(t.total_files(), 1);
+    }
+
+    #[test]
+    fn read_within_caps_enforces_byte_cap_on_actual_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("big.bin");
+        // 100 real bytes, cap allows 50 — the file's actual size is enforced,
+        // not any earlier walk stat.
+        std::fs::write(&p, vec![7u8; 100]).unwrap();
+        let mut t = CapTracker::new(UploadCaps {
+            max_bytes: 50,
+            max_files: 100,
+        });
+        let err = read_within_caps(&p, &mut t).unwrap_err();
         assert!(err.to_string().contains("max_bytes"), "got: {err}");
     }
 
