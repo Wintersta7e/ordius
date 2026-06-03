@@ -142,11 +142,10 @@ pub enum EngineError {
     },
     /// An [`add_env`](crate::Engine::add_env) call paired an SSH env with a
     /// workspace binding it cannot honour. SSH reaches the workspace over SFTP,
-    /// so `Shared`/`Translated` bindings — which assume the host path is
-    /// directly visible or deterministically translatable inside the env — are
-    /// meaningless. Use `Sync` (upload/sync) or `Unsupported` (no workspace).
-    /// Caught at the writer boundary so the boot probe never builds an SSH
-    /// dispatcher with an impossible binding.
+    /// so only `Sync` (upload) or `Unsupported` (no workspace) apply;
+    /// `Shared`/`Translated`/`BindMount` all assume the host filesystem is
+    /// reachable in-place inside the env. Caught at the writer boundary so the
+    /// boot probe never builds an SSH dispatcher with an impossible binding.
     #[error(
         "env id '{id}': SSH environments cannot use a '{binding}' workspace binding; \
          use 'sync' or 'unsupported'"
@@ -154,7 +153,7 @@ pub enum EngineError {
     EnvWorkspaceBindingUnsupported {
         /// Offending env id.
         id: String,
-        /// The rejected binding kind (`shared` or `translated`).
+        /// The rejected binding kind (`shared`, `translated`, or `bind_mount`).
         binding: &'static str,
     },
     /// A writer (typically [`set_env_enabled`](crate::Engine::set_env_enabled))

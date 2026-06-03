@@ -1380,12 +1380,11 @@ fn validate_id_spec_kind(
 
 /// Reject workspace bindings an env variant cannot honour.
 ///
-/// SSH environments reach the workspace over SFTP, so `Shared`/`Translated`
-/// bindings — which assume the host path is directly visible or
-/// deterministically translatable inside the env — are meaningless; an SSH env
-/// uses `Sync` (upload) or `Unsupported` (no workspace). Caught at
-/// [`Engine::add_env`] so the boot probe never builds an SSH dispatcher with an
-/// impossible binding.
+/// SSH reaches the workspace over SFTP, so only `Sync` (upload) or `Unsupported`
+/// (no workspace) apply. `Shared`/`Translated`/`BindMount` all assume the host
+/// filesystem is reachable in-place inside the env, which SSH cannot provide —
+/// reject them at [`Engine::add_env`] so the boot probe never builds an SSH
+/// dispatcher with an impossible binding.
 fn validate_workspace_binding(
     id: &environment::runtime::EnvId,
     spec: &environment::runtime::EnvSpec,
@@ -1399,9 +1398,8 @@ fn validate_workspace_binding(
         let rejected = match workspace_binding {
             WorkspaceBinding::Shared => Some("shared"),
             WorkspaceBinding::Translated => Some("translated"),
-            WorkspaceBinding::BindMount { .. }
-            | WorkspaceBinding::Sync { .. }
-            | WorkspaceBinding::Unsupported => None,
+            WorkspaceBinding::BindMount { .. } => Some("bind_mount"),
+            WorkspaceBinding::Sync { .. } | WorkspaceBinding::Unsupported => None,
         };
         if let Some(binding) = rejected {
             return Err(EngineError::EnvWorkspaceBindingUnsupported {
@@ -1571,7 +1569,13 @@ mod engine_tests {
         use environment::runtime::{EnvId, EnvSpec, WorkspaceBinding};
 
         let ssh = EnvId::ssh("box");
-        for binding in [WorkspaceBinding::Shared, WorkspaceBinding::Translated] {
+        for binding in [
+            WorkspaceBinding::Shared,
+            WorkspaceBinding::Translated,
+            WorkspaceBinding::BindMount {
+                env_path: "/x".into(),
+            },
+        ] {
             let err = validate_workspace_binding(&ssh, &ssh_spec(binding)).unwrap_err();
             assert!(
                 matches!(err, EngineError::EnvWorkspaceBindingUnsupported { .. }),
