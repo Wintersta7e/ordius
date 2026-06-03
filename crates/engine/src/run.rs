@@ -227,6 +227,9 @@ impl Engine {
     ///   structural validation.
     /// - [`EngineError::AlreadyRunning`] if another run already
     ///   holds the workflow's lock.
+    // Threading the root run_cancel into `run_loop_inner` pushed this one
+    // line past clippy's limit; the body is already as flat as it gets.
+    #[allow(clippy::too_many_lines)]
     pub fn start_run(
         self: &Arc<Self>,
         wf: Arc<Workflow>,
@@ -314,6 +317,9 @@ impl Engine {
                 em,
                 workspace,
                 variables,
+                // Local cancel == root run_cancel at top level; they diverge
+                // only inside child workflows (see `run_child_workflow`).
+                cancel.clone(),
                 cancel,
                 auto_resume_checkpoints,
                 0,
@@ -418,6 +424,7 @@ impl Engine {
         child_wf: Arc<Workflow>,
         variables: HashMap<String, String>,
         parent_cancel: &CancellationToken,
+        run_cancel: CancellationToken,
         compose_depth: u32,
         workspace_override: Option<PathBuf>,
         scratch_prefix: &str,
@@ -488,7 +495,12 @@ impl Engine {
             em,
             workspace,
             variables,
+            // `child_cancel` is the LOCAL token (a child of the
+            // fail-fast/timeout parent); `run_cancel` is the run's ROOT
+            // token, forwarded UNCHANGED so write-back-skip logic sees
+            // only a genuine user cancel.
             child_cancel,
+            run_cancel,
             false,
             compose_depth,
             parent_snapshot,
@@ -521,6 +533,7 @@ impl Engine {
         workspace: PathBuf,
         variables: HashMap<String, String>,
         cancel: CancellationToken,
+        run_cancel: CancellationToken,
         auto_resume: bool,
         compose_depth: u32,
         run_snapshot: Arc<crate::environment::runtime::RunSnapshot>,
@@ -652,6 +665,8 @@ impl Engine {
                     attempt: std::sync::atomic::AtomicU32::new(1),
                     auto_resume,
                     workspace_manager: Arc::clone(&workspace_manager),
+                    env_cwd: parking_lot::Mutex::new(None),
+                    run_cancel: run_cancel.clone(),
                 };
 
                 sched.start_node(&node.id);

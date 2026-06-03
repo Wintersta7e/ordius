@@ -7,6 +7,7 @@
 
 use crate::checkpoints::CheckpointRegistry;
 use crate::emitter::Emitter;
+use crate::environment::runtime::transport::EnvPath;
 use crate::recorder::RunRecorder;
 use crate::secrets::Store;
 use crate::types::PortValue;
@@ -110,6 +111,31 @@ pub struct RunContext {
     /// number the run loop will later persist for the `node_runs`
     /// row and the terminal `node:done` / `node:error` event.
     pub attempt: AtomicU32,
+    /// Per-node env-side working directory resolved by `reconcile_in`
+    /// before dispatch and consumed by `reconcile_out` after. `None`
+    /// until a node's reconcile step records a cwd. Interior-mutable
+    /// (the context is shared `&RunContext` across the dispatch path).
+    pub env_cwd: parking_lot::Mutex<Option<EnvPath>>,
+    /// The run's ROOT user-cancellation token — cancelled only by
+    /// `cancel_run` / shutdown, NOT by parallel fail-fast or a
+    /// per-attempt timeout. Forwarded UNCHANGED into child workflows so
+    /// a child can distinguish a genuine user cancel (skip workspace
+    /// write-back) from a fail-fast/timeout cancel of its local token.
+    pub run_cancel: tokio_util::sync::CancellationToken,
+}
+
+impl RunContext {
+    /// Record the env-side working directory resolved for the current
+    /// node, replacing any prior value.
+    pub fn set_env_cwd(&self, p: EnvPath) {
+        *self.env_cwd.lock() = Some(p);
+    }
+
+    /// Clone out the current env-side working directory, if any.
+    #[must_use]
+    pub fn env_cwd(&self) -> Option<EnvPath> {
+        self.env_cwd.lock().clone()
+    }
 }
 
 /// Build the closure that `template::SubstitutionContext::secrets`
@@ -129,5 +155,28 @@ pub fn make_secrets_resolver(ctx: &RunContext) -> impl Fn(&str) -> Option<String
         let value = store.get(name).ok()?;
         emitter.register_secret(name.to_string(), value.clone());
         Some(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::environment::runtime::transport::EnvPath;
+
+    /// `set_env_cwd` stores the env-side cwd and `env_cwd` reads it
+    /// back. A freshly-built `RunContext` carries no cwd and an
+    /// un-cancelled root token (the H3 reconcile fields are additive
+    /// and default to inert until a later task consumes them).
+    #[test]
+    fn env_cwd_round_trips_and_run_cancel_starts_uncancelled() {
+        let (ctx, _rx, _dir) = super::super::test_support::make_ctx();
+
+        assert!(ctx.env_cwd().is_none(), "fresh ctx has no env_cwd");
+        assert!(
+            !ctx.run_cancel.is_cancelled(),
+            "fresh ctx run_cancel must not be cancelled",
+        );
+
+        ctx.set_env_cwd(EnvPath::new("/x"));
+        assert_eq!(ctx.env_cwd(), Some(EnvPath::new("/x")));
     }
 }

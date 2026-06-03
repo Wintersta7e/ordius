@@ -141,6 +141,7 @@ impl NodeExecutor for ParallelExecutor {
                 &item_var,
                 &index_var,
                 &group_cancel,
+                &ctx.run_cancel,
                 next_depth,
                 &ctx.workspace,
                 &ctx.run_snapshot,
@@ -212,6 +213,7 @@ impl NodeExecutor for ParallelExecutor {
                     &item_var,
                     &index_var,
                     &group_cancel,
+                    &ctx.run_cancel,
                     next_depth,
                     &ctx.workspace,
                     &ctx.run_snapshot,
@@ -265,6 +267,7 @@ fn spawn_one(
     item_var: &str,
     index_var: &str,
     group_cancel: &CancellationToken,
+    run_cancel: &CancellationToken,
     next_depth: u32,
     workspace: &std::path::Path,
     parent_snapshot: &Arc<crate::environment::runtime::RunSnapshot>,
@@ -282,13 +285,20 @@ fn spawn_one(
     };
     vars.insert(item_var.to_string(), item_str);
     vars.insert(index_var.to_string(), index.to_string());
+    // `child_cancel` is the LOCAL token — a clone of the fail-fast
+    // `group_cancel`, so a sibling failure / timeout trips it. `run_cancel`
+    // is the run's ROOT user-cancel token, forwarded UNCHANGED so a child's
+    // write-back-skip logic only fires on a genuine user cancel, never on
+    // fail-fast.
     let child_cancel = group_cancel.clone();
+    let run_cancel = run_cancel.clone();
     joinset.spawn(async move {
         let res = engine
             .run_child_workflow(
                 child_wf,
                 vars,
                 &child_cancel,
+                run_cancel,
                 next_depth,
                 Some(workspace),
                 "parallel-",

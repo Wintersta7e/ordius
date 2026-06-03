@@ -103,6 +103,8 @@ async fn template_resolves_secret_and_redacts_in_event_log() {
         workspace_manager: std::sync::Arc::new(
             ordius_engine::environment::runtime::workspace::WorkspaceManager::new(),
         ),
+        env_cwd: parking_lot::Mutex::new(None),
+        run_cancel: tokio_util::sync::CancellationToken::new(),
     };
 
     let executor = InProcessExecutor::new();

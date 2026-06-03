@@ -111,6 +111,8 @@ async fn two_delay_nodes_run_end_to_end() {
         workspace_manager: std::sync::Arc::new(
             ordius_engine::environment::runtime::workspace::WorkspaceManager::new(),
         ),
+        env_cwd: parking_lot::Mutex::new(None),
+        run_cancel: tokio_util::sync::CancellationToken::new(),
     };
     let executor = InProcessExecutor::new();
     let mut sched = Scheduler::new(&wf);

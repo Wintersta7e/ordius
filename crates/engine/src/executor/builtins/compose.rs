@@ -64,7 +64,11 @@ impl NodeExecutor for ComposeExecutor {
             .run_child_workflow(
                 Arc::new(child_wf),
                 vars,
+                // `&cancel` is the LOCAL token for this compose attempt;
+                // `ctx.run_cancel` is the run's ROOT user-cancel token,
+                // forwarded unchanged (NOT the local cancel).
                 &cancel,
+                ctx.run_cancel.clone(),
                 u32::try_from(next_depth).unwrap_or(u32::MAX),
                 Some(ctx.workspace.clone()),
                 "compose-",

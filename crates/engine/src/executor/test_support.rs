@@ -104,6 +104,8 @@ pub(super) fn make_ctx() -> (RunContext, broadcast::Receiver<RunEvent>, TempDir)
         workspace_manager: std::sync::Arc::new(
             crate::environment::runtime::workspace::WorkspaceManager::new(),
         ),
+        env_cwd: parking_lot::Mutex::new(None),
+        run_cancel: tokio_util::sync::CancellationToken::new(),
     };
     (ctx, rx, dir)
 }

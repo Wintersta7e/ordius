@@ -712,6 +712,8 @@ mod tests {
             workspace_manager: std::sync::Arc::new(
                 crate::environment::runtime::workspace::WorkspaceManager::new(),
             ),
+            env_cwd: parking_lot::Mutex::new(None),
+            run_cancel: tokio_util::sync::CancellationToken::new(),
         };
         (engine, ctx, dir)
     }
@@ -903,6 +905,8 @@ mod tests {
             workspace_manager: std::sync::Arc::new(
                 crate::environment::runtime::workspace::WorkspaceManager::new(),
             ),
+            env_cwd: parking_lot::Mutex::new(None),
+            run_cancel: tokio_util::sync::CancellationToken::new(),
         };
         (ctx, dir)
     }

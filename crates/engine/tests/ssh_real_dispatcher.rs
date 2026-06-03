@@ -749,6 +749,8 @@ async fn real_ssh_run_uploads_runs_and_writes_back() {
         attempt: std::sync::atomic::AtomicU32::new(1),
         auto_resume: false,
         workspace_manager: Arc::clone(&wm),
+        env_cwd: parking_lot::Mutex::new(None),
+        run_cancel: tokio_util::sync::CancellationToken::new(),
     };
 
     // Run the shell node through the real executor → resolve_cwd uploads the
