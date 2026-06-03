@@ -19,6 +19,7 @@ use ordius_engine::environment::runtime::ssh::SshDispatcher;
 use ordius_engine::environment::runtime::ssh::config::SshConfig;
 use ordius_engine::environment::runtime::ssh::host_key::HostKeyHandler;
 use ordius_engine::environment::runtime::transport::Stdio;
+use ordius_engine::environment::runtime::workspace::FileKind;
 use ordius_engine::environment::runtime::{
     EnvId, EnvInfo, EnvSpec, EnvState, ProbePlan, ProcessCmd, SshAuth, WorkspaceBinding,
 };
@@ -801,4 +802,583 @@ async fn real_ssh_run_uploads_runs_and_writes_back() {
         t.stat(&root).await.unwrap().is_none(),
         "remote ephemeral root must be deleted"
     );
+}
+
+// ── Per-node reconcile (H3) e2e against a real SSH server ──────────────────────
+//
+// The four tests below prove the H3 behaviours the in-memory fake can't:
+// downstream visibility of a remote node's output, the per-key lease serialising
+// concurrent same-workspace nodes, user-cancel skipping write-back while a
+// timeout still writes back, and `reconcile_in` clearing pre-existing remote
+// symlinks before upload. They share the helpers in this section.
+
+/// A unique-per-invocation run id so re-runs never collide with leftover remote
+/// state under `/tmp` (production uses a unique `run.id` for the same reason).
+fn uniq_run_id(label: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("h3-{label}-{}-{nanos}", std::process::id())
+}
+
+/// `Sync { Sftp, Force }` binding whose ephemeral root embeds `{{run.id}}`.
+/// With a [`uniq_run_id`] the expanded root is `/tmp/ordius-h3-<run_id>`.
+fn h3_force_binding() -> WorkspaceBinding {
+    use ordius_engine::environment::runtime::env::{SyncStrategy, WriteBackPolicy};
+    WorkspaceBinding::Sync {
+        env_path_template: "/tmp/ordius-h3-{{run.id}}".into(),
+        strategy: SyncStrategy::Sftp,
+        write_back: WriteBackPolicy::Force { ignore: vec![] },
+    }
+}
+
+/// The expanded ephemeral root for `run_id` under [`h3_force_binding`].
+fn h3_root(run_id: &str) -> String {
+    format!("/tmp/ordius-h3-{run_id}")
+}
+
+/// Build a `RunContext` that targets `dispatcher` (an SSH env) with an ephemeral
+/// `Sync{Force}` binding, sharing the given `wm` so the per-key lease is visible
+/// across contexts that share an `(env, host_ws)` key.
+///
+/// Mirrors the manual `RunContext` construction in
+/// `real_ssh_run_uploads_runs_and_writes_back` (every field incl.
+/// `env_cwd: Mutex::new(None)` + a fresh `run_cancel`). The returned context is
+/// what a test drives through the run loop's reconcile cycle by hand.
+#[allow(clippy::too_many_lines)]
+fn h3_run_context(
+    dispatcher: &Arc<dyn Dispatcher>,
+    env_id: &EnvId,
+    host_ws: &std::path::Path,
+    run_id: &str,
+    wm: &Arc<ordius_engine::environment::runtime::workspace::WorkspaceManager>,
+) -> ordius_engine::executor::RunContext {
+    use ordius_engine::checkpoints::CheckpointRegistry;
+    use ordius_engine::db::open;
+    use ordius_engine::emitter::Emitter;
+    use ordius_engine::environment::runtime::env::EnvSpec;
+    use ordius_engine::environment::runtime::{ResourceRegistry, RunSnapshot, WorkflowId};
+    use ordius_engine::executor::{RunContext, wrap_process_env};
+    use ordius_engine::recorder::RunRecorder;
+    use ordius_engine::types::{Node, Pos, Workflow};
+
+    // Only `workspace_binding` is read from this spec by RunSnapshot; the real
+    // connection details live on the dispatcher, so the rest are placeholders.
+    let spec = EnvSpec::Ssh {
+        host: "unused".into(),
+        port: 22,
+        user: "unused".into(),
+        auth: SshAuth::KeyFile {
+            path: "/unused".into(),
+            passphrase_ref: None,
+        },
+        host_key_pins: vec![],
+        workspace_binding: h3_force_binding(),
+        resources: vec![],
+    };
+
+    let mut dispatchers: HashMap<EnvId, Arc<dyn Dispatcher>> = HashMap::new();
+    dispatchers.insert(env_id.clone(), Arc::clone(dispatcher));
+    let mut specs: HashMap<EnvId, EnvSpec> = HashMap::new();
+    specs.insert(env_id.clone(), spec);
+
+    let wf = Workflow {
+        id: "ssh-h3".into(),
+        name: "SSH H3".into(),
+        schema_version: 1,
+        created_at: None,
+        updated_at: None,
+        variables: HashMap::new(),
+        triggers: vec![],
+        // A placeholder node so RunRecorder::start has a workflow to record;
+        // the actual command run per test is supplied at call time.
+        nodes: vec![Node {
+            id: "run".into(),
+            ty: "shell".into(),
+            name: "run".into(),
+            config: HashMap::new(),
+            pos: Pos::default(),
+            timeout_ms: None,
+            retry: None,
+            continue_on_error: false,
+            target_env: Some(env_id.clone()),
+        }],
+        edges: vec![],
+        resources: vec![],
+        default_env: None,
+    };
+
+    // Each context gets its own throwaway DB (a unique temp dir per run_id keeps
+    // concurrent contexts from sharing a SQLite file).
+    let db_dir = std::env::temp_dir().join(format!("ordius-h3-db-{run_id}"));
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let pool = open(db_dir.join("t.db")).unwrap();
+    // The recorder generates its own DB run_id; we don't use it. Every
+    // template/scope/snapshot below takes the caller's unique `run_id` directly,
+    // so the expanded ephemeral root is `h3_root(run_id)`.
+    let rec = Arc::new(
+        RunRecorder::start(pool, &wf, "{}", &HashMap::new(), "test").unwrap_or_else(|e| {
+            panic!("RunRecorder::start failed: {e}");
+        }),
+    );
+    let (em, _rx) = Emitter::new(rec.clone());
+    let em = Arc::new(em);
+
+    let run_snapshot = Arc::new(RunSnapshot {
+        run_id: run_id.to_string(),
+        workflow_id: WorkflowId(wf.id.clone()),
+        default_env: env_id.clone(),
+        registry: ResourceRegistry::new().snapshot(),
+        dispatchers: Arc::new(dispatchers),
+        catalogs: Arc::new(HashMap::new()),
+        specs: Arc::new(specs),
+    });
+
+    RunContext {
+        run_id: run_id.to_string(),
+        workflow_id: wf.id.clone(),
+        workflow_name: wf.name,
+        started_at_iso: "2026-01-01T00:00:00Z".into(),
+        workspace: host_ws.to_path_buf(),
+        variables: HashMap::new(),
+        recorder: rec,
+        emitter: em,
+        secrets_store: None,
+        env: wrap_process_env(),
+        current_inputs: HashMap::new(),
+        upstream_outputs: HashMap::new(),
+        checkpoints: Arc::new(CheckpointRegistry::new()),
+        events: Arc::new(ordius_engine::events_registry::EventRegistry::new()),
+        run_snapshot,
+        engine: std::sync::Weak::new(),
+        compose_depth: 0,
+        iteration: 1,
+        attempt: std::sync::atomic::AtomicU32::new(1),
+        auto_resume: false,
+        workspace_manager: Arc::clone(wm),
+        env_cwd: parking_lot::Mutex::new(None),
+        run_cancel: tokio_util::sync::CancellationToken::new(),
+    }
+}
+
+/// Run a single `shell` node with `command` against `ctx`'s SSH env, performing
+/// the run loop's `reconcile_in → set_env_cwd → SubprocessExecutor.run` cycle.
+/// The command executes in the synced remote cwd (the executor reads
+/// `ctx.env_cwd()`), so a relative `> file.txt` lands inside the ephemeral root.
+///
+/// Returns after the node completes; the caller owns `reconcile_out`/teardown.
+async fn h3_reconcile_in_and_run(
+    ctx: &ordius_engine::executor::RunContext,
+    dispatcher: &Arc<dyn Dispatcher>,
+    env_id: &EnvId,
+    command: &str,
+) {
+    use ordius_engine::environment::runtime::workspace::RunScope;
+    use ordius_engine::executor::{NodeExecutor, SubprocessExecutor};
+    use ordius_engine::registry::Registry;
+    use ordius_engine::types::{Node, Pos};
+
+    let binding = ctx.run_snapshot.workspace_binding(env_id);
+    let run_scope = RunScope {
+        run_id: &ctx.run_id,
+        workflow_id: &ctx.workflow_id,
+        workflow_name: &ctx.workflow_name,
+        started_at_iso: &ctx.started_at_iso,
+    };
+    let cwd = ctx
+        .workspace_manager
+        .reconcile_in(dispatcher.as_ref(), &binding, &ctx.workspace, &run_scope)
+        .await
+        .expect("reconcile_in uploads the workspace");
+    ctx.set_env_cwd(cwd);
+
+    let node = Node {
+        id: "run".into(),
+        ty: "shell".into(),
+        name: "run".into(),
+        config: HashMap::from([("command".into(), serde_json::json!(command))]),
+        pos: Pos::default(),
+        timeout_ms: None,
+        retry: None,
+        continue_on_error: false,
+        target_env: Some(env_id.clone()),
+    };
+    let reg = Registry::with_v1_0_builtins();
+    let nt = reg.get("shell").expect("shell built-in registered");
+    SubprocessExecutor
+        .run(&node, &nt, ctx, CancellationToken::new())
+        .await
+        .expect("shell node runs on the remote");
+}
+
+/// Run one raw command on the remote via the dispatcher (no workspace cwd, no
+/// node). Used to plant remote state (e.g. symlinks) outside the reconcile path.
+/// Asserts a zero exit.
+async fn h3_remote_exec(dispatcher: &Arc<dyn Dispatcher>, sh: &str) {
+    let mut p = dispatcher
+        .spawn(ProcessCmd {
+            program: "sh".into(),
+            args: vec!["-c".into(), sh.into()],
+            env: HashMap::new(),
+            cwd: None,
+            stdin: None,
+            stdout: Stdio::Piped,
+            stderr: Stdio::Piped,
+        })
+        .await
+        .expect("remote exec spawn");
+    let exit = p.wait().await.expect("remote exec wait");
+    assert_eq!(exit.code, 0, "remote exec `{sh}` must exit 0, got {exit:?}");
+}
+
+/// Test 1 — `reconcile_out` makes an SSH node's output visible on the host.
+///
+/// A downstream host node would read `handoff.txt` from the host workspace; this
+/// asserts the file (written by the remote node) is present on the host after
+/// `reconcile_out`, which is exactly that hand-off property.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "gated: requires ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"]
+async fn real_ssh_mid_dag_handoff() {
+    let Some(ssh) = build_dispatcher_for_transport_test().await else {
+        eprintln!(
+            "skipping mid-dag handoff test; set ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"
+        );
+        return;
+    };
+    let env_id = ssh.info().id.clone();
+    let dispatcher: Arc<dyn Dispatcher> = Arc::new(ssh);
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let host_ws = tmp.path().to_path_buf();
+    let run_id = uniq_run_id("handoff");
+
+    let wm = Arc::new(ordius_engine::environment::runtime::workspace::WorkspaceManager::new());
+    let ctx = h3_run_context(&dispatcher, &env_id, &host_ws, &run_id, &wm);
+
+    // Remote node writes its output into the synced cwd.
+    h3_reconcile_in_and_run(&ctx, &dispatcher, &env_id, "echo node1-out > handoff.txt").await;
+
+    // reconcile_out surfaces the remote write on the host (where a downstream
+    // host node would read it).
+    let binding = ctx.run_snapshot.workspace_binding(&env_id);
+    wm.reconcile_out(dispatcher.as_ref(), &binding, &host_ws)
+        .await
+        .expect("reconcile_out writes the delta back");
+
+    let got = std::fs::read_to_string(host_ws.join("handoff.txt"))
+        .expect("handoff.txt must be written back to the host workspace");
+    assert_eq!(
+        got.trim(),
+        "node1-out",
+        "downstream host node would read node1's output; got {got:?}"
+    );
+
+    wm.teardown_all(ordius_engine::environment::runtime::workspace::RunOutcome::Completed)
+        .await;
+}
+
+/// Test 2 — the per-key execution lease serialises two concurrent same-`(env,
+/// host_ws)` reconcile cycles so the shared host workspace is not torn.
+///
+/// Two tasks each `acquire_execution_lease` on the SAME key, run a full cycle
+/// against the SAME host workspace (distinct `run_id` ⇒ distinct ephemeral root;
+/// distinct output file), hold the lease across the whole cycle, then drop it.
+/// The lease is the thing under test: both contend the same key, one waits.
+///
+/// Why this isn't a tautology: both cycles share ONE `WorkspaceManager` and the
+/// same `(env, host_ws)` key, so they contend the single per-key `WorkspaceState`
+/// entry that `reconcile_in` inserts and `reconcile_out` reads. Without the lease,
+/// task B's `reconcile_in` would clobber task A's state (a *different*
+/// `env_side_root`) mid-cycle, so A's `reconcile_out` would diff against B's root
+/// and either error or write the wrong delta. The lease forces A's whole cycle to
+/// finish before B's begins; both files landing correctly is the observable proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "gated: requires ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"]
+async fn real_ssh_parallel_same_env_serializes() {
+    use ordius_engine::environment::runtime::workspace::{RunOutcome, WorkspaceManager};
+
+    let Some(ssh) = build_dispatcher_for_transport_test().await else {
+        eprintln!(
+            "skipping parallel lease test; set ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"
+        );
+        return;
+    };
+    let env_id = ssh.info().id.clone();
+    let dispatcher: Arc<dyn Dispatcher> = Arc::new(ssh);
+
+    // ONE shared host workspace and ONE shared manager — so both tasks contend
+    // the same lease key `(env_id, host_ws)`.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let host_ws = tmp.path().to_path_buf();
+    let wm = Arc::new(WorkspaceManager::new());
+
+    // One full reconcile cycle, holding the lease across the entire cycle.
+    let cycle = |file: &'static str, label: &'static str| {
+        let dispatcher = Arc::clone(&dispatcher);
+        let env_id = env_id.clone();
+        let host_ws = host_ws.clone();
+        let wm = Arc::clone(&wm);
+        async move {
+            let key = (env_id.clone(), host_ws.clone());
+            // Held across reconcile_in → run → reconcile_out → drop.
+            let _lease = wm.acquire_execution_lease(key).await;
+
+            let run_id = uniq_run_id(label);
+            let ctx = h3_run_context(&dispatcher, &env_id, &host_ws, &run_id, &wm);
+            h3_reconcile_in_and_run(
+                &ctx,
+                &dispatcher,
+                &env_id,
+                &format!("echo {label}-data > {file}"),
+            )
+            .await;
+            let binding = ctx.run_snapshot.workspace_binding(&env_id);
+            wm.reconcile_out(dispatcher.as_ref(), &binding, &host_ws)
+                .await
+                .expect("reconcile_out under lease");
+            // Lease dropped here, at end of the cycle.
+        }
+    };
+
+    let a = tokio::spawn(cycle("parallel-a.txt", "a"));
+    let b = tokio::spawn(cycle("parallel-b.txt", "b"));
+    let (ra, rb) = tokio::join!(a, b);
+    ra.expect("task A must not panic");
+    rb.expect("task B must not panic");
+
+    // The lease serialised the two host-side reconciles: both files are present
+    // and correct, i.e. neither cycle clobbered the shared workspace.
+    let got_a = std::fs::read_to_string(host_ws.join("parallel-a.txt"))
+        .expect("parallel-a.txt must be present");
+    let got_b = std::fs::read_to_string(host_ws.join("parallel-b.txt"))
+        .expect("parallel-b.txt must be present");
+    assert_eq!(got_a.trim(), "a-data", "task A output mismatch");
+    assert_eq!(got_b.trim(), "b-data", "task B output mismatch");
+
+    wm.teardown_all(RunOutcome::Completed).await;
+}
+
+/// Test 3 — `reconcile_out` is skipped on a genuine user cancel but runs on a
+/// timeout/fail-fast. Replicates the run loop's exact guard
+/// `if synced && !ctx.run_cancel.is_cancelled() { reconcile_out }`
+/// (see `run_with_retry` in `crates/engine/src/run.rs`, which external tests
+/// cannot call directly).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "gated: requires ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"]
+#[allow(clippy::too_many_lines)]
+async fn real_ssh_cancel_skips_writeback_timeout_keeps() {
+    use ordius_engine::environment::runtime::workspace::{RunOutcome, WorkspaceManager};
+
+    let Some(ssh) = build_dispatcher_for_transport_test().await else {
+        eprintln!(
+            "skipping cancel/timeout test; set ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"
+        );
+        return;
+    };
+    let env_id = ssh.info().id.clone();
+    let dispatcher: Arc<dyn Dispatcher> = Arc::new(ssh);
+
+    // ── Sub-case CANCEL: user cancel ⇒ guard fails ⇒ write-back skipped ──
+    {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let host_ws = tmp.path().to_path_buf();
+        let run_id = uniq_run_id("cancel");
+        let wm = Arc::new(WorkspaceManager::new());
+        let ctx = h3_run_context(&dispatcher, &env_id, &host_ws, &run_id, &wm);
+
+        h3_reconcile_in_and_run(
+            &ctx,
+            &dispatcher,
+            &env_id,
+            "echo should-not-land > cancelled.txt",
+        )
+        .await;
+
+        // A genuine user cancel cancels the run-root token.
+        ctx.run_cancel.cancel();
+
+        // The run loop's guard: synced && !run_cancel.is_cancelled().
+        let binding = ctx.run_snapshot.workspace_binding(&env_id);
+        if !ctx.run_cancel.is_cancelled() {
+            wm.reconcile_out(dispatcher.as_ref(), &binding, &host_ws)
+                .await
+                .expect("reconcile_out");
+        }
+        wm.teardown_all(RunOutcome::CancelledByUser).await;
+
+        // Write-back was skipped: the remote-written file never reached the host.
+        assert!(
+            !host_ws.join("cancelled.txt").exists(),
+            "user cancel must skip write-back (cancelled.txt must be absent)"
+        );
+        // Teardown still cleaned up the ephemeral root.
+        let t = dispatcher
+            .workspace_transport()
+            .unwrap()
+            .open()
+            .await
+            .unwrap();
+        assert!(
+            t.stat(&h3_root(&run_id)).await.unwrap().is_none(),
+            "ephemeral root must be deleted even on cancel"
+        );
+    }
+
+    // ── Sub-case KEEP: timeout/fail-fast ⇒ run_cancel UNcancelled ⇒ write-back ──
+    {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let host_ws = tmp.path().to_path_buf();
+        let run_id = uniq_run_id("keep");
+        let wm = Arc::new(WorkspaceManager::new());
+        let ctx = h3_run_context(&dispatcher, &env_id, &host_ws, &run_id, &wm);
+
+        h3_reconcile_in_and_run(&ctx, &dispatcher, &env_id, "echo should-land > kept.txt").await;
+
+        // A timeout/fail-fast cancels only the local/attempt token, NEVER
+        // run_cancel — so the guard passes and write-back runs.
+        let binding = ctx.run_snapshot.workspace_binding(&env_id);
+        if !ctx.run_cancel.is_cancelled() {
+            wm.reconcile_out(dispatcher.as_ref(), &binding, &host_ws)
+                .await
+                .expect("reconcile_out");
+        }
+        wm.teardown_all(RunOutcome::Completed).await;
+
+        let got = std::fs::read_to_string(host_ws.join("kept.txt"))
+            .expect("kept.txt must be written back (run_cancel was not cancelled)");
+        assert_eq!(got.trim(), "should-land", "kept.txt content mismatch");
+    }
+}
+
+/// Test 4 — `reconcile_in`'s reset clears pre-existing remote symlinks (both a
+/// target-path link and an intermediate-dir link) so no stale link redirects an
+/// upload. After reset, the target path must be a regular `File` with host
+/// content and the intermediate path a real directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "gated: requires ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"]
+#[allow(clippy::too_many_lines)]
+async fn real_ssh_reconcile_in_clears_symlinks() {
+    use ordius_engine::environment::runtime::workspace::{RunOutcome, RunScope, WorkspaceManager};
+
+    let Some(ssh) = build_dispatcher_for_transport_test().await else {
+        eprintln!(
+            "skipping symlink-clearing test; set ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"
+        );
+        return;
+    };
+    // The symlink test drives `reconcile_in` directly (no RunContext/snapshot),
+    // so it never needs the env id locally — `reconcile_in` keys its state by
+    // `dispatcher.info().id` internally.
+    let dispatcher: Arc<dyn Dispatcher> = Arc::new(ssh);
+
+    // Host workspace: a regular a.txt and sub/b.txt.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let host_ws = tmp.path().to_path_buf();
+    std::fs::write(host_ws.join("a.txt"), b"host-a").unwrap();
+    std::fs::create_dir(host_ws.join("sub")).unwrap();
+    std::fs::write(host_ws.join("sub").join("b.txt"), b"host-b").unwrap();
+
+    let run_id = uniq_run_id("symlink");
+    let root = h3_root(&run_id);
+    let wm = Arc::new(WorkspaceManager::new());
+
+    // Plant pre-existing remote symlinks BEFORE reconcile_in:
+    //   <root>/a.txt -> /etc/hostname   (a target-path symlink)
+    //   <root>/sub   -> /tmp            (an intermediate-dir symlink)
+    // A no-follow-unaware uploader would redirect writes through these.
+    h3_remote_exec(
+        &dispatcher,
+        &format!("mkdir -p {root} && ln -s /etc/hostname {root}/a.txt && ln -s /tmp {root}/sub"),
+    )
+    .await;
+
+    // Sanity: the planted entries really are symlinks before the reset.
+    {
+        let t = dispatcher
+            .workspace_transport()
+            .unwrap()
+            .open()
+            .await
+            .unwrap();
+        assert_eq!(
+            t.stat(&format!("{root}/a.txt"))
+                .await
+                .unwrap()
+                .map(|m| m.kind),
+            Some(FileKind::Symlink),
+            "precondition: a.txt must be a symlink before reconcile_in"
+        );
+        assert_eq!(
+            t.stat(&format!("{root}/sub"))
+                .await
+                .unwrap()
+                .map(|m| m.kind),
+            Some(FileKind::Symlink),
+            "precondition: sub must be a symlink before reconcile_in"
+        );
+    }
+
+    // reconcile_in resets the remote tree to mirror the host (delete-before-upload
+    // clears the symlinks first).
+    let binding = h3_force_binding();
+    let run_scope = RunScope {
+        run_id: &run_id,
+        workflow_id: "wf-symlink",
+        workflow_name: "Symlink Test",
+        started_at_iso: "2026-01-01T00:00:00Z",
+    };
+    let cwd = wm
+        .reconcile_in(dispatcher.as_ref(), &binding, &host_ws, &run_scope)
+        .await
+        .expect("reconcile_in must clear the symlinks and upload host files");
+    assert_eq!(
+        cwd.as_str(),
+        root,
+        "expanded root must match the planted root"
+    );
+
+    // Verify via the transport: a.txt is now a regular File with host content,
+    // and sub is a real directory containing b.txt = host-b.
+    let t = dispatcher
+        .workspace_transport()
+        .unwrap()
+        .open()
+        .await
+        .unwrap();
+
+    let a_meta = t
+        .stat(&format!("{root}/a.txt"))
+        .await
+        .unwrap()
+        .expect("a.txt must exist after reset");
+    assert_eq!(
+        a_meta.kind,
+        FileKind::File,
+        "a.txt must be a regular File after reset (symlink cleared)"
+    );
+    assert_eq!(
+        t.download_file(&format!("{root}/a.txt")).await.unwrap(),
+        b"host-a",
+        "a.txt must hold host content, not the symlink target"
+    );
+
+    let sub_meta = t
+        .stat(&format!("{root}/sub"))
+        .await
+        .unwrap()
+        .expect("sub must exist after reset");
+    assert_eq!(
+        sub_meta.kind,
+        FileKind::Dir,
+        "sub must be a real directory after reset (symlink cleared)"
+    );
+    assert_eq!(
+        t.download_file(&format!("{root}/sub/b.txt")).await.unwrap(),
+        b"host-b",
+        "sub/b.txt must hold host content"
+    );
+
+    drop(t);
+    wm.teardown_all(RunOutcome::Completed).await;
 }
