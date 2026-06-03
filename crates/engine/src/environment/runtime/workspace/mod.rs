@@ -4,7 +4,7 @@ pub mod manager;
 pub mod safety;
 /// Workspace transport traits and implementations.
 pub mod transport;
-pub use manager::{RunOutcome, RunScope, WorkspaceManager};
+pub use manager::{RunOutcome, RunScope, WorkspaceExecutionLease, WorkspaceManager};
 pub use transport::{FileKind, FileMeta, WorkspaceTransport, WorkspaceTransportFactory};
 
 #[cfg(any(test, feature = "testing"))]

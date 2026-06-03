@@ -19,7 +19,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, OnceCell};
+use parking_lot::Mutex as SyncMutex;
+use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
 
 use crate::environment::runtime::dispatcher::Dispatcher;
 use crate::environment::runtime::env::{EnvId, WorkspaceBinding, WriteBackPolicy};
@@ -34,7 +35,22 @@ use super::transport::{FileKind, WorkspaceTransport, WorkspaceTransportFactory};
 /// Inner map type for the singleflight prepared-workspace registry.
 type PreparedMap = HashMap<(EnvId, PathBuf), Arc<OnceCell<Arc<PreparedWorkspace>>>>;
 
+/// Identity of one synced workspace; lease and state are keyed by it.
+pub(crate) type WorkspaceKey = (EnvId, PathBuf);
+
+/// Inner map type for the per-key execution lease registry.
+type LeaseMap = HashMap<WorkspaceKey, Arc<tokio::sync::Mutex<()>>>;
+
 // ── Types ─────────────────────────────────────────────────────────────────────
+
+/// RAII guard for a node's exclusive execution cycle on one workspace key.
+///
+/// Held for the duration of a node's reconcile cycle; a second call to
+/// [`WorkspaceManager::acquire_execution_lease`] with the same key blocks
+/// until this guard is dropped.  Distinct keys never contend.
+pub struct WorkspaceExecutionLease {
+    _guard: OwnedMutexGuard<()>,
+}
 
 /// Terminal classification handed to [`WorkspaceManager::teardown_all`]
 /// so write-back/cleanup policy can branch on how the run ended.
@@ -108,6 +124,11 @@ pub struct WorkspaceManager {
     /// the same env share one upload without holding the map lock across I/O.
     prepared: Mutex<PreparedMap>,
 
+    /// Per-key execution lease registry.  The `parking_lot` (sync) map lock is
+    /// only held long enough to clone the `Arc`; the async `tokio::sync::Mutex`
+    /// inside each entry serialises concurrent reconcile cycles for the same key.
+    leases: SyncMutex<LeaseMap>,
+
     /// Test-only seam: records the last [`RunOutcome`] passed to
     /// [`Self::teardown_all`]. Lets run-loop tests observe that
     /// teardown fired with the correct outcome on every exit path.
@@ -128,6 +149,7 @@ impl Default for WorkspaceManager {
     fn default() -> Self {
         Self {
             prepared: Mutex::new(HashMap::new()),
+            leases: SyncMutex::new(HashMap::new()),
             #[cfg(any(test, feature = "testing"))]
             last_outcome: std::sync::Mutex::new(None),
         }
@@ -139,6 +161,30 @@ impl WorkspaceManager {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Acquire an exclusive execution lease for `key`.
+    ///
+    /// Returns a RAII [`WorkspaceExecutionLease`] guard.  A second call with the
+    /// same key blocks until the first guard is dropped.  Calls with distinct
+    /// keys proceed independently.
+    ///
+    /// # Ordering contract
+    ///
+    /// The `parking_lot` sync lock on `leases` is dropped **before** the
+    /// `.await` — a sync guard is never held across an await point.
+    pub async fn acquire_execution_lease(&self, key: WorkspaceKey) -> WorkspaceExecutionLease {
+        let m = {
+            let mut leases = self.leases.lock(); // parking_lot — sync; dropped before await
+            Arc::clone(
+                leases
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        }; // sync guard dropped here
+        WorkspaceExecutionLease {
+            _guard: m.lock_owned().await,
+        }
     }
 
     /// Resolve the working directory inside the target env.
@@ -989,6 +1035,59 @@ mod tests {
             b"fine",
             "the legitimate sibling must still be written back"
         );
+    }
+
+    // ── WorkspaceExecutionLease ───────────────────────────────────────────────
+
+    /// Same key blocks; distinct key does not.
+    ///
+    /// Proof:
+    ///   (a) While A's lease is held, `acquire_execution_lease(A)` wrapped in a
+    ///       50 ms timeout returns `Err` (still blocked).
+    ///   (b) `acquire_execution_lease(B)` under the same timeout returns `Ok`
+    ///       immediately — distinct keys never contend.
+    ///   (c) After A's guard is dropped, `acquire_execution_lease(A)` succeeds.
+    #[tokio::test]
+    async fn lease_serializes_same_key_allows_distinct() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let mgr = WorkspaceManager::new();
+        let key_a: WorkspaceKey = (EnvId::local(), PathBuf::from("/ws/a"));
+        let key_b: WorkspaceKey = (EnvId::local(), PathBuf::from("/ws/b"));
+
+        // Acquire lease A.
+        let lease_a = mgr.acquire_execution_lease(key_a.clone()).await;
+
+        // (a) A second acquire on key A must block (timeout expires).
+        assert!(
+            timeout(
+                Duration::from_millis(50),
+                mgr.acquire_execution_lease(key_a.clone()),
+            )
+            .await
+            .is_err(),
+            "acquire_execution_lease(A) must block while A is held"
+        );
+
+        // (b) Key B resolves immediately — no contention with A.
+        let lease_b = timeout(
+            Duration::from_millis(50),
+            mgr.acquire_execution_lease(key_b),
+        )
+        .await
+        .expect("acquire_execution_lease(B) must not block — distinct key");
+        drop(lease_b);
+
+        // (c) Drop A; now acquiring A must succeed.
+        drop(lease_a);
+        let lease_a2 = timeout(
+            Duration::from_millis(50),
+            mgr.acquire_execution_lease(key_a),
+        )
+        .await
+        .expect("acquire_execution_lease(A) must succeed after guard is dropped");
+        drop(lease_a2);
     }
 
     /// A host-side symlinked directory inside the workspace must not let
