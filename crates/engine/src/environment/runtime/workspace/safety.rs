@@ -66,6 +66,35 @@ pub fn is_safe_relative(rel: &str) -> bool {
             .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
+/// Whether writing `host_ws/rel` would traverse an existing symlink.
+///
+/// Returns `false` if any existing component of `host_ws/<rel>` is a symlink —
+/// a host-side symlinked directory could redirect a write outside the
+/// workspace. Only existing components are checked; missing ones are created as
+/// real directories by the caller. Complements [`is_safe_relative`], which only
+/// inspects the path string (`..`), not the live host filesystem.
+#[must_use]
+pub fn host_target_is_symlink_safe(host_ws: &Path, rel: &str) -> bool {
+    use std::path::Component;
+    let mut cur = host_ws.to_path_buf();
+    for comp in Path::new(rel).components() {
+        match comp {
+            Component::Normal(c) => {
+                cur.push(c);
+                if let Ok(md) = std::fs::symlink_metadata(&cur)
+                    && md.file_type().is_symlink()
+                {
+                    return false;
+                }
+            },
+            Component::CurDir => {},
+            // is_safe_relative already rejects these; be defensive.
+            _ => return false,
+        }
+    }
+    true
+}
+
 // ── 2. Ignore rules ───────────────────────────────────────────────────────────
 
 /// Default-ignored path prefixes (checked against the first path segment or
@@ -413,24 +442,6 @@ pub fn hash_file(abs: &Path) -> Result<String, DispatchError> {
         reason: format!("read `{}` for hashing: {e}", abs.display()),
     })?;
     Ok(sha256_hex(&bytes))
-}
-
-/// Hash every entry in `entries` and return a [`Manifest`].
-pub fn build_manifest(host_ws: &Path, entries: &[WalkEntry]) -> Result<Manifest, DispatchError> {
-    let _ = host_ws; // root provided for context; abs paths in WalkEntry are self-contained
-    let mut manifest = Manifest::new();
-    for entry in entries {
-        let sha256_hex = hash_file(&entry.abs)?;
-        manifest.insert(
-            entry.rel_path.clone(),
-            FileEntry {
-                sha256_hex,
-                size: entry.size,
-                mode: entry.mode,
-            },
-        );
-    }
-    Ok(manifest)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

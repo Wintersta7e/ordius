@@ -27,7 +27,7 @@ use crate::environment::runtime::error::DispatchError;
 use crate::environment::runtime::transport::EnvPath;
 
 use super::safety;
-use super::transport::{FileKind, WorkspaceTransportFactory};
+use super::transport::{FileKind, WorkspaceTransport, WorkspaceTransportFactory};
 
 // ── Type aliases ──────────────────────────────────────────────────────────────
 
@@ -253,40 +253,31 @@ impl WorkspaceManager {
         })?;
         let t = factory.open().await?;
 
-        // Ensure the root directory exists (transport mkdir creates parents).
+        // Create the root, then upload. A failure after mkdir leaves a partial
+        // remote root; the never-completed singleflight cell is dropped, so
+        // teardown never sees the root. Clean it up best-effort here before
+        // propagating, otherwise the ephemeral dir leaks on the remote.
         t.mkdir(env_side_root).await?;
-
-        // Walk the host workspace, applying default ignore rules.
-        let entries = safety::walk_workspace(host_ws)?;
-
-        // Enforce caps BEFORE any bytes leave the host.
-        let caps = safety::UploadCaps::default();
-        let mut tracker = safety::CapTracker::new(caps);
-        for entry in &entries {
-            tracker.add(entry.size)?;
+        match upload_files(dispatcher, t, env_side_root, host_ws).await {
+            Ok(upload_manifest) => Ok(Arc::new(PreparedWorkspace {
+                env_side_root: env_side_root.to_string(),
+                lifecycle,
+                write_back,
+                upload_manifest,
+                host_ws: host_ws.to_path_buf(),
+                transport_factory: factory,
+            })),
+            Err(e) => {
+                if let Err(cleanup_err) = remove_tree(factory.as_ref(), env_side_root).await {
+                    tracing::warn!(
+                        env_root = env_side_root,
+                        error = %cleanup_err,
+                        "failed to remove partial upload root after upload error"
+                    );
+                }
+                Err(e)
+            },
         }
-
-        // Upload each file.
-        for entry in &entries {
-            let bytes =
-                std::fs::read(&entry.abs).map_err(|e| DispatchError::WorkspaceUnavailable {
-                    env_id: dispatcher.info().id.as_str().to_owned(),
-                    reason: format!("read `{}` for upload: {e}", entry.abs.display()),
-                })?;
-            let remote_path = format!("{env_side_root}/{}", entry.rel_path);
-            t.upload_file(&remote_path, &bytes).await?;
-        }
-
-        let upload_manifest = safety::build_manifest(host_ws, &entries)?;
-
-        Ok(Arc::new(PreparedWorkspace {
-            env_side_root: env_side_root.to_string(),
-            lifecycle,
-            write_back,
-            upload_manifest,
-            host_ws: host_ws.to_path_buf(),
-            transport_factory: factory,
-        }))
     }
 
     /// Tear down every workspace prepared during the run.
@@ -332,6 +323,47 @@ impl WorkspaceManager {
 /// Write back (unless user-cancelled) then delete the ephemeral root for one
 /// prepared workspace. Cleanup is attempted even if write-back fails; the first
 /// error encountered is returned for the caller to log.
+/// Walk + cap-check + upload every file under `host_ws`, building the manifest
+/// from the EXACT bytes uploaded.
+///
+/// Hashing the sent bytes (rather than re-reading the file) means a concurrent
+/// host edit during the run can't make write-back mistake unchanged remote
+/// content for "changed" and clobber the newer host file. Consumes the
+/// transport; the caller `mkdir`s the root first and cleans up on error.
+async fn upload_files(
+    dispatcher: &dyn Dispatcher,
+    t: Box<dyn WorkspaceTransport>,
+    env_side_root: &str,
+    host_ws: &Path,
+) -> Result<safety::Manifest, DispatchError> {
+    let entries = safety::walk_workspace(host_ws)?;
+
+    // Enforce caps BEFORE any bytes leave the host.
+    let mut tracker = safety::CapTracker::new(safety::UploadCaps::default());
+    for entry in &entries {
+        tracker.add(entry.size)?;
+    }
+
+    let mut manifest = safety::Manifest::new();
+    for entry in &entries {
+        let bytes = std::fs::read(&entry.abs).map_err(|e| DispatchError::WorkspaceUnavailable {
+            env_id: dispatcher.info().id.as_str().to_owned(),
+            reason: format!("read `{}` for upload: {e}", entry.abs.display()),
+        })?;
+        let remote_path = format!("{env_side_root}/{}", entry.rel_path);
+        t.upload_file(&remote_path, &bytes).await?;
+        manifest.insert(
+            entry.rel_path.clone(),
+            safety::FileEntry {
+                sha256_hex: safety::sha256_hex(&bytes),
+                size: bytes.len() as u64,
+                mode: entry.mode,
+            },
+        );
+    }
+    Ok(manifest)
+}
+
 async fn teardown_one(pw: &PreparedWorkspace, outcome: RunOutcome) -> Result<(), DispatchError> {
     // Write-back is skipped entirely on user cancellation.
     let write_res = if outcome == RunOutcome::CancelledByUser {
@@ -388,6 +420,16 @@ async fn write_back(pw: &PreparedWorkspace) -> Result<(), DispatchError> {
                 rel,
                 env_root = %pw.env_side_root,
                 "skipping write-back of unsafe (escaping) env-side path"
+            );
+            continue;
+        }
+        // A traversal-free `rel` can still escape via a host-side symlinked
+        // directory; never write through one.
+        if !safety::host_target_is_symlink_safe(&pw.host_ws, rel) {
+            tracing::warn!(
+                rel,
+                env_root = %pw.env_side_root,
+                "skipping write-back: host path traverses a symlink"
             );
             continue;
         }
@@ -953,6 +995,42 @@ mod tests {
             std::fs::read(host_ws.join("ok.txt")).unwrap(),
             b"fine",
             "the legitimate sibling must still be written back"
+        );
+    }
+
+    /// A host-side symlinked directory inside the workspace must not let
+    /// write-back escape — writing through it would redirect outside the tree.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn teardown_force_does_not_follow_host_symlink_dirs() {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile::TempDir::new().unwrap();
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path().join("ws");
+        std::fs::create_dir(&host_ws).unwrap();
+        // host_ws/link -> <outside>  (a symlinked directory inside the workspace)
+        symlink(outside.path(), host_ws.join("link")).unwrap();
+
+        let root = "/tmp/ordius-wb-symlink";
+        let (mgr, fake) = manager_with_prepared(
+            root,
+            &host_ws,
+            WriteBackPolicy::Force { ignore: vec![] },
+            Manifest::new(),
+        )
+        .await;
+
+        // The "server" creates a file under the host-symlinked `link/` dir.
+        fake.upload_file(&format!("{root}/link/pwned.txt"), b"pwned")
+            .await
+            .unwrap();
+
+        mgr.teardown_all(RunOutcome::Completed).await;
+
+        assert!(
+            !outside.path().join("pwned.txt").exists(),
+            "write-back must not follow a host-side symlinked directory"
         );
     }
 }
