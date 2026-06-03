@@ -51,6 +51,21 @@ pub fn validate_env_root(expanded: &str) -> Result<(), DispatchError> {
     Ok(())
 }
 
+/// Whether `rel` is a safe *relative* path to write into the host workspace.
+///
+/// Safe = non-empty, with only normal (or `.`) components — no `..`, no
+/// absolute root, no drive prefix. Guards write-back against a malicious or
+/// compromised remote returning a traversal path that would escape the
+/// workspace.
+#[must_use]
+pub fn is_safe_relative(rel: &str) -> bool {
+    use std::path::Component;
+    !rel.is_empty()
+        && Path::new(rel)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
 // ── 2. Ignore rules ───────────────────────────────────────────────────────────
 
 /// Default-ignored path prefixes (checked against the first path segment or
@@ -458,6 +473,19 @@ mod tests {
     #[test]
     fn validate_env_root_accepts_valid() {
         assert!(validate_env_root("/tmp/ordius-abc").is_ok());
+    }
+
+    // ── is_safe_relative ──
+
+    #[test]
+    fn is_safe_relative_accepts_plain_rejects_traversal() {
+        assert!(is_safe_relative("a.txt"));
+        assert!(is_safe_relative("sub/b.txt"));
+        assert!(is_safe_relative("./a.txt"));
+        assert!(!is_safe_relative(""), "empty is unsafe");
+        assert!(!is_safe_relative("../escape"), "parent dir is unsafe");
+        assert!(!is_safe_relative("a/../../escape"), "embedded .. is unsafe");
+        assert!(!is_safe_relative("/etc/passwd"), "absolute is unsafe");
     }
 
     // ── is_default_ignored ──

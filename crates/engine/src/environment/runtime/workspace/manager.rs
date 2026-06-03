@@ -380,6 +380,17 @@ async fn write_back(pw: &PreparedWorkspace) -> Result<(), DispatchError> {
         let Some(rel) = entry.rel_path.strip_prefix(&prefix) else {
             continue; // defensive: listing returned a path outside the root
         };
+        // Defense-in-depth: a malicious / compromised server could return a
+        // listing entry whose path escapes the synced root (e.g. `../..`); never
+        // write outside the host workspace.
+        if !safety::is_safe_relative(rel) {
+            tracing::warn!(
+                rel,
+                env_root = %pw.env_side_root,
+                "skipping write-back of unsafe (escaping) env-side path"
+            );
+            continue;
+        }
         if safety::should_ignore(rel, ignore) {
             continue;
         }
@@ -902,6 +913,46 @@ mod tests {
         assert!(
             !host_ws.join("debug.log").exists(),
             "ignored *.log file must not be written back"
+        );
+    }
+
+    /// A malicious / compromised server returning a path that escapes the synced
+    /// root must NOT be written outside the host workspace during write-back.
+    #[tokio::test]
+    async fn teardown_force_skips_traversal_paths() {
+        let host = tempfile::TempDir::new().unwrap();
+        // Nest the workspace so a `..` escape would land inside the (auto-cleaned)
+        // temp dir rather than polluting the real filesystem.
+        let host_ws = host.path().join("ws");
+        std::fs::create_dir(&host_ws).unwrap();
+
+        let root = "/tmp/ordius-wb-evil";
+        let (mgr, fake) = manager_with_prepared(
+            root,
+            &host_ws,
+            WriteBackPolicy::Force { ignore: vec![] },
+            Manifest::new(),
+        )
+        .await;
+
+        // The "server" presents a traversal path plus a legitimate sibling.
+        fake.upload_file(&format!("{root}/../escape.txt"), b"pwned")
+            .await
+            .unwrap();
+        fake.upload_file(&format!("{root}/ok.txt"), b"fine")
+            .await
+            .unwrap();
+
+        mgr.teardown_all(RunOutcome::Completed).await;
+
+        assert!(
+            !host.path().join("escape.txt").exists(),
+            "traversal write-back must be skipped (no escape outside the workspace)"
+        );
+        assert_eq!(
+            std::fs::read(host_ws.join("ok.txt")).unwrap(),
+            b"fine",
+            "the legitimate sibling must still be written back"
         );
     }
 }
