@@ -16,13 +16,16 @@
 //! `workflow:done` / `workflow:error` / `workflow:stopped`.
 
 use crate::emitter::Emitter;
-use crate::environment::runtime::workspace::{RunOutcome, WorkspaceManager};
+use crate::environment::runtime::env::WorkspaceBinding;
+use crate::environment::runtime::workspace::{RunOutcome, RunScope, WorkspaceManager};
 use crate::events::{EventType, RunEvent};
 use crate::executor::builtins::condition::NODE_TYPE_ID as CONDITION_NODE_TYPE_ID;
 use crate::executor::{Dispatcher, NodeError, NodeExecutor, RunContext, wrap_process_env};
 use crate::recorder::{NodeRunRow, RunRecorder};
 use crate::scheduler::Scheduler;
-use crate::types::{BackoffStrategy, EdgeType, PortValue, RetryOn, RetryPolicy, Workflow};
+use crate::types::{
+    BackoffStrategy, EdgeType, ExecutionBackend, PortValue, RetryOn, RetryPolicy, Workflow,
+};
 use crate::{Engine, EngineError, Result};
 use futures::FutureExt; // `catch_unwind` on the run-loop future
 use std::collections::HashMap;
@@ -803,6 +806,13 @@ impl Engine {
 /// `(final_result, final_attempt, started_at, finished_at)` so
 /// the caller's `finalize_node_run` writes the row that records
 /// the terminal outcome.
+///
+/// For a `Subprocess`-backend node bound to a `Sync` workspace this also owns
+/// per-node workspace reconciliation: a per-key execution lease (so two nodes
+/// sharing the same `(env, host_ws)` never reset it concurrently), a
+/// `reconcile_in` reset before each attempt (records `ctx.env_cwd`), and a
+/// `reconcile_out` write-back after the final attempt. Non-`Sync`/non-`Subprocess`
+/// nodes take no lease and `reconcile_in` degrades to a plain `translate_path`.
 #[allow(clippy::too_many_arguments)]
 async fn run_with_retry(
     dispatcher: &Dispatcher,
@@ -822,6 +832,31 @@ async fn run_with_retry(
     i64,
     i64,
 )> {
+    let effective_env = node
+        .target_env
+        .clone()
+        .unwrap_or_else(|| ctx.run_snapshot.default_env.clone());
+    let binding = ctx.run_snapshot.workspace_binding(&effective_env);
+    let is_subprocess = nt.execution.backend == ExecutionBackend::Subprocess;
+    let synced = is_subprocess && matches!(binding, WorkspaceBinding::Sync { .. });
+    // Held across every attempt + the post-loop `reconcile_out`; dropped on
+    // each `return`. `None` (no lease) for non-synced nodes.
+    let _lease = if synced {
+        Some(
+            ctx.workspace_manager
+                .acquire_execution_lease((effective_env.clone(), ctx.workspace.clone()))
+                .await,
+        )
+    } else {
+        None
+    };
+    let run_scope = RunScope {
+        run_id: &ctx.run_id,
+        workflow_id: &ctx.workflow_id,
+        workflow_name: &ctx.workflow_name,
+        started_at_iso: &ctx.started_at_iso,
+    };
+
     let mut attempt: u32 = 1;
     loop {
         // Publish the current attempt to the shared `RunContext` so
@@ -859,7 +894,19 @@ async fn run_with_retry(
         // Child token so a timeout for this attempt doesn't cancel
         // the run-wide token (which would prevent further retries).
         let attempt_cancel = cancel.child_token();
-        let res = dispatch_one_attempt(dispatcher, node, nt, ctx, attempt_cancel, timeout_ms).await;
+        let res = dispatch_attempt(
+            dispatcher,
+            node,
+            nt,
+            ctx,
+            is_subprocess,
+            &effective_env,
+            &binding,
+            &run_scope,
+            attempt_cancel,
+            timeout_ms,
+        )
+        .await;
         let finished_at = chrono::Utc::now().timestamp_millis();
 
         let should_retry = match &res {
@@ -869,37 +916,31 @@ async fn run_with_retry(
         };
 
         if !should_retry {
+            // Final attempt for a synced subprocess node: write the remote delta
+            // back to the host. A timed-out or fail-fasted node still writes back
+            // (those cancel only the local `cancel`/`attempt_cancel`, not the
+            // run's root token); ONLY a genuine user cancel (`ctx.run_cancel`)
+            // skips. A write-back failure replaces `res` with a `Subprocess` error.
+            if synced
+                && !ctx.run_cancel.is_cancelled()
+                && let Err(e) = reconcile_out_final(ctx, &binding, &effective_env).await
+            {
+                return Ok((Err(e), attempt, started_at, finished_at));
+            }
             return Ok((res, attempt, started_at, finished_at));
         }
 
         // Mid-retry: persist this attempt's failure + emit node:retry.
-        let msg = res
-            .as_ref()
-            .err()
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        recorder.record_node_run(&NodeRunRow {
-            node_id: &node.id,
+        persist_attempt_failure(
+            recorder,
+            emitter,
+            node,
             iteration,
             attempt,
-            node_type: &node.ty,
-            status: "error",
-            started_at: Some(started_at),
-            finished_at: Some(finished_at),
-            duration_ms: Some(finished_at - started_at),
-            output_summary: None,
-            error: Some(&msg),
-        })?;
-        emitter.emit_node(
-            EventType::NodeRetry,
-            node.id.clone(),
-            iteration,
-            attempt,
-            HashMap::from([
-                ("prev_error".into(), serde_json::json!(msg)),
-                ("next_attempt".into(), serde_json::json!(attempt + 1)),
-            ]),
-        );
+            started_at,
+            finished_at,
+            &res,
+        )?;
 
         let delay = compute_backoff(policy, attempt);
         tokio::select! {
@@ -910,6 +951,110 @@ async fn run_with_retry(
         }
         attempt += 1;
     }
+}
+
+/// Record this attempt's failing `node_runs` row and emit `node:retry`.
+/// Factored out of `run_with_retry`'s loop so the mid-retry bookkeeping doesn't
+/// inflate the driver.
+#[allow(clippy::too_many_arguments)]
+fn persist_attempt_failure(
+    recorder: &RunRecorder,
+    emitter: &Emitter,
+    node: &crate::types::Node,
+    iteration: u32,
+    attempt: u32,
+    started_at: i64,
+    finished_at: i64,
+    res: &std::result::Result<crate::executor::NodeOutputs, NodeError>,
+) -> Result<()> {
+    let msg = res
+        .as_ref()
+        .err()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    recorder.record_node_run(&NodeRunRow {
+        node_id: &node.id,
+        iteration,
+        attempt,
+        node_type: &node.ty,
+        status: "error",
+        started_at: Some(started_at),
+        finished_at: Some(finished_at),
+        duration_ms: Some(finished_at - started_at),
+        output_summary: None,
+        error: Some(&msg),
+    })?;
+    emitter.emit_node(
+        EventType::NodeRetry,
+        node.id.clone(),
+        iteration,
+        attempt,
+        HashMap::from([
+            ("prev_error".into(), serde_json::json!(msg)),
+            ("next_attempt".into(), serde_json::json!(attempt + 1)),
+        ]),
+    );
+    Ok(())
+}
+
+/// Dispatch one attempt of `node`. For a `Subprocess`-backend node this first
+/// resolves the per-env dispatcher from the run snapshot and runs `reconcile_in`
+/// (a remote-reset for a `Sync` workspace, a plain `translate_path` otherwise),
+/// recording the env-side cwd on the context before the executor reads it. A
+/// missing env-dispatcher or a `reconcile_in` failure is returned as an inner
+/// `NodeError` so the caller's retry / continue-on-error logic still applies —
+/// never a hard early return. `dispatcher` (the executor router) is distinct
+/// from the snapshot's per-env dispatcher used only for reconcile.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_attempt(
+    dispatcher: &Dispatcher,
+    node: &crate::types::Node,
+    nt: &crate::types::NodeType,
+    ctx: &RunContext,
+    is_subprocess: bool,
+    effective_env: &crate::environment::runtime::EnvId,
+    binding: &WorkspaceBinding,
+    run_scope: &RunScope<'_>,
+    attempt_cancel: CancellationToken,
+    timeout_ms: Option<u64>,
+) -> std::result::Result<crate::executor::NodeOutputs, NodeError> {
+    if !is_subprocess {
+        return dispatch_one_attempt(dispatcher, node, nt, ctx, attempt_cancel, timeout_ms).await;
+    }
+    let Some(env_dispatcher) = ctx.run_snapshot.dispatcher(effective_env).cloned() else {
+        return Err(NodeError::Config(format!(
+            "env '{}' not in run snapshot scope",
+            effective_env.as_str()
+        )));
+    };
+    match ctx
+        .workspace_manager
+        .reconcile_in(env_dispatcher.as_ref(), binding, &ctx.workspace, run_scope)
+        .await
+    {
+        Ok(cwd) => {
+            ctx.set_env_cwd(cwd);
+            dispatch_one_attempt(dispatcher, node, nt, ctx, attempt_cancel, timeout_ms).await
+        },
+        Err(e) => Err(NodeError::Subprocess(format!("reconcile_in: {e}"))),
+    }
+}
+
+/// Write back the remote workspace delta for a synced subprocess node after its
+/// final attempt. A no-op when the env-dispatcher is absent from the snapshot;
+/// surfaces a `reconcile_out` failure as a `NodeError` for the caller to record.
+async fn reconcile_out_final(
+    ctx: &RunContext,
+    binding: &WorkspaceBinding,
+    effective_env: &crate::environment::runtime::EnvId,
+) -> std::result::Result<(), NodeError> {
+    let Some(env_dispatcher) = ctx.run_snapshot.dispatcher(effective_env).cloned() else {
+        return Ok(());
+    };
+    ctx.workspace_manager
+        .reconcile_out(env_dispatcher.as_ref(), binding, &ctx.workspace)
+        .await
+        .map_err(|e| NodeError::Subprocess(format!("reconcile_out: {e}")))
 }
 
 /// Dispatch a single attempt under an optional per-attempt

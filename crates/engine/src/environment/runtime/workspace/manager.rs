@@ -1,26 +1,33 @@
-/// Workspace manager — H2-T2 scope.
-///
-/// H1: `resolve_cwd` delegated to `dispatcher.translate_path` for all
-/// bindings (behaviour unchanged for Local/WSL/BindMount/Shared/Translated).
-///
-/// H2-T2: `WorkspaceBinding::Sync` with `SyncStrategy::Sftp` and a
-/// `{{run.id}}`-containing template is handled — ephemeral upload via SFTP,
-/// singleflight-serialised per `(EnvId, host_ws)` key so parallel nodes on
-/// the same env share one upload.
-///
-/// H2-T3: `teardown_all` writes changed/new files back to the host
-/// (`None`/`Force`, skipped on user cancel) and deletes the ephemeral root.
-///
-/// Not yet implemented (deferred):
-/// - Persistent workspace reuse (template without `{{run.id}}`).
-/// - `SafeOrDiverge` write-back (rejected upstream in `resolve_cwd`).
+//! Workspace manager — per-node reconcile (H3).
+//!
+//! The run loop drives reconciliation for a `Subprocess`-backend node whose
+//! effective env binds the workspace with `WorkspaceBinding::Sync`:
+//!
+//! - `reconcile_in` (host→remote, per attempt): resets the env-side tree to
+//!   mirror the host (upload host files + delete remote-only extras) and
+//!   records per-key [`WorkspaceState`]. Every non-`Sync` binding delegates to
+//!   `dispatcher.translate_path` (behaviour unchanged for
+//!   Local/WSL/BindMount/Shared/Translated).
+//! - `reconcile_out` (remote→host, after the final attempt): writes changed/new
+//!   files back and propagates remote deletions (`None`/`Force`), advancing the
+//!   baseline. Skipped only on a genuine user cancel.
+//! - `teardown_all`: a write-back safety net for runs that panic between
+//!   `reconcile_in` and `reconcile_out` (non-user-cancel only) plus ephemeral
+//!   root deletion.
+//!
+//! Same-key concurrency is serialised by a per-key execution lease the run loop
+//! holds across a node's reconcile cycle.
+//!
+//! Not yet implemented (deferred):
+//! - Persistent workspace reuse (template without `{{run.id}}`) — H5.
+//! - `SafeOrDiverge` write-back (rejected in `reconcile_out`) — next phase.
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex as SyncMutex;
-use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
+use tokio::sync::OwnedMutexGuard;
 
 use crate::environment::runtime::dispatcher::Dispatcher;
 use crate::environment::runtime::env::{EnvId, WorkspaceBinding, WriteBackPolicy};
@@ -28,12 +35,9 @@ use crate::environment::runtime::error::DispatchError;
 use crate::environment::runtime::transport::EnvPath;
 
 use super::safety;
-use super::transport::{FileKind, WorkspaceTransport, WorkspaceTransportFactory};
+use super::transport::{FileKind, WorkspaceTransportFactory};
 
 // ── Type aliases ──────────────────────────────────────────────────────────────
-
-/// Inner map type for the singleflight prepared-workspace registry.
-type PreparedMap = HashMap<(EnvId, PathBuf), Arc<OnceCell<Arc<PreparedWorkspace>>>>;
 
 /// Identity of one synced workspace; lease and state are keyed by it.
 pub(crate) type WorkspaceKey = (EnvId, PathBuf);
@@ -68,31 +72,14 @@ pub enum RunOutcome {
 }
 
 /// Per-node lifecycle of the uploaded workspace.
+///
+/// Only `Ephemeral` (root contains `{{run.id}}`, unique per run, deleted on
+/// teardown) is supported in H3. Stable/persistent roots are rejected by
+/// [`lifecycle_of`] and land in H5, which will add the corresponding variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lifecycle {
     /// Workspace root contains `{{run.id}}` — unique per run, deleted on teardown.
     Ephemeral,
-    /// Workspace root is stable across runs — reuse / incremental sync.
-    Persistent,
-}
-
-/// State captured once a workspace has been uploaded for one `(EnvId, host_ws)` pair.
-///
-/// Stored in `WorkspaceManager::prepared` so teardown (H2-T3) can locate it.
-struct PreparedWorkspace {
-    /// Absolute env-side root that was created and populated.
-    env_side_root: String,
-    lifecycle: Lifecycle,
-    /// Policy the caller specified; teardown branches on it for write-back.
-    write_back: WriteBackPolicy,
-    /// Manifest of every file that was uploaded. Teardown diffs the env-side
-    /// tree against it to find files the run changed or created.
-    upload_manifest: safety::Manifest,
-    /// Host workspace path; write-back targets are resolved relative to it.
-    host_ws: PathBuf,
-    /// Factory used to reopen a transport for write-back + ephemeral delete.
-    /// Captured at upload time so teardown needs no `Dispatcher` handle.
-    transport_factory: Arc<dyn WorkspaceTransportFactory>,
 }
 
 /// Per-key state for the per-node reconcile machinery (H3+).
@@ -128,7 +115,7 @@ impl std::fmt::Debug for WorkspaceState {
 // ── Run scope ─────────────────────────────────────────────────────────────────
 
 /// Lightweight view of the current run's identity; passed to
-/// `resolve_cwd` so it can expand `env_path_template`.
+/// `reconcile_in` so it can expand `env_path_template`.
 pub struct RunScope<'a> {
     /// Stable run identifier.
     pub run_id: &'a str,
@@ -144,16 +131,11 @@ pub struct RunScope<'a> {
 
 /// Run-tree-scoped owner of workspace sync policy.
 ///
-/// Invariant: `prepared` grows monotonically during a run; it is read (but
-/// not mutated) by `teardown_all`. The map lock is only held while inserting
-/// a new `OnceCell`; actual upload I/O runs outside the lock.
+/// Holds the per-key execution leases and the per-key reconcile [`WorkspaceState`]
+/// (populated by `reconcile_in`, drained by `teardown_all`). Each map's `parking_lot`
+/// lock is only held long enough to read/insert an entry — never across transport I/O.
 #[derive(Debug)]
 pub struct WorkspaceManager {
-    /// Per-`(EnvId, host_ws)` upload cell.  Inserting the cell is atomic;
-    /// the cell itself serialises the upload so parallel node executions on
-    /// the same env share one upload without holding the map lock across I/O.
-    prepared: Mutex<PreparedMap>,
-
     /// Per-key execution lease registry.  The `parking_lot` (sync) map lock is
     /// only held long enough to clone the `Arc`; the async `tokio::sync::Mutex`
     /// inside each entry serialises concurrent reconcile cycles for the same key.
@@ -170,19 +152,9 @@ pub struct WorkspaceManager {
     pub last_outcome: std::sync::Mutex<Option<RunOutcome>>,
 }
 
-impl std::fmt::Debug for PreparedWorkspace {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PreparedWorkspace")
-            .field("env_side_root", &self.env_side_root)
-            .field("lifecycle", &self.lifecycle)
-            .finish_non_exhaustive()
-    }
-}
-
 impl Default for WorkspaceManager {
     fn default() -> Self {
         Self {
-            prepared: Mutex::new(HashMap::new()),
             leases: SyncMutex::new(HashMap::new()),
             state: SyncMutex::new(HashMap::new()),
             #[cfg(any(test, feature = "testing"))]
@@ -222,145 +194,6 @@ impl WorkspaceManager {
         }
     }
 
-    /// Resolve the working directory inside the target env.
-    ///
-    /// - `Shared`, `Translated`, `BindMount` — delegates to
-    ///   `dispatcher.translate_path` (H1 behaviour, unchanged).
-    /// - `Sync { strategy: Sftp, write_back: None|Force, env_path_template }`
-    ///   where the template contains `{{run.id}}` — uploads the workspace over
-    ///   SFTP, singleflight-serialised per `(EnvId, host_ws)` pair, returns
-    ///   the env-side root.
-    /// - Everything else returns `Err(DispatchError::Unsupported)`.
-    pub async fn resolve_cwd(
-        &self,
-        dispatcher: &dyn Dispatcher,
-        binding: &WorkspaceBinding,
-        host_ws: &Path,
-        run: &RunScope<'_>,
-    ) -> Result<EnvPath, DispatchError> {
-        use crate::environment::runtime::env::SyncStrategy;
-
-        match binding {
-            // H1 paths — delegate to translate_path unchanged.
-            WorkspaceBinding::Shared
-            | WorkspaceBinding::Translated
-            | WorkspaceBinding::BindMount { .. }
-            | WorkspaceBinding::Unsupported => dispatcher.translate_path(host_ws),
-
-            WorkspaceBinding::Sync {
-                env_path_template,
-                strategy,
-                write_back,
-            } => {
-                // Guard: only SFTP sync is implemented.
-                if *strategy != SyncStrategy::Sftp {
-                    return Err(DispatchError::Unsupported(
-                        "only SFTP workspace sync is implemented".into(),
-                    ));
-                }
-                // Guard: SafeOrDiverge write-back is deferred.
-                if matches!(write_back, WriteBackPolicy::SafeOrDiverge { .. }) {
-                    return Err(DispatchError::Unsupported(
-                        "SafeOrDiverge write-back is deferred to a later phase".into(),
-                    ));
-                }
-
-                // Guard: catch the common typo `{{run_id}}` (underscore) before
-                // expand_env_root turns it into an opaque "unknown namespace" error.
-                if env_path_template.contains("{{run_id}}")
-                    && !env_path_template.contains("{{run.id}}")
-                {
-                    return Err(DispatchError::Unsupported(
-                        "the per-run placeholder is {{run.id}}, not {{run_id}}".into(),
-                    ));
-                }
-
-                let env_side_root = expand_env_root(env_path_template, run, host_ws)?;
-
-                // Ephemeral iff the template contains `{{run.id}}` — the only
-                // supported per-run discriminant marker.
-                let lifecycle = if env_path_template.contains("{{run.id}}") {
-                    Lifecycle::Ephemeral
-                } else {
-                    Lifecycle::Persistent
-                };
-
-                if lifecycle == Lifecycle::Persistent {
-                    return Err(DispatchError::Unsupported(
-                        "persistent workspace reuse is deferred to a later phase".into(),
-                    ));
-                }
-
-                // Singleflight: get-or-insert a OnceCell for this key,
-                // clone the Arc, DROP the map lock, THEN drive the upload.
-                let key = (dispatcher.info().id.clone(), host_ws.to_path_buf());
-                let cell = {
-                    let mut map = self.prepared.lock().await;
-                    Arc::clone(map.entry(key).or_insert_with(|| Arc::new(OnceCell::new())))
-                };
-
-                let pw = cell
-                    .get_or_try_init(|| async {
-                        self.upload(
-                            dispatcher,
-                            &env_side_root,
-                            host_ws,
-                            write_back.clone(),
-                            lifecycle,
-                        )
-                        .await
-                    })
-                    .await?;
-
-                Ok(EnvPath::new(pw.env_side_root.clone()))
-            },
-        }
-    }
-
-    /// Perform the actual SFTP upload for one `(env, host_ws)` pair.
-    ///
-    /// Called at most once per key thanks to the `OnceCell` guard in
-    /// `resolve_cwd`.
-    async fn upload(
-        &self,
-        dispatcher: &dyn Dispatcher,
-        env_side_root: &str,
-        host_ws: &Path,
-        write_back: WriteBackPolicy,
-        lifecycle: Lifecycle,
-    ) -> Result<Arc<PreparedWorkspace>, DispatchError> {
-        let factory = dispatcher.workspace_transport().ok_or_else(|| {
-            DispatchError::Unsupported("environment has no workspace transport".into())
-        })?;
-        let t = factory.open().await?;
-
-        // Create the root, then upload. A failure after mkdir leaves a partial
-        // remote root; the never-completed singleflight cell is dropped, so
-        // teardown never sees the root. Clean it up best-effort here before
-        // propagating, otherwise the ephemeral dir leaks on the remote.
-        t.mkdir(env_side_root).await?;
-        match upload_files(t, env_side_root, host_ws).await {
-            Ok(upload_manifest) => Ok(Arc::new(PreparedWorkspace {
-                env_side_root: env_side_root.to_string(),
-                lifecycle,
-                write_back,
-                upload_manifest,
-                host_ws: host_ws.to_path_buf(),
-                transport_factory: factory,
-            })),
-            Err(e) => {
-                if let Err(cleanup_err) = remove_tree(factory.as_ref(), env_side_root).await {
-                    tracing::warn!(
-                        env_root = env_side_root,
-                        error = %cleanup_err,
-                        "failed to remove partial upload root after upload error"
-                    );
-                }
-                Err(e)
-            },
-        }
-    }
-
     /// Tear down every workspace prepared during the run.
     ///
     /// Fires on every run-loop exit path (success, error, or panic), before the
@@ -377,22 +210,51 @@ impl WorkspaceManager {
             *self.last_outcome.lock().unwrap() = Some(outcome);
         }
 
-        // Drain the map — teardown owns these entries; nothing reads `prepared`
-        // after the run loop exits. Skip cells whose upload never completed.
-        let prepared: Vec<Arc<PreparedWorkspace>> = {
-            let mut map = self.prepared.lock().await;
-            std::mem::take(&mut *map)
-                .into_values()
-                .filter_map(|cell| cell.get().cloned())
+        // Drain the per-key state — teardown owns these entries; nothing reads
+        // `state` after the run loop exits.
+        let states: Vec<(WorkspaceKey, WorkspaceState)> = {
+            std::mem::take(&mut *self.state.lock())
+                .into_iter()
                 .collect()
         };
 
-        for pw in prepared {
-            if let Err(e) = teardown_one(&pw, outcome).await {
+        for (key, s) in states {
+            // A node may have panicked between reconcile_in and reconcile_out,
+            // leaving changes unwritten. On any non-user-cancel outcome, write
+            // back the remaining delta (no-op when reconcile_out already advanced
+            // the baseline). User cancel deliberately skips.
+            if outcome != RunOutcome::CancelledByUser
+                && !matches!(s.write_back, WriteBackPolicy::None)
+            {
+                let ignore = match &s.write_back {
+                    WriteBackPolicy::Force { ignore } => ignore.clone(),
+                    // SafeOrDiverge can't reach H3 (reconcile_out rejects it).
+                    _ => Vec::new(),
+                };
+                if let Err(e) = write_back_delta(
+                    &s.transport_factory,
+                    &s.env_side_root,
+                    &key.1,
+                    &s.last_remote_manifest,
+                    &ignore,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        env_root = %s.env_side_root,
+                        error = %e,
+                        "teardown write-back failed"
+                    );
+                }
+            }
+
+            if s.lifecycle == Lifecycle::Ephemeral
+                && let Err(e) = remove_tree(s.transport_factory.as_ref(), &s.env_side_root).await
+            {
                 tracing::warn!(
-                    env_root = %pw.env_side_root,
+                    env_root = %s.env_side_root,
                     error = %e,
-                    "workspace teardown failed; continuing (best-effort)"
+                    "ephemeral teardown failed"
                 );
             }
         }
@@ -537,130 +399,6 @@ impl WorkspaceManager {
 }
 
 // ── Teardown helpers ──────────────────────────────────────────────────────────
-
-/// Write back (unless user-cancelled) then delete the ephemeral root for one
-/// prepared workspace. Cleanup is attempted even if write-back fails; the first
-/// error encountered is returned for the caller to log.
-/// Walk + cap-check + upload every file under `host_ws`, building the manifest
-/// from the EXACT bytes uploaded.
-///
-/// Hashing the sent bytes (rather than re-reading the file) means a concurrent
-/// host edit during the run can't make write-back mistake unchanged remote
-/// content for "changed" and clobber the newer host file. Consumes the
-/// transport; the caller `mkdir`s the root first and cleans up on error.
-async fn upload_files(
-    t: Box<dyn WorkspaceTransport>,
-    env_side_root: &str,
-    host_ws: &Path,
-) -> Result<safety::Manifest, DispatchError> {
-    let entries = safety::walk_workspace(host_ws)?;
-
-    // Account caps against the bytes ACTUALLY read (bounded), not the walk's
-    // stale stat — a file that grew since the walk can't bypass the cap.
-    let mut tracker = safety::CapTracker::new(safety::UploadCaps::default());
-    let mut manifest = safety::Manifest::new();
-    for entry in &entries {
-        let bytes = safety::read_within_caps(&entry.abs, &mut tracker)?;
-        let remote_path = format!("{env_side_root}/{}", entry.rel_path);
-        t.upload_file(&remote_path, &bytes).await?;
-        manifest.insert(
-            entry.rel_path.clone(),
-            safety::FileEntry {
-                sha256_hex: safety::sha256_hex(&bytes),
-                size: bytes.len() as u64,
-                mode: entry.mode,
-            },
-        );
-    }
-    Ok(manifest)
-}
-
-async fn teardown_one(pw: &PreparedWorkspace, outcome: RunOutcome) -> Result<(), DispatchError> {
-    // Write-back is skipped entirely on user cancellation.
-    let write_res = if outcome == RunOutcome::CancelledByUser {
-        Ok(())
-    } else {
-        write_back(pw).await
-    };
-
-    // Ephemeral cleanup always runs — even on cancel or after a write-back error.
-    let cleanup_res = if pw.lifecycle == Lifecycle::Ephemeral {
-        remove_tree(pw.transport_factory.as_ref(), &pw.env_side_root).await
-    } else {
-        Ok(())
-    };
-
-    // Surface the first error (write-back takes precedence), but only after
-    // cleanup has been attempted.
-    write_res.and(cleanup_res)
-}
-
-/// Copy env-side files the run changed or created back into the host workspace.
-///
-/// `Force` writes back any file absent from the upload manifest or whose content
-/// hash differs from it, honouring the policy's ignore globs. `None` is a no-op.
-/// `SafeOrDiverge` cannot reach teardown (`resolve_cwd` rejects it before upload);
-/// it is treated defensively as "no write-back".
-///
-/// Ignore globs use single-segment `*` semantics (see `safety::should_ignore`):
-/// `*.log` matches `debug.log` but not `logs/debug.log` — use `**/*.log` for
-/// nested matches.
-async fn write_back(pw: &PreparedWorkspace) -> Result<(), DispatchError> {
-    let ignore = match &pw.write_back {
-        WriteBackPolicy::Force { ignore } => ignore.as_slice(),
-        WriteBackPolicy::None | WriteBackPolicy::SafeOrDiverge { .. } => return Ok(()),
-    };
-
-    // A fresh transport per sync phase (the factory's documented contract).
-    let t = pw.transport_factory.open().await?;
-    let prefix = format!("{}/", pw.env_side_root);
-
-    for entry in t.list_tree(&pw.env_side_root).await? {
-        if entry.kind != FileKind::File {
-            continue;
-        }
-        // Map the absolute env-side path back to a host-relative path.
-        let Some(rel) = entry.rel_path.strip_prefix(&prefix) else {
-            continue; // defensive: listing returned a path outside the root
-        };
-        // Defense-in-depth: a malicious / compromised server could return a
-        // listing entry whose path escapes the synced root (e.g. `../..`); never
-        // write outside the host workspace.
-        if !safety::is_safe_relative(rel) {
-            tracing::warn!(
-                rel,
-                env_root = %pw.env_side_root,
-                "skipping write-back of unsafe (escaping) env-side path"
-            );
-            continue;
-        }
-        // A traversal-free `rel` can still escape via a host-side symlinked
-        // directory; never write through one.
-        if !safety::host_target_is_symlink_safe(&pw.host_ws, rel) {
-            tracing::warn!(
-                rel,
-                env_root = %pw.env_side_root,
-                "skipping write-back: host path traverses a symlink"
-            );
-            continue;
-        }
-        if safety::should_ignore(rel, ignore) {
-            continue;
-        }
-
-        let bytes = t.download_file(&entry.rel_path).await?;
-
-        // Changed = absent from the upload manifest, or content hash differs.
-        let changed = pw
-            .upload_manifest
-            .get(rel)
-            .is_none_or(|meta| meta.sha256_hex != safety::sha256_hex(&bytes));
-        if changed {
-            write_host_file_atomic(&pw.host_ws, rel, &bytes)?;
-        }
-    }
-    Ok(())
-}
 
 /// Make the remote tree at `root` byte-for-byte equal to the host tree at
 /// `host_ws`, returning a [`safety::Manifest`] of the bytes uploaded.
@@ -1001,7 +739,7 @@ fn sync_params(
 /// produce a clear error rather than silently falling back.
 ///
 /// The common typo `{{run_id}}` (underscore) is also detected with a hint
-/// message naming both forms, matching the existing hint in `resolve_cwd`.
+/// message naming both forms.
 fn lifecycle_of(tmpl: &str) -> Result<Lifecycle, DispatchError> {
     if tmpl.contains("{{run_id}}") && !tmpl.contains("{{run.id}}") {
         return Err(DispatchError::Unsupported(
@@ -1067,29 +805,13 @@ mod tests {
         ConflictDetect, EnvId, EnvInfo, EnvSpec, EnvState, SyncStrategy, WorkspaceBinding,
         WriteBackPolicy,
     };
-    use crate::environment::runtime::local::LocalDispatcher;
     use std::collections::HashMap;
     use std::path::Path;
 
-    use super::super::safety::{FileEntry, Manifest, hash_file};
     use super::super::transport::{
         FakeWorkspaceTransport, FakeWorkspaceTransportFactory, WorkspaceTransport,
     };
     use std::sync::Arc;
-    use tokio::sync::OnceCell;
-
-    fn local_info() -> EnvInfo {
-        EnvInfo {
-            id: EnvId::local(),
-            label: "Local (host)".into(),
-            spec: EnvSpec::Local {
-                resources: vec![],
-                host_direct_verifications: HashMap::default(),
-            },
-            state: EnvState::Reachable,
-            enabled: true,
-        }
-    }
 
     fn sample_run<'a>() -> RunScope<'a> {
         RunScope {
@@ -1098,24 +820,6 @@ mod tests {
             workflow_name: "Test Workflow",
             started_at_iso: "2026-01-01T00:00:00Z",
         }
-    }
-
-    // ── H1 regression ─────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn resolve_cwd_shared_delegates_to_translate_path() {
-        let d = LocalDispatcher::new(local_info());
-        let mgr = WorkspaceManager::new();
-        let cwd = mgr
-            .resolve_cwd(
-                &d,
-                &WorkspaceBinding::Shared,
-                Path::new("/workspaces/wf"),
-                &sample_run(),
-            )
-            .await
-            .expect("ok");
-        assert_eq!(cwd.as_str(), "/workspaces/wf");
     }
 
     // ── expand_env_root ───────────────────────────────────────────────────────
@@ -1136,93 +840,6 @@ mod tests {
         assert!(
             err.to_string().contains(".."),
             "expected dotdot error; got: {err}"
-        );
-    }
-
-    // ── resolve_cwd Sync guards ───────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn resolve_cwd_sync_rsync_unsupported() {
-        let d = LocalDispatcher::new(local_info());
-        let mgr = WorkspaceManager::new();
-        let binding = WorkspaceBinding::Sync {
-            env_path_template: "/tmp/ordius-{{run.id}}".into(),
-            strategy: SyncStrategy::Rsync,
-            write_back: WriteBackPolicy::None,
-        };
-        let err = mgr
-            .resolve_cwd(&d, &binding, Path::new("/ws"), &sample_run())
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("SFTP"),
-            "expected SFTP error; got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_cwd_sync_safe_or_diverge_unsupported() {
-        let d = LocalDispatcher::new(local_info());
-        let mgr = WorkspaceManager::new();
-        let binding = WorkspaceBinding::Sync {
-            env_path_template: "/tmp/ordius-{{run.id}}".into(),
-            strategy: SyncStrategy::Sftp,
-            write_back: WriteBackPolicy::SafeOrDiverge {
-                mode: ConflictDetect::Manifest,
-                ignore: vec![],
-                max_files: 5_000,
-            },
-        };
-        let err = mgr
-            .resolve_cwd(&d, &binding, Path::new("/ws"), &sample_run())
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("SafeOrDiverge"),
-            "expected SafeOrDiverge error; got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_cwd_sync_persistent_unsupported() {
-        let d = LocalDispatcher::new(local_info());
-        let mgr = WorkspaceManager::new();
-        // Template without `{{run.id}}` → persistent (deferred).
-        let binding = WorkspaceBinding::Sync {
-            env_path_template: "/stable/path".into(),
-            strategy: SyncStrategy::Sftp,
-            write_back: WriteBackPolicy::None,
-        };
-        let err = mgr
-            .resolve_cwd(&d, &binding, Path::new("/ws"), &sample_run())
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("persistent"),
-            "expected persistent error; got: {err}"
-        );
-    }
-
-    /// `{{run_id}}` (underscore) is NOT a valid placeholder — the engine uses
-    /// dotted namespaces and would emit an opaque "unknown namespace" error.
-    /// We intercept it early with a clear hint message.
-    #[tokio::test]
-    async fn resolve_cwd_sync_run_id_underscore_gives_hint_error() {
-        let d = LocalDispatcher::new(local_info());
-        let mgr = WorkspaceManager::new();
-        let binding = WorkspaceBinding::Sync {
-            env_path_template: "/tmp/ordius-{{run_id}}".into(),
-            strategy: SyncStrategy::Sftp,
-            write_back: WriteBackPolicy::None,
-        };
-        let err = mgr
-            .resolve_cwd(&d, &binding, Path::new("/ws"), &sample_run())
-            .await
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("{{run.id}}") && msg.contains("{{run_id}}"),
-            "expected hint naming both forms; got: {msg}"
         );
     }
 
@@ -1250,50 +867,28 @@ mod tests {
 
     // ── teardown_all ──────────────────────────────────────────────────────────
 
-    /// Build a manager whose `prepared` map holds one ephemeral entry rooted at
-    /// `root` with the given `write_back` policy and `manifest`, backed by a
-    /// fresh fake transport. Returns the manager plus a state-sharing handle to
-    /// the fake so the test can seed "remote" changes and assert post-teardown.
-    async fn manager_with_prepared(
-        root: &str,
+    /// Seed a manager's per-key `state` by running `reconcile_in` against a
+    /// fresh fake "remote" (this uploads `host_ws` as the write-back baseline,
+    /// exactly as a real run's first attempt would). Returns the manager, a
+    /// state-sharing handle to the fake, and the expanded env-side root so the
+    /// test can stage "remote" changes and assert post-teardown.
+    ///
+    /// `teardown_all` is the safety net for a node that never reached
+    /// `reconcile_out` (e.g. a mid-node panic): the staged remote delta is what
+    /// it must still write back.
+    async fn manager_seeded_via_reconcile(
+        root_template: &str,
         host_ws: &Path,
         write_back: WriteBackPolicy,
-        manifest: Manifest,
-    ) -> (WorkspaceManager, FakeWorkspaceTransport) {
-        let fake = FakeWorkspaceTransport::default();
-        let pw = PreparedWorkspace {
-            env_side_root: root.to_string(),
-            lifecycle: Lifecycle::Ephemeral,
-            write_back,
-            upload_manifest: manifest,
-            host_ws: host_ws.to_path_buf(),
-            transport_factory: Arc::new(FakeWorkspaceTransportFactory::new(fake.clone())),
-        };
-        let cell = OnceCell::new();
-        cell.set(Arc::new(pw)).expect("seed prepared cell");
+    ) -> (WorkspaceManager, FakeWorkspaceTransport, String) {
+        let (d, fake) = ssh_dispatcher_with_fake("teardown");
         let mgr = WorkspaceManager::new();
-        mgr.prepared.lock().await.insert(
-            (EnvId::ssh("h2-teardown"), host_ws.to_path_buf()),
-            Arc::new(cell),
-        );
-        (mgr, fake)
-    }
-
-    /// A one-file manifest at `rel` recording the current on-disk hash of
-    /// `host_ws/rel` — i.e. "this is what we uploaded".
-    fn manifest_of(host_ws: &Path, rel: &str) -> Manifest {
-        let abs = host_ws.join(rel);
-        let size = std::fs::metadata(&abs).unwrap().len();
-        let mut m = Manifest::new();
-        m.insert(
-            rel.to_string(),
-            FileEntry {
-                sha256_hex: hash_file(&abs).unwrap(),
-                size,
-                mode: 0o644,
-            },
-        );
-        m
+        let binding = sftp_binding(root_template, write_back);
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in seeds per-key state");
+        (mgr, fake, cwd.as_str().to_string())
     }
 
     /// Force write-back on a clean completion copies changed + new env-side
@@ -1304,12 +899,10 @@ mod tests {
         let host_ws = host.path();
         std::fs::write(host_ws.join("a.txt"), b"original").unwrap();
 
-        let root = "/tmp/ordius-wb-done";
-        let (mgr, fake) = manager_with_prepared(
-            root,
+        let (mgr, fake, root) = manager_seeded_via_reconcile(
+            "/tmp/ordius-wb-done-{{run.id}}",
             host_ws,
             WriteBackPolicy::Force { ignore: vec![] },
-            manifest_of(host_ws, "a.txt"),
         )
         .await;
 
@@ -1341,7 +934,7 @@ mod tests {
             "remote file must be deleted"
         );
         assert!(
-            fake.stat(root).await.unwrap().is_none(),
+            fake.stat(&root).await.unwrap().is_none(),
             "ephemeral root dir must be deleted"
         );
     }
@@ -1354,12 +947,10 @@ mod tests {
         let host_ws = host.path();
         std::fs::write(host_ws.join("a.txt"), b"original").unwrap();
 
-        let root = "/tmp/ordius-wb-cancel";
-        let (mgr, fake) = manager_with_prepared(
-            root,
+        let (mgr, fake, root) = manager_seeded_via_reconcile(
+            "/tmp/ordius-wb-cancel-{{run.id}}",
             host_ws,
             WriteBackPolicy::Force { ignore: vec![] },
-            manifest_of(host_ws, "a.txt"),
         )
         .await;
 
@@ -1377,7 +968,7 @@ mod tests {
         );
         // Cleanup still happens.
         assert!(
-            fake.stat(root).await.unwrap().is_none(),
+            fake.stat(&root).await.unwrap().is_none(),
             "ephemeral root must be deleted even on cancel"
         );
     }
@@ -1390,12 +981,10 @@ mod tests {
         let host_ws = host.path();
         std::fs::write(host_ws.join("a.txt"), b"original").unwrap();
 
-        let root = "/tmp/ordius-wb-none";
-        let (mgr, fake) = manager_with_prepared(
-            root,
+        let (mgr, fake, root) = manager_seeded_via_reconcile(
+            "/tmp/ordius-wb-none-{{run.id}}",
             host_ws,
             WriteBackPolicy::None,
-            manifest_of(host_ws, "a.txt"),
         )
         .await;
 
@@ -1411,7 +1000,7 @@ mod tests {
             "None policy must not write back"
         );
         assert!(
-            fake.stat(root).await.unwrap().is_none(),
+            fake.stat(&root).await.unwrap().is_none(),
             "ephemeral root must still be deleted under None policy"
         );
     }
@@ -1423,14 +1012,13 @@ mod tests {
         let host = tempfile::TempDir::new().unwrap();
         let host_ws = host.path();
 
-        let root = "/tmp/ordius-wb-ignore";
-        let (mgr, fake) = manager_with_prepared(
-            root,
+        // Empty host workspace ⇒ empty baseline ⇒ every env-side file counts as new.
+        let (mgr, fake, root) = manager_seeded_via_reconcile(
+            "/tmp/ordius-wb-ignore-{{run.id}}",
             host_ws,
             WriteBackPolicy::Force {
                 ignore: vec!["*.log".into()],
             },
-            Manifest::new(), // empty manifest: every env-side file counts as new
         )
         .await;
 
@@ -1464,12 +1052,10 @@ mod tests {
         let host_ws = host.path().join("ws");
         std::fs::create_dir(&host_ws).unwrap();
 
-        let root = "/tmp/ordius-wb-evil";
-        let (mgr, fake) = manager_with_prepared(
-            root,
+        let (mgr, fake, root) = manager_seeded_via_reconcile(
+            "/tmp/ordius-wb-evil-{{run.id}}",
             &host_ws,
             WriteBackPolicy::Force { ignore: vec![] },
-            Manifest::new(),
         )
         .await;
 
@@ -1561,12 +1147,10 @@ mod tests {
         // host_ws/link -> <outside>  (a symlinked directory inside the workspace)
         symlink(outside.path(), host_ws.join("link")).unwrap();
 
-        let root = "/tmp/ordius-wb-symlink";
-        let (mgr, fake) = manager_with_prepared(
-            root,
+        let (mgr, fake, root) = manager_seeded_via_reconcile(
+            "/tmp/ordius-wb-symlink-{{run.id}}",
             &host_ws,
             WriteBackPolicy::Force { ignore: vec![] },
-            Manifest::new(),
         )
         .await;
 
@@ -2026,5 +1610,36 @@ mod tests {
         mgr.reconcile_out(&d, &WorkspaceBinding::Shared, Path::new("/ws"))
             .await
             .expect("shared reconcile_out is a no-op");
+    }
+
+    /// `SafeOrDiverge` write-back is deferred to a later phase: `reconcile_out`
+    /// is the gate that rejects it (replacing the old `resolve_cwd` guard).
+    #[tokio::test]
+    async fn reconcile_out_safe_or_diverge_unsupported() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"host-a").unwrap();
+
+        let (d, _fake) = ssh_dispatcher_with_fake("safe-or-diverge");
+        let mgr = WorkspaceManager::new();
+        let binding = sftp_binding(
+            "/tmp/ordius-{{run.id}}",
+            WriteBackPolicy::SafeOrDiverge {
+                mode: ConflictDetect::Manifest,
+                ignore: vec![],
+                max_files: 5_000,
+            },
+        );
+
+        // reconcile_in seeds state (SafeOrDiverge is NOT rejected here).
+        mgr.reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in accepts SafeOrDiverge (gate is reconcile_out)");
+
+        let err = mgr.reconcile_out(&d, &binding, host_ws).await.unwrap_err();
+        assert!(
+            err.to_string().contains("SafeOrDiverge"),
+            "expected SafeOrDiverge error; got: {err}"
+        );
     }
 }

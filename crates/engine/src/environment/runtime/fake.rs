@@ -136,8 +136,8 @@ impl FakeRemoteDispatcher {
     /// Attach a workspace transport factory, enabling `workspace_transport()`
     /// to return `Some(factory)`. Returns `self` for chaining.
     ///
-    /// Use this to drive `WorkspaceManager::resolve_cwd` and reconcile tests
-    /// without a real SSH connection.
+    /// Use this to drive `WorkspaceManager` reconcile tests without a real SSH
+    /// connection.
     #[must_use]
     pub fn with_workspace_transport(mut self, factory: Arc<dyn WorkspaceTransportFactory>) -> Self {
         self.workspace_transport_factory = Some(factory);

@@ -162,15 +162,18 @@ pub fn make_secrets_resolver(ctx: &RunContext) -> impl Fn(&str) -> Option<String
 mod tests {
     use crate::environment::runtime::transport::EnvPath;
 
-    /// `set_env_cwd` stores the env-side cwd and `env_cwd` reads it
-    /// back. A freshly-built `RunContext` carries no cwd and an
-    /// un-cancelled root token (the H3 reconcile fields are additive
-    /// and default to inert until a later task consumes them).
+    /// `set_env_cwd` stores the env-side cwd and `env_cwd` reads it back. The
+    /// `make_ctx` fixture seeds `env_cwd` to the workspace path (mirroring the
+    /// run loop's `reconcile_in` for the Local env), and a fresh ctx carries an
+    /// un-cancelled root token.
     #[test]
     fn env_cwd_round_trips_and_run_cancel_starts_uncancelled() {
         let (ctx, _rx, _dir) = super::super::test_support::make_ctx();
 
-        assert!(ctx.env_cwd().is_none(), "fresh ctx has no env_cwd");
+        assert!(
+            ctx.env_cwd().is_some(),
+            "make_ctx seeds env_cwd as the run loop would",
+        );
         assert!(
             !ctx.run_cancel.is_cancelled(),
             "fresh ctx run_cancel must not be cancelled",

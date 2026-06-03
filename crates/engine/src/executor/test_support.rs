@@ -104,7 +104,15 @@ pub(super) fn make_ctx() -> (RunContext, broadcast::Receiver<RunEvent>, TempDir)
         workspace_manager: std::sync::Arc::new(
             crate::environment::runtime::workspace::WorkspaceManager::new(),
         ),
-        env_cwd: parking_lot::Mutex::new(None),
+        // The run loop's `reconcile_in` sets this before dispatching a
+        // subprocess node (for the Local env it equals `translate_path` of the
+        // workspace, i.e. the workspace path itself). Tests that drive an
+        // executor directly bypass the run loop, so seed it here to match.
+        env_cwd: parking_lot::Mutex::new(Some(
+            crate::environment::runtime::transport::EnvPath::new(
+                dir.path().to_string_lossy().into_owned(),
+            ),
+        )),
         run_cancel: tokio_util::sync::CancellationToken::new(),
     };
     (ctx, rx, dir)

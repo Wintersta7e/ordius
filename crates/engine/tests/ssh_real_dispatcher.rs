@@ -409,9 +409,9 @@ async fn real_ssh_ephemeral_upload_makes_files_visible() {
     };
 
     let cwd = mgr
-        .resolve_cwd(&dispatcher, &binding, host_ws, &run)
+        .reconcile_in(&dispatcher, &binding, host_ws, &run)
         .await
-        .expect("resolve_cwd must succeed");
+        .expect("reconcile_in must succeed");
 
     assert_eq!(
         cwd.as_str(),
@@ -512,9 +512,9 @@ async fn real_ssh_force_writeback_and_ephemeral_cleanup() {
             started_at_iso: "2026-01-01T00:00:00Z",
         };
         let root = mgr
-            .resolve_cwd(&dispatcher, &force(), host_ws, &run)
+            .reconcile_in(&dispatcher, &force(), host_ws, &run)
             .await
-            .expect("resolve_cwd uploads")
+            .expect("reconcile_in uploads")
             .as_str()
             .to_string();
         assert!(
@@ -582,9 +582,9 @@ async fn real_ssh_force_writeback_and_ephemeral_cleanup() {
             started_at_iso: "2026-01-01T00:00:00Z",
         };
         let root = mgr
-            .resolve_cwd(&dispatcher, &force(), host_ws, &run)
+            .reconcile_in(&dispatcher, &force(), host_ws, &run)
             .await
-            .expect("resolve_cwd uploads")
+            .expect("reconcile_in uploads")
             .as_str()
             .to_string();
 
@@ -753,8 +753,22 @@ async fn real_ssh_run_uploads_runs_and_writes_back() {
         run_cancel: tokio_util::sync::CancellationToken::new(),
     };
 
-    // Run the shell node through the real executor → resolve_cwd uploads the
-    // workspace and the command runs in the synced remote cwd.
+    // This test drives the executor directly (bypassing `run_with_retry`), so it
+    // performs the same reconcile cycle the run loop owns: reconcile_in (upload +
+    // record env_cwd) → run → reconcile_out (write the remote delta back).
+    let binding = ctx.run_snapshot.workspace_binding(&ssh_id);
+    let run_scope = ordius_engine::environment::runtime::workspace::RunScope {
+        run_id: &ctx.run_id,
+        workflow_id: &ctx.workflow_id,
+        workflow_name: &ctx.workflow_name,
+        started_at_iso: &ctx.started_at_iso,
+    };
+    let cwd = wm
+        .reconcile_in(dispatcher.as_ref(), &binding, &host_ws, &run_scope)
+        .await
+        .expect("reconcile_in uploads the workspace");
+    ctx.set_env_cwd(cwd);
+
     let reg = Registry::with_v1_0_builtins();
     let nt = reg.get("shell").expect("shell built-in registered");
     SubprocessExecutor
@@ -762,7 +776,13 @@ async fn real_ssh_run_uploads_runs_and_writes_back() {
         .await
         .expect("shell node runs on the remote");
 
-    // Teardown writes the remote-created file back and deletes the root.
+    // reconcile_out writes the remote-created file back to the host workspace.
+    wm.reconcile_out(dispatcher.as_ref(), &binding, &host_ws)
+        .await
+        .expect("reconcile_out writes the delta back");
+
+    // Teardown deletes the ephemeral root (write-back already done above; this is
+    // the safety-net no-op for the delta).
     wm.teardown_all(RunOutcome::Completed).await;
 
     let got = std::fs::read_to_string(host_ws.join("result.txt"))

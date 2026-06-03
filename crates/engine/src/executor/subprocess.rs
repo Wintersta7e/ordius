@@ -93,9 +93,8 @@ impl NodeExecutor for SubprocessExecutor {
             .ok_or_else(|| NodeError::Config("execution.command is empty".into()))?;
 
         // Select the dispatcher for the node's target_env (default = run's
-        // default_env) and translate the host workspace into an env-side
-        // path. Failures propagate loudly — no silent fallback to the host
-        // namespace.
+        // default_env) used to spawn the process. Failures propagate loudly —
+        // no silent fallback to the host namespace.
         let effective_env = node
             .target_env
             .clone()
@@ -110,24 +109,12 @@ impl NodeExecutor for SubprocessExecutor {
                 ))
             })?
             .clone();
-        let binding = ctx.run_snapshot.workspace_binding(&effective_env);
-        let run_scope = crate::environment::runtime::workspace::RunScope {
-            run_id: &ctx.run_id,
-            workflow_id: &ctx.workflow_id,
-            workflow_name: &ctx.workflow_name,
-            started_at_iso: &ctx.started_at_iso,
-        };
+        // The env-side cwd is resolved by the run loop's `reconcile_in` (which
+        // also resets a synced workspace) before this attempt and stored on the
+        // context. This executor is now a passive reader.
         let cwd = ctx
-            .workspace_manager
-            .resolve_cwd(dispatcher.as_ref(), &binding, &ctx.workspace, &run_scope)
-            .await
-            .map_err(|e| {
-                NodeError::Config(format!(
-                    "shell: env '{}' cannot resolve workspace cwd '{}': {e}",
-                    effective_env.as_str(),
-                    ctx.workspace.display(),
-                ))
-            })?;
+            .env_cwd()
+            .ok_or_else(|| NodeError::Config("subprocess: env_cwd not set by run loop".into()))?;
 
         let process_cmd = ProcessCmd {
             program: program.clone(),
