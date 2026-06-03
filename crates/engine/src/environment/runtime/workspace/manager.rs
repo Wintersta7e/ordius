@@ -95,6 +95,37 @@ struct PreparedWorkspace {
     transport_factory: Arc<dyn WorkspaceTransportFactory>,
 }
 
+/// Per-key state for the per-node reconcile machinery (H3+).
+///
+/// Populated by `reconcile_in` (T2b, not yet implemented) and read by
+/// `reconcile_out` for write-back delta diffing. Stored in
+/// [`WorkspaceManager::state`] keyed by [`WorkspaceKey`].
+#[allow(dead_code)] // fields populated / consumed by reconcile_in/out (T2b)
+struct WorkspaceState {
+    /// Absolute env-side root for this key (already expanded from the template).
+    env_side_root: String,
+    /// Whether the root is unique per-run (Ephemeral) or stable (Persistent).
+    lifecycle: Lifecycle,
+    /// Factory for reopening a transport during reconcile phases.
+    transport_factory: Arc<dyn WorkspaceTransportFactory>,
+    /// Write-back policy for this workspace.
+    write_back: WriteBackPolicy,
+    /// Snapshot of the remote manifest as of the last `reconcile_in`/`reconcile_out`.
+    /// Used as the write-back baseline by `reconcile_out`.
+    last_remote_manifest: safety::Manifest,
+}
+
+impl std::fmt::Debug for WorkspaceState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkspaceState")
+            .field("env_side_root", &self.env_side_root)
+            .field("lifecycle", &self.lifecycle)
+            .field("write_back", &self.write_back)
+            .field("last_remote_manifest_len", &self.last_remote_manifest.len())
+            .finish_non_exhaustive()
+    }
+}
+
 // ── Run scope ─────────────────────────────────────────────────────────────────
 
 /// Lightweight view of the current run's identity; passed to
@@ -129,6 +160,11 @@ pub struct WorkspaceManager {
     /// inside each entry serialises concurrent reconcile cycles for the same key.
     leases: SyncMutex<LeaseMap>,
 
+    /// Per-key reconcile state for H3 per-node workspace reconciliation.
+    /// Populated by `reconcile_in` (T2b) and consumed by `reconcile_out`.
+    #[allow(dead_code)] // populated by reconcile_in (T2b, not yet implemented)
+    state: SyncMutex<HashMap<WorkspaceKey, WorkspaceState>>,
+
     /// Test-only seam: records the last [`RunOutcome`] passed to
     /// [`Self::teardown_all`]. Lets run-loop tests observe that
     /// teardown fired with the correct outcome on every exit path.
@@ -150,6 +186,7 @@ impl Default for WorkspaceManager {
         Self {
             prepared: Mutex::new(HashMap::new()),
             leases: SyncMutex::new(HashMap::new()),
+            state: SyncMutex::new(HashMap::new()),
             #[cfg(any(test, feature = "testing"))]
             last_outcome: std::sync::Mutex::new(None),
         }
@@ -559,6 +596,65 @@ fn host_io_err(path: &Path, op: &str, e: &std::io::Error) -> DispatchError {
 }
 
 // ── Template expansion ────────────────────────────────────────────────────────
+
+// ── Pure helpers for H3 reconcile scaffolding ─────────────────────────────────
+
+/// Extract `(env_path_template, write_back)` from a `Sync { strategy: Sftp }`
+/// binding, or `None` for every other binding that requires no file sync.
+///
+/// Returns `Err(DispatchError::Unsupported)` for `Sync { strategy: Rsync }`
+/// (not yet implemented) so callers surface a clear error at the point they
+/// discover the binding rather than silently no-op-ing.
+#[allow(dead_code)] // called by reconcile_in (T2b, not yet implemented)
+fn sync_params(
+    binding: &WorkspaceBinding,
+) -> Result<Option<(&str, &WriteBackPolicy)>, DispatchError> {
+    use crate::environment::runtime::env::SyncStrategy;
+    match binding {
+        WorkspaceBinding::Sync {
+            env_path_template,
+            strategy: SyncStrategy::Sftp,
+            write_back,
+        } => Ok(Some((env_path_template.as_str(), write_back))),
+
+        WorkspaceBinding::Sync {
+            strategy: SyncStrategy::Rsync,
+            ..
+        } => Err(DispatchError::Unsupported(
+            "only SFTP workspace sync is implemented".into(),
+        )),
+
+        // All non-Sync bindings need no per-node file transfer.
+        _ => Ok(None),
+    }
+}
+
+/// Classify a `Sync` env-path template as [`Lifecycle::Ephemeral`] or reject it.
+///
+/// A template is ephemeral iff it contains the `{{run.id}}` token — only then
+/// is the remote root unique per run and safe to delete on teardown.
+///
+/// Persistent templates (no `{{run.id}}`) are deferred to Phase H5; this
+/// function returns `Err(DispatchError::Unsupported)` for them so callers
+/// produce a clear error rather than silently falling back.
+///
+/// The common typo `{{run_id}}` (underscore) is also detected with a hint
+/// message naming both forms, matching the existing hint in `resolve_cwd`.
+#[allow(dead_code)] // called by reconcile_in (T2b, not yet implemented)
+fn lifecycle_of(tmpl: &str) -> Result<Lifecycle, DispatchError> {
+    if tmpl.contains("{{run_id}}") && !tmpl.contains("{{run.id}}") {
+        return Err(DispatchError::Unsupported(
+            "the per-run placeholder is {{run.id}}, not {{run_id}}".into(),
+        ));
+    }
+    if tmpl.contains("{{run.id}}") {
+        Ok(Lifecycle::Ephemeral)
+    } else {
+        Err(DispatchError::Unsupported(
+            "persistent workspace reuse is deferred to a later phase (H5)".into(),
+        ))
+    }
+}
 
 /// Expand `template` against `run` + `host_ws`, then validate the result.
 ///
@@ -1123,6 +1219,147 @@ mod tests {
         assert!(
             !outside.path().join("pwned.txt").exists(),
             "write-back must not follow a host-side symlinked directory"
+        );
+    }
+
+    // ── sync_params ───────────────────────────────────────────────────────────
+
+    /// `Sync { strategy: Sftp }` → `Some((template, write_back))`
+    #[test]
+    fn sync_params_sftp_returns_some() {
+        let wb = WriteBackPolicy::None;
+        let binding = WorkspaceBinding::Sync {
+            env_path_template: "/tmp/ordius-{{run.id}}".into(),
+            strategy: SyncStrategy::Sftp,
+            write_back: wb.clone(),
+        };
+        let result = sync_params(&binding).expect("Sftp must not error");
+        let (tmpl, policy) = result.expect("Sftp must return Some");
+        assert_eq!(tmpl, "/tmp/ordius-{{run.id}}");
+        assert_eq!(*policy, wb);
+    }
+
+    /// `Sync { strategy: Rsync }` → `Err(Unsupported)`
+    #[test]
+    fn sync_params_rsync_returns_err() {
+        let binding = WorkspaceBinding::Sync {
+            env_path_template: "/tmp/ordius-{{run.id}}".into(),
+            strategy: SyncStrategy::Rsync,
+            write_back: WriteBackPolicy::None,
+        };
+        let err = sync_params(&binding).unwrap_err();
+        assert!(
+            err.to_string().contains("SFTP"),
+            "expected SFTP error; got: {err}"
+        );
+    }
+
+    /// Non-Sync bindings (Shared, Unsupported, etc.) → `Ok(None)`
+    #[test]
+    fn sync_params_shared_and_unsupported_return_none() {
+        assert!(sync_params(&WorkspaceBinding::Shared).unwrap().is_none());
+        assert!(
+            sync_params(&WorkspaceBinding::Unsupported)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            sync_params(&WorkspaceBinding::Translated)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // ── lifecycle_of ──────────────────────────────────────────────────────────
+
+    /// `{{run.id}}` in the template → `Lifecycle::Ephemeral`
+    #[test]
+    fn lifecycle_of_run_dot_id_is_ephemeral() {
+        let lc = lifecycle_of("/tmp/ordius-{{run.id}}").expect("must succeed");
+        assert_eq!(lc, Lifecycle::Ephemeral);
+    }
+
+    /// Template without any run-id token → `Err(Unsupported)` mentioning "persistent"
+    #[test]
+    fn lifecycle_of_no_token_is_err_persistent() {
+        let err = lifecycle_of("/stable/path").unwrap_err();
+        assert!(
+            err.to_string().contains("persistent"),
+            "expected 'persistent' in error; got: {err}"
+        );
+    }
+
+    /// `{{run_id}}` (underscore typo) → `Err(Unsupported)` hinting both forms
+    #[test]
+    fn lifecycle_of_run_id_underscore_gives_hint_error() {
+        let err = lifecycle_of("/tmp/ordius-{{run_id}}").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("{{run.id}}") && msg.contains("{{run_id}}"),
+            "expected hint naming both forms; got: {msg}"
+        );
+    }
+
+    // ── fake_models_symlinks (manager-side integration) ───────────────────────
+
+    /// Seed a symlink in the fake factory, open a transport, and verify:
+    /// `list_tree` emits Symlink, `stat` is Symlink (no-follow), `read_link`
+    /// returns the target, and `remove_file` unlinks the symlink entry itself.
+    #[tokio::test]
+    async fn fake_models_symlinks() {
+        use super::super::transport::{
+            FakeWorkspaceTransportFactory, FileKind, WorkspaceTransportFactory,
+        };
+
+        let factory = FakeWorkspaceTransportFactory::default();
+        factory.seed_symlink("root/link.txt", "../target.txt");
+
+        let t = factory.open().await.unwrap();
+        t.upload_file("root/real.txt", b"data").await.unwrap();
+
+        // list_tree includes the symlink as Symlink
+        let listing = t.list_tree("root").await.unwrap();
+        let link = listing
+            .iter()
+            .find(|m| m.rel_path == "root/link.txt")
+            .expect("symlink must appear in list_tree");
+        assert_eq!(
+            link.kind,
+            FileKind::Symlink,
+            "list_tree: must report Symlink"
+        );
+
+        // stat is Symlink (no-follow)
+        let meta = t
+            .stat("root/link.txt")
+            .await
+            .unwrap()
+            .expect("stat: must return Some");
+        assert_eq!(
+            meta.kind,
+            FileKind::Symlink,
+            "stat: must be Symlink (no-follow)"
+        );
+
+        // read_link returns the stored target
+        let target = t.read_link("root/link.txt").await.unwrap();
+        assert_eq!(target, "../target.txt");
+
+        // read_link on a regular file is an error
+        assert!(
+            t.read_link("root/real.txt").await.is_err(),
+            "read_link on regular file must error"
+        );
+
+        // remove_file unlinks the symlink entry; the regular file is untouched
+        t.remove_file("root/link.txt").await.unwrap();
+        assert!(
+            t.stat("root/link.txt").await.unwrap().is_none(),
+            "symlink must be gone after remove_file"
+        );
+        assert!(
+            t.stat("root/real.txt").await.unwrap().is_some(),
+            "regular file must be untouched"
         );
     }
 }

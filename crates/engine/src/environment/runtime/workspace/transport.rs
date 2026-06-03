@@ -97,7 +97,9 @@ pub trait WorkspaceTransport: Send {
 /// `mkdir` records a dir entry; `upload_file` records bytes; `list_tree`
 /// returns all entries whose `rel_path` is rooted under the given prefix;
 /// `set_permissions` records the mode but is otherwise a no-op;
-/// `read_link` always returns `DispatchError::Unsupported`.
+/// `read_link` returns the stored target for symlinks seeded via
+/// [`FakeWorkspaceTransportFactory::seed_symlink`], or `Unsupported` for
+/// non-symlink paths. Symlink semantics are no-follow (like real SFTP lstat).
 ///
 /// Gated on `#[cfg(any(test, feature = "testing"))]` to match the existing
 /// fake convention in `fake.rs`.
@@ -119,6 +121,8 @@ mod fake_impl {
         modes: BTreeMap<String, u32>,
         /// explicit dir entries (mkdir)
         dirs: BTreeSet<String>,
+        /// symlink path → target (no-follow semantics, like real SFTP)
+        symlinks: BTreeMap<String, String>,
     }
 
     /// In-memory fake for [`WorkspaceTransport`]. Clones share state.
@@ -185,6 +189,17 @@ mod fake_impl {
                         });
                     }
                 }
+                // Symlinks are emitted as Symlink entries (no-follow, like real SFTP).
+                for path in fs.symlinks.keys() {
+                    if rel.is_empty() || path.starts_with(&prefix) {
+                        entries.push(FileMeta {
+                            rel_path: path.clone(),
+                            kind: FileKind::Symlink,
+                            size: 0,
+                            mode: *fs.modes.get(path).unwrap_or(&0o777),
+                        });
+                    }
+                }
             }
 
             Ok(entries)
@@ -192,6 +207,15 @@ mod fake_impl {
 
         async fn stat(&self, rel: &str) -> Result<Option<FileMeta>, DispatchError> {
             let fs = self.inner.lock();
+            // Check symlinks first — no-follow semantics, like real SFTP lstat.
+            if fs.symlinks.contains_key(rel) {
+                return Ok(Some(FileMeta {
+                    rel_path: rel.to_owned(),
+                    kind: FileKind::Symlink,
+                    size: 0,
+                    mode: *fs.modes.get(rel).unwrap_or(&0o777),
+                }));
+            }
             let result = fs.files.get(rel).map_or_else(
                 || {
                     fs.dirs.contains(rel).then(|| FileMeta {
@@ -215,9 +239,12 @@ mod fake_impl {
         }
 
         async fn read_link(&self, rel: &str) -> Result<String, DispatchError> {
-            Err(DispatchError::Unsupported(format!(
-                "FakeWorkspaceTransport does not support symlinks (read_link: {rel})"
-            )))
+            self.inner
+                .lock()
+                .symlinks
+                .get(rel)
+                .cloned()
+                .ok_or_else(|| DispatchError::Unsupported(format!("not a symlink: {rel}")))
         }
 
         async fn rename(&self, from: &str, to: &str) -> Result<(), DispatchError> {
@@ -244,6 +271,11 @@ mod fake_impl {
 
         async fn remove_file(&self, rel: &str) -> Result<(), DispatchError> {
             let mut fs = self.inner.lock();
+            // A symlink is also removed by remove_file (unlinks the entry, no-follow).
+            if fs.symlinks.remove(rel).is_some() {
+                fs.modes.remove(rel);
+                return Ok(());
+            }
             fs.files
                 .remove(rel)
                 .ok_or_else(|| DispatchError::WorkspaceUnavailable {
@@ -292,6 +324,20 @@ mod fake_impl {
         pub const fn new(transport: FakeWorkspaceTransport) -> Self {
             Self { transport }
         }
+
+        /// Seed a symlink entry in the backing store.
+        ///
+        /// Records `rel` → `target` as a symlink (no-follow semantics). The
+        /// symlink will appear in `list_tree`, `stat` (as `FileKind::Symlink`),
+        /// and `read_link` without following the target. `remove_file` unlinks
+        /// the entry itself, not the target.
+        pub fn seed_symlink(&self, rel: &str, target: &str) {
+            self.transport
+                .inner
+                .lock()
+                .symlinks
+                .insert(rel.to_owned(), target.to_owned());
+        }
     }
 
     #[async_trait]
@@ -310,6 +356,60 @@ pub use fake_impl::{FakeWorkspaceTransport, FakeWorkspaceTransportFactory};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fake_models_symlinks() {
+        let factory = FakeWorkspaceTransportFactory::default();
+        // Seed a regular file and a symlink at the same level.
+        factory.seed_symlink("root/link.txt", "../target.txt");
+        let t = factory.open().await.unwrap();
+
+        // upload a regular file alongside the symlink
+        t.upload_file("root/file.txt", b"data").await.unwrap();
+
+        // list_tree includes the symlink as FileKind::Symlink
+        let listing = t.list_tree("root").await.unwrap();
+        let link_entry = listing
+            .iter()
+            .find(|m| m.rel_path == "root/link.txt")
+            .expect("symlink must appear in list_tree");
+        assert_eq!(
+            link_entry.kind,
+            FileKind::Symlink,
+            "list_tree must report Symlink"
+        );
+
+        // stat reports Symlink (no-follow)
+        let meta = t
+            .stat("root/link.txt")
+            .await
+            .unwrap()
+            .expect("stat must return Some");
+        assert_eq!(
+            meta.kind,
+            FileKind::Symlink,
+            "stat must report Symlink (no-follow)"
+        );
+
+        // read_link returns the stored target
+        let target = t.read_link("root/link.txt").await.unwrap();
+        assert_eq!(target, "../target.txt");
+
+        // read_link on a non-symlink returns an error
+        assert!(
+            t.read_link("root/file.txt").await.is_err(),
+            "read_link on file must error"
+        );
+
+        // remove_file unlinks the symlink entry itself, not the target
+        t.remove_file("root/link.txt").await.unwrap();
+        assert!(
+            t.stat("root/link.txt").await.unwrap().is_none(),
+            "symlink must be gone after remove_file"
+        );
+        // The regular file is untouched
+        assert!(t.stat("root/file.txt").await.unwrap().is_some());
+    }
 
     #[tokio::test]
     async fn fake_transport_round_trip() {

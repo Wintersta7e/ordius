@@ -31,6 +31,7 @@ use super::error::DispatchError;
 use super::plan::{ProbePlan, ProbeSummary};
 use super::resource::{Capability, ProbeSpec, ResourceDefinition, ResourceId};
 use super::transport::{EnvPath, HttpError, HttpRequest, HttpResponse, ProcessCmd};
+use super::workspace::WorkspaceTransportFactory;
 
 // ── FakeResource ─────────────────────────────────────────────────────────────
 
@@ -73,7 +74,6 @@ impl FakeResource {
 ///
 /// Build one with `new`, seed resources with `with_seeded`, then pass to any
 /// code that accepts `&dyn Dispatcher`.
-#[derive(Debug)]
 pub struct FakeRemoteDispatcher {
     info: EnvInfo,
     /// Seeded outcomes keyed by resource id. Protected by `parking_lot::Mutex`
@@ -81,6 +81,25 @@ pub struct FakeRemoteDispatcher {
     /// construction without requiring `async` or `tokio` context.
     seeded: Mutex<HashMap<ResourceId, FakeResource>>,
     transport: Arc<FakeHttpTransport>,
+    /// Optional workspace transport factory; `None` returns the default (no
+    /// transport). Set via [`Self::with_workspace_transport`].
+    workspace_transport_factory: Option<Arc<dyn WorkspaceTransportFactory>>,
+}
+
+impl std::fmt::Debug for FakeRemoteDispatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeRemoteDispatcher")
+            .field("info", &self.info)
+            .field("transport", &self.transport)
+            .field(
+                "workspace_transport_factory",
+                &self
+                    .workspace_transport_factory
+                    .as_ref()
+                    .map(|_| "<factory>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl FakeRemoteDispatcher {
@@ -90,6 +109,7 @@ impl FakeRemoteDispatcher {
             info,
             seeded: Mutex::new(HashMap::new()),
             transport: Arc::new(FakeHttpTransport::default()),
+            workspace_transport_factory: None,
         }
     }
 
@@ -110,6 +130,17 @@ impl FakeRemoteDispatcher {
     #[must_use]
     pub fn with_seeded(self, id: &str, res: FakeResource) -> Self {
         self.seeded.lock().insert(ResourceId(id.into()), res);
+        self
+    }
+
+    /// Attach a workspace transport factory, enabling `workspace_transport()`
+    /// to return `Some(factory)`. Returns `self` for chaining.
+    ///
+    /// Use this to drive `WorkspaceManager::resolve_cwd` and reconcile tests
+    /// without a real SSH connection.
+    #[must_use]
+    pub fn with_workspace_transport(mut self, factory: Arc<dyn WorkspaceTransportFactory>) -> Self {
+        self.workspace_transport_factory = Some(factory);
         self
     }
 }
@@ -231,6 +262,12 @@ impl Dispatcher for FakeRemoteDispatcher {
             "/fake/{}",
             host_path.to_string_lossy().trim_start_matches('/'),
         )))
+    }
+
+    /// Return the seeded factory if one was set via
+    /// [`FakeRemoteDispatcher::with_workspace_transport`]; otherwise `None`.
+    fn workspace_transport(&self) -> Option<Arc<dyn super::workspace::WorkspaceTransportFactory>> {
+        self.workspace_transport_factory.clone()
     }
 }
 
