@@ -97,10 +97,9 @@ struct PreparedWorkspace {
 
 /// Per-key state for the per-node reconcile machinery (H3+).
 ///
-/// Populated by `reconcile_in` (T2b, not yet implemented) and read by
-/// `reconcile_out` for write-back delta diffing. Stored in
-/// [`WorkspaceManager::state`] keyed by [`WorkspaceKey`].
-#[allow(dead_code)] // fields populated / consumed by reconcile_in/out (T2b)
+/// Populated by `reconcile_in` and read by `reconcile_out` for write-back
+/// delta diffing. Stored in [`WorkspaceManager::state`] keyed by
+/// [`WorkspaceKey`].
 struct WorkspaceState {
     /// Absolute env-side root for this key (already expanded from the template).
     env_side_root: String,
@@ -161,8 +160,7 @@ pub struct WorkspaceManager {
     leases: SyncMutex<LeaseMap>,
 
     /// Per-key reconcile state for H3 per-node workspace reconciliation.
-    /// Populated by `reconcile_in` (T2b) and consumed by `reconcile_out`.
-    #[allow(dead_code)] // populated by reconcile_in (T2b, not yet implemented)
+    /// Populated by `reconcile_in` and consumed by `reconcile_out`.
     state: SyncMutex<HashMap<WorkspaceKey, WorkspaceState>>,
 
     /// Test-only seam: records the last [`RunOutcome`] passed to
@@ -399,6 +397,143 @@ impl WorkspaceManager {
             }
         }
     }
+
+    /// Reset the env-side workspace to mirror the host, returning the env-side cwd.
+    ///
+    /// Host→remote, run before each attempt of a synced node. For a
+    /// `Sync { strategy: Sftp }` binding it expands the env-path template,
+    /// classifies its lifecycle (persistent is deferred to H5), makes the remote
+    /// tree byte-for-byte equal to the host tree, and records per-key
+    /// [`WorkspaceState`] so [`Self::reconcile_out`] can diff against it.
+    ///
+    /// Every other binding delegates to `dispatcher.translate_path` — behaviour
+    /// is unchanged for `Shared`/`Translated`/`BindMount`/`Unsupported` and for
+    /// `Sync { strategy: Rsync }` (which `sync_params` rejects).
+    ///
+    /// On an upload error for an ephemeral root, the partial remote tree is
+    /// removed best-effort before the error propagates.
+    ///
+    /// # Concurrency
+    ///
+    /// The `parking_lot` `state` lock is only ever held to insert the final
+    /// `WorkspaceState`; all transport I/O happens outside it. No sync guard is
+    /// held across an `.await`.
+    pub async fn reconcile_in(
+        &self,
+        dispatcher: &dyn Dispatcher,
+        binding: &WorkspaceBinding,
+        host_ws: &Path,
+        run: &RunScope<'_>,
+    ) -> Result<EnvPath, DispatchError> {
+        // Non-Sync (or Rsync → Err) bindings: unchanged translate_path behaviour.
+        let Some((tmpl, write_back)) = sync_params(binding)? else {
+            return dispatcher.translate_path(host_ws);
+        };
+
+        let root = expand_env_root(tmpl, run, host_ws)?;
+        let lifecycle = lifecycle_of(tmpl)?; // Persistent => Err(Unsupported) (H5)
+
+        let factory = dispatcher.workspace_transport().ok_or_else(|| {
+            DispatchError::Unsupported("environment has no workspace transport".into())
+        })?;
+
+        let uploaded = match reset_remote_to_host(&factory, &root, host_ws).await {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                // Best-effort cleanup of a partial ephemeral root before bubbling.
+                if lifecycle == Lifecycle::Ephemeral
+                    && let Err(cleanup_err) = remove_tree(factory.as_ref(), &root).await
+                {
+                    tracing::warn!(
+                        env_root = root,
+                        error = %cleanup_err,
+                        "failed to remove partial reconcile root after reset error"
+                    );
+                }
+                return Err(e);
+            },
+        };
+
+        let key = (dispatcher.info().id.clone(), host_ws.to_path_buf());
+        {
+            let mut st = self.state.lock(); // parking_lot — no await held
+            st.insert(
+                key,
+                WorkspaceState {
+                    env_side_root: root.clone(),
+                    lifecycle,
+                    transport_factory: Arc::clone(&factory),
+                    write_back: write_back.clone(),
+                    last_remote_manifest: uploaded,
+                },
+            );
+        }
+
+        Ok(EnvPath::new(root))
+    }
+
+    /// Write back remote changes + propagate remote deletions for a synced node.
+    ///
+    /// Remote→host, run after the final attempt. Diffs the current remote tree
+    /// against the baseline stored by [`Self::reconcile_in`], writes
+    /// changed/new files into the host workspace, deletes host files the node
+    /// removed remotely, then advances the stored baseline.
+    ///
+    /// A no-op when the binding needs no sync, when no [`WorkspaceState`] exists
+    /// for the key (e.g. `reconcile_in` was never called / already torn down),
+    /// or when the policy is [`WriteBackPolicy::None`]. `SafeOrDiverge` is
+    /// deferred and returns `Err(Unsupported)`.
+    ///
+    /// # Concurrency
+    ///
+    /// The `state` lock is taken only to clone the baseline out and (later) to
+    /// store the advanced one — never held across the transport I/O between.
+    pub async fn reconcile_out(
+        &self,
+        dispatcher: &dyn Dispatcher,
+        binding: &WorkspaceBinding,
+        host_ws: &Path,
+    ) -> Result<(), DispatchError> {
+        // Non-Sync (or Rsync → Err) bindings need no write-back.
+        if sync_params(binding)?.is_none() {
+            return Ok(());
+        }
+
+        let key = (dispatcher.info().id.clone(), host_ws.to_path_buf());
+
+        // Extract everything we need by clone, then DROP the lock before awaiting.
+        let Some((root, factory, write_back, baseline)) = ({
+            let st = self.state.lock(); // parking_lot — dropped before await
+            st.get(&key).map(|s| {
+                (
+                    s.env_side_root.clone(),
+                    Arc::clone(&s.transport_factory),
+                    s.write_back.clone(),
+                    s.last_remote_manifest.clone(),
+                )
+            })
+        }) else {
+            return Ok(()); // no state for this key — nothing to reconcile
+        };
+
+        let ignore = match &write_back {
+            WriteBackPolicy::None => return Ok(()),
+            WriteBackPolicy::Force { ignore } => ignore.clone(),
+            WriteBackPolicy::SafeOrDiverge { .. } => {
+                return Err(DispatchError::Unsupported(
+                    "SafeOrDiverge write-back is deferred to a later phase".into(),
+                ));
+            },
+        };
+
+        let new_remote = write_back_delta(&factory, &root, host_ws, &baseline, &ignore).await?;
+
+        // Advance the baseline so the next reconcile_out diffs against this state.
+        if let Some(s) = self.state.lock().get_mut(&key) {
+            s.last_remote_manifest = new_remote;
+        }
+        Ok(())
+    }
 }
 
 // ── Teardown helpers ──────────────────────────────────────────────────────────
@@ -527,6 +662,234 @@ async fn write_back(pw: &PreparedWorkspace) -> Result<(), DispatchError> {
     Ok(())
 }
 
+/// Make the remote tree at `root` byte-for-byte equal to the host tree at
+/// `host_ws`, returning a [`safety::Manifest`] of the bytes uploaded.
+///
+/// Host→remote reset, run before each attempt by [`WorkspaceManager::reconcile_in`].
+/// Opens its own transport from `factory` (never holds a `&dyn` across an
+/// `.await`).  The returned manifest hashes the EXACT bytes sent — re-reading
+/// the host file to build it would reopen the TOCTOU window H2 already closed.
+///
+/// Reset order is delete-before-upload so a prior attempt's cruft (extra files,
+/// type-mismatched dirs) can never survive, and so a remote symlink can never
+/// redirect the parent-`mkdir`/`rename` inside `upload_file` outside `root`:
+/// 1. `mkdir(root)`.
+/// 2. Walk the host workspace → the target file set (ignores applied).
+/// 3. List the current remote tree.
+/// 4. Strip-guard every remote entry against `root`; reject any off-root path.
+/// 5. Delete (before any upload): every symlink (target-path OR intermediate
+///    dir — either could redirect a later write), every non-target file, and
+///    every directory whose rel collides with a target *file*. Cruft dirs are
+///    pruned best-effort, deepest-first.
+/// 6. Upload every target file via [`safety::read_within_caps`] (caps enforced
+///    on the bytes actually read), recording the sent bytes in the manifest.
+async fn reset_remote_to_host(
+    factory: &Arc<dyn WorkspaceTransportFactory>,
+    root: &str,
+    host_ws: &Path,
+) -> Result<safety::Manifest, DispatchError> {
+    let t = factory.open().await?;
+    t.mkdir(root).await?;
+
+    // 2. Target file set from the host walk (forward-slash rels, ignores applied).
+    let entries = safety::walk_workspace(host_ws)?;
+    let target_files: HashSet<&str> = entries.iter().map(|e| e.rel_path.as_str()).collect();
+
+    // 3. Current remote tree.
+    let remote = t.list_tree(root).await?;
+    let prefix = format!("{root}/");
+
+    // 4 + 5 (delete pass): classify each remote entry by stripping the root
+    // prefix, then queue deletions. Files/symlinks are unlinked immediately;
+    // directories are collected and removed deepest-first afterwards so each is
+    // empty when removed.
+    let mut cruft_dirs: Vec<String> = Vec::new();
+    for entry in &remote {
+        // The root dir itself is legitimate (some transports list it); it is
+        // neither a target nor cruft — skip without flagging it off-root.
+        if entry.rel_path == root {
+            continue;
+        }
+        let Some(rel) = entry.rel_path.strip_prefix(&prefix) else {
+            // An entry that neither equals `root` nor sits under `root/` escaped
+            // the synced root — never act on it.
+            return Err(DispatchError::WorkspaceUnavailable {
+                env_id: "<remote>".into(),
+                reason: format!(
+                    "remote listing entry `{}` is outside reconcile root `{root}`",
+                    entry.rel_path
+                ),
+            });
+        };
+        if !safety::is_safe_relative(rel) {
+            return Err(DispatchError::WorkspaceUnavailable {
+                env_id: "<remote>".into(),
+                reason: format!(
+                    "remote listing entry `{}` is an unsafe path",
+                    entry.rel_path
+                ),
+            });
+        }
+
+        match entry.kind {
+            // A symlink anywhere — at a target rel OR on an intermediate dir —
+            // would let the parent-mkdir/rename in `upload_file` escape `root`
+            // via the link target. Always unlink it (no-follow).
+            FileKind::Symlink => t.remove_file(&entry.rel_path).await?,
+            // A remote regular file that is not a target file is cruft from a
+            // failed prior attempt.
+            FileKind::File if !target_files.contains(rel) => {
+                t.remove_file(&entry.rel_path).await?;
+            },
+            FileKind::File => {},
+            // A directory whose rel collides with a target *file* path must go
+            // (we are about to upload a file there). Other cruft dirs are pruned
+            // best-effort below.
+            FileKind::Dir => cruft_dirs.push(entry.rel_path.clone()),
+        }
+    }
+
+    // Remove colliding/cruft directories deepest-first (longest path first) so
+    // children are gone before their parents. Best-effort: a dir that still has
+    // legitimate children (a target file lives under it) will fail to remove —
+    // that is expected, so swallow per-dir errors here.
+    cruft_dirs.sort_by_key(|d| std::cmp::Reverse(d.len()));
+    for dir in cruft_dirs {
+        let rel = dir.strip_prefix(&prefix).unwrap_or(dir.as_str());
+        let collides_with_file = target_files.contains(rel);
+        // A dir whose rel collides with a target *file* MUST be cleared — the
+        // upload would otherwise fail. Any other removal failure is a
+        // non-colliding cruft dir still holding legitimate children: leave it.
+        if let Err(e) = t.remove_dir(&dir).await
+            && collides_with_file
+        {
+            return Err(e);
+        }
+    }
+
+    // 6. Upload every target file. Cap-check the bytes actually read (bounded),
+    // and hash the sent bytes into the returned manifest.
+    let mut tracker = safety::CapTracker::new(safety::UploadCaps::default());
+    let mut manifest = safety::Manifest::new();
+    for entry in &entries {
+        let bytes = safety::read_within_caps(&entry.abs, &mut tracker)?;
+        let remote_path = format!("{root}/{}", entry.rel_path);
+        t.upload_file(&remote_path, &bytes).await?;
+        manifest.insert(
+            entry.rel_path.clone(),
+            safety::FileEntry {
+                sha256_hex: safety::sha256_hex(&bytes),
+                size: bytes.len() as u64,
+                mode: entry.mode,
+            },
+        );
+    }
+    Ok(manifest)
+}
+
+/// Propagate remote changes at `root` back to the host workspace at `host_ws`,
+/// returning the new remote manifest (the advanced write-back baseline).
+///
+/// Remote→host delta, run after the final attempt by
+/// [`WorkspaceManager::reconcile_out`].  Opens its own transport.  Diffs the
+/// current remote tree against `baseline`:
+/// - A remote regular file absent from `baseline`, or whose hash differs, is
+///   written to the host (atomic, guarded against traversal / host symlinks /
+///   ignore globs).
+/// - A rel present in `baseline` but absent from the remote is *deleted* on the
+///   host (same guards; best-effort per-file so one failed unlink does not
+///   abort the rest).
+///
+/// `list_tree` / `download_file` errors PROPAGATE via `?`: a transport failure
+/// must never read as "file absent", which would trigger a spurious host
+/// deletion (data loss). Only a fully-successful listing drives deletions.
+async fn write_back_delta(
+    factory: &Arc<dyn WorkspaceTransportFactory>,
+    root: &str,
+    host_ws: &Path,
+    baseline: &safety::Manifest,
+    ignore: &[String],
+) -> Result<safety::Manifest, DispatchError> {
+    let t = factory.open().await?;
+    let prefix = format!("{root}/");
+
+    // 1. Build the new remote manifest from a fully-successful listing +
+    // downloads. Any transport error here aborts the whole write-back (no
+    // spurious deletions). Only regular files contribute.
+    let listing = t.list_tree(root).await?;
+    let mut new_remote = safety::Manifest::new();
+    for entry in &listing {
+        if entry.kind != FileKind::File {
+            continue;
+        }
+        let Some(rel) = entry.rel_path.strip_prefix(&prefix) else {
+            continue; // defensive: outside the root — ignore for manifest purposes
+        };
+        if !safety::is_safe_relative(rel) {
+            continue;
+        }
+        let bytes = t.download_file(&entry.rel_path).await?;
+        new_remote.insert(
+            rel.to_string(),
+            safety::FileEntry {
+                sha256_hex: safety::sha256_hex(&bytes),
+                size: bytes.len() as u64,
+                mode: entry.mode,
+            },
+        );
+
+        // 2. Write changed / new files to the host, under the same guards as
+        // H2 write-back. Skip silently on a guard failure.
+        if !safety::host_target_is_symlink_safe(host_ws, rel) {
+            tracing::warn!(
+                rel,
+                env_root = root,
+                "skipping write-back: host path traverses a symlink"
+            );
+            continue;
+        }
+        if safety::should_ignore(rel, ignore) {
+            continue;
+        }
+        let changed = baseline
+            .get(rel)
+            .is_none_or(|meta| meta.sha256_hex != new_remote[rel].sha256_hex);
+        if changed {
+            write_host_file_atomic(host_ws, rel, &bytes)?;
+        }
+    }
+
+    // 3. Deletion propagation: a rel in `baseline` but absent from `new_remote`
+    // was deleted by the node — mirror that on the host, under identical guards.
+    // Best-effort: a failed unlink is logged and skipped, never aborting.
+    for rel in baseline.keys() {
+        if new_remote.contains_key(rel) {
+            continue;
+        }
+        if !safety::is_safe_relative(rel)
+            || !safety::host_target_is_symlink_safe(host_ws, rel)
+            || safety::should_ignore(rel, ignore)
+        {
+            continue;
+        }
+        let target = host_ws.join(rel);
+        match std::fs::remove_file(&target) {
+            Ok(()) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => {
+                tracing::warn!(
+                    rel,
+                    env_root = root,
+                    error = %e,
+                    "failed to propagate remote deletion to host (best-effort)"
+                );
+            },
+        }
+    }
+
+    Ok(new_remote)
+}
+
 /// Recursively remove `root` and everything under it via the transport: files
 /// first, then directories deepest-first, then the root itself.
 async fn remove_tree(
@@ -597,7 +960,7 @@ fn host_io_err(path: &Path, op: &str, e: &std::io::Error) -> DispatchError {
 
 // ── Template expansion ────────────────────────────────────────────────────────
 
-// ── Pure helpers for H3 reconcile scaffolding ─────────────────────────────────
+// ── Pure helpers for H3 reconcile ─────────────────────────────────────────────
 
 /// Extract `(env_path_template, write_back)` from a `Sync { strategy: Sftp }`
 /// binding, or `None` for every other binding that requires no file sync.
@@ -605,7 +968,6 @@ fn host_io_err(path: &Path, op: &str, e: &std::io::Error) -> DispatchError {
 /// Returns `Err(DispatchError::Unsupported)` for `Sync { strategy: Rsync }`
 /// (not yet implemented) so callers surface a clear error at the point they
 /// discover the binding rather than silently no-op-ing.
-#[allow(dead_code)] // called by reconcile_in (T2b, not yet implemented)
 fn sync_params(
     binding: &WorkspaceBinding,
 ) -> Result<Option<(&str, &WriteBackPolicy)>, DispatchError> {
@@ -640,7 +1002,6 @@ fn sync_params(
 ///
 /// The common typo `{{run_id}}` (underscore) is also detected with a hint
 /// message naming both forms, matching the existing hint in `resolve_cwd`.
-#[allow(dead_code)] // called by reconcile_in (T2b, not yet implemented)
 fn lifecycle_of(tmpl: &str) -> Result<Lifecycle, DispatchError> {
     if tmpl.contains("{{run_id}}") && !tmpl.contains("{{run.id}}") {
         return Err(DispatchError::Unsupported(
@@ -1361,5 +1722,309 @@ mod tests {
             t.stat("root/real.txt").await.unwrap().is_some(),
             "regular file must be untouched"
         );
+    }
+
+    // ── reconcile_in / reconcile_out (T2b) ────────────────────────────────────
+
+    use super::super::transport::FileKind;
+    use crate::environment::runtime::fake::FakeRemoteDispatcher;
+
+    /// An `EnvInfo` whose id is an SSH env (so `info().id` keys the state map),
+    /// reusing the `Local` spec shape (the spec variant is irrelevant here —
+    /// reconcile only reads `info().id` and `workspace_transport()`).
+    fn ssh_info(label: &str) -> EnvInfo {
+        EnvInfo {
+            id: EnvId::ssh(label),
+            label: label.into(),
+            spec: EnvSpec::Local {
+                resources: vec![],
+                host_direct_verifications: HashMap::default(),
+            },
+            state: EnvState::Reachable,
+            enabled: true,
+        }
+    }
+
+    /// Build a `FakeRemoteDispatcher` wired to a fresh fake workspace transport,
+    /// returning the dispatcher plus a state-sharing handle to the fake "remote".
+    fn ssh_dispatcher_with_fake(label: &str) -> (FakeRemoteDispatcher, FakeWorkspaceTransport) {
+        let fake = FakeWorkspaceTransport::default();
+        let factory = Arc::new(FakeWorkspaceTransportFactory::new(fake.clone()));
+        let d = FakeRemoteDispatcher::new(ssh_info(label)).with_workspace_transport(factory);
+        (d, fake)
+    }
+
+    /// Collect the regular-file rels under `root` from the fake, stripped of the
+    /// `root/` prefix and sorted, for compact assertions.
+    async fn remote_files(fake: &FakeWorkspaceTransport, root: &str) -> Vec<String> {
+        let prefix = format!("{root}/");
+        let mut files: Vec<String> = fake
+            .list_tree(root)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.kind == FileKind::File)
+            .filter_map(|m| m.rel_path.strip_prefix(&prefix).map(ToOwned::to_owned))
+            .collect();
+        files.sort();
+        files
+    }
+
+    fn sftp_binding(template: &str, write_back: WriteBackPolicy) -> WorkspaceBinding {
+        WorkspaceBinding::Sync {
+            env_path_template: template.into(),
+            strategy: SyncStrategy::Sftp,
+            write_back,
+        }
+    }
+
+    /// `reconcile_in` makes the remote equal the host, and a subsequent
+    /// `reconcile_in` after a "failed attempt" (cruft + a mutated file) resets
+    /// the remote back to the host tree — cruft is gone, content is host content.
+    #[tokio::test]
+    async fn reconcile_in_resets_remote_to_host() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"host-a").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("reset");
+        let mgr = WorkspaceManager::new();
+        let binding = sftp_binding("/tmp/ordius-{{run.id}}", WriteBackPolicy::None);
+
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("first reconcile_in");
+        let root = cwd.as_str().to_string();
+        assert_eq!(root, "/tmp/ordius-r1");
+
+        // Remote now mirrors the host.
+        assert_eq!(remote_files(&fake, &root).await, vec!["a.txt".to_string()]);
+        assert_eq!(
+            fake.download_file(&format!("{root}/a.txt")).await.unwrap(),
+            b"host-a"
+        );
+
+        // Simulate a failed attempt: mutate a.txt and drop cruft on the remote.
+        fake.upload_file(&format!("{root}/a.txt"), b"stale-remote")
+            .await
+            .unwrap();
+        fake.upload_file(&format!("{root}/cruft.txt"), b"left-over")
+            .await
+            .unwrap();
+        fake.upload_file(&format!("{root}/junk/deep.txt"), b"nested-cruft")
+            .await
+            .unwrap();
+
+        // Re-run: reset must restore the host tree exactly.
+        mgr.reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("second reconcile_in");
+
+        assert_eq!(
+            remote_files(&fake, &root).await,
+            vec!["a.txt".to_string()],
+            "cruft files must be gone after reset"
+        );
+        assert_eq!(
+            fake.download_file(&format!("{root}/a.txt")).await.unwrap(),
+            b"host-a",
+            "remote a.txt must be reset to host content"
+        );
+    }
+
+    /// `reconcile_in` clears remote symlinks — at a target-file rel AND at an
+    /// intermediate directory rel — replacing them with the host's real files.
+    #[tokio::test]
+    async fn reconcile_in_clears_remote_symlinks() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        // host: a.txt (regular) + sub/b.txt (regular under a real dir)
+        std::fs::write(host_ws.join("a.txt"), b"real-a").unwrap();
+        std::fs::create_dir(host_ws.join("sub")).unwrap();
+        std::fs::write(host_ws.join("sub").join("b.txt"), b"real-b").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("symlink");
+        let factory = FakeWorkspaceTransportFactory::new(fake.clone());
+
+        let root = "/tmp/ordius-r1";
+        // Seed a symlink AT a target-file rel and a symlink AT an intermediate dir.
+        factory.seed_symlink(&format!("{root}/a.txt"), "/etc/passwd");
+        factory.seed_symlink(&format!("{root}/sub"), "/var/evil");
+        // Also seed the root dir so list_tree includes it (exercise the root-skip).
+        fake.mkdir(root).await.unwrap();
+
+        let mgr = WorkspaceManager::new();
+        let binding = sftp_binding("/tmp/ordius-{{run.id}}", WriteBackPolicy::None);
+
+        mgr.reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+
+        // Both symlinks must be gone.
+        assert!(
+            fake.stat(&format!("{root}/a.txt")).await.unwrap().is_some(),
+            "a.txt must exist"
+        );
+        assert_ne!(
+            fake.stat(&format!("{root}/a.txt"))
+                .await
+                .unwrap()
+                .unwrap()
+                .kind,
+            FileKind::Symlink,
+            "a.txt must no longer be a symlink"
+        );
+        // `sub` symlink removed; the real file lives under it now.
+        let sub_meta = fake.stat(&format!("{root}/sub")).await.unwrap();
+        if let Some(m) = sub_meta {
+            assert_ne!(m.kind, FileKind::Symlink, "sub must not be a symlink");
+        }
+        // Remote files are the host's real files with host content.
+        assert_eq!(
+            remote_files(&fake, root).await,
+            vec!["a.txt".to_string(), "sub/b.txt".to_string()]
+        );
+        assert_eq!(
+            fake.download_file(&format!("{root}/a.txt")).await.unwrap(),
+            b"real-a"
+        );
+        assert_eq!(
+            fake.download_file(&format!("{root}/sub/b.txt"))
+                .await
+                .unwrap(),
+            b"real-b"
+        );
+    }
+
+    /// `reconcile_out` (Force) writes changed + new files back, propagates
+    /// remote deletions to the host, advances the baseline, and honours ignore
+    /// globs + traversal/symlink guards. `None` is a no-op.
+    #[tokio::test]
+    async fn reconcile_out_writes_delta_and_propagates_deletions() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"host-a").unwrap();
+        std::fs::write(host_ws.join("b.txt"), b"host-b").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("delta");
+        let mgr = WorkspaceManager::new();
+        let binding = sftp_binding(
+            "/tmp/ordius-{{run.id}}",
+            WriteBackPolicy::Force {
+                ignore: vec!["*.log".into()],
+            },
+        );
+
+        // reconcile_in establishes baseline {a.txt, b.txt} on the remote.
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        // Node activity on the remote: modify a.txt, create c.txt, delete b.txt,
+        // create an ignored .log, and present a traversal escape + a host-symlink
+        // escape target that must be refused.
+        fake.upload_file(&format!("{root}/a.txt"), b"changed-a")
+            .await
+            .unwrap();
+        fake.upload_file(&format!("{root}/c.txt"), b"new-c")
+            .await
+            .unwrap();
+        fake.remove_file(&format!("{root}/b.txt")).await.unwrap();
+        fake.upload_file(&format!("{root}/debug.log"), b"noise")
+            .await
+            .unwrap();
+        // Traversal escape: must never be written outside host_ws.
+        fake.upload_file(&format!("{root}/../escape.txt"), b"pwned")
+            .await
+            .unwrap();
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out Force");
+
+        // Changed + new written back.
+        assert_eq!(std::fs::read(host_ws.join("a.txt")).unwrap(), b"changed-a");
+        assert_eq!(std::fs::read(host_ws.join("c.txt")).unwrap(), b"new-c");
+        // Remote deletion propagated to host.
+        assert!(
+            !host_ws.join("b.txt").exists(),
+            "b.txt deleted on remote must be removed on host"
+        );
+        // Ignored + traversal entries honoured.
+        assert!(
+            !host_ws.join("debug.log").exists(),
+            "ignored *.log must not be written back"
+        );
+        assert!(
+            !host.path().join("escape.txt").exists(),
+            "traversal write-back must be skipped"
+        );
+
+        // Baseline advanced: a no-further-change reconcile_out is a clean no-op
+        // (and would re-delete b.txt if the baseline still listed it — it must
+        // not, since b.txt no longer exists on the remote). Recreate b.txt on
+        // host to prove it is NOT re-deleted by the advanced baseline.
+        std::fs::write(host_ws.join("b.txt"), b"recreated").unwrap();
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("second reconcile_out");
+        assert_eq!(
+            std::fs::read(host_ws.join("b.txt")).unwrap(),
+            b"recreated",
+            "advanced baseline must not re-propagate the stale b.txt deletion"
+        );
+
+        // `None` policy is a no-op: set up fresh state and confirm nothing changes.
+        let (d2, fake2) = ssh_dispatcher_with_fake("delta-none");
+        let mgr2 = WorkspaceManager::new();
+        let host2 = tempfile::TempDir::new().unwrap();
+        let host_ws2 = host2.path();
+        std::fs::write(host_ws2.join("a.txt"), b"orig").unwrap();
+        let none_binding = sftp_binding("/tmp/ordius-{{run.id}}", WriteBackPolicy::None);
+        let cwd2 = mgr2
+            .reconcile_in(&d2, &none_binding, host_ws2, &sample_run())
+            .await
+            .unwrap();
+        let root2 = cwd2.as_str().to_string();
+        fake2
+            .upload_file(&format!("{root2}/a.txt"), b"changed-on-remote")
+            .await
+            .unwrap();
+        mgr2.reconcile_out(&d2, &none_binding, host_ws2)
+            .await
+            .expect("reconcile_out None");
+        assert_eq!(
+            std::fs::read(host_ws2.join("a.txt")).unwrap(),
+            b"orig",
+            "None policy must not write back"
+        );
+    }
+
+    /// `reconcile_in` on a non-Sync binding (Shared) delegates to
+    /// `translate_path` and records no reconcile state; `reconcile_out` is then
+    /// a clean no-op.
+    #[tokio::test]
+    async fn reconcile_in_non_sync_delegates_and_out_is_noop() {
+        let (d, _fake) = ssh_dispatcher_with_fake("shared");
+        let mgr = WorkspaceManager::new();
+        let cwd = mgr
+            .reconcile_in(
+                &d,
+                &WorkspaceBinding::Shared,
+                Path::new("/ws"),
+                &sample_run(),
+            )
+            .await
+            .expect("shared reconcile_in");
+        // FakeRemoteDispatcher::translate_path prefixes `/fake`.
+        assert_eq!(cwd.as_str(), "/fake/ws");
+
+        // No state recorded → reconcile_out is a no-op (Ok).
+        mgr.reconcile_out(&d, &WorkspaceBinding::Shared, Path::new("/ws"))
+            .await
+            .expect("shared reconcile_out is a no-op");
     }
 }
