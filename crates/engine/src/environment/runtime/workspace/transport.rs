@@ -162,6 +162,13 @@ mod fake_impl {
         /// preserve-on-failure test prove cleanup was *skipped*, not merely failed.
         /// Toggled via [`FakeWorkspaceTransport::set_fail_download`].
         fail_download: bool,
+        /// Test-only error hook: when set, `upload_file` and
+        /// `upload_file_atomic_via` return an error instead of writing. Drives a
+        /// half-acquired-lock failure (the persistent owner.json write fails after
+        /// the lock dir is created) without breaking listing/removal — so a test
+        /// can prove the lock stayed tracked for teardown release.
+        /// Toggled via [`FakeWorkspaceTransport::set_fail_upload`].
+        fail_upload: bool,
     }
 
     /// In-memory fake for [`WorkspaceTransport`]. Clones share state.
@@ -179,6 +186,15 @@ mod fake_impl {
         /// distinguish "cleanup skipped" from "cleanup failed").
         pub fn set_fail_download(&self, fail: bool) {
             self.inner.lock().fail_download = fail;
+        }
+
+        /// Test-only error hook: when `fail` is `true`, every subsequent
+        /// `upload_file` / `upload_file_atomic_via` call returns an error instead
+        /// of writing. Used to drive a half-acquired persistent-lock failure (the
+        /// owner.json write fails after the lock dir is created), while listing /
+        /// removal stay healthy so a test can prove the lock stayed tracked.
+        pub fn set_fail_upload(&self, fail: bool) {
+            self.inner.lock().fail_upload = fail;
         }
 
         /// Create the dir at `rel`, erroring if ANY entry already exists there
@@ -208,6 +224,13 @@ mod fake_impl {
 
         async fn upload_file(&self, rel: &str, bytes: &[u8]) -> Result<(), DispatchError> {
             let mut fs = self.inner.lock();
+            if fs.fail_upload {
+                drop(fs);
+                return Err(DispatchError::WorkspaceUnavailable {
+                    env_id: "fake".into(),
+                    reason: format!("injected upload failure for: {rel}"),
+                });
+            }
             // Ensure parent dir entries exist implicitly.
             if let Some(parent) = rel.rsplit_once('/').map(|(p, _)| p) {
                 fs.dirs.insert(parent.to_owned());
@@ -232,6 +255,13 @@ mod fake_impl {
                 "temp_dir_rel must name the held lock-dir scratch"
             );
             let mut fs = self.inner.lock();
+            if fs.fail_upload {
+                drop(fs);
+                return Err(DispatchError::WorkspaceUnavailable {
+                    env_id: "fake".into(),
+                    reason: format!("injected upload failure for: {target_rel}"),
+                });
+            }
             if let Some(parent) = target_rel.rsplit_once('/').map(|(p, _)| p) {
                 fs.dirs.insert(parent.to_owned());
             }

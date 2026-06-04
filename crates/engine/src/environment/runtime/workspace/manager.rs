@@ -20,8 +20,12 @@
 //! Same-key concurrency is serialised by a per-key execution lease the run loop
 //! holds across a node's reconcile cycle.
 //!
+//! Persistent workspace reuse (template without `{{run.id}}`, H5) is wired
+//! through `reconcile_in`: a stable root acquires a remote `.ordius.lock`, syncs
+//! the host additively (never deleting foreign content), and is never deleted on
+//! teardown (only the lock is released).
+//!
 //! Not yet implemented (deferred):
-//! - Persistent workspace reuse (template without `{{run.id}}`) — H5.
 //! - `SafeOrDiverge` conflict modes other than `Manifest` (`Checksum`/`MtimeSize`
 //!   are rejected in `reconcile_in`, before any upload).
 use std::collections::HashMap;
@@ -39,7 +43,7 @@ use crate::environment::runtime::transport::EnvPath;
 
 use super::safe_or_diverge;
 use super::safety;
-use super::transport::{FileKind, WorkspaceTransport, WorkspaceTransportFactory};
+use super::transport::{FileKind, LockOutcome, WorkspaceTransport, WorkspaceTransportFactory};
 
 // ── Type aliases ──────────────────────────────────────────────────────────────
 
@@ -77,19 +81,20 @@ pub enum RunOutcome {
 
 /// Per-node lifecycle of the uploaded workspace.
 ///
-/// Only `Ephemeral` (root contains `{{run.id}}`, unique per run, deleted on
-/// teardown) is supported in H3. Stable/persistent roots are rejected by
-/// [`lifecycle_of`] and land in H5, which will add the corresponding variant.
+/// Classified by [`lifecycle_of`] from the env-path template: a `{{run.id}}`
+/// token makes the root unique per run (`Ephemeral`); a stable template (no
+/// token) is reused across runs, lock-guarded, and never deleted (`Persistent`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lifecycle {
     /// Workspace root contains `{{run.id}}` — unique per run, deleted on teardown.
     Ephemeral,
+    /// Stable template — reused across runs, lock-guarded, never deleted.
+    Persistent,
 }
 
 /// Persisted in `<root>/.ordius.lock/owner.json` so a contending run can name who
 /// holds the lock. (H5 persistent-reuse lock.)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[allow(dead_code)] // populated by H5 persistent-lock acquire path; unused until then
 pub(super) struct LockOwner {
     /// Top-level run id (child workflows inherit the parent snapshot).
     pub(super) top_run_id: String,
@@ -203,8 +208,6 @@ pub struct WorkspaceManager {
     /// Remote locks held this run, keyed (`EnvId`, root). A lock is inserted the
     /// instant its `.ordius.lock` dir is created (before `owner.json`), so teardown
     /// can always release it. Released (rmdir) by `teardown_all`. (H5.)
-    #[allow(dead_code)]
-    // populated and released by H5 persistent-lock acquire/teardown; unused until then
     persistent_locks: SyncMutex<HashMap<(EnvId, String), Arc<dyn WorkspaceTransportFactory>>>,
 
     /// Test-only seam: records the last [`RunOutcome`] passed to
@@ -244,6 +247,18 @@ impl WorkspaceManager {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Number of persistent remote locks currently tracked (test-only seam).
+    ///
+    /// A lock is tracked from the instant its `.ordius.lock` dir is created
+    /// (before `owner.json`), so this counts half-acquired locks too — letting a
+    /// test prove a lock stays tracked for teardown release even when the
+    /// owner.json write fails.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn persistent_lock_count(&self) -> usize {
+        self.persistent_locks.lock().len()
     }
 
     /// Acquire an exclusive execution lease for `key`.
@@ -375,9 +390,12 @@ impl WorkspaceManager {
     ///
     /// Host→remote, run before each attempt of a synced node. For a
     /// `Sync { strategy: Sftp }` binding it expands the env-path template,
-    /// classifies its lifecycle (persistent is deferred to H5), makes the remote
-    /// tree byte-for-byte equal to the host tree, and records per-key
-    /// [`WorkspaceState`] so [`Self::reconcile_out`] can diff against it.
+    /// classifies its lifecycle, and records per-key [`WorkspaceState`] so
+    /// [`Self::reconcile_out`] can diff against it. An **ephemeral** root
+    /// (`{{run.id}}`) is reset host→remote (byte-for-byte equal, deleted on
+    /// teardown); a **persistent** root (stable template) acquires a remote
+    /// `.ordius.lock`, syncs the host additively (never deleting foreign content),
+    /// and is never auto-deleted.
     ///
     /// Every other binding delegates to `dispatcher.translate_path` — behaviour
     /// is unchanged for `Shared`/`Translated`/`BindMount`/`Unsupported` and for
@@ -415,21 +433,55 @@ impl WorkspaceManager {
         }
 
         let root = expand_env_root(tmpl, run, host_ws)?;
-        let lifecycle = lifecycle_of(tmpl)?; // Persistent => Err(Unsupported) (H5)
+        let lifecycle = lifecycle_of(tmpl)?; // Ephemeral ({{run.id}}) or Persistent
 
         let factory = dispatcher.workspace_transport().ok_or_else(|| {
             DispatchError::Unsupported("environment has no workspace transport".into())
         })?;
 
+        let env_id = dispatcher.info().id.clone();
+        let key = (env_id.clone(), host_ws.to_path_buf());
+
+        match lifecycle {
+            Lifecycle::Ephemeral => {
+                self.reconcile_in_ephemeral(
+                    &factory, &env_id, &key, &root, host_ws, write_back, run,
+                )
+                .await
+            },
+            Lifecycle::Persistent => {
+                self.reconcile_in_persistent(
+                    &factory, &env_id, &key, &root, host_ws, write_back, run,
+                )
+                .await
+            },
+        }
+    }
+
+    /// Ephemeral `reconcile_in`: preserved-root recovery (ephemeral-only),
+    /// host→remote reset, store [`WorkspaceState`], and record the per-run root
+    /// for deletion at teardown. Unchanged from the H3 flow.
+    async fn reconcile_in_ephemeral(
+        &self,
+        factory: &Arc<dyn WorkspaceTransportFactory>,
+        env_id: &EnvId,
+        key: &WorkspaceKey,
+        root: &str,
+        host_ws: &Path,
+        write_back: &WriteBackPolicy,
+        run: &RunScope<'_>,
+    ) -> Result<EnvPath, DispatchError> {
         // A root whose earlier `reconcile_out` write-back failed holds the only
         // copy of that node's output. Resetting it host→remote would destroy the
         // unreconciled changes, so move it aside to a recovery sibling and clear
         // the flag; the reset below then recreates the root clean. The recovery
         // copy stays on the server for manual retrieval. If the move itself fails
         // the error propagates and the root is left intact (fail closed).
-        let preserve_key = (dispatcher.info().id.clone(), root.clone());
+        // (Recovery is ephemeral-only — design D2 — so it lives in this branch;
+        // persistent roots are never reset/recovered.)
+        let preserve_key = (env_id.clone(), root.to_string());
         if self.preserved_roots.lock().contains(&preserve_key) {
-            let recovery = recover_preserved_root(&factory, &root).await?;
+            let recovery = recover_preserved_root(factory, root).await?;
             self.preserved_roots.lock().remove(&preserve_key);
             tracing::warn!(
                 env_id = %preserve_key.0.as_str(),
@@ -439,13 +491,11 @@ impl WorkspaceManager {
             );
         }
 
-        let uploaded = match reset_remote_to_host(&factory, &root, host_ws).await {
+        let uploaded = match reset_remote_to_host(factory, root, host_ws).await {
             Ok(manifest) => manifest,
             Err(e) => {
                 // Best-effort cleanup of a partial ephemeral root before bubbling.
-                if lifecycle == Lifecycle::Ephemeral
-                    && let Err(cleanup_err) = remove_tree(factory.as_ref(), &root).await
-                {
+                if let Err(cleanup_err) = remove_tree(factory.as_ref(), root).await {
                     tracing::warn!(
                         env_root = root,
                         error = %cleanup_err,
@@ -456,20 +506,18 @@ impl WorkspaceManager {
             },
         };
 
-        let key = (dispatcher.info().id.clone(), host_ws.to_path_buf());
         {
             let mut st = self.state.lock(); // parking_lot — no await held
             st.insert(
-                key,
+                key.clone(),
                 WorkspaceState {
-                    env_side_root: root.clone(),
-                    lifecycle,
-                    transport_factory: Arc::clone(&factory),
+                    env_side_root: root.to_string(),
+                    lifecycle: Lifecycle::Ephemeral,
+                    transport_factory: Arc::clone(factory),
                     write_back: write_back.clone(),
                     // Ephemeral: both baselines equal the uploaded manifest (a
                     // reset leaves the remote byte-for-byte equal to the host, no
-                    // foreign files). A later task overrides last_remote_manifest
-                    // for persistent roots (uploaded ∪ preserved foreign entries).
+                    // foreign files).
                     host_manifest_at_in: uploaded.clone(),
                     last_remote_manifest: uploaded,
                     run_id: run.run_id.to_string(),
@@ -482,14 +530,145 @@ impl WorkspaceManager {
         // distinct run-id roots — the `state` entry above only keeps the latest).
         // The reset succeeded, so the root really exists on the remote. Sync
         // insert; the guard drops before the return — no await held.
-        if lifecycle == Lifecycle::Ephemeral {
-            self.ephemeral_roots.lock().insert(
-                (dispatcher.info().id.clone(), root.clone()),
-                Arc::clone(&factory),
+        self.ephemeral_roots
+            .lock()
+            .insert((env_id.clone(), root.to_string()), Arc::clone(factory));
+
+        Ok(EnvPath::new(root.to_string()))
+    }
+
+    /// Persistent reconcile-in: ensure the stable root exists, acquire the
+    /// remote `.ordius.lock` once per `(env, root)` this run, additively sync the
+    /// host onto it (never deleting foreign content), and store the two-manifest
+    /// [`WorkspaceState`]. The root is NEVER recorded for deletion — persistent
+    /// roots are reused across runs and torn down only by lock release.
+    ///
+    /// The lock is held for the whole run; teardown releases it on every terminal
+    /// outcome. A lock is tracked in `persistent_locks` from the instant its dir
+    /// is created (before owner.json), so a later owner.json failure cannot leak
+    /// an untracked lock (design §6, §8).
+    async fn reconcile_in_persistent(
+        &self,
+        factory: &Arc<dyn WorkspaceTransportFactory>,
+        env_id: &EnvId,
+        key: &WorkspaceKey,
+        root: &str,
+        host_ws: &Path,
+        write_back: &WriteBackPolicy,
+        run: &RunScope<'_>,
+    ) -> Result<EnvPath, DispatchError> {
+        // 1. Ensure the root exists (race-tolerant mkdir from T4).
+        {
+            let t = factory.open().await?;
+            t.mkdir(root).await?;
+        }
+
+        // 2. Lock-once per (env, root) this run. If we already hold it (a later
+        //    node / retry / loop iteration on the same key), skip acquisition.
+        let lock_key = (env_id.clone(), root.to_string());
+        let already_held = self.persistent_locks.lock().contains_key(&lock_key);
+        if !already_held {
+            self.acquire_persistent_lock(factory, &lock_key, root, run)
+                .await?;
+        }
+
+        // 3. Additive host→remote sync (never deletes remote-only content). On
+        //    error the lock stays tracked — teardown releases it; do NOT remove it.
+        let (host_at_in, last_remote) = sync_remote_additive(factory, root, host_ws).await?;
+
+        // 4. Store the two-manifest state (NOT recorded in ephemeral_roots).
+        {
+            let mut st = self.state.lock(); // parking_lot — no await held
+            st.insert(
+                key.clone(),
+                WorkspaceState {
+                    env_side_root: root.to_string(),
+                    lifecycle: Lifecycle::Persistent,
+                    transport_factory: Arc::clone(factory),
+                    write_back: write_back.clone(),
+                    host_manifest_at_in: host_at_in,
+                    last_remote_manifest: last_remote,
+                    run_id: run.run_id.to_string(),
+                },
             );
         }
 
-        Ok(EnvPath::new(root))
+        Ok(EnvPath::new(root.to_string()))
+    }
+
+    /// Acquire the remote `<root>/.ordius.lock` for a persistent root.
+    ///
+    /// On `Acquired`: track the lock in `persistent_locks` IMMEDIATELY (before
+    /// owner.json — so an owner.json failure cannot leak an untracked lock), then
+    /// write owner.json best-effort. If the owner.json write fails, best-effort
+    /// remove it, leave the lock TRACKED (teardown releases it), and return the
+    /// error. On `Contended`: best-effort read owner.json and fail fast naming the
+    /// owner.
+    async fn acquire_persistent_lock(
+        &self,
+        factory: &Arc<dyn WorkspaceTransportFactory>,
+        lock_key: &(EnvId, String),
+        root: &str,
+        run: &RunScope<'_>,
+    ) -> Result<(), DispatchError> {
+        let lock_rel = format!("{root}/.ordius.lock");
+        let t = factory.open().await?;
+        match t.try_acquire_lock_dir(&lock_rel).await? {
+            LockOutcome::Acquired => {
+                // Track BEFORE owner.json so a write failure can't leak an
+                // untracked lock; teardown always finds + releases it.
+                self.persistent_locks
+                    .lock()
+                    .insert(lock_key.clone(), Arc::clone(factory));
+
+                // Best-effort owner.json. A failure here leaves the lock tracked.
+                let owner = LockOwner {
+                    top_run_id: run.top_run_id.into(),
+                    current_run_id: run.run_id.into(),
+                    host: gethostname::gethostname().to_string_lossy().into_owned(),
+                    started_at: run.started_at_iso.into(),
+                };
+                let owner_rel = format!("{lock_rel}/owner.json");
+                let result = match serde_json::to_vec_pretty(&owner) {
+                    Ok(json) => t.upload_file(&owner_rel, &json).await,
+                    Err(e) => Err(DispatchError::WorkspaceUnavailable {
+                        env_id: lock_key.0.as_str().to_string(),
+                        reason: format!("serialize lock owner.json: {e}"),
+                    }),
+                };
+                if let Err(e) = result {
+                    // Best-effort cleanup of a partial owner.json; ignore its
+                    // result (consume via `is_err` so the lock's Result destructor
+                    // doesn't trip `let-underscore-drop`). Leave the lock TRACKED —
+                    // teardown releases it.
+                    let _cleanup_failed = t.remove_file(&owner_rel).await.is_err();
+                    return Err(e);
+                }
+                Ok(())
+            },
+            LockOutcome::Contended => {
+                // Best-effort: name the owner if owner.json reads + parses.
+                let owner = t
+                    .download_file(&format!("{lock_rel}/owner.json"))
+                    .await
+                    .map_or(None, |bytes| {
+                        serde_json::from_slice::<LockOwner>(&bytes).ok()
+                    });
+                let reason = match owner {
+                    Some(o) => format!(
+                        "persistent workspace `{root}` is locked by run {} on {} since {}",
+                        o.current_run_id, o.host, o.started_at
+                    ),
+                    None => {
+                        format!("persistent workspace `{root}` is locked by another run")
+                    },
+                };
+                Err(DispatchError::WorkspaceUnavailable {
+                    env_id: lock_key.0.as_str().to_string(),
+                    reason,
+                })
+            },
+        }
     }
 
     /// Write back remote changes + propagate remote deletions for a synced node.
@@ -524,7 +703,7 @@ impl WorkspaceManager {
         let key = (dispatcher.info().id.clone(), host_ws.to_path_buf());
 
         // Extract everything we need by clone, then DROP the lock before awaiting.
-        let Some((root, factory, write_back, baselines, run_id)) = ({
+        let Some((root, factory, write_back, baselines, run_id, lifecycle)) = ({
             let st = self.state.lock(); // parking_lot — dropped before await
             st.get(&key).map(|s| {
                 (
@@ -536,6 +715,7 @@ impl WorkspaceManager {
                         remote: s.last_remote_manifest.clone(),
                     },
                     s.run_id.clone(),
+                    s.lifecycle,
                 )
             })
         }) else {
@@ -560,10 +740,15 @@ impl WorkspaceManager {
                 // The env-side root still holds the node's unreconciled output.
                 // Record it so `teardown_all` keeps it for recovery instead of
                 // deleting, and a later same-key `reconcile_in` moves it aside
-                // (not reset over it).
-                self.preserved_roots
-                    .lock()
-                    .insert((key.0.clone(), root.clone()));
+                // (not reset over it). Recovery is EPHEMERAL-only (design §12,
+                // D2): a persistent root is never reset/recovered (the additive +
+                // no-delete-teardown invariants already protect its output), so a
+                // persistent write-back failure must NOT enter `preserved_roots`.
+                if lifecycle == Lifecycle::Ephemeral {
+                    self.preserved_roots
+                        .lock()
+                        .insert((key.0.clone(), root.clone()));
+                }
                 return Err(e);
             },
         };
@@ -755,9 +940,6 @@ async fn reset_remote_to_host(
 /// Uploads use [`WorkspaceTransport::upload_file_atomic_via`] with a temp under
 /// the held lock dir (`<root>/.ordius.lock/tmp`), so a pre-existing foreign
 /// `<target>.ordius.tmp` is never clobbered (§7.1).
-// Exercised by the additive-sync unit tests; the persistent `reconcile_in` wiring
-// that calls it in production lands in a later H5 task.
-#[allow(dead_code)]
 async fn sync_remote_additive(
     factory: &Arc<dyn WorkspaceTransportFactory>,
     root: &str,
@@ -866,7 +1048,6 @@ async fn sync_remote_additive(
 /// by value and returns it so the caller reuses the same session for uploads (a
 /// borrowed `&dyn` would make the future `!Send`, since the trait is `Send` but
 /// not `Sync`).
-#[allow(dead_code)] // see sync_remote_additive
 async fn clear_additive_obstructions(
     t: Box<dyn WorkspaceTransport>,
     root: &str,
@@ -1490,17 +1671,17 @@ fn sync_params(
     }
 }
 
-/// Classify a `Sync` env-path template as [`Lifecycle::Ephemeral`] or reject it.
+/// Classify a `Sync` env-path template as [`Lifecycle::Ephemeral`] or
+/// [`Lifecycle::Persistent`].
 ///
 /// A template is ephemeral iff it contains the `{{run.id}}` token — only then
-/// is the remote root unique per run and safe to delete on teardown.
+/// is the remote root unique per run and safe to delete on teardown. A stable
+/// template (no token) is persistent: reused across runs, lock-guarded, never
+/// deleted.
 ///
-/// Persistent templates (no `{{run.id}}`) are deferred to Phase H5; this
-/// function returns `Err(DispatchError::Unsupported)` for them so callers
-/// produce a clear error rather than silently falling back.
-///
-/// The common typo `{{run_id}}` (underscore) is also detected with a hint
-/// message naming both forms.
+/// The common typo `{{run_id}}` (underscore) is still rejected with a hint
+/// message naming both forms — otherwise it would silently classify as
+/// persistent and never substitute the run id.
 fn lifecycle_of(tmpl: &str) -> Result<Lifecycle, DispatchError> {
     if tmpl.contains("{{run_id}}") && !tmpl.contains("{{run.id}}") {
         return Err(DispatchError::Unsupported(
@@ -1510,9 +1691,7 @@ fn lifecycle_of(tmpl: &str) -> Result<Lifecycle, DispatchError> {
     if tmpl.contains("{{run.id}}") {
         Ok(Lifecycle::Ephemeral)
     } else {
-        Err(DispatchError::Unsupported(
-            "persistent workspace reuse is deferred to a later phase (H5)".into(),
-        ))
+        Ok(Lifecycle::Persistent)
     }
 }
 
@@ -2386,13 +2565,18 @@ mod tests {
         assert_eq!(lc, Lifecycle::Ephemeral);
     }
 
-    /// Template without any run-id token → `Err(Unsupported)` mentioning "persistent"
+    /// Stable template (no run-id token) → `Persistent`; `{{run.id}}` →
+    /// `Ephemeral`; the `{{run_id}}` underscore typo stays an `Err`.
     #[test]
-    fn lifecycle_of_no_token_is_err_persistent() {
-        let err = lifecycle_of("/stable/path").unwrap_err();
+    fn lifecycle_of_classifies_persistent() {
+        assert_eq!(lifecycle_of("/srv/ws").unwrap(), Lifecycle::Persistent);
+        assert_eq!(
+            lifecycle_of("/srv/{{run.id}}").unwrap(),
+            Lifecycle::Ephemeral
+        );
         assert!(
-            err.to_string().contains("persistent"),
-            "expected 'persistent' in error; got: {err}"
+            lifecycle_of("/srv/{{run_id}}").is_err(),
+            "the underscore typo must stay an error"
         );
     }
 
@@ -4218,5 +4402,184 @@ mod tests {
         assert_eq!(back.current_run_id, "child");
         assert_eq!(back.host, "box");
         assert_eq!(back.started_at, "2026-01-01T00:00:00Z");
+    }
+
+    // ── persistent reconcile_in (T9) ──────────────────────────────────────────
+
+    /// A `Sync` binding whose template has NO `{{run.id}}` token → persistent
+    /// (stable root, lock-guarded, never deleted).
+    fn persistent_binding() -> WorkspaceBinding {
+        sftp_binding("/srv/persist", WriteBackPolicy::None)
+    }
+
+    /// Build a dispatcher wired to an EXISTING fake transport (shares its
+    /// `Arc<Mutex<FakeFs>>`), so two managers/dispatchers can act on one remote.
+    fn ssh_dispatcher_sharing(label: &str, fake: &FakeWorkspaceTransport) -> FakeRemoteDispatcher {
+        let factory = Arc::new(FakeWorkspaceTransportFactory::new(fake.clone()));
+        FakeRemoteDispatcher::new(ssh_info(label)).with_workspace_transport(factory)
+    }
+
+    /// Read + parse `<root>/.ordius.lock/owner.json` from the fake remote.
+    async fn read_owner(fake: &FakeWorkspaceTransport, root: &str) -> LockOwner {
+        let raw = fake
+            .download_file(&format!("{root}/.ordius.lock/owner.json"))
+            .await
+            .expect("owner.json must exist");
+        serde_json::from_slice(&raw).expect("owner.json must parse")
+    }
+
+    /// Persistent `reconcile_in` acquires the remote lock, writes `owner.json`, and
+    /// additively uploads host files onto the stable root.
+    #[tokio::test]
+    async fn persistent_reconcile_in_acquires_lock_and_uploads() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"hostA").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("persist-acquire");
+        let mgr = WorkspaceManager::new();
+        let binding = persistent_binding();
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("persistent reconcile_in");
+        let root = cwd.as_str().to_string();
+        assert_eq!(root, "/srv/persist");
+
+        // The lock dir + owner.json exist on the remote.
+        assert!(
+            fake.stat(&format!("{root}/.ordius.lock"))
+                .await
+                .unwrap()
+                .is_some(),
+            "lock dir must exist after acquire"
+        );
+        let owner = read_owner(&fake, &root).await;
+        assert_eq!(owner.current_run_id, "r1");
+        assert_eq!(owner.top_run_id, "r1");
+        assert_eq!(owner.started_at, "2026-01-01T00:00:00Z");
+
+        // Host file was uploaded. (`remote_files` also lists the lock dir's
+        // owner.json, so filter the reserved `.ordius.lock` subtree out.)
+        let non_lock: Vec<String> = remote_files(&fake, &root)
+            .await
+            .into_iter()
+            .filter(|r| !r.starts_with(".ordius.lock/"))
+            .collect();
+        assert_eq!(non_lock, vec!["a.txt".to_string()]);
+        assert_eq!(
+            fake.download_file(&format!("{root}/a.txt")).await.unwrap(),
+            b"hostA",
+        );
+
+        // The lock is tracked so teardown can release it.
+        assert_eq!(mgr.persistent_lock_count(), 1);
+    }
+
+    /// A second manager (sharing the same remote fs) that reconciles the same
+    /// persistent root after the first holds the lock fails fast with the owner
+    /// named.
+    #[tokio::test]
+    async fn persistent_reconcile_in_contends_across_managers() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"hostA").unwrap();
+
+        // Shared remote fs across the two dispatchers/managers.
+        let fake = FakeWorkspaceTransport::default();
+        let d_a = ssh_dispatcher_sharing("persist-a", &fake);
+        let d_b = ssh_dispatcher_sharing("persist-b", &fake);
+        let binding = persistent_binding();
+
+        let mgr_a = WorkspaceManager::new();
+        mgr_a
+            .reconcile_in(&d_a, &binding, host_ws, &sample_run())
+            .await
+            .expect("manager A acquires the lock");
+
+        // Manager B, distinct run id, same remote root → Contended.
+        let run_b = RunScope {
+            run_id: "r2",
+            top_run_id: "r2",
+            workflow_id: "wf2",
+            workflow_name: "Other",
+            started_at_iso: "2026-02-02T00:00:00Z",
+        };
+        let mgr_b = WorkspaceManager::new();
+        let err = mgr_b
+            .reconcile_in(&d_b, &binding, host_ws, &run_b)
+            .await
+            .expect_err("manager B must fail on a held lock");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("locked") && msg.contains("r1"),
+            "contention error must name the owner run; got: {msg}"
+        );
+        // B never tracked a lock (it didn't acquire one).
+        assert_eq!(mgr_b.persistent_lock_count(), 0);
+    }
+
+    /// Two persistent `reconcile_in` calls on the SAME manager + key are
+    /// idempotent: the second skips lock acquisition (lock already held) and does
+    /// not clobber owner.json with a second write.
+    #[tokio::test]
+    async fn persistent_reconcile_in_same_manager_idempotent_lock() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"hostA").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("persist-idem");
+        let mgr = WorkspaceManager::new();
+        let binding = persistent_binding();
+
+        mgr.reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("first reconcile_in");
+        let owner_first = read_owner(&fake, "/srv/persist").await;
+
+        // Second reconcile_in for the same (env, root): must succeed, not error,
+        // not re-acquire (so owner.json is unchanged).
+        mgr.reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("second reconcile_in is a no-op on the lock");
+
+        assert_eq!(mgr.persistent_lock_count(), 1, "still exactly one lock");
+        let owner_second = read_owner(&fake, "/srv/persist").await;
+        assert_eq!(
+            owner_first.current_run_id, owner_second.current_run_id,
+            "owner.json must not be clobbered on the idempotent second call"
+        );
+    }
+
+    /// If `owner.json` upload fails after the lock dir is created, `reconcile_in`
+    /// errors BUT leaves the lock TRACKED so teardown can release it.
+    #[tokio::test]
+    async fn persistent_reconcile_in_half_acquired_lock_still_tracked() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"hostA").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("persist-half");
+        let mgr = WorkspaceManager::new();
+        let binding = persistent_binding();
+
+        // Make the owner.json upload fail.
+        fake.set_fail_upload(true);
+
+        let err = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect_err("owner.json write failure must propagate");
+        assert!(
+            err.to_string().contains("injected upload failure"),
+            "got: {err}"
+        );
+
+        // The lock dir was created and is TRACKED, so teardown releases it.
+        assert_eq!(
+            mgr.persistent_lock_count(),
+            1,
+            "a half-acquired lock must stay tracked for teardown release"
+        );
     }
 }
