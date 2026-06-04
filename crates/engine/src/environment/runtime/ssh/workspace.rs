@@ -216,6 +216,13 @@ impl WorkspaceTransport for SshSftpTransport {
         file.shutdown()
             .await
             .map_err(|e| self.err("flush (lock-dir tmp)", &e.into()))?;
+        // SFTP `SSH_FXP_RENAME` does not overwrite an existing target on a stock
+        // OpenSSH server (it returns FAILURE). The ephemeral reset deletes targets
+        // before upload, but the additive persistent path routinely overwrites a
+        // file kept from a prior run, so drop the target first (best-effort —
+        // `NotFound` is fine). The target is a host-owned file we are replacing,
+        // not foreign content, and our new bytes are safe in the lock-dir temp.
+        let _removed = self.session.remove_file(target_rel).await.is_err();
         self.session
             .rename(tmp, target_rel)
             .await
