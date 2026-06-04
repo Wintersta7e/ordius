@@ -366,6 +366,9 @@ impl WorkspaceManager {
         // entry) but each gets its own run-id root — all are tracked here. A root
         // in `preserve` (its write-back failed) is the sole copy of the node's
         // output, so it is kept on the server for recovery instead of deleted.
+        //
+        // Persistent roots are intentionally never in `ephemeral_roots` and so
+        // are never deleted here — only their lock is released below.
         let roots: Vec<((EnvId, String), Arc<dyn WorkspaceTransportFactory>)> = {
             std::mem::take(&mut *self.ephemeral_roots.lock())
                 .into_iter()
@@ -382,6 +385,27 @@ impl WorkspaceManager {
             }
             if let Err(e) = remove_tree(factory.as_ref(), &key.1).await {
                 tracing::warn!(env_root = %key.1, error = %e, "ephemeral teardown failed");
+            }
+        }
+
+        // Persistent lock release: runs on EVERY outcome, including
+        // CancelledByUser (write-back is skipped on cancel; lock release is not).
+        // Drain `persistent_locks` without holding the parking_lot lock across
+        // the await — same pattern as `ephemeral_roots` above.
+        let locks: Vec<((EnvId, String), Arc<dyn WorkspaceTransportFactory>)> = {
+            std::mem::take(&mut *self.persistent_locks.lock())
+                .into_iter()
+                .collect()
+        };
+        for ((env_id, root), factory) in locks {
+            let lock_rel = format!("{root}/.ordius.lock");
+            if let Err(e) = remove_tree(factory.as_ref(), &lock_rel).await {
+                tracing::warn!(
+                    env_id = %env_id.as_str(),
+                    env_root = %root,
+                    error = %e,
+                    "failed to release persistent workspace lock"
+                );
             }
         }
     }
@@ -4580,6 +4604,119 @@ mod tests {
             mgr.persistent_lock_count(),
             1,
             "a half-acquired lock must stay tracked for teardown release"
+        );
+    }
+
+    // ── teardown_all: persistent lock release (T10) ───────────────────────────
+
+    /// `teardown_all(Completed)` releases the persistent lock (removes the whole
+    /// `.ordius.lock` subtree) while keeping the root and its files intact.
+    #[tokio::test]
+    async fn persistent_teardown_releases_lock_keeps_root() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"hostA").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("persist-teardown-done");
+        let mgr = WorkspaceManager::new();
+        let binding = persistent_binding();
+        mgr.reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("persistent reconcile_in");
+
+        // Pre-condition: lock exists, a.txt is present.
+        assert!(
+            fake.stat("/srv/persist/.ordius.lock")
+                .await
+                .unwrap()
+                .is_some(),
+            "lock dir must exist before teardown"
+        );
+        assert!(
+            fake.stat("/srv/persist/a.txt").await.unwrap().is_some(),
+            "a.txt must exist before teardown"
+        );
+        assert_eq!(mgr.persistent_lock_count(), 1);
+
+        mgr.teardown_all(RunOutcome::Completed).await;
+
+        // Root and its files are KEPT (persistent root is never deleted).
+        assert!(
+            fake.stat("/srv/persist").await.unwrap().is_some(),
+            "persistent root must not be deleted"
+        );
+        assert!(
+            fake.stat("/srv/persist/a.txt").await.unwrap().is_some(),
+            "files in the persistent root must survive teardown"
+        );
+
+        // Lock is RELEASED (the whole .ordius.lock subtree is gone).
+        assert!(
+            fake.stat("/srv/persist/.ordius.lock")
+                .await
+                .unwrap()
+                .is_none(),
+            "lock dir must be removed after teardown"
+        );
+        assert!(
+            fake.stat("/srv/persist/.ordius.lock/owner.json")
+                .await
+                .unwrap()
+                .is_none(),
+            "owner.json must be gone after teardown"
+        );
+
+        // Lock map drained.
+        assert_eq!(
+            mgr.persistent_lock_count(),
+            0,
+            "lock map must be empty after teardown"
+        );
+    }
+
+    /// `teardown_all(CancelledByUser)` also releases the persistent lock — lock
+    /// release is unconditional, unlike write-back which is skipped on cancel.
+    #[tokio::test]
+    async fn persistent_teardown_releases_lock_on_user_cancel() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"hostA").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("persist-teardown-cancel");
+        let mgr = WorkspaceManager::new();
+        let binding = persistent_binding();
+        mgr.reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("persistent reconcile_in");
+
+        assert_eq!(mgr.persistent_lock_count(), 1);
+
+        mgr.teardown_all(RunOutcome::CancelledByUser).await;
+
+        // Root and files are KEPT even on cancel.
+        assert!(
+            fake.stat("/srv/persist").await.unwrap().is_some(),
+            "persistent root must not be deleted on cancel"
+        );
+        assert!(
+            fake.stat("/srv/persist/a.txt").await.unwrap().is_some(),
+            "files in the persistent root must survive cancel teardown"
+        );
+
+        // Lock is RELEASED — unconditional even on user cancel.
+        assert!(
+            fake.stat("/srv/persist/.ordius.lock")
+                .await
+                .unwrap()
+                .is_none(),
+            "lock dir must be removed even on user cancel"
+        );
+
+        // Lock map drained.
+        assert_eq!(
+            mgr.persistent_lock_count(),
+            0,
+            "lock map must be empty after cancel teardown"
         );
     }
 }
