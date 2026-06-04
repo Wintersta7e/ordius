@@ -14,6 +14,7 @@ use russh_sftp::protocol::{FileAttributes, StatusCode};
 use tokio::io::AsyncWriteExt as _;
 
 use crate::environment::runtime::error::DispatchError;
+use crate::environment::runtime::workspace::safety;
 use crate::environment::runtime::workspace::transport::{
     FileKind, FileMeta, WorkspaceTransport, WorkspaceTransportFactory,
 };
@@ -134,10 +135,18 @@ impl WorkspaceTransport for SshSftpTransport {
                 .await
                 .map_err(|ref e| self.err("try_exists (mkdir)", e))?;
             if !exists {
-                self.session
-                    .create_dir(so_far.clone())
-                    .await
-                    .map_err(|ref e| self.err("create_dir (mkdir)", e))?;
+                let create_result = self.session.create_dir(so_far.clone()).await;
+                if let Err(ref create_err) = create_result {
+                    // Race-tolerant: a concurrent run may have created this
+                    // component between our check and create_dir; tolerate it
+                    // if it's now a directory (Codex R2).
+                    match self.session.symlink_metadata(&so_far).await {
+                        Ok(attrs) if attrs.file_type().is_dir() => {
+                            // Another writer raced us; the directory exists — continue.
+                        },
+                        _ => return Err(self.err("create_dir (mkdir)", create_err)),
+                    }
+                }
             }
         }
         Ok(())
@@ -181,7 +190,7 @@ impl WorkspaceTransport for SshSftpTransport {
 
     async fn list_tree(&self, rel: &str) -> Result<Vec<FileMeta>, DispatchError> {
         let mut results = Vec::new();
-        list_tree_recursive(&self.session, rel, &self.env_id, &mut results).await?;
+        list_tree_recursive(&self.session, rel, rel, &self.env_id, &mut results).await?;
         Ok(results)
     }
 
@@ -236,12 +245,21 @@ impl WorkspaceTransport for SshSftpTransport {
 /// Recursive tree walk: reads `dir` and appends a `FileMeta` for every entry
 /// *within* `dir` (the directory itself is not listed), descending into
 /// subdirectories without following symlinks.
+///
+/// `root` is the path passed to the top-level [`WorkspaceTransport::list_tree`]
+/// call.  Each entry's `rel_path` is the full remote SFTP path (as returned by
+/// `entry.path()`); callers strip the `root/` prefix to obtain the
+/// root-relative segment.  We compute the same root-relative segment here to
+/// apply the reserved-dir filter before emitting or recursing.
 async fn list_tree_recursive(
     session: &SftpSession,
     dir: &str,
+    root: &str,
     env_id: &str,
     results: &mut Vec<FileMeta>,
 ) -> Result<(), DispatchError> {
+    let prefix = format!("{root}/");
+
     let entries = session
         .read_dir(dir)
         .await
@@ -251,6 +269,16 @@ async fn list_tree_recursive(
         let path = entry.path();
         let ft = entry.file_type();
         let meta = entry.metadata();
+
+        // Compute the root-relative segment (same stripping callers apply).
+        let root_rel = path.strip_prefix(&prefix).unwrap_or(path.as_str());
+
+        // Never descend into / emit reserved trees (.ordius.lock, .git, ...) —
+        // the lock dir must never reach a manifest (Codex R2 MAJOR §9.2).
+        if safety::is_reserved_remote_rel(root_rel) {
+            continue;
+        }
+
         let kind = if ft.is_dir() {
             FileKind::Dir
         } else if ft.is_symlink() {
@@ -268,7 +296,7 @@ async fn list_tree_recursive(
 
         // Recurse into directories but not symlinks (don't follow).
         if ft.is_dir() {
-            Box::pin(list_tree_recursive(session, &path, env_id, results)).await?;
+            Box::pin(list_tree_recursive(session, &path, root, env_id, results)).await?;
         }
     }
 

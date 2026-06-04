@@ -164,6 +164,7 @@ mod fake_impl {
                 });
             }
             fs.dirs.insert(rel.to_string());
+            drop(fs);
             Ok(())
         }
     }
