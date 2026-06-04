@@ -352,7 +352,12 @@ impl WorkspaceManager {
                     error = %e,
                     "teardown write-back failed"
                 );
-                preserve.insert((key.0.clone(), s.env_side_root.clone()));
+                // Only ephemeral roots are deleted (so only they need preserving);
+                // persistent roots are never in `ephemeral_roots`. Gate the insert
+                // to mirror `reconcile_out`'s identical lifecycle guard.
+                if s.lifecycle == Lifecycle::Ephemeral {
+                    preserve.insert((key.0.clone(), s.env_side_root.clone()));
+                }
             }
         }
 
@@ -675,9 +680,8 @@ impl WorkspaceManager {
                 let owner = t
                     .download_file(&format!("{lock_rel}/owner.json"))
                     .await
-                    .map_or(None, |bytes| {
-                        serde_json::from_slice::<LockOwner>(&bytes).ok()
-                    });
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<LockOwner>(&bytes).ok());
                 let reason = match owner {
                     Some(o) => format!(
                         "persistent workspace `{root}` is locked by run {} on {} since {}",
