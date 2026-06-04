@@ -166,6 +166,12 @@ pub struct WorkspaceManager {
     /// repeated same-`(env, root)` inserts.
     ephemeral_roots: SyncMutex<HashMap<(EnvId, String), Arc<dyn WorkspaceTransportFactory>>>,
 
+    /// Remote roots whose write-back failed and must not be reset or deleted
+    /// (recoverable output). A `reconcile_out` write-back failure records
+    /// `(EnvId, root)` here so a later same-key `reconcile_in` refuses to reset
+    /// that root and `teardown_all` keeps it on the server for recovery.
+    preserved_roots: SyncMutex<HashSet<(EnvId, String)>>,
+
     /// Test-only seam: records the last [`RunOutcome`] passed to
     /// [`Self::teardown_all`]. Lets run-loop tests observe that
     /// teardown fired with the correct outcome on every exit path.
@@ -190,6 +196,7 @@ impl Default for WorkspaceManager {
             leases: SyncMutex::new(HashMap::new()),
             state: SyncMutex::new(HashMap::new()),
             ephemeral_roots: SyncMutex::new(HashMap::new()),
+            preserved_roots: SyncMutex::new(HashSet::new()),
             #[cfg(any(test, feature = "testing"))]
             last_outcome: std::sync::Mutex::new(None),
         }
@@ -291,6 +298,11 @@ impl WorkspaceManager {
             }
         }
 
+        // Merge in roots preserved by a `reconcile_out` write-back failure: those
+        // env-side trees are the only copy of a node's output and must not be
+        // deleted here either.
+        preserve.extend(std::mem::take(&mut *self.preserved_roots.lock()));
+
         // Ephemeral cleanup: delete *every* root recorded this run, not just the
         // last per key. parallel/compose children share host_ws (one `state`
         // entry) but each gets its own run-id root — all are tracked here. A root
@@ -365,6 +377,22 @@ impl WorkspaceManager {
         let factory = dispatcher.workspace_transport().ok_or_else(|| {
             DispatchError::Unsupported("environment has no workspace transport".into())
         })?;
+
+        // Refuse to reset a root whose earlier `reconcile_out` write-back failed:
+        // it is the only copy of that node's output. Resetting it host→remote
+        // would destroy the unreconciled changes.
+        if self
+            .preserved_roots
+            .lock()
+            .contains(&(dispatcher.info().id.clone(), root.clone()))
+        {
+            return Err(DispatchError::WorkspaceUnavailable {
+                env_id: dispatcher.info().id.as_str().into(),
+                reason: format!(
+                    "remote root `{root}` holds unreconciled output from a failed write-back; refusing to reset it (recover or clear it manually)"
+                ),
+            });
+        }
 
         let uploaded = match reset_remote_to_host(&factory, &root, host_ws).await {
             Ok(manifest) => manifest,
@@ -463,7 +491,7 @@ impl WorkspaceManager {
 
         // Policy-dispatched: None no-ops, Force overwrites, SafeOrDiverge writes
         // back where the host is unchanged and diverges where it conflicts.
-        let new_remote = reconcile_write_back(
+        let new_remote = match reconcile_write_back(
             &write_back,
             &factory,
             &root,
@@ -472,7 +500,19 @@ impl WorkspaceManager {
             &run_id,
             key.0.as_str(),
         )
-        .await?;
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                // The env-side root still holds the node's unreconciled output.
+                // Record it so a later same-key `reconcile_in` refuses to reset
+                // it and `teardown_all` keeps it for recovery instead of deleting.
+                self.preserved_roots
+                    .lock()
+                    .insert((key.0.clone(), root.clone()));
+                return Err(e);
+            },
+        };
 
         // Advance the baseline so the next reconcile_out diffs against this state.
         if let Some(s) = self.state.lock().get_mut(&key) {
@@ -609,8 +649,8 @@ async fn reset_remote_to_host(
     // anything nested under them: create each remote dir (records it in the
     // manifest so reconcile can track empty/parent dirs) and upload each file,
     // cap-checking the bytes actually read (bounded) and hashing the sent bytes
-    // into the returned manifest. Write-back stays files-only for now (dir
-    // create/prune lands in a later task).
+    // into the returned manifest. Write-back mirrors dir creates/prunes back to
+    // the host via `reconcile_host_dirs`.
     let mut tracker = safety::CapTracker::new(safety::UploadCaps::default());
     let mut manifest = safety::Manifest::new();
     for entry in &entries {
@@ -995,19 +1035,16 @@ fn report_only(rel: &str, reason: DivergeReason, host: &HostState) -> DivergeEnt
 /// Write a remote file's bytes into the divergence dir and record a report
 /// entry preserving both hashes + the artifact path. Fails closed (propagates)
 /// when the artifact path is unsafe.
-#[allow(clippy::too_many_arguments)]
 fn diverge_file(
     report: &mut DivergeReport,
-    host_ws: &Path,
-    run_id: &str,
-    env_id: &str,
+    ctx: &SodCtx,
     rel: &str,
     bytes: &[u8],
     reason: DivergeReason,
     host: &HostState,
     remote_sha256: &str,
 ) -> Result<(), DispatchError> {
-    let diverged_path = write_diverged_artifact(host_ws, run_id, env_id, rel, bytes)?;
+    let diverged_path = write_diverged_artifact(ctx.host_ws, ctx.run_id, ctx.env_id, rel, bytes)?;
     report.diverged.push(DivergeEntry {
         rel: rel.to_string(),
         reason,
@@ -1120,9 +1157,7 @@ fn sod_type_changes(
                 // Untracked host children remain — cannot replace; preserve bytes.
                 Err(_) => diverge_file(
                     report,
-                    ctx.host_ws,
-                    ctx.run_id,
-                    ctx.env_id,
+                    ctx,
                     rel,
                     &f.bytes,
                     DivergeReason::HostTypeChanged,
@@ -1133,9 +1168,7 @@ fn sod_type_changes(
         } else {
             diverge_file(
                 report,
-                ctx.host_ws,
-                ctx.run_id,
-                ctx.env_id,
+                ctx,
                 rel,
                 &f.bytes,
                 conflict_reason(&host, ctx.baseline, rel),
@@ -1200,9 +1233,7 @@ fn sod_file_writes(
         } else {
             diverge_file(
                 report,
-                ctx.host_ws,
-                ctx.run_id,
-                ctx.env_id,
+                ctx,
                 rel,
                 &f.bytes,
                 conflict_reason(&host, ctx.baseline, rel),
@@ -1530,8 +1561,6 @@ fn host_io_err(path: &Path, op: &str, e: &std::io::Error) -> DispatchError {
 /// Serializes as `snake_case` for the on-disk `diverge-report.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-// Wired into the SafeOrDiverge write-back by a later task; only the test module
-// constructs these variants for now.
 enum DivergeReason {
     /// The host file changed since the baseline (and so did the remote).
     HostModified,
@@ -1553,7 +1582,6 @@ enum DivergeReason {
 
 /// One diverged path in a [`DivergeReport`].
 #[derive(Debug, Clone, Serialize)]
-// Wired into the SafeOrDiverge write-back by a later task.
 struct DivergeEntry {
     /// Forward-slash relative path (from the workspace root) that diverged.
     rel: String,
@@ -1573,7 +1601,6 @@ struct DivergeEntry {
 /// A run's diverged write-backs, serialized to
 /// `.ordius/diverged/<run>/<env>/diverge-report.json`.
 #[derive(Debug, Clone, Serialize)]
-// Wired into the SafeOrDiverge write-back by a later task.
 struct DivergeReport {
     /// Run that produced the divergence.
     run_id: String,
@@ -1681,7 +1708,6 @@ fn write_artifact_atomic(
 /// Fail-closed: rejects an empty `run_id`/`env_id`, and (via
 /// [`write_artifact_atomic`]) rejects when any existing component of the artifact
 /// path is a symlink or unreadable.
-// Wired into the SafeOrDiverge write-back by a later task.
 fn write_diverged_artifact(
     host_ws: &Path,
     run_id: &str,
@@ -1712,7 +1738,6 @@ fn write_diverged_artifact(
 /// The caller guards `!report.diverged.is_empty()`. Same fail-closed empty-id +
 /// per-component symlink gate and atomic temp+rename write as
 /// [`write_diverged_artifact`] (both go through [`write_artifact_atomic`]).
-// Wired into the SafeOrDiverge write-back by a later task.
 fn write_diverge_report(
     host_ws: &Path,
     run_id: &str,
@@ -1849,8 +1874,6 @@ pub(crate) fn expand_env_root(
 /// still byte-and-type identical to what we uploaded at the start of the run?".
 /// `UnsafeSymlink` and `Unreadable` are distinct *fail-closed* states — a path
 /// we cannot safely classify must never be treated as "unchanged".
-// The conflict-detection helpers land ahead of their caller; a later task wires
-// them into `reconcile_out`. Exercised by unit tests in the meantime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HostState {
     /// The path does not exist on the host.
@@ -2406,6 +2429,116 @@ mod tests {
         assert!(
             fake.stat(&format!("{root}/a.txt")).await.unwrap().is_some(),
             "the node's only copy of its output must not be destroyed"
+        );
+    }
+
+    /// A `reconcile_out` write-back that FAILS must persist the env-side root as
+    /// preserved so a later `teardown_all` does NOT delete it — that tree is the
+    /// node's only output copy. The download hook is turned back ON before
+    /// teardown so teardown's own write-back would SUCCEED and (absent the
+    /// persisted preserve) delete the root: its survival here proves the
+    /// persisted-preserve path, not a coincidentally-failed teardown write-back.
+    #[tokio::test]
+    async fn reconcile_out_failure_preserves_root_from_teardown() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"orig").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-out-fail");
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let root = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in")
+            .as_str()
+            .to_string();
+
+        // The node produced output on the remote.
+        fake.upload_file(&format!("{root}/a.txt"), b"node-out")
+            .await
+            .unwrap();
+
+        // Drive the reconcile_out write-back to Err: `list_remote_files` downloads
+        // each file and propagates the failure.
+        fake.set_fail_download(true);
+        let err = mgr
+            .reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect_err("reconcile_out write-back must fail");
+        assert!(
+            matches!(err, DispatchError::WorkspaceUnavailable { .. }),
+            "reconcile_out surfaces the injected transport error: {err}"
+        );
+
+        // Heal the transport so teardown's OWN write-back succeeds and WOULD
+        // delete the root were it not persisted as preserved.
+        fake.set_fail_download(false);
+        mgr.teardown_all(RunOutcome::Failed).await;
+
+        // The root + the node's output survive: the persisted preserve skipped it.
+        assert!(
+            fake.stat(&root).await.unwrap().is_some(),
+            "root preserved by reconcile_out failure must not be deleted by teardown"
+        );
+        assert!(
+            fake.stat(&format!("{root}/a.txt")).await.unwrap().is_some(),
+            "the node's only output copy must survive teardown"
+        );
+    }
+
+    /// After a `reconcile_out` write-back failure preserves a root, a later
+    /// same-key `reconcile_in` must REFUSE to reset it (resetting host→remote
+    /// would destroy the unreconciled output). The refusal is a
+    /// `WorkspaceUnavailable` error and the remote output is left untouched.
+    #[tokio::test]
+    async fn reconcile_in_refuses_reset_of_preserved_root() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"orig").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-in-refuse");
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let root = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in")
+            .as_str()
+            .to_string();
+
+        fake.upload_file(&format!("{root}/a.txt"), b"node-out")
+            .await
+            .unwrap();
+
+        // Fail the reconcile_out write-back to preserve (env, root).
+        fake.set_fail_download(true);
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect_err("reconcile_out write-back must fail");
+
+        // Heal the transport: a fresh reconcile_in for the SAME key would now
+        // reset the root host→remote — but the preserve guard must refuse.
+        fake.set_fail_download(false);
+        let err = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect_err("reconcile_in must refuse to reset a preserved root");
+        match err {
+            DispatchError::WorkspaceUnavailable { reason, .. } => {
+                assert!(
+                    reason.contains("failed write-back") && reason.contains(&root),
+                    "refusal must name the preserved root + reason: {reason}"
+                );
+            },
+            other => panic!("expected WorkspaceUnavailable, got: {other}"),
+        }
+
+        // The node's unreconciled output on the remote is untouched (not reset).
+        assert_eq!(
+            fake.download_file(&format!("{root}/a.txt")).await.unwrap(),
+            b"node-out",
+            "the preserved root's output must not be overwritten by the refused reset"
         );
     }
 
