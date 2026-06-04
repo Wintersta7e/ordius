@@ -878,13 +878,16 @@ async fn clear_additive_obstructions(
     let remote_files: HashSet<&str> = listing.files.iter().map(|f| f.rel.as_str()).collect();
 
     // 1. Escape symlinks (at the rel or on an ancestor). Collect, dedup, remove.
+    //    Cover BOTH file targets and dir targets: a remote symlink at a host-dir
+    //    rel (even when that dir is empty) must be cleared before `mkdir` runs,
+    //    otherwise `mkdir` follows the symlink and host content escapes the root.
     let mut symlinks_to_remove: HashSet<&String> = HashSet::new();
-    for file_rel in target_files {
+    for target_rel in target_files.iter().chain(target_dirs.iter()) {
         for sym in &listing.symlinks {
             if safety::is_reserved_remote_rel(sym) {
                 continue;
             }
-            if *file_rel == sym.as_str() || file_rel.starts_with(&format!("{sym}/")) {
+            if *target_rel == sym.as_str() || target_rel.starts_with(&format!("{sym}/")) {
                 symlinks_to_remove.insert(sym);
             }
         }
@@ -2794,6 +2797,44 @@ mod tests {
                 .unwrap(),
             b"k",
             "foreign child must survive a conflict"
+        );
+    }
+
+    /// A remote symlink AT a host-dir rel (with no files under it) escapes unless
+    /// the obstruction pass also covers dir targets — regression for the bug where
+    /// `clear_additive_obstructions` only scanned `target_files`.
+    #[tokio::test]
+    async fn additive_removes_symlink_above_empty_host_dir() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        // Host workspace has an EMPTY directory `a` (no file under it).
+        std::fs::create_dir(host_ws.join("a")).unwrap();
+
+        let (factory, fake) = additive_factory();
+        let root = "/tmp/persist-symlink-dir";
+        fake.mkdir(root).await.unwrap();
+        // Remote has a foreign symlink exactly at the host-dir rel `a`.
+        let factory_ref = FakeWorkspaceTransportFactory::new(fake.clone());
+        factory_ref.seed_symlink(&format!("{root}/a"), "/escape/target");
+
+        let result = sync_remote_additive(&factory, root, host_ws).await;
+        assert!(result.is_ok(), "additive sync must succeed; got {result:?}");
+
+        // The symlink must be gone — `a` must now be a real directory.
+        let meta = fake
+            .stat(&format!("{root}/a"))
+            .await
+            .unwrap()
+            .expect("`a` must exist after additive sync");
+        assert_ne!(
+            meta.kind,
+            FileKind::Symlink,
+            "`a` must no longer be a symlink; escape-symlink removal must cover dir targets"
+        );
+        assert_eq!(
+            meta.kind,
+            FileKind::Dir,
+            "`a` must be a directory after the symlink is removed and mkdir runs"
         );
     }
 
