@@ -149,8 +149,12 @@ impl std::fmt::Debug for WorkspaceState {
 /// Lightweight view of the current run's identity; passed to
 /// `reconcile_in` so it can expand `env_path_template`.
 pub struct RunScope<'a> {
-    /// Stable run identifier.
+    /// The current, possibly-child run identifier.
     pub run_id: &'a str,
+    /// Top-level run id (child workflows inherit the parent run snapshot). The
+    /// persistent-workspace lock lives for the whole run tree, so its owner is the
+    /// top run, while `run_id` is the current (possibly child) run.
+    pub top_run_id: &'a str,
     /// Workflow id.
     pub workflow_id: &'a str,
     /// Human-readable workflow name.
@@ -1382,6 +1386,7 @@ mod tests {
     fn sample_run<'a>() -> RunScope<'a> {
         RunScope {
             run_id: "r1",
+            top_run_id: "r1",
             workflow_id: "wf1",
             workflow_name: "Test Workflow",
             started_at_iso: "2026-01-01T00:00:00Z",
@@ -1665,12 +1670,14 @@ mod tests {
         // Two distinct run ids → two distinct ephemeral roots, same host_ws.
         let run_a = RunScope {
             run_id: "run-a",
+            top_run_id: "run-a",
             workflow_id: "wf1",
             workflow_name: "Test Workflow",
             started_at_iso: "2026-01-01T00:00:00Z",
         };
         let run_b = RunScope {
             run_id: "run-b",
+            top_run_id: "run-b",
             workflow_id: "wf1",
             workflow_name: "Test Workflow",
             started_at_iso: "2026-01-01T00:00:00Z",

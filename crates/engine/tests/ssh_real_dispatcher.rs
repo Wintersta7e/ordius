@@ -399,6 +399,7 @@ async fn real_ssh_ephemeral_upload_makes_files_visible() {
     let mgr = ordius_engine::environment::runtime::workspace::WorkspaceManager::new();
     let run = ordius_engine::environment::runtime::workspace::RunScope {
         run_id: "h2t2",
+        top_run_id: "h2t2",
         workflow_id: "wf-test",
         workflow_name: "Upload Test",
         started_at_iso: "2026-01-01T00:00:00Z",
@@ -508,6 +509,7 @@ async fn real_ssh_force_writeback_and_ephemeral_cleanup() {
         let rid = uniq("h2t3done");
         let run = RunScope {
             run_id: &rid,
+            top_run_id: &rid,
             workflow_id: "wf-wb",
             workflow_name: "Writeback Test",
             started_at_iso: "2026-01-01T00:00:00Z",
@@ -578,6 +580,7 @@ async fn real_ssh_force_writeback_and_ephemeral_cleanup() {
         let rid = uniq("h2t3cancel");
         let run = RunScope {
             run_id: &rid,
+            top_run_id: &rid,
             workflow_id: "wf-wb",
             workflow_name: "Writeback Test",
             started_at_iso: "2026-01-01T00:00:00Z",
@@ -760,6 +763,7 @@ async fn real_ssh_run_uploads_runs_and_writes_back() {
     let binding = ctx.run_snapshot.workspace_binding(&ssh_id);
     let run_scope = ordius_engine::environment::runtime::workspace::RunScope {
         run_id: &ctx.run_id,
+        top_run_id: &ctx.run_snapshot.run_id,
         workflow_id: &ctx.workflow_id,
         workflow_name: &ctx.workflow_name,
         started_at_iso: &ctx.started_at_iso,
@@ -1025,6 +1029,7 @@ async fn h3_reconcile_in_and_run(
     let binding = ctx.run_snapshot.workspace_binding(env_id);
     let run_scope = RunScope {
         run_id: &ctx.run_id,
+        top_run_id: &ctx.run_snapshot.run_id,
         workflow_id: &ctx.workflow_id,
         workflow_name: &ctx.workflow_name,
         started_at_iso: &ctx.started_at_iso,
@@ -1367,6 +1372,7 @@ async fn real_ssh_reconcile_in_clears_symlinks() {
     let binding = h3_force_binding();
     let run_scope = RunScope {
         run_id: &run_id,
+        top_run_id: &run_id,
         workflow_id: "wf-symlink",
         workflow_name: "Symlink Test",
         started_at_iso: "2026-01-01T00:00:00Z",
@@ -1473,6 +1479,7 @@ async fn safe_or_diverge_diverges_on_concurrent_host_edit() {
     let binding = sod_binding();
     let run_scope = RunScope {
         run_id: &run_id,
+        top_run_id: &run_id,
         workflow_id: "wf-sod",
         workflow_name: "SafeOrDiverge Test",
         started_at_iso: "2026-01-01T00:00:00Z",
@@ -1608,6 +1615,7 @@ async fn safe_or_diverge_recovers_preserved_root() {
     let binding = sod_binding();
     let run_scope = RunScope {
         run_id: &run_id,
+        top_run_id: &run_id,
         workflow_id: "wf-sod-rec",
         workflow_name: "SafeOrDiverge Recovery Test",
         started_at_iso: "2026-01-01T00:00:00Z",

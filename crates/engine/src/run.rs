@@ -858,6 +858,7 @@ async fn run_with_retry(
     };
     let run_scope = RunScope {
         run_id: &ctx.run_id,
+        top_run_id: &ctx.run_snapshot.run_id,
         workflow_id: &ctx.workflow_id,
         workflow_name: &ctx.workflow_name,
         started_at_iso: &ctx.started_at_iso,
