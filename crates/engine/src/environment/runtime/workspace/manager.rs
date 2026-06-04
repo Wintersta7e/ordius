@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex as SyncMutex;
+use serde::Serialize;
 use tokio::sync::OwnedMutexGuard;
 
 use crate::environment::runtime::dispatcher::Dispatcher;
@@ -972,6 +973,172 @@ fn host_io_err(path: &Path, op: &str, e: &std::io::Error) -> DispatchError {
         env_id: "<host>".into(),
         reason: format!("write-back {op} `{}`: {e}", path.display()),
     }
+}
+
+// ── SafeOrDiverge divergence artifacts ─────────────────────────────────────────
+
+/// Why a file written back from the remote diverged from the host baseline and
+/// could not be applied in place.
+///
+/// Serializes as `snake_case` for the on-disk `diverge-report.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+// Wired into the SafeOrDiverge write-back by a later task; only the test module
+// constructs these variants for now.
+#[allow(dead_code)]
+enum DivergeReason {
+    /// The host file changed since the baseline (and so did the remote).
+    HostModified,
+    /// The host file was deleted since the baseline.
+    HostDeleted,
+    /// A new host file appeared where the remote wants to write.
+    HostCreated,
+    /// The host entry changed file-type (e.g. file → dir) since the baseline.
+    HostTypeChanged,
+    /// The host path is unsafe to write through (symlink/unreadable component).
+    HostUnsafe,
+    /// The remote deleted a file the host had concurrently modified.
+    DeleteVsHostModified,
+    /// A directory the remote deleted is non-empty on the host.
+    DirDeleteNonempty,
+    /// The remote returned a symlink, which write-back does not support.
+    RemoteUnsupportedSymlink,
+}
+
+/// One diverged path in a [`DivergeReport`].
+#[derive(Debug, Clone, Serialize)]
+// Wired into the SafeOrDiverge write-back by a later task.
+#[allow(dead_code)]
+struct DivergeEntry {
+    /// Forward-slash relative path (from the workspace root) that diverged.
+    rel: String,
+    /// Why it diverged.
+    reason: DivergeReason,
+    /// Host baseline content hash, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_sha256: Option<String>,
+    /// Remote content hash, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_sha256: Option<String>,
+    /// Relative path of the side-written divergence artifact, when one exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diverged_path: Option<String>,
+}
+
+/// A run's diverged write-backs, serialized to
+/// `.ordius/diverged/<run>/<env>/diverge-report.json`.
+#[derive(Debug, Clone, Serialize)]
+// Wired into the SafeOrDiverge write-back by a later task.
+#[allow(dead_code)]
+struct DivergeReport {
+    /// Run that produced the divergence.
+    run_id: String,
+    /// Env whose write-back diverged.
+    env_id: String,
+    /// One entry per diverged path.
+    diverged: Vec<DivergeEntry>,
+}
+
+/// Fail-closed reject for a divergence path that traverses a symlinked or
+/// unreadable host component, mirroring [`safety::classify_artifact_path`].
+fn reject_unsafe_artifact_path(artifact_rel: &str) -> DispatchError {
+    DispatchError::WorkspaceUnavailable {
+        env_id: "<host>".into(),
+        reason: format!(
+            "refusing to write divergence artifact through a symlinked/unreadable path: \
+             {artifact_rel}"
+        ),
+    }
+}
+
+/// Write `bytes` to a side artifact under
+/// `.ordius/diverged/<enc(run_id)>/<enc(env_id)>/<rel>` instead of clobbering
+/// `host_ws/<rel>` in place, returning the forward-slash artifact rel path.
+///
+/// Fail-closed: rejects when any existing component of the artifact path is a
+/// symlink or unreadable (a host-side symlinked dir could redirect the write
+/// outside the workspace). Unlike `write_host_file_atomic`, missing parents are
+/// created as real dirs only after the path clears the symlink gate.
+// Wired into the SafeOrDiverge write-back by a later task.
+#[allow(dead_code)]
+fn write_diverged_artifact(
+    host_ws: &Path,
+    run_id: &str,
+    env_id: &str,
+    rel: &str,
+    bytes: &[u8],
+) -> Result<String, DispatchError> {
+    let artifact_rel = format!(
+        ".ordius/diverged/{}/{}/{}",
+        safety::encode_segment(run_id),
+        safety::encode_segment(env_id),
+        rel
+    );
+
+    match safety::classify_artifact_path(host_ws, &artifact_rel) {
+        safety::ArtifactPathState::Ok => {},
+        safety::ArtifactPathState::Symlink | safety::ArtifactPathState::Unreadable => {
+            return Err(reject_unsafe_artifact_path(&artifact_rel));
+        },
+    }
+
+    let target = host_ws.join(&artifact_rel);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| host_io_err(parent, "create diverged dir", &e))?;
+    }
+    let tmp = tmp_sibling(&target);
+    std::fs::write(&tmp, bytes).map_err(|e| host_io_err(&tmp, "write diverged temp file", &e))?;
+    std::fs::rename(&tmp, &target)
+        .map_err(|e| host_io_err(&target, "rename diverged into place", &e))?;
+
+    Ok(artifact_rel)
+}
+
+/// Write `report` as pretty JSON to
+/// `.ordius/diverged/<enc(run_id)>/<enc(env_id)>/diverge-report.json`.
+///
+/// The caller guards `!report.diverged.is_empty()`. Same fail-closed
+/// symlink/unreadable gate and atomic temp+rename write as
+/// [`write_diverged_artifact`].
+// Wired into the SafeOrDiverge write-back by a later task.
+#[allow(dead_code)]
+fn write_diverge_report(
+    host_ws: &Path,
+    run_id: &str,
+    env_id: &str,
+    report: &DivergeReport,
+) -> Result<(), DispatchError> {
+    let report_rel = format!(
+        ".ordius/diverged/{}/{}/diverge-report.json",
+        safety::encode_segment(run_id),
+        safety::encode_segment(env_id),
+    );
+
+    match safety::classify_artifact_path(host_ws, &report_rel) {
+        safety::ArtifactPathState::Ok => {},
+        safety::ArtifactPathState::Symlink | safety::ArtifactPathState::Unreadable => {
+            return Err(reject_unsafe_artifact_path(&report_rel));
+        },
+    }
+
+    let json =
+        serde_json::to_vec_pretty(report).map_err(|e| DispatchError::WorkspaceUnavailable {
+            env_id: "<host>".into(),
+            reason: format!("serialize diverge report: {e}"),
+        })?;
+
+    let target = host_ws.join(&report_rel);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| host_io_err(parent, "create diverged dir", &e))?;
+    }
+    let tmp = tmp_sibling(&target);
+    std::fs::write(&tmp, &json).map_err(|e| host_io_err(&tmp, "write diverge report temp", &e))?;
+    std::fs::rename(&tmp, &target)
+        .map_err(|e| host_io_err(&target, "rename diverge report into place", &e))?;
+
+    Ok(())
 }
 
 // ── Template expansion ────────────────────────────────────────────────────────
@@ -2347,5 +2514,127 @@ mod tests {
             || std::fs::read_dir(&dir).is_ok();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         can_read
+    }
+
+    // ── SafeOrDiverge artifact / report writers ───────────────────────────────
+
+    /// Writing a divergence artifact must fail closed when `.ordius` is a
+    /// symlink: nothing may be written *through* it (a symlinked dir could
+    /// redirect the write outside the workspace).
+    #[cfg(unix)]
+    #[test]
+    fn write_diverged_artifact_fails_closed_on_symlinked_ordius() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host_ws = tmp.path();
+
+        // A real target dir that `.ordius` will point at, plus the symlink.
+        let target = tmp.path().join("redirect-target");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, host_ws.join(".ordius")).unwrap();
+
+        let res = write_diverged_artifact(host_ws, "run1", "ssh:h", "src/o.txt", b"remote");
+        assert!(res.is_err(), "expected fail-closed Err, got {res:?}");
+
+        // Nothing was written through the symlink: the target dir stays empty.
+        let leaked: Vec<_> = std::fs::read_dir(&target).unwrap().collect();
+        assert!(
+            leaked.is_empty(),
+            "symlink target must stay empty; found {leaked:?}"
+        );
+    }
+
+    /// Happy path: the artifact lands under `.ordius/diverged/<run>/<env>/<rel>`
+    /// and the in-place host path is never touched.
+    #[test]
+    fn write_diverged_artifact_happy_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host_ws = tmp.path();
+
+        let artifact_rel =
+            write_diverged_artifact(host_ws, "run1", "ssh:h", "src/o.txt", b"remote-bytes")
+                .unwrap();
+
+        assert!(
+            artifact_rel.starts_with(".ordius/diverged/"),
+            "rel must be under .ordius/diverged/; got {artifact_rel}"
+        );
+        assert!(
+            artifact_rel.ends_with("/src/o.txt"),
+            "rel must end with the original relative path; got {artifact_rel}"
+        );
+
+        let written = std::fs::read(host_ws.join(&artifact_rel)).unwrap();
+        assert_eq!(written, b"remote-bytes");
+
+        // Divergence never clobbers the in-place path.
+        assert!(
+            !host_ws.join("src/o.txt").exists(),
+            "the in-place host file must not be created by divergence"
+        );
+    }
+
+    /// The report serializes `reason` in `snake_case` and omits the optional sha
+    /// / path fields when they are `None` (`skip_serializing_if`).
+    #[test]
+    fn write_diverge_report_writes_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host_ws = tmp.path();
+
+        let report = DivergeReport {
+            run_id: "run1".into(),
+            env_id: "ssh:h".into(),
+            diverged: vec![
+                DivergeEntry {
+                    rel: "src/o.txt".into(),
+                    reason: DivergeReason::HostModified,
+                    host_sha256: Some("ab".into()),
+                    remote_sha256: Some("cd".into()),
+                    diverged_path: Some(".ordius/diverged/.../src/o.txt".into()),
+                },
+                DivergeEntry {
+                    rel: "gone".into(),
+                    reason: DivergeReason::DeleteVsHostModified,
+                    host_sha256: None,
+                    remote_sha256: None,
+                    diverged_path: None,
+                },
+            ],
+        };
+
+        write_diverge_report(host_ws, "run1", "ssh:h", &report).unwrap();
+
+        let report_rel = format!(
+            ".ordius/diverged/{}/{}/diverge-report.json",
+            safety::encode_segment("run1"),
+            safety::encode_segment("ssh:h"),
+        );
+        let raw = std::fs::read(host_ws.join(&report_rel)).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+
+        let entries = json["diverged"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // First entry: snake_case reason + all three optional fields present.
+        let first = &entries[0];
+        assert_eq!(first["reason"], "host_modified");
+        assert_eq!(first["host_sha256"], "ab");
+        assert_eq!(first["remote_sha256"], "cd");
+        assert_eq!(first["diverged_path"], ".ordius/diverged/.../src/o.txt");
+
+        // Second entry: snake_case reason + the three optional fields OMITTED.
+        let second = &entries[1];
+        assert_eq!(second["reason"], "delete_vs_host_modified");
+        assert!(
+            second.get("host_sha256").is_none(),
+            "host_sha256 must be omitted when None; got {second}"
+        );
+        assert!(
+            second.get("remote_sha256").is_none(),
+            "remote_sha256 must be omitted when None; got {second}"
+        );
+        assert!(
+            second.get("diverged_path").is_none(),
+            "diverged_path must be omitted when None; got {second}"
+        );
     }
 }
