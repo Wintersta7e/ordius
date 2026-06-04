@@ -5,7 +5,6 @@
 //! Used by the workspace sync manager to validate roots, filter paths,
 //! enforce caps, and build per-file manifests before any bytes leave the host.
 
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -324,26 +323,41 @@ pub fn read_within_caps(abs: &Path, tracker: &mut CapTracker) -> Result<Vec<u8>,
 
 // ── 4. Workspace walk ─────────────────────────────────────────────────────────
 
-/// A single file entry produced by [`walk_workspace`].
+/// Whether a [`WalkEntry`] is a regular file or a directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    /// A regular file.
+    File,
+    /// A directory.
+    Dir,
+}
+
+/// A single entry produced by [`walk_workspace`] — a regular file or directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalkEntry {
     /// Forward-slash relative path from the workspace root.
     pub rel_path: String,
     /// Absolute path on the host.
     pub abs: PathBuf,
-    /// File size in bytes.
+    /// Whether this entry is a file or a directory.
+    pub kind: EntryKind,
+    /// File size in bytes. Zero for directories.
     pub size: u64,
     /// Unix permissions bits (e.g. `0o644`).  Always `0o644` on non-Unix.
     pub mode: u32,
 }
 
-/// Recursively walk `host_ws`, yielding regular files only.
+/// Recursively walk `host_ws`, yielding regular files and directories.
 ///
+/// - Yields a [`EntryKind::Dir`] entry for each non-ignored directory and a
+///   [`EntryKind::File`] entry for each regular file. The workspace root itself
+///   (rel `""`) is never yielded.
 /// - Skips symlinks entirely (no follow, no yield).
 ///   // TODO(H-later): symlink handling
 /// - Skips any path where [`should_ignore`](should_ignore) returns `true`, and
 ///   does **not** descend into ignored directories.
-/// - Returns paths with forward-slash separators relative to `host_ws`.
+/// - Returns paths with forward-slash separators relative to `host_ws`, sorted
+///   so shallower paths precede the entries nested under them.
 pub fn walk_workspace(host_ws: &Path) -> Result<Vec<WalkEntry>, DispatchError> {
     let mut entries = Vec::new();
     walk_dir_recursive(host_ws, host_ws, &mut entries)?;
@@ -403,6 +417,20 @@ fn walk_dir_recursive(
         }
 
         if ft.is_dir() {
+            let meta =
+                std::fs::metadata(&abs).map_err(|e| DispatchError::WorkspaceUnavailable {
+                    env_id: "<host>".into(),
+                    reason: format!("metadata `{}`: {e}", abs.display()),
+                })?;
+            // Record the directory itself (root is never an iterated entry here),
+            // then descend into it.
+            out.push(WalkEntry {
+                rel_path: rel,
+                abs: abs.clone(),
+                kind: EntryKind::Dir,
+                size: 0,
+                mode: unix_mode(&meta),
+            });
             walk_dir_recursive(root, &abs, out)?;
         } else if ft.is_file() {
             let meta =
@@ -417,6 +445,7 @@ fn walk_dir_recursive(
             out.push(WalkEntry {
                 rel_path: rel,
                 abs,
+                kind: EntryKind::File,
                 size,
                 mode,
             });
@@ -450,8 +479,27 @@ pub struct FileEntry {
     pub mode: u32,
 }
 
-/// Manifest: maps forward-slash relative path → [`FileEntry`].
-pub type Manifest = HashMap<String, FileEntry>;
+/// A snapshot of a synced workspace tree: regular files plus the directories
+/// that hold them (including empty ones).
+///
+/// `files` maps forward-slash relative path → [`FileEntry`]; `dirs` is the set
+/// of forward-slash relative directory paths (the workspace root is never
+/// included). Both are ordered so callers can walk shallow-first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Manifest {
+    /// Forward-slash relative path → per-file metadata.
+    pub files: std::collections::BTreeMap<String, FileEntry>,
+    /// Forward-slash relative directory paths (root excluded).
+    pub dirs: std::collections::BTreeSet<String>,
+}
+
+impl Manifest {
+    /// An empty manifest.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 /// Lowercase hex SHA-256 of `bytes`.
 #[must_use]
@@ -600,7 +648,46 @@ mod tests {
             !paths.contains(&".env"),
             ".env must be ignored; got {paths:?}"
         );
-        assert_eq!(paths.len(), 2, "expected exactly 2 entries; got {paths:?}");
+        assert!(
+            !paths.contains(&".git"),
+            ".git dir must be ignored; got {paths:?}"
+        );
+        // The non-ignored directory is also yielded (as a Dir entry).
+        assert!(paths.contains(&"sub"), "missing sub dir; got {paths:?}");
+        // Exactly two files + one directory survive the ignore rules.
+        assert_eq!(paths.len(), 3, "expected exactly 3 entries; got {paths:?}");
+    }
+
+    #[test]
+    fn walk_workspace_yields_dirs_excluding_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Create: a.txt, sub/b.txt, empty/ (an empty directory).
+        std::fs::write(root.join("a.txt"), b"hello").unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("b.txt"), b"world").unwrap();
+        std::fs::create_dir(root.join("empty")).unwrap();
+
+        let entries = walk_workspace(root).unwrap();
+
+        // The workspace root is never yielded.
+        assert!(
+            entries.iter().all(|e| !e.rel_path.is_empty()),
+            "root (rel_path == \"\") must never be yielded; got {entries:?}"
+        );
+
+        let kind_of = |rel: &str| {
+            entries.iter().find(|e| e.rel_path == rel).map_or_else(
+                || panic!("missing entry {rel}; got {entries:?}"),
+                |e| e.kind,
+            )
+        };
+
+        assert_eq!(kind_of("a.txt"), EntryKind::File, "a.txt is a file");
+        assert_eq!(kind_of("sub/b.txt"), EntryKind::File, "sub/b.txt is a file");
+        assert_eq!(kind_of("sub"), EntryKind::Dir, "sub is a dir");
+        assert_eq!(kind_of("empty"), EntryKind::Dir, "empty is a dir");
     }
 
     // ── CapTracker ──

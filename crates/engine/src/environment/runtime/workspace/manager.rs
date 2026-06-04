@@ -108,7 +108,10 @@ impl std::fmt::Debug for WorkspaceState {
             .field("env_side_root", &self.env_side_root)
             .field("lifecycle", &self.lifecycle)
             .field("write_back", &self.write_back)
-            .field("last_remote_manifest_len", &self.last_remote_manifest.len())
+            .field(
+                "last_remote_manifest_files",
+                &self.last_remote_manifest.files.len(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -458,7 +461,7 @@ impl WorkspaceManager {
 /// type-mismatched dirs) can never survive, and so a remote symlink can never
 /// redirect the parent-`mkdir`/`rename` inside `upload_file` outside `root`:
 /// 1. `mkdir(root)`.
-/// 2. Walk the host workspace → the target file set (ignores applied).
+/// 2. Walk the host workspace → the target file and directory sets (ignores applied).
 /// 3. List the current remote tree.
 /// 4. Strip-guard every remote entry against `root`; reject any off-root path.
 /// 5. Delete (before any upload): every symlink (target-path OR intermediate
@@ -466,7 +469,8 @@ impl WorkspaceManager {
 ///    every directory whose rel collides with a target *file*. Cruft dirs are
 ///    pruned best-effort, deepest-first.
 /// 6. Upload every target file via [`safety::read_within_caps`] (caps enforced
-///    on the bytes actually read), recording the sent bytes in the manifest.
+///    on the bytes actually read) and `mkdir` every target directory, recording
+///    both the sent file bytes and the directory rels in the manifest.
 async fn reset_remote_to_host(
     factory: &Arc<dyn WorkspaceTransportFactory>,
     root: &str,
@@ -475,9 +479,20 @@ async fn reset_remote_to_host(
     let t = factory.open().await?;
     t.mkdir(root).await?;
 
-    // 2. Target file set from the host walk (forward-slash rels, ignores applied).
+    // 2. Target sets from the host walk (forward-slash rels, ignores applied).
+    // Files and dirs are tracked separately so the delete pass can tell a stale
+    // remote file from a directory the host also has at the same rel.
     let entries = safety::walk_workspace(host_ws)?;
-    let target_files: HashSet<&str> = entries.iter().map(|e| e.rel_path.as_str()).collect();
+    let target_files: HashSet<&str> = entries
+        .iter()
+        .filter(|e| e.kind == safety::EntryKind::File)
+        .map(|e| e.rel_path.as_str())
+        .collect();
+    let target_dirs: HashSet<&str> = entries
+        .iter()
+        .filter(|e| e.kind == safety::EntryKind::Dir)
+        .map(|e| e.rel_path.as_str())
+        .collect();
 
     // 3. Current remote tree.
     let remote = t.list_tree(root).await?;
@@ -534,12 +549,16 @@ async fn reset_remote_to_host(
     }
 
     // Remove colliding/cruft directories deepest-first (longest path first) so
-    // children are gone before their parents. Best-effort: a dir that still has
-    // legitimate children (a target file lives under it) will fail to remove —
-    // that is expected, so swallow per-dir errors here.
+    // children are gone before their parents. A remote dir whose rel matches a
+    // target dir is legitimate and kept (the upload mirrors it). Best-effort: a
+    // dir that still has legitimate children (a target file lives under it) will
+    // fail to remove — that is expected, so swallow per-dir errors here.
     cruft_dirs.sort_by_key(|d| std::cmp::Reverse(d.len()));
     for dir in cruft_dirs {
         let rel = dir.strip_prefix(&prefix).unwrap_or(dir.as_str());
+        if target_dirs.contains(rel) {
+            continue; // host also has this dir — keep it
+        }
         let collides_with_file = target_files.contains(rel);
         // A dir whose rel collides with a target *file* MUST be cleared — the
         // upload would otherwise fail. Any other removal failure is a
@@ -551,22 +570,34 @@ async fn reset_remote_to_host(
         }
     }
 
-    // 6. Upload every target file. Cap-check the bytes actually read (bounded),
-    // and hash the sent bytes into the returned manifest.
+    // 6. Mirror the host tree. The walk is sorted, so directories appear before
+    // anything nested under them: create each remote dir (records it in the
+    // manifest so reconcile can track empty/parent dirs) and upload each file,
+    // cap-checking the bytes actually read (bounded) and hashing the sent bytes
+    // into the returned manifest. Write-back stays files-only for now (dir
+    // create/prune lands in a later task).
     let mut tracker = safety::CapTracker::new(safety::UploadCaps::default());
     let mut manifest = safety::Manifest::new();
     for entry in &entries {
-        let bytes = safety::read_within_caps(&entry.abs, &mut tracker)?;
-        let remote_path = format!("{root}/{}", entry.rel_path);
-        t.upload_file(&remote_path, &bytes).await?;
-        manifest.insert(
-            entry.rel_path.clone(),
-            safety::FileEntry {
-                sha256_hex: safety::sha256_hex(&bytes),
-                size: bytes.len() as u64,
-                mode: entry.mode,
+        match entry.kind {
+            safety::EntryKind::Dir => {
+                t.mkdir(&format!("{root}/{}", entry.rel_path)).await?;
+                manifest.dirs.insert(entry.rel_path.clone());
             },
-        );
+            safety::EntryKind::File => {
+                let bytes = safety::read_within_caps(&entry.abs, &mut tracker)?;
+                let remote_path = format!("{root}/{}", entry.rel_path);
+                t.upload_file(&remote_path, &bytes).await?;
+                manifest.files.insert(
+                    entry.rel_path.clone(),
+                    safety::FileEntry {
+                        sha256_hex: safety::sha256_hex(&bytes),
+                        size: bytes.len() as u64,
+                        mode: entry.mode,
+                    },
+                );
+            },
+        }
     }
     Ok(manifest)
 }
@@ -613,7 +644,7 @@ async fn write_back_delta(
             continue;
         }
         let bytes = t.download_file(&entry.rel_path).await?;
-        new_remote.insert(
+        new_remote.files.insert(
             rel.to_string(),
             safety::FileEntry {
                 sha256_hex: safety::sha256_hex(&bytes),
@@ -636,8 +667,9 @@ async fn write_back_delta(
             continue;
         }
         let changed = baseline
+            .files
             .get(rel)
-            .is_none_or(|meta| meta.sha256_hex != new_remote[rel].sha256_hex);
+            .is_none_or(|meta| meta.sha256_hex != new_remote.files[rel].sha256_hex);
         if changed {
             write_host_file_atomic(host_ws, rel, &bytes)?;
         }
@@ -646,8 +678,8 @@ async fn write_back_delta(
     // 3. Deletion propagation: a rel in `baseline` but absent from `new_remote`
     // was deleted by the node — mirror that on the host, under identical guards.
     // Best-effort: a failed unlink is logged and skipped, never aborting.
-    for rel in baseline.keys() {
-        if new_remote.contains_key(rel) {
+    for rel in baseline.files.keys() {
+        if new_remote.files.contains_key(rel) {
             continue;
         }
         if !safety::is_safe_relative(rel)
