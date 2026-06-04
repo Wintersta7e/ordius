@@ -1070,6 +1070,96 @@ pub(crate) fn expand_env_root(
     Ok(root)
 }
 
+// ── host@in conflict spine ──────────────────────────────────────────────────────
+
+/// The live shape of a host workspace path, captured for conflict detection.
+///
+/// Produced by [`classify_host_state`] and compared against the `host@in`
+/// baseline manifest via [`matches_host_at_in`] to answer: "is the host path
+/// still byte-and-type identical to what we uploaded at the start of the run?".
+/// `UnsafeSymlink` and `Unreadable` are distinct *fail-closed* states — a path
+/// we cannot safely classify must never be treated as "unchanged".
+// The conflict-detection helpers land ahead of their caller; a later task wires
+// them into `reconcile_out`. Exercised by unit tests in the meantime.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostState {
+    /// The path does not exist on the host.
+    Absent,
+    /// A regular file with the given lowercase-hex SHA-256 of its bytes
+    /// (computed via [`safety::sha256_hex`], so it is comparable to a manifest
+    /// [`safety::FileEntry::sha256_hex`]).
+    File {
+        /// Lowercase-hex SHA-256 of the file contents.
+        sha256_hex: String,
+    },
+    /// A directory.
+    Dir,
+    /// A component of the path (including the terminal entry) is a symlink, so
+    /// the path cannot be classified or mutated safely. Fail closed.
+    UnsafeSymlink,
+    /// The path's metadata could not be read for a reason other than "does not
+    /// exist" (e.g. a permission error), or it is a non-file/non-dir entry
+    /// (fifo, socket, …) we cannot safely mutate. Fail closed.
+    Unreadable,
+}
+
+/// Classify the live shape of `host_ws/rel` for conflict detection.
+///
+/// First defers to [`safety::classify_artifact_path`] for the symlink-traversal
+/// and unreadable-component checks (so the same fail-closed rules used for
+/// write-back govern conflict detection). Only when every component is clean
+/// does it stat the terminal path: missing → [`HostState::Absent`], a dir →
+/// [`HostState::Dir`], a regular file → its content hash, and anything else
+/// (other stat error, fifo/socket/…, or a hash read error) →
+/// [`HostState::Unreadable`].
+#[allow(dead_code)] // wired into reconcile_out by a later task; unit-tested now.
+fn classify_host_state(host_ws: &std::path::Path, rel: &str) -> HostState {
+    use std::io::ErrorKind;
+
+    match safety::classify_artifact_path(host_ws, rel) {
+        safety::ArtifactPathState::Symlink => return HostState::UnsafeSymlink,
+        safety::ArtifactPathState::Unreadable => return HostState::Unreadable,
+        safety::ArtifactPathState::Ok => {},
+    }
+
+    let target = host_ws.join(rel);
+    let md = match std::fs::symlink_metadata(&target) {
+        Ok(md) => md,
+        Err(e) if e.kind() == ErrorKind::NotFound => return HostState::Absent,
+        Err(_) => return HostState::Unreadable,
+    };
+
+    if md.is_dir() {
+        HostState::Dir
+    } else if md.is_file() {
+        safety::hash_file(&target).map_or(HostState::Unreadable, |sha256_hex| HostState::File {
+            sha256_hex,
+        })
+    } else {
+        // fifo / socket / device / etc. — cannot safely mutate. Fail closed.
+        HostState::Unreadable
+    }
+}
+
+/// Whether `state` is byte-and-type identical to the `host@in` `baseline` at
+/// `rel` — i.e. the host path is unchanged since upload.
+///
+/// `UnsafeSymlink` and `Unreadable` always return `false` (fail closed): a path
+/// we cannot trust to be unchanged is treated as a conflict.
+#[allow(dead_code)] // wired into reconcile_out by a later task; unit-tested now.
+fn matches_host_at_in(state: &HostState, baseline: &safety::Manifest, rel: &str) -> bool {
+    match state {
+        HostState::Absent => !baseline.files.contains_key(rel) && !baseline.dirs.contains(rel),
+        HostState::File { sha256_hex } => baseline
+            .files
+            .get(rel)
+            .is_some_and(|e| &e.sha256_hex == sha256_hex),
+        HostState::Dir => baseline.dirs.contains(rel),
+        HostState::UnsafeSymlink | HostState::Unreadable => false,
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2123,5 +2213,135 @@ mod tests {
             b"host-a",
             "teardown must not write anything back for a rejected SafeOrDiverge binding"
         );
+    }
+
+    // ── classify_host_state / matches_host_at_in ──────────────────────────────
+
+    /// `classify_host_state` reports each live host shape correctly, and its
+    /// `File` hash is byte-comparable with a manifest `FileEntry.sha256_hex`
+    /// (both go through `safety::sha256_hex` of the same bytes).
+    #[test]
+    fn classify_host_state_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host_ws = tmp.path();
+
+        // A regular file → File { sha256_hex } matching sha256_hex(<bytes>).
+        let bytes = b"host file contents";
+        std::fs::write(host_ws.join("f.txt"), bytes).unwrap();
+        assert_eq!(
+            classify_host_state(host_ws, "f.txt"),
+            HostState::File {
+                sha256_hex: safety::sha256_hex(bytes),
+            },
+        );
+
+        // A directory → Dir.
+        std::fs::create_dir(host_ws.join("d")).unwrap();
+        assert_eq!(classify_host_state(host_ws, "d"), HostState::Dir);
+
+        // A missing rel → Absent.
+        assert_eq!(classify_host_state(host_ws, "missing"), HostState::Absent);
+
+        // A path whose component is a symlink → UnsafeSymlink.
+        #[cfg(unix)]
+        {
+            let target = host_ws.join("real");
+            std::fs::create_dir(&target).unwrap();
+            std::os::unix::fs::symlink(&target, host_ws.join("link")).unwrap();
+            assert_eq!(
+                classify_host_state(host_ws, "link/inside.txt"),
+                HostState::UnsafeSymlink,
+            );
+            // The symlink itself (terminal component) is also unsafe.
+            assert_eq!(
+                classify_host_state(host_ws, "link"),
+                HostState::UnsafeSymlink
+            );
+        }
+
+        // An unreadable component (chmod 0o000 parent) → Unreadable. Skipped as
+        // root, where permission bits are bypassed.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if !running_as_root() {
+                let blocked = host_ws.join("blocked");
+                std::fs::create_dir(&blocked).unwrap();
+                std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+                let state = classify_host_state(host_ws, "blocked/child");
+                // Restore perms so tempdir cleanup can recurse.
+                std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+                assert_eq!(state, HostState::Unreadable, "got {state:?}");
+            }
+        }
+    }
+
+    /// `matches_host_at_in` compares a `HostState` against the `host@in`
+    /// baseline manifest: identical → true; any byte/type/presence drift or an
+    /// unsafe/unreadable host → false.
+    #[test]
+    fn matches_host_at_in_predicate() {
+        let mut baseline = safety::Manifest::new();
+        baseline.files.insert(
+            "f.txt".to_string(),
+            safety::FileEntry {
+                sha256_hex: safety::sha256_hex(b"baseline bytes"),
+                size: 14,
+                mode: 0o644,
+            },
+        );
+        baseline.dirs.insert("d".to_string());
+
+        // File with the baseline sha → matches; a different sha → no match.
+        assert!(matches_host_at_in(
+            &HostState::File {
+                sha256_hex: safety::sha256_hex(b"baseline bytes"),
+            },
+            &baseline,
+            "f.txt",
+        ));
+        assert!(!matches_host_at_in(
+            &HostState::File {
+                sha256_hex: safety::sha256_hex(b"drifted bytes"),
+            },
+            &baseline,
+            "f.txt",
+        ));
+
+        // Dir for a baseline dir → matches; for an unknown rel → no match.
+        assert!(matches_host_at_in(&HostState::Dir, &baseline, "d"));
+        assert!(!matches_host_at_in(&HostState::Dir, &baseline, "unknown"));
+
+        // Absent for an unknown rel → matches (nothing was uploaded there);
+        // Absent for a baseline file → no match (the host lost it).
+        assert!(matches_host_at_in(&HostState::Absent, &baseline, "unknown"));
+        assert!(!matches_host_at_in(&HostState::Absent, &baseline, "f.txt"));
+
+        // Unsafe / unreadable host states never match — fail closed.
+        assert!(!matches_host_at_in(
+            &HostState::UnsafeSymlink,
+            &baseline,
+            "f.txt"
+        ));
+        assert!(!matches_host_at_in(
+            &HostState::Unreadable,
+            &baseline,
+            "f.txt"
+        ));
+    }
+
+    /// True when the test process can lstat inside a 0o000 directory it owns —
+    /// the signature of running as root (permission bits are bypassed).
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        use std::os::unix::fs::PermissionsExt as _;
+        let probe = tempfile::tempdir().unwrap();
+        let dir = probe.path().join("p");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let can_read = std::fs::symlink_metadata(dir.join("anything")).is_ok()
+            || std::fs::read_dir(&dir).is_ok();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        can_read
     }
 }
