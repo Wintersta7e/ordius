@@ -1,5 +1,7 @@
 /// Workspace sync manager skeleton.
 pub mod manager;
+/// Persistent-workspace additive host→remote sync (extracted from `manager`).
+mod persistent;
 /// `SafeOrDiverge` conflict-aware write-back (extracted from `manager`).
 mod safe_or_diverge;
 /// Upload safety helpers (ignore rules, caps, walk, manifest).
