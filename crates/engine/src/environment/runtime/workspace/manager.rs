@@ -1022,7 +1022,11 @@ fn diverge_file(
 /// host still matches `host@in` is removed (`remove_file`/`remove_dir`, never
 /// recursive); a non-empty host dir is kept (`dir_delete_nonempty`); a host that
 /// diverged is kept (`delete_vs_host_modified` / `host_unsafe`).
-fn sod_deletions(ctx: &SodCtx, report: &mut DivergeReport, deletions: &[(String, bool)]) {
+fn sod_deletions(
+    ctx: &SodCtx,
+    report: &mut DivergeReport,
+    deletions: &[(String, bool)],
+) -> Result<(), DispatchError> {
     for (rel, is_dir) in deletions {
         let host = classify_host_state(ctx.host_ws, rel);
         // No-op: the node deleted this rel and the host is already absent (the
@@ -1052,13 +1056,13 @@ fn sod_deletions(ctx: &SodCtx, report: &mut DivergeReport, deletions: &[(String,
                     .diverged
                     .push(report_only(rel, DivergeReason::DirDeleteNonempty, &host));
             },
-            Err(e) => tracing::warn!(
-                rel = rel.as_str(),
-                error = %e,
-                "SafeOrDiverge: best-effort delete failed"
-            ),
+            // An unexpected host fs error means a node mutation failed; abort the
+            // phase so write-back returns `Err`, the baseline is not advanced,
+            // and teardown preserves the remote root.
+            Err(e) => return Err(host_io_err(&target, "delete", &e)),
         }
     }
+    Ok(())
 }
 
 /// Phase 2 — file↔dir type-change replacements (the dir→file children were
@@ -1077,16 +1081,18 @@ fn sod_type_changes(
         }
         if matches_host_at_in(&host, ctx.baseline, rel) {
             // Host is the uploaded file — remove it, then create the dir in its
-            // place. A NotFound here is benign (already gone).
-            if let Err(e) = std::fs::remove_file(ctx.host_ws.join(rel))
+            // place. A NotFound here is benign (already gone); any other fs
+            // error means the node's dir output would be lost — propagate.
+            let target = ctx.host_ws.join(rel);
+            if let Err(e) = std::fs::remove_file(&target)
                 && e.kind() != std::io::ErrorKind::NotFound
             {
-                tracing::warn!(rel = rel.as_str(), error = %e, "SafeOrDiverge: type-change file remove failed");
+                return Err(host_io_err(&target, "type-change file remove", &e));
             }
             if safety::host_target_is_symlink_safe(ctx.host_ws, rel)
-                && let Err(e) = std::fs::create_dir_all(ctx.host_ws.join(rel))
+                && let Err(e) = std::fs::create_dir_all(&target)
             {
-                tracing::warn!(rel = rel.as_str(), error = %e, "SafeOrDiverge: type-change dir create failed");
+                return Err(host_io_err(&target, "type-change dir create", &e));
             }
         } else {
             report.diverged.push(report_only(
@@ -1143,17 +1149,22 @@ fn sod_type_changes(
 
 /// Phase 3 — create plain new directories (shallow-first). A host that diverged
 /// from `host@in` (now holds a file/symlink) is reported, not overwritten.
-fn sod_dir_creates(ctx: &SodCtx, report: &mut DivergeReport, creates: &[String]) {
+fn sod_dir_creates(
+    ctx: &SodCtx,
+    report: &mut DivergeReport,
+    creates: &[String],
+) -> Result<(), DispatchError> {
     for rel in creates {
         let host = classify_host_state(ctx.host_ws, rel);
         if host == HostState::Dir {
             continue; // already a dir
         }
         if matches_host_at_in(&host, ctx.baseline, rel) {
-            if safety::host_target_is_symlink_safe(ctx.host_ws, rel)
-                && let Err(e) = std::fs::create_dir_all(ctx.host_ws.join(rel))
-            {
-                tracing::warn!(rel = rel.as_str(), error = %e, "SafeOrDiverge: dir create failed");
+            if safety::host_target_is_symlink_safe(ctx.host_ws, rel) {
+                let target = ctx.host_ws.join(rel);
+                if let Err(e) = std::fs::create_dir_all(&target) {
+                    return Err(host_io_err(&target, "dir create", &e));
+                }
             }
         } else {
             report.diverged.push(report_only(
@@ -1163,6 +1174,7 @@ fn sod_dir_creates(ctx: &SodCtx, report: &mut DivergeReport, creates: &[String])
             ));
         }
     }
+    Ok(())
 }
 
 /// Phase 4 — write plain changed/new files. The host is overwritten only where
@@ -1275,14 +1287,15 @@ fn sod_partition<'a>(
         .collect();
     dir_creates.sort_unstable();
 
-    // Plain changed/new files (not a dir→file type change).
+    // Plain changed/new files (not a dir→file type change). `keep` excludes
+    // unsafe/ignored/symlink-shadowed rels — without it a malformed listing
+    // (symlink `d` + a listed child `d/x`) could write `d/x` over a host file.
     let file_writes: Vec<&RemoteFile> = listing
         .files
         .iter()
         .filter(|f| {
-            !baseline.dirs.contains(&f.rel)
-                && safety::is_safe_relative(&f.rel)
-                && !safety::should_ignore(&f.rel, ignore)
+            keep(&f.rel)
+                && !baseline.dirs.contains(&f.rel)
                 && baseline
                     .files
                     .get(&f.rel)
@@ -1392,9 +1405,9 @@ async fn write_back_safe_or_diverge(
         env_id,
         baseline,
     };
-    sod_deletions(&ctx, &mut report, &plan.deletions);
+    sod_deletions(&ctx, &mut report, &plan.deletions)?;
     sod_type_changes(&ctx, &mut report, &plan.file_to_dir, &plan.dir_to_file)?;
-    sod_dir_creates(&ctx, &mut report, &plan.dir_creates);
+    sod_dir_creates(&ctx, &mut report, &plan.dir_creates)?;
     sod_file_writes(&ctx, &mut report, &plan.file_writes)?;
 
     if !report.diverged.is_empty() {
@@ -1582,14 +1595,92 @@ fn reject_unsafe_artifact_path(artifact_rel: &str) -> DispatchError {
     }
 }
 
+/// Reject an empty `run_id`/`env_id`: `encode_segment("")` is `""`, which would
+/// collapse the `.ordius/diverged/<run>/<env>/` path layout.
+fn reject_empty_id(kind: &str) -> DispatchError {
+    DispatchError::WorkspaceUnavailable {
+        env_id: "<host>".into(),
+        reason: format!("refusing to write divergence artifact: empty {kind}"),
+    }
+}
+
+/// Atomically write `bytes` to `host_ws/<artifact_rel>`, creating each missing
+/// `.ordius/diverged/...` parent component one at a time and re-checking — with
+/// `symlink_metadata` immediately before each `create_dir` — that the component
+/// is a real directory, not a symlink. This narrows (but cannot fully close,
+/// absent an `openat`-style primitive) the TOCTOU window where a concurrent
+/// actor swaps a freshly-created dir for a symlink that would redirect the write
+/// outside the workspace. The leaf is written via temp+rename for atomicity.
+///
+/// Fail-closed: any component that is, or becomes, a symlink/non-directory →
+/// `Err`; an unreadable component (non-`NotFound` `symlink_metadata` error) →
+/// `Err`.
+fn write_artifact_atomic(
+    host_ws: &Path,
+    artifact_rel: &str,
+    bytes: &[u8],
+) -> Result<(), DispatchError> {
+    // Preflight the whole path (the existing-components symlink/unreadable gate).
+    match safety::classify_artifact_path(host_ws, artifact_rel) {
+        safety::ArtifactPathState::Ok => {},
+        safety::ArtifactPathState::Symlink | safety::ArtifactPathState::Unreadable => {
+            return Err(reject_unsafe_artifact_path(artifact_rel));
+        },
+    }
+
+    let target = host_ws.join(artifact_rel);
+
+    // Create each missing parent component individually, re-checking right before
+    // each `create_dir` that the existing/just-created component is a real dir.
+    let mut cur = host_ws.to_path_buf();
+    for comp in Path::new(artifact_rel).components() {
+        match comp {
+            std::path::Component::Normal(c) => cur.push(c),
+            std::path::Component::CurDir => continue,
+            // is_safe_relative / the preflight reject these; fail closed anyway.
+            _ => return Err(reject_unsafe_artifact_path(artifact_rel)),
+        }
+        // Only walk parent components here; the leaf is written via temp+rename.
+        if cur == target {
+            break;
+        }
+        match std::fs::symlink_metadata(&cur) {
+            Ok(md) if md.file_type().is_symlink() || !md.file_type().is_dir() => {
+                return Err(reject_unsafe_artifact_path(artifact_rel));
+            },
+            Ok(_) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&cur)
+                    .map_err(|e| host_io_err(&cur, "create diverged dir", &e))?;
+                // Re-check the component we just created is a real dir (not a
+                // symlink a racing actor planted between the check and mkdir).
+                match std::fs::symlink_metadata(&cur) {
+                    Ok(md) if md.file_type().is_dir() => {},
+                    _ => return Err(reject_unsafe_artifact_path(artifact_rel)),
+                }
+            },
+            Err(_) => return Err(reject_unsafe_artifact_path(artifact_rel)),
+        }
+    }
+
+    let tmp = tmp_sibling(&target);
+    std::fs::write(&tmp, bytes).map_err(|e| host_io_err(&tmp, "write diverged temp file", &e))?;
+    std::fs::rename(&tmp, &target)
+        .map_err(|e| host_io_err(&target, "rename diverged into place", &e))?;
+    // Residual race: between each `symlink_metadata` recheck and the subsequent
+    // `create_dir`/write there is a sub-syscall gap an attacker could still win.
+    // Closing it fully needs an `openat`/`O_NOFOLLOW`-style primitive we don't
+    // have on the Windows host; this keeps the window as small as practical.
+    Ok(())
+}
+
 /// Write `bytes` to a side artifact under
 /// `.ordius/diverged/<enc(run_id)>/<enc(env_id)>/<rel>` instead of clobbering
 /// `host_ws/<rel>` in place, returning the forward-slash artifact rel path.
 ///
-/// Fail-closed: rejects when any existing component of the artifact path is a
-/// symlink or unreadable (a host-side symlinked dir could redirect the write
-/// outside the workspace). Unlike `write_host_file_atomic`, missing parents are
-/// created as real dirs only after the path clears the symlink gate.
+/// Fail-closed: rejects an empty `run_id`/`env_id`, and (via
+/// [`write_artifact_atomic`]) rejects when any existing component of the artifact
+/// path is a symlink or unreadable.
 // Wired into the SafeOrDiverge write-back by a later task.
 fn write_diverged_artifact(
     host_ws: &Path,
@@ -1598,6 +1689,12 @@ fn write_diverged_artifact(
     rel: &str,
     bytes: &[u8],
 ) -> Result<String, DispatchError> {
+    if run_id.is_empty() {
+        return Err(reject_empty_id("run_id"));
+    }
+    if env_id.is_empty() {
+        return Err(reject_empty_id("env_id"));
+    }
     let artifact_rel = format!(
         ".ordius/diverged/{}/{}/{}",
         safety::encode_segment(run_id),
@@ -1605,32 +1702,16 @@ fn write_diverged_artifact(
         rel
     );
 
-    match safety::classify_artifact_path(host_ws, &artifact_rel) {
-        safety::ArtifactPathState::Ok => {},
-        safety::ArtifactPathState::Symlink | safety::ArtifactPathState::Unreadable => {
-            return Err(reject_unsafe_artifact_path(&artifact_rel));
-        },
-    }
-
-    let target = host_ws.join(&artifact_rel);
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| host_io_err(parent, "create diverged dir", &e))?;
-    }
-    let tmp = tmp_sibling(&target);
-    std::fs::write(&tmp, bytes).map_err(|e| host_io_err(&tmp, "write diverged temp file", &e))?;
-    std::fs::rename(&tmp, &target)
-        .map_err(|e| host_io_err(&target, "rename diverged into place", &e))?;
-
+    write_artifact_atomic(host_ws, &artifact_rel, bytes)?;
     Ok(artifact_rel)
 }
 
 /// Write `report` as pretty JSON to
 /// `.ordius/diverged/<enc(run_id)>/<enc(env_id)>/diverge-report.json`.
 ///
-/// The caller guards `!report.diverged.is_empty()`. Same fail-closed
-/// symlink/unreadable gate and atomic temp+rename write as
-/// [`write_diverged_artifact`].
+/// The caller guards `!report.diverged.is_empty()`. Same fail-closed empty-id +
+/// per-component symlink gate and atomic temp+rename write as
+/// [`write_diverged_artifact`] (both go through [`write_artifact_atomic`]).
 // Wired into the SafeOrDiverge write-back by a later task.
 fn write_diverge_report(
     host_ws: &Path,
@@ -1638,18 +1719,17 @@ fn write_diverge_report(
     env_id: &str,
     report: &DivergeReport,
 ) -> Result<(), DispatchError> {
+    if run_id.is_empty() {
+        return Err(reject_empty_id("run_id"));
+    }
+    if env_id.is_empty() {
+        return Err(reject_empty_id("env_id"));
+    }
     let report_rel = format!(
         ".ordius/diverged/{}/{}/diverge-report.json",
         safety::encode_segment(run_id),
         safety::encode_segment(env_id),
     );
-
-    match safety::classify_artifact_path(host_ws, &report_rel) {
-        safety::ArtifactPathState::Ok => {},
-        safety::ArtifactPathState::Symlink | safety::ArtifactPathState::Unreadable => {
-            return Err(reject_unsafe_artifact_path(&report_rel));
-        },
-    }
 
     let json =
         serde_json::to_vec_pretty(report).map_err(|e| DispatchError::WorkspaceUnavailable {
@@ -1657,17 +1737,7 @@ fn write_diverge_report(
             reason: format!("serialize diverge report: {e}"),
         })?;
 
-    let target = host_ws.join(&report_rel);
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| host_io_err(parent, "create diverged dir", &e))?;
-    }
-    let tmp = tmp_sibling(&target);
-    std::fs::write(&tmp, &json).map_err(|e| host_io_err(&tmp, "write diverge report temp", &e))?;
-    std::fs::rename(&tmp, &target)
-        .map_err(|e| host_io_err(&target, "rename diverge report into place", &e))?;
-
-    Ok(())
+    write_artifact_atomic(host_ws, &report_rel, &json)
 }
 
 // ── Template expansion ────────────────────────────────────────────────────────
@@ -3602,6 +3672,65 @@ mod tests {
         assert_eq!(std::fs::read(&d_path).unwrap(), b"now-a-file");
     }
 
+    /// The node replaces a dir with a file, but the host concurrently edits the
+    /// dir's child after `reconcile_in`. The child no longer matches `host@in`,
+    /// so its deletion diverges (`delete_vs_host_modified`) and the child is
+    /// KEPT — which leaves the host dir non-empty, so the dir→file replacement
+    /// can't complete and the node's file `d` diverges (`host_type_changed`).
+    #[tokio::test]
+    async fn sod_type_change_dir_to_file_under_concurrent_host_modify() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::create_dir(host_ws.join("d")).unwrap();
+        std::fs::write(host_ws.join("d").join("old.txt"), b"o").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-type-change-race");
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        // Node output: remove the child + the dir, replace `d` with a file.
+        fake.remove_file(&format!("{root}/d/old.txt"))
+            .await
+            .unwrap();
+        fake.remove_dir(&format!("{root}/d")).await.unwrap();
+        fake.upload_file(&format!("{root}/d"), b"now-a-file")
+            .await
+            .unwrap();
+        // Concurrent host edit of the child AFTER reconcile_in uploaded baseline.
+        std::fs::write(host_ws.join("d").join("old.txt"), b"user-edit").unwrap();
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out");
+
+        // The user's concurrent edit is preserved (the deletion diverged).
+        assert_eq!(
+            std::fs::read(host_ws.join("d").join("old.txt")).unwrap(),
+            b"user-edit",
+            "concurrently-edited child must be kept",
+        );
+        // `d` stays a directory — it could not be emptied, so the file can't land.
+        assert!(
+            host_ws.join("d").is_dir(),
+            "host `d` must stay a dir (non-empty, can't be replaced)",
+        );
+        // The node's file bytes diverge instead of clobbering the host dir.
+        let artifact = diverged_dir(host_ws, "ssh:sod-type-change-race").join("d");
+        assert_eq!(std::fs::read(&artifact).unwrap(), b"now-a-file");
+
+        let report = read_diverge_report(host_ws, "ssh:sod-type-change-race");
+        assert_eq!(
+            report_entry(&report, "d/old.txt")["reason"],
+            "delete_vs_host_modified",
+        );
+        assert_eq!(report_entry(&report, "d")["reason"], "host_type_changed");
+    }
+
     /// `max_files` is a fail-fast cap: when more entries would be touched than
     /// allowed, `reconcile_out` errors BEFORE any host mutation.
     #[tokio::test]
@@ -3933,6 +4062,44 @@ mod tests {
         assert!(
             second.get("diverged_path").is_none(),
             "diverged_path must be omitted when None; got {second}"
+        );
+    }
+
+    /// Fail-closed: an empty `run_id` or `env_id` would `encode_segment` to `""`
+    /// and collapse the `.ordius/diverged/<run>/<env>/` layout. Both writers
+    /// reject it instead of writing.
+    #[test]
+    fn divergence_writers_reject_empty_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host_ws = tmp.path();
+
+        assert!(
+            write_diverged_artifact(host_ws, "", "ssh:h", "src/o.txt", b"x").is_err(),
+            "empty run_id must be rejected"
+        );
+        assert!(
+            write_diverged_artifact(host_ws, "run1", "", "src/o.txt", b"x").is_err(),
+            "empty env_id must be rejected"
+        );
+
+        let report = DivergeReport {
+            run_id: String::new(),
+            env_id: "ssh:h".into(),
+            diverged: vec![],
+        };
+        assert!(
+            write_diverge_report(host_ws, "", "ssh:h", &report).is_err(),
+            "empty run_id must be rejected by the report writer"
+        );
+        assert!(
+            write_diverge_report(host_ws, "run1", "", &report).is_err(),
+            "empty env_id must be rejected by the report writer"
+        );
+
+        // Nothing was written: `.ordius` was never created.
+        assert!(
+            !host_ws.join(".ordius").exists(),
+            "no divergence dir must be created for a rejected empty id"
         );
     }
 }
