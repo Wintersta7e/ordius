@@ -95,6 +95,76 @@ pub fn host_target_is_symlink_safe(host_ws: &Path, rel: &str) -> bool {
     true
 }
 
+/// Encode `s` as a single filesystem-safe path segment (base64url, no pad).
+///
+/// Run/env ids become path components under `.ordius/diverged/...`. An SSH env
+/// id is literally `ssh:<label>` — the `:` is a drive/ADS separator on the
+/// Windows host, and other ids may carry `/` or `.`. base64url (`A–Z a–z 0–9
+/// _ -`, no `=` padding) maps any input to exactly one safe segment, and the
+/// encoding is injective so distinct ids never collide. Round-trips via
+/// `URL_SAFE_NO_PAD.decode`.
+#[must_use]
+pub fn encode_segment(s: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s.as_bytes())
+}
+
+/// Classification of a candidate host artifact path produced by
+/// [`classify_artifact_path`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactPathState {
+    /// Every existing component is a real (non-symlink) entry — safe to create
+    /// any missing components and write under this path.
+    Ok,
+    /// An existing component is a symlink — writing would traverse it and could
+    /// escape the workspace. Reject.
+    Symlink,
+    /// A component's metadata could not be read for a reason other than "does
+    /// not exist" (e.g. a permission error). Fail closed and reject.
+    Unreadable,
+}
+
+/// Classify whether `host_ws/rel` is safe to create-and-write into, returning
+/// a tri-state instead of [`host_target_is_symlink_safe`]'s bool.
+///
+/// Walks the [`Component::Normal`](std::path::Component::Normal) parts of `rel`
+/// onto `host_ws`. For each existing component:
+/// - a symlink → [`ArtifactPathState::Symlink`];
+/// - a `symlink_metadata` error that is **not** `NotFound` →
+///   [`ArtifactPathState::Unreadable`] (fail closed);
+/// - `NotFound` → the path doesn't exist yet; the caller creates it as a real
+///   dir, so keep walking (deeper components are also `NotFound`).
+///
+/// Any non-`Normal`/non-`CurDir` component (e.g. `..`, an absolute root) is
+/// treated as [`ArtifactPathState::Unreadable`]: callers should reject such
+/// `rel`s via [`is_safe_relative`] first, but this fails closed regardless.
+///
+/// All components clear → [`ArtifactPathState::Ok`].
+#[must_use]
+pub fn classify_artifact_path(host_ws: &Path, rel: &str) -> ArtifactPathState {
+    use std::io::ErrorKind;
+    use std::path::Component;
+
+    let mut cur = host_ws.to_path_buf();
+    for comp in Path::new(rel).components() {
+        match comp {
+            Component::Normal(c) => {
+                cur.push(c);
+                match std::fs::symlink_metadata(&cur) {
+                    Ok(md) if md.file_type().is_symlink() => return ArtifactPathState::Symlink,
+                    Ok(_) => {},
+                    Err(e) if e.kind() == ErrorKind::NotFound => {},
+                    Err(_) => return ArtifactPathState::Unreadable,
+                }
+            },
+            Component::CurDir => {},
+            // is_safe_relative rejects these; fail closed if one slips through.
+            _ => return ArtifactPathState::Unreadable,
+        }
+    }
+    ArtifactPathState::Ok
+}
+
 // ── 2. Ignore rules ───────────────────────────────────────────────────────────
 
 /// Default-ignored path prefixes (checked against the first path segment or
@@ -747,6 +817,115 @@ mod tests {
         });
         let err = read_within_caps(&p, &mut t).unwrap_err();
         assert!(err.to_string().contains("max_bytes"), "got: {err}");
+    }
+
+    // ── encode_segment ──
+
+    #[test]
+    fn encode_segment_is_safe_single_segment() {
+        use base64::Engine as _;
+
+        let encoded = encode_segment("ssh:host");
+
+        // Every char must be in the base64url alphabet (no `/`, `.`, `:`, `%`,
+        // `+`, `=`) so the result is one filesystem-safe path segment.
+        assert!(
+            encoded
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "encoded segment has unsafe chars: {encoded}"
+        );
+        assert!(!encoded.is_empty(), "encoded segment must be non-empty");
+
+        // Round-trips back to the original bytes.
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&encoded)
+            .unwrap();
+        assert_eq!(decoded, b"ssh:host");
+
+        // Distinct inputs produce distinct outputs.
+        assert_ne!(encode_segment("a"), encode_segment("b"));
+    }
+
+    // ── classify_artifact_path ──
+
+    #[test]
+    fn classify_artifact_path_classifies_states() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host_ws = tmp.path();
+
+        // A fully-missing path is Ok — the caller creates the components.
+        assert_eq!(
+            classify_artifact_path(host_ws, ".ordius/diverged/x/y/z.txt"),
+            ArtifactPathState::Ok,
+        );
+
+        // A symlinked component anywhere along the walk is rejected.
+        #[cfg(unix)]
+        {
+            let link_src = host_ws.join("real-target");
+            std::fs::create_dir(&link_src).unwrap();
+            std::os::unix::fs::symlink(&link_src, host_ws.join(".ordius")).unwrap();
+            assert_eq!(
+                classify_artifact_path(host_ws, ".ordius/diverged/x"),
+                ArtifactPathState::Symlink,
+            );
+        }
+
+        // A non-Normal/non-CurDir component (e.g. `..`) is treated defensively
+        // as Unreadable — callers should have rejected it via is_safe_relative
+        // first, but classify_artifact_path fails closed.
+        assert_eq!(
+            classify_artifact_path(host_ws, "../escape"),
+            ArtifactPathState::Unreadable,
+        );
+    }
+
+    // An Unreadable component requires `symlink_metadata` to fail with a
+    // non-NotFound error. On Unix we force this by removing read+execute from a
+    // parent directory so the OS denies the lstat of a child. Skipped when run
+    // as root (root bypasses the permission bits, so the error never occurs).
+    #[cfg(unix)]
+    #[test]
+    fn classify_artifact_path_reports_unreadable_on_permission_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // unsafe libc::getuid is unavailable; detect root via a sentinel write.
+        if running_as_root() {
+            eprintln!("skipping: running as root, permission bits are bypassed");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let host_ws = tmp.path();
+
+        // host_ws/blocked exists; strip its read+exec so lstat of a child fails
+        // with EACCES (a non-NotFound error) rather than NotFound.
+        let blocked = host_ws.join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let state = classify_artifact_path(host_ws, "blocked/child");
+
+        // Restore perms so tempdir cleanup can recurse.
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(state, ArtifactPathState::Unreadable, "got {state:?}");
+    }
+
+    /// True when the test process can lstat inside a 0o000 directory it owns —
+    /// the signature of running as root (permission bits are bypassed).
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        use std::os::unix::fs::PermissionsExt as _;
+        let probe = tempfile::tempdir().unwrap();
+        let dir = probe.path().join("p");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let can_read = std::fs::symlink_metadata(dir.join("anything")).is_ok()
+            || std::fs::read_dir(&dir).is_ok();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        can_read
     }
 
     // ── hash_file ──
