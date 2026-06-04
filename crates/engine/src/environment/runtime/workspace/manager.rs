@@ -9,8 +9,10 @@
 //!   `dispatcher.translate_path` (behaviour unchanged for
 //!   Local/WSL/BindMount/Shared/Translated).
 //! - `reconcile_out` (remote→host, after the final attempt): writes changed/new
-//!   files back and propagates remote deletions (`None`/`Force`), advancing the
-//!   baseline. Skipped only on a genuine user cancel.
+//!   files back and propagates remote deletions, advancing the baseline.
+//!   Policy-dispatched: `None` no-ops, `Force` overwrites, `SafeOrDiverge`
+//!   diverges host-changed paths into `.ordius/diverged/`. Skipped only on a
+//!   genuine user cancel.
 //! - `teardown_all`: a `Force`-only write-back safety net for runs that panic
 //!   between `reconcile_in` and `reconcile_out` (non-user-cancel only) plus
 //!   deletion of every ephemeral root tracked during the run.
@@ -20,8 +22,8 @@
 //!
 //! Not yet implemented (deferred):
 //! - Persistent workspace reuse (template without `{{run.id}}`) — H5.
-//! - `SafeOrDiverge` write-back (rejected in `reconcile_in`, before any upload)
-//!   — next phase.
+//! - `SafeOrDiverge` conflict modes other than `Manifest` (`Checksum`/`MtimeSize`
+//!   are rejected in `reconcile_in`, before any upload).
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -32,7 +34,7 @@ use serde::Serialize;
 use tokio::sync::OwnedMutexGuard;
 
 use crate::environment::runtime::dispatcher::Dispatcher;
-use crate::environment::runtime::env::{EnvId, WorkspaceBinding, WriteBackPolicy};
+use crate::environment::runtime::env::{ConflictDetect, EnvId, WorkspaceBinding, WriteBackPolicy};
 use crate::environment::runtime::error::DispatchError;
 use crate::environment::runtime::transport::EnvPath;
 
@@ -102,7 +104,6 @@ struct WorkspaceState {
     /// Used as the write-back baseline by `reconcile_out`.
     last_remote_manifest: safety::Manifest,
     /// Run id of the reconcile that populated this state (for divergence paths).
-    #[allow(dead_code)] // read by the divergence path in a later task
     run_id: String,
 }
 
@@ -321,13 +322,14 @@ impl WorkspaceManager {
             return dispatcher.translate_path(host_ws);
         };
 
-        // SafeOrDiverge write-back is deferred to a later phase. Reject it BEFORE
-        // any upload (restoring the pre-H3 `resolve_cwd` gate): the node fails
-        // before running and no `WorkspaceState` is stored, so the `teardown_all`
-        // safety net can never force-write it.
-        if matches!(write_back, WriteBackPolicy::SafeOrDiverge { .. }) {
+        // SafeOrDiverge supports only the `Manifest` (content-hash) conflict
+        // mode. Reject the unimplemented modes BEFORE any upload: the node fails
+        // before running and no `WorkspaceState` is stored.
+        if let WriteBackPolicy::SafeOrDiverge { mode, .. } = &write_back
+            && *mode != ConflictDetect::Manifest
+        {
             return Err(DispatchError::Unsupported(
-                "SafeOrDiverge write-back is deferred to a later phase".into(),
+                "SafeOrDiverge conflict mode is not implemented (only Manifest)".into(),
             ));
         }
 
@@ -394,9 +396,10 @@ impl WorkspaceManager {
     ///
     /// A no-op when the binding needs no sync, when no [`WorkspaceState`] exists
     /// for the key (e.g. `reconcile_in` was never called / already torn down),
-    /// or when the policy is [`WriteBackPolicy::None`]. `SafeOrDiverge` is now
-    /// rejected earlier by [`Self::reconcile_in`] (before any upload, so no state
-    /// is stored) — the arm here is defensive and unreachable.
+    /// or when the policy is [`WriteBackPolicy::None`]. The write-back is
+    /// policy-dispatched via `reconcile_write_back`: `Force` overwrites the host,
+    /// `SafeOrDiverge` writes back where the host is unchanged and diverges where
+    /// it conflicts (preserving the host copy under `.ordius/diverged/`).
     ///
     /// # Concurrency
     ///
@@ -416,7 +419,7 @@ impl WorkspaceManager {
         let key = (dispatcher.info().id.clone(), host_ws.to_path_buf());
 
         // Extract everything we need by clone, then DROP the lock before awaiting.
-        let Some((root, factory, write_back, baseline)) = ({
+        let Some((root, factory, write_back, baseline, run_id)) = ({
             let st = self.state.lock(); // parking_lot — dropped before await
             st.get(&key).map(|s| {
                 (
@@ -424,25 +427,25 @@ impl WorkspaceManager {
                     Arc::clone(&s.transport_factory),
                     s.write_back.clone(),
                     s.last_remote_manifest.clone(),
+                    s.run_id.clone(),
                 )
             })
         }) else {
             return Ok(()); // no state for this key — nothing to reconcile
         };
 
-        let ignore = match &write_back {
-            WriteBackPolicy::None => return Ok(()),
-            WriteBackPolicy::Force { ignore } => ignore.clone(),
-            // Defensive + unreachable: reconcile_in rejects SafeOrDiverge before
-            // storing any state, so no SafeOrDiverge state can reach here.
-            WriteBackPolicy::SafeOrDiverge { .. } => {
-                return Err(DispatchError::Unsupported(
-                    "SafeOrDiverge write-back is deferred to a later phase".into(),
-                ));
-            },
-        };
-
-        let new_remote = write_back_delta(&factory, &root, host_ws, &baseline, &ignore).await?;
+        // Policy-dispatched: None no-ops, Force overwrites, SafeOrDiverge writes
+        // back where the host is unchanged and diverges where it conflicts.
+        let new_remote = reconcile_write_back(
+            &write_back,
+            &factory,
+            &root,
+            host_ws,
+            &baseline,
+            &run_id,
+            key.0.as_str(),
+        )
+        .await?;
 
         // Advance the baseline so the next reconcile_out diffs against this state.
         if let Some(s) = self.state.lock().get_mut(&key) {
@@ -907,6 +910,510 @@ fn reconcile_host_dirs(
     }
 }
 
+/// Run-invariant context shared by the `SafeOrDiverge` phases.
+struct SodCtx<'a> {
+    host_ws: &'a Path,
+    run_id: &'a str,
+    env_id: &'a str,
+    baseline: &'a safety::Manifest,
+}
+
+/// The host file hash when the host is a regular file, else `None`
+/// (for `DivergeEntry.host_sha256`).
+fn host_sha_opt(host: &HostState) -> Option<String> {
+    match host {
+        HostState::File { sha256_hex } => Some(sha256_hex.clone()),
+        _ => None,
+    }
+}
+
+/// Classify a host that has *diverged* from what `reconcile_in` uploaded into a
+/// [`DivergeReason`]. Only meaningful once `matches_host_at_in` has returned
+/// `false` for this rel.
+fn conflict_reason(host: &HostState, baseline: &safety::Manifest, rel: &str) -> DivergeReason {
+    match host {
+        HostState::UnsafeSymlink | HostState::Unreadable => DivergeReason::HostUnsafe,
+        HostState::File { .. } => {
+            if baseline.dirs.contains(rel) {
+                DivergeReason::HostTypeChanged
+            } else if baseline.files.contains_key(rel) {
+                DivergeReason::HostModified
+            } else {
+                DivergeReason::HostCreated
+            }
+        },
+        HostState::Dir => {
+            if baseline.files.contains_key(rel) {
+                DivergeReason::HostTypeChanged
+            } else {
+                DivergeReason::HostCreated
+            }
+        },
+        HostState::Absent => DivergeReason::HostDeleted,
+    }
+}
+
+/// A report entry for a conflict where no remote bytes are preserved (the host
+/// is kept in place).
+fn report_only(rel: &str, reason: DivergeReason, host: &HostState) -> DivergeEntry {
+    DivergeEntry {
+        rel: rel.to_string(),
+        reason,
+        host_sha256: host_sha_opt(host),
+        remote_sha256: None,
+        diverged_path: None,
+    }
+}
+
+/// Write a remote file's bytes into the divergence dir and record a report
+/// entry preserving both hashes + the artifact path. Fails closed (propagates)
+/// when the artifact path is unsafe.
+#[allow(clippy::too_many_arguments)]
+fn diverge_file(
+    report: &mut DivergeReport,
+    host_ws: &Path,
+    run_id: &str,
+    env_id: &str,
+    rel: &str,
+    bytes: &[u8],
+    reason: DivergeReason,
+    host: &HostState,
+    remote_sha256: &str,
+) -> Result<(), DispatchError> {
+    let diverged_path = write_diverged_artifact(host_ws, run_id, env_id, rel, bytes)?;
+    report.diverged.push(DivergeEntry {
+        rel: rel.to_string(),
+        reason,
+        host_sha256: host_sha_opt(host),
+        remote_sha256: Some(remote_sha256.to_string()),
+        diverged_path: Some(diverged_path),
+    });
+    Ok(())
+}
+
+/// Phase 1 — apply plain deletions (deepest-first). Each `(rel, is_dir)` whose
+/// host still matches `host@in` is removed (`remove_file`/`remove_dir`, never
+/// recursive); a non-empty host dir is kept (`dir_delete_nonempty`); a host that
+/// diverged is kept (`delete_vs_host_modified` / `host_unsafe`).
+fn sod_deletions(ctx: &SodCtx, report: &mut DivergeReport, deletions: &[(String, bool)]) {
+    for (rel, is_dir) in deletions {
+        let host = classify_host_state(ctx.host_ws, rel);
+        // No-op: the node deleted this rel and the host is already absent (the
+        // user agreed) — nothing to remove and no false conflict to report.
+        if host == HostState::Absent {
+            continue;
+        }
+        if !matches_host_at_in(&host, ctx.baseline, rel) {
+            let reason = match host {
+                HostState::UnsafeSymlink | HostState::Unreadable => DivergeReason::HostUnsafe,
+                _ => DivergeReason::DeleteVsHostModified,
+            };
+            report.diverged.push(report_only(rel, reason, &host));
+            continue;
+        }
+        let target = ctx.host_ws.join(rel);
+        let res = if *is_dir {
+            std::fs::remove_dir(&target)
+        } else {
+            std::fs::remove_file(&target)
+        };
+        match res {
+            Ok(()) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) if *is_dir && e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                report
+                    .diverged
+                    .push(report_only(rel, DivergeReason::DirDeleteNonempty, &host));
+            },
+            Err(e) => tracing::warn!(
+                rel = rel.as_str(),
+                error = %e,
+                "SafeOrDiverge: best-effort delete failed"
+            ),
+        }
+    }
+}
+
+/// Phase 2 — file↔dir type-change replacements (the dir→file children were
+/// already removed in phase 1, so the host dir is empty here). A host that no
+/// longer matches `host@in` is preserved (diverged / reported).
+fn sod_type_changes(
+    ctx: &SodCtx,
+    report: &mut DivergeReport,
+    file_to_dir: &[String],
+    dir_to_file: &[&RemoteFile],
+) -> Result<(), DispatchError> {
+    for rel in file_to_dir {
+        let host = classify_host_state(ctx.host_ws, rel);
+        if host == HostState::Dir {
+            continue; // already a dir
+        }
+        if matches_host_at_in(&host, ctx.baseline, rel) {
+            // Host is the uploaded file — remove it, then create the dir in its
+            // place. A NotFound here is benign (already gone).
+            if let Err(e) = std::fs::remove_file(ctx.host_ws.join(rel))
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(rel = rel.as_str(), error = %e, "SafeOrDiverge: type-change file remove failed");
+            }
+            if safety::host_target_is_symlink_safe(ctx.host_ws, rel)
+                && let Err(e) = std::fs::create_dir_all(ctx.host_ws.join(rel))
+            {
+                tracing::warn!(rel = rel.as_str(), error = %e, "SafeOrDiverge: type-change dir create failed");
+            }
+        } else {
+            report.diverged.push(report_only(
+                rel,
+                conflict_reason(&host, ctx.baseline, rel),
+                &host,
+            ));
+        }
+    }
+    for f in dir_to_file {
+        let rel = f.rel.as_str();
+        let host = classify_host_state(ctx.host_ws, rel);
+        if let HostState::File { sha256_hex } = &host
+            && *sha256_hex == f.entry.sha256_hex
+        {
+            continue; // host already holds the node's bytes
+        }
+        if matches_host_at_in(&host, ctx.baseline, rel) {
+            match std::fs::remove_dir(ctx.host_ws.join(rel)) {
+                Ok(()) => {
+                    if safety::host_target_is_symlink_safe(ctx.host_ws, rel) {
+                        write_host_file_atomic(ctx.host_ws, rel, &f.bytes)?;
+                    }
+                },
+                // Untracked host children remain — cannot replace; preserve bytes.
+                Err(_) => diverge_file(
+                    report,
+                    ctx.host_ws,
+                    ctx.run_id,
+                    ctx.env_id,
+                    rel,
+                    &f.bytes,
+                    DivergeReason::HostTypeChanged,
+                    &host,
+                    &f.entry.sha256_hex,
+                )?,
+            }
+        } else {
+            diverge_file(
+                report,
+                ctx.host_ws,
+                ctx.run_id,
+                ctx.env_id,
+                rel,
+                &f.bytes,
+                conflict_reason(&host, ctx.baseline, rel),
+                &host,
+                &f.entry.sha256_hex,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Phase 3 — create plain new directories (shallow-first). A host that diverged
+/// from `host@in` (now holds a file/symlink) is reported, not overwritten.
+fn sod_dir_creates(ctx: &SodCtx, report: &mut DivergeReport, creates: &[String]) {
+    for rel in creates {
+        let host = classify_host_state(ctx.host_ws, rel);
+        if host == HostState::Dir {
+            continue; // already a dir
+        }
+        if matches_host_at_in(&host, ctx.baseline, rel) {
+            if safety::host_target_is_symlink_safe(ctx.host_ws, rel)
+                && let Err(e) = std::fs::create_dir_all(ctx.host_ws.join(rel))
+            {
+                tracing::warn!(rel = rel.as_str(), error = %e, "SafeOrDiverge: dir create failed");
+            }
+        } else {
+            report.diverged.push(report_only(
+                rel,
+                conflict_reason(&host, ctx.baseline, rel),
+                &host,
+            ));
+        }
+    }
+}
+
+/// Phase 4 — write plain changed/new files. The host is overwritten only where
+/// it still matches `host@in`; otherwise the node's bytes are diverged and the
+/// host is kept.
+fn sod_file_writes(
+    ctx: &SodCtx,
+    report: &mut DivergeReport,
+    writes: &[&RemoteFile],
+) -> Result<(), DispatchError> {
+    for f in writes {
+        let rel = f.rel.as_str();
+        let host = classify_host_state(ctx.host_ws, rel);
+        if let HostState::File { sha256_hex } = &host
+            && *sha256_hex == f.entry.sha256_hex
+        {
+            continue; // host already holds the node's bytes
+        }
+        if matches_host_at_in(&host, ctx.baseline, rel) {
+            if safety::host_target_is_symlink_safe(ctx.host_ws, rel) {
+                write_host_file_atomic(ctx.host_ws, rel, &f.bytes)?;
+            }
+        } else {
+            diverge_file(
+                report,
+                ctx.host_ws,
+                ctx.run_id,
+                ctx.env_id,
+                rel,
+                &f.bytes,
+                conflict_reason(&host, ctx.baseline, rel),
+                &host,
+                &f.entry.sha256_hex,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The classified work for a `SafeOrDiverge` write-back: which rels are plain
+/// deletions / dir-creates / file-writes, which are file↔dir type changes, and
+/// which baseline rels a remote symlink shadows. Computed up front so the
+/// `max_files` cap can fail-fast before any host mutation.
+struct SodPlan<'a> {
+    /// Baseline files the node turned into a dir (file→dir), replaced atomically.
+    file_to_dir: Vec<String>,
+    /// Baseline dirs the node turned into a file (dir→file), replaced atomically.
+    dir_to_file: Vec<&'a RemoteFile>,
+    /// Plain deletions `(rel, is_dir)`, deepest-first.
+    deletions: Vec<(String, bool)>,
+    /// Plain new directories, shallow-first.
+    dir_creates: Vec<String>,
+    /// Plain changed/new files to write.
+    file_writes: Vec<&'a RemoteFile>,
+    /// Remote symlinks that shadow a baseline rel (reported, host untouched).
+    shadowing_symlinks: Vec<String>,
+    /// Total entries this write-back would mutate (drives the `max_files` cap).
+    considered: usize,
+}
+
+/// Partition the remote delta into the `SafeOrDiverge` phase work-sets (pure —
+/// no host mutation). Type-change rels are excluded from the plain
+/// delete/create/write sets so phase 2 can replace them atomically.
+fn sod_partition<'a>(
+    baseline: &safety::Manifest,
+    new_remote: &safety::Manifest,
+    listing: &'a RemoteListing,
+    ignore: &[String],
+) -> SodPlan<'a> {
+    // A rel survives the plain passes only if it is safe, not ignored, and not
+    // hidden behind a remote symlink.
+    let keep = |rel: &str| {
+        safety::is_safe_relative(rel)
+            && !safety::should_ignore(rel, ignore)
+            && is_shadowed_by_symlink(rel, &listing.symlinks).is_none()
+    };
+
+    let file_to_dir: Vec<String> = baseline
+        .files
+        .keys()
+        .filter(|rel| new_remote.dirs.contains(*rel) && keep(rel))
+        .cloned()
+        .collect();
+    let dir_to_file: Vec<&RemoteFile> = listing
+        .files
+        .iter()
+        .filter(|f| baseline.dirs.contains(&f.rel) && keep(&f.rel))
+        .collect();
+
+    // Plain deletions (baseline rels truly gone — not a type change), deepest-first.
+    let mut deletions: Vec<(String, bool)> = Vec::new();
+    for rel in baseline.files.keys() {
+        if !new_remote.files.contains_key(rel) && !new_remote.dirs.contains(rel) && keep(rel) {
+            deletions.push((rel.clone(), false));
+        }
+    }
+    for rel in &baseline.dirs {
+        if !new_remote.dirs.contains(rel) && !new_remote.files.contains_key(rel) && keep(rel) {
+            deletions.push((rel.clone(), true));
+        }
+    }
+    deletions.sort_by_key(|(r, _)| std::cmp::Reverse(r.len()));
+
+    // Plain new dirs (not a file→dir type change), shallow-first.
+    let mut dir_creates: Vec<String> = new_remote
+        .dirs
+        .difference(&baseline.dirs)
+        .filter(|rel| !baseline.files.contains_key(*rel) && keep(rel))
+        .cloned()
+        .collect();
+    dir_creates.sort_unstable();
+
+    // Plain changed/new files (not a dir→file type change).
+    let file_writes: Vec<&RemoteFile> = listing
+        .files
+        .iter()
+        .filter(|f| {
+            !baseline.dirs.contains(&f.rel)
+                && safety::is_safe_relative(&f.rel)
+                && !safety::should_ignore(&f.rel, ignore)
+                && baseline
+                    .files
+                    .get(&f.rel)
+                    .is_none_or(|m| m.sha256_hex != f.entry.sha256_hex)
+        })
+        .collect();
+
+    // Remote symlinks that shadow a baseline rel (or subtree) — unsupported content.
+    let shadowing_symlinks: Vec<String> = listing
+        .symlinks
+        .iter()
+        .filter(|s| {
+            let prefix = format!("{s}/");
+            baseline
+                .files
+                .keys()
+                .any(|r| r == *s || r.starts_with(&prefix))
+                || baseline
+                    .dirs
+                    .iter()
+                    .any(|r| r == *s || r.starts_with(&prefix))
+        })
+        .cloned()
+        .collect();
+
+    let considered = deletions.len()
+        + file_to_dir.len()
+        + dir_to_file.len()
+        + dir_creates.len()
+        + file_writes.len();
+
+    SodPlan {
+        file_to_dir,
+        dir_to_file,
+        deletions,
+        dir_creates,
+        file_writes,
+        shadowing_symlinks,
+        considered,
+    }
+}
+
+/// `SafeOrDiverge` write-back: write a node's output back to the host **only where
+/// the host still matches what `reconcile_in` uploaded** (`host@in`); where the
+/// host changed concurrently, preserve the node's version under
+/// `.ordius/diverged/<run>/<env>/<rel>` + a JSON report and leave the host alone.
+///
+/// Remote symlinks are unsupported content: never synced, never counted as a
+/// deletion (a baseline rel they shadow is reported `remote_unsupported_symlink`,
+/// host untouched). The four phases (deletions → type changes → dir creates →
+/// file writes) keep parents/children from colliding; each mutation re-classifies
+/// the host immediately before acting (the best-effort TOCTOU recheck). Returns
+/// the advanced remote manifest (the new baseline) and the report.
+#[allow(clippy::too_many_arguments)]
+async fn write_back_safe_or_diverge(
+    factory: &Arc<dyn WorkspaceTransportFactory>,
+    root: &str,
+    host_ws: &Path,
+    baseline: &safety::Manifest,
+    ignore: &[String],
+    max_files: usize,
+    run_id: &str,
+    env_id: &str,
+) -> Result<(safety::Manifest, DivergeReport), DispatchError> {
+    let t = factory.open().await?;
+    let listing = list_remote_files(t, root).await?;
+
+    // Advanced baseline (returned regardless of conflicts).
+    let mut new_remote = safety::Manifest::new();
+    new_remote.dirs.clone_from(&listing.dirs);
+    for f in &listing.files {
+        new_remote.files.insert(f.rel.clone(), f.entry.clone());
+    }
+
+    // Classify the work up front so the cap fails fast before any host mutation.
+    let plan = sod_partition(baseline, &new_remote, &listing, ignore);
+    if plan.considered > max_files {
+        return Err(DispatchError::WorkspaceUnavailable {
+            env_id: "<host>".into(),
+            reason: format!(
+                "SafeOrDiverge write-back would touch {} entries, exceeding max_files={max_files}",
+                plan.considered
+            ),
+        });
+    }
+
+    let mut report = DivergeReport {
+        run_id: run_id.to_string(),
+        env_id: env_id.to_string(),
+        diverged: Vec::new(),
+    };
+    for rel in &plan.shadowing_symlinks {
+        report.diverged.push(DivergeEntry {
+            rel: rel.clone(),
+            reason: DivergeReason::RemoteUnsupportedSymlink,
+            host_sha256: None,
+            remote_sha256: None,
+            diverged_path: None,
+        });
+    }
+
+    // Four-phase application (each mutation re-classifies the host immediately
+    // before acting — the best-effort TOCTOU recheck).
+    let ctx = SodCtx {
+        host_ws,
+        run_id,
+        env_id,
+        baseline,
+    };
+    sod_deletions(&ctx, &mut report, &plan.deletions);
+    sod_type_changes(&ctx, &mut report, &plan.file_to_dir, &plan.dir_to_file)?;
+    sod_dir_creates(&ctx, &mut report, &plan.dir_creates);
+    sod_file_writes(&ctx, &mut report, &plan.file_writes)?;
+
+    if !report.diverged.is_empty() {
+        write_diverge_report(host_ws, run_id, env_id, &report)?;
+    }
+    Ok((new_remote, report))
+}
+
+/// Dispatch a node's final write-back by policy, returning the advanced remote
+/// manifest (the new baseline). `None` is a no-op (baseline unchanged); `Force`
+/// overwrites the host; `SafeOrDiverge` writes back where the host is unchanged
+/// and diverges where it conflicts. Used by both `reconcile_out` and the
+/// `teardown_all` safety net so the two paths apply identical semantics.
+async fn reconcile_write_back(
+    policy: &WriteBackPolicy,
+    factory: &Arc<dyn WorkspaceTransportFactory>,
+    root: &str,
+    host_ws: &Path,
+    baseline: &safety::Manifest,
+    run_id: &str,
+    env_id: &str,
+) -> Result<safety::Manifest, DispatchError> {
+    match policy {
+        WriteBackPolicy::None => Ok(baseline.clone()),
+        WriteBackPolicy::Force { ignore } => {
+            write_back_delta(factory, root, host_ws, baseline, ignore).await
+        },
+        WriteBackPolicy::SafeOrDiverge {
+            mode,
+            ignore,
+            max_files,
+        } => {
+            if *mode != ConflictDetect::Manifest {
+                return Err(DispatchError::Unsupported(
+                    "SafeOrDiverge conflict mode is not implemented (only Manifest)".into(),
+                ));
+            }
+            write_back_safe_or_diverge(
+                factory, root, host_ws, baseline, ignore, *max_files, run_id, env_id,
+            )
+            .await
+            .map(|(manifest, _report)| manifest)
+        },
+    }
+}
+
 /// Recursively remove `root` and everything under it via the transport: files
 /// first, then directories deepest-first, then the root itself.
 async fn remove_tree(
@@ -985,7 +1492,6 @@ fn host_io_err(path: &Path, op: &str, e: &std::io::Error) -> DispatchError {
 #[serde(rename_all = "snake_case")]
 // Wired into the SafeOrDiverge write-back by a later task; only the test module
 // constructs these variants for now.
-#[allow(dead_code)]
 enum DivergeReason {
     /// The host file changed since the baseline (and so did the remote).
     HostModified,
@@ -1008,7 +1514,6 @@ enum DivergeReason {
 /// One diverged path in a [`DivergeReport`].
 #[derive(Debug, Clone, Serialize)]
 // Wired into the SafeOrDiverge write-back by a later task.
-#[allow(dead_code)]
 struct DivergeEntry {
     /// Forward-slash relative path (from the workspace root) that diverged.
     rel: String,
@@ -1029,7 +1534,6 @@ struct DivergeEntry {
 /// `.ordius/diverged/<run>/<env>/diverge-report.json`.
 #[derive(Debug, Clone, Serialize)]
 // Wired into the SafeOrDiverge write-back by a later task.
-#[allow(dead_code)]
 struct DivergeReport {
     /// Run that produced the divergence.
     run_id: String,
@@ -1060,7 +1564,6 @@ fn reject_unsafe_artifact_path(artifact_rel: &str) -> DispatchError {
 /// outside the workspace). Unlike `write_host_file_atomic`, missing parents are
 /// created as real dirs only after the path clears the symlink gate.
 // Wired into the SafeOrDiverge write-back by a later task.
-#[allow(dead_code)]
 fn write_diverged_artifact(
     host_ws: &Path,
     run_id: &str,
@@ -1102,7 +1605,6 @@ fn write_diverged_artifact(
 /// symlink/unreadable gate and atomic temp+rename write as
 /// [`write_diverged_artifact`].
 // Wired into the SafeOrDiverge write-back by a later task.
-#[allow(dead_code)]
 fn write_diverge_report(
     host_ws: &Path,
     run_id: &str,
@@ -1252,7 +1754,6 @@ pub(crate) fn expand_env_root(
 /// we cannot safely classify must never be treated as "unchanged".
 // The conflict-detection helpers land ahead of their caller; a later task wires
 // them into `reconcile_out`. Exercised by unit tests in the meantime.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HostState {
     /// The path does not exist on the host.
@@ -1284,7 +1785,6 @@ enum HostState {
 /// [`HostState::Dir`], a regular file → its content hash, and anything else
 /// (other stat error, fifo/socket/…, or a hash read error) →
 /// [`HostState::Unreadable`].
-#[allow(dead_code)] // wired into reconcile_out by a later task; unit-tested now.
 fn classify_host_state(host_ws: &std::path::Path, rel: &str) -> HostState {
     use std::io::ErrorKind;
 
@@ -1318,7 +1818,6 @@ fn classify_host_state(host_ws: &std::path::Path, rel: &str) -> HostState {
 ///
 /// `UnsafeSymlink` and `Unreadable` always return `false` (fail closed): a path
 /// we cannot trust to be unchanged is treated as a conflict.
-#[allow(dead_code)] // wired into reconcile_out by a later task; unit-tested now.
 fn matches_host_at_in(state: &HostState, baseline: &safety::Manifest, rel: &str) -> bool {
     match state {
         HostState::Absent => !baseline.files.contains_key(rel) && !baseline.dirs.contains(rel),
@@ -1338,7 +1837,7 @@ mod tests {
     use super::*;
     use crate::environment::runtime::env::{
         ConflictDetect, EnvId, EnvInfo, EnvSpec, EnvState, SyncStrategy, WorkspaceBinding,
-        WriteBackPolicy,
+        WriteBackPolicy, default_max_files,
     };
     use std::collections::HashMap;
     use std::path::Path;
@@ -2340,49 +2839,626 @@ mod tests {
             .expect("shared reconcile_out is a no-op");
     }
 
-    /// `SafeOrDiverge` write-back is deferred to a later phase: `reconcile_in`
-    /// is the gate that rejects it BEFORE any upload (restoring the pre-H3
-    /// `resolve_cwd` behaviour). The node fails before running and before any
-    /// `WorkspaceState` is stored, so `teardown_all` can never force-write a
-    /// `SafeOrDiverge` binding — the data-integrity property.
+    /// Only the `Manifest` conflict mode is implemented for `SafeOrDiverge`:
+    /// `Checksum` and `MtimeSize` are rejected by `reconcile_in` BEFORE any
+    /// upload (the node fails before running and no `WorkspaceState` is stored),
+    /// while `Manifest` succeeds and uploads the host tree as the baseline.
     #[tokio::test]
-    async fn reconcile_in_rejects_safe_or_diverge() {
+    async fn reconcile_in_rejects_unsupported_safe_or_diverge_modes() {
+        // Unsupported modes (Checksum, MtimeSize) are rejected before any upload.
+        for mode in [ConflictDetect::Checksum, ConflictDetect::MtimeSize] {
+            let host = tempfile::TempDir::new().unwrap();
+            let host_ws = host.path();
+            std::fs::write(host_ws.join("a.txt"), b"host-a").unwrap();
+
+            let (d, fake) = ssh_dispatcher_with_fake("sod-reject");
+            let mgr = WorkspaceManager::new();
+            let binding = sftp_binding(
+                "/tmp/ordius-{{run.id}}",
+                WriteBackPolicy::SafeOrDiverge {
+                    mode,
+                    ignore: vec![],
+                    max_files: default_max_files(),
+                },
+            );
+
+            let err = mgr
+                .reconcile_in(&d, &binding, host_ws, &sample_run())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, DispatchError::Unsupported(_)),
+                "expected Unsupported for mode {mode:?}; got: {err}"
+            );
+            assert!(
+                err.to_string().contains("SafeOrDiverge"),
+                "error should name SafeOrDiverge; got: {err}"
+            );
+
+            // No state stored: nothing uploaded, teardown writes nothing back.
+            assert!(
+                fake.stat("/tmp/ordius-r1").await.unwrap().is_none(),
+                "no remote root must be created when reconcile_in rejects the mode"
+            );
+            mgr.teardown_all(RunOutcome::Failed).await;
+            assert_eq!(
+                std::fs::read(host_ws.join("a.txt")).unwrap(),
+                b"host-a",
+                "teardown must not write back for a rejected SafeOrDiverge mode"
+            );
+        }
+
+        // The supported Manifest mode succeeds and uploads the host tree.
         let host = tempfile::TempDir::new().unwrap();
         let host_ws = host.path();
         std::fs::write(host_ws.join("a.txt"), b"host-a").unwrap();
 
-        let (d, fake) = ssh_dispatcher_with_fake("safe-or-diverge");
+        let (d, fake) = ssh_dispatcher_with_fake("sod-manifest");
         let mgr = WorkspaceManager::new();
         let binding = sftp_binding(
             "/tmp/ordius-{{run.id}}",
             WriteBackPolicy::SafeOrDiverge {
                 mode: ConflictDetect::Manifest,
                 ignore: vec![],
-                max_files: 5_000,
+                max_files: default_max_files(),
             },
         );
 
-        // reconcile_in rejects SafeOrDiverge before any upload.
-        let err = mgr
+        let cwd = mgr
             .reconcile_in(&d, &binding, host_ws, &sample_run())
             .await
-            .unwrap_err();
+            .expect("Manifest mode must be accepted by reconcile_in");
+        let root = cwd.as_str().to_string();
+        assert_eq!(root, "/tmp/ordius-r1");
+        // The host tree was uploaded as the baseline.
+        assert_eq!(remote_files(&fake, &root).await, vec!["a.txt".to_string()]);
+        assert_eq!(
+            fake.download_file(&format!("{root}/a.txt")).await.unwrap(),
+            b"host-a",
+        );
+    }
+
+    // ── SafeOrDiverge (Manifest) conflict-divergence matrix ───────────────────
+
+    /// A `SafeOrDiverge { Manifest }` binding with default caps and no ignores.
+    fn sod_binding() -> WorkspaceBinding {
+        sftp_binding(
+            "/tmp/ordius-{{run.id}}",
+            WriteBackPolicy::SafeOrDiverge {
+                mode: ConflictDetect::Manifest,
+                ignore: vec![],
+                max_files: default_max_files(),
+            },
+        )
+    }
+
+    /// The `.ordius/diverged/<enc run>/<enc env>` directory for `env_id` under
+    /// `host_ws` (run id is always `"r1"` via `sample_run`).
+    fn diverged_dir(host_ws: &Path, env_id: &str) -> std::path::PathBuf {
+        host_ws
+            .join(".ordius")
+            .join("diverged")
+            .join(safety::encode_segment("r1"))
+            .join(safety::encode_segment(env_id))
+    }
+
+    /// Read + parse the `diverge-report.json` under the divergence dir for `env_id`.
+    fn read_diverge_report(host_ws: &Path, env_id: &str) -> serde_json::Value {
+        let path = diverged_dir(host_ws, env_id).join("diverge-report.json");
+        let raw = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("diverge report at {}: {e}", path.display()));
+        serde_json::from_slice(&raw).unwrap()
+    }
+
+    /// Find the single report entry whose `rel` equals `rel`.
+    fn report_entry<'a>(report: &'a serde_json::Value, rel: &str) -> &'a serde_json::Value {
+        report["diverged"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["rel"] == rel)
+            .unwrap_or_else(|| panic!("no report entry for rel `{rel}` in {report}"))
+    }
+
+    /// Host untouched since `reconcile_in` → the node's bytes are written back in
+    /// place; no divergence dir is created.
+    #[tokio::test]
+    async fn sod_host_untouched_writes_back() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"orig").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-untouched");
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        fake.upload_file(&format!("{root}/a.txt"), b"node-out")
+            .await
+            .unwrap();
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out");
+
+        assert_eq!(std::fs::read(host_ws.join("a.txt")).unwrap(), b"node-out");
         assert!(
-            err.to_string().contains("SafeOrDiverge"),
-            "expected SafeOrDiverge error; got: {err}"
+            !diverged_dir(host_ws, "ssh:sod-untouched").exists(),
+            "no divergence dir for a clean write-back"
+        );
+    }
+
+    /// Host modified concurrently → host KEPT, the node's bytes diverge under
+    /// `.ordius/diverged/...`, report reason `host_modified`.
+    #[tokio::test]
+    async fn sod_host_modified_diverges() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"orig").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-modified");
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        fake.upload_file(&format!("{root}/a.txt"), b"node-out")
+            .await
+            .unwrap();
+        // Concurrent host edit AFTER reconcile_in uploaded the baseline.
+        std::fs::write(host_ws.join("a.txt"), b"user-edit").unwrap();
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out");
+
+        // Host is preserved.
+        assert_eq!(std::fs::read(host_ws.join("a.txt")).unwrap(), b"user-edit");
+        // Node bytes preserved under the divergence dir.
+        let artifact = diverged_dir(host_ws, "ssh:sod-modified").join("a.txt");
+        assert_eq!(std::fs::read(&artifact).unwrap(), b"node-out");
+        // Report records the conflict.
+        let report = read_diverge_report(host_ws, "ssh:sod-modified");
+        let entry = report_entry(&report, "a.txt");
+        assert_eq!(entry["reason"], "host_modified");
+        assert!(entry.get("remote_sha256").is_some(), "got {entry}");
+        assert!(entry.get("diverged_path").is_some(), "got {entry}");
+    }
+
+    /// A new node file at a rel the host never had → written back in place; no
+    /// divergence.
+    #[tokio::test]
+    async fn sod_new_file_host_absent_writes() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("keep.txt"), b"k").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-new");
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        fake.upload_file(&format!("{root}/c.txt"), b"new-c")
+            .await
+            .unwrap();
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out");
+
+        assert_eq!(std::fs::read(host_ws.join("c.txt")).unwrap(), b"new-c");
+        assert!(
+            !diverged_dir(host_ws, "ssh:sod-new").exists(),
+            "a brand-new file is not a conflict"
+        );
+    }
+
+    /// Host created a file at the rel the node also writes → host KEPT, node
+    /// bytes diverge, report reason `host_created`.
+    #[tokio::test]
+    async fn sod_host_created_diverges() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("keep.txt"), b"k").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-created");
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        fake.upload_file(&format!("{root}/c.txt"), b"node-c")
+            .await
+            .unwrap();
+        // Host concurrently creates c.txt too.
+        std::fs::write(host_ws.join("c.txt"), b"user-c").unwrap();
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out");
+
+        assert_eq!(std::fs::read(host_ws.join("c.txt")).unwrap(), b"user-c");
+        let artifact = diverged_dir(host_ws, "ssh:sod-created").join("c.txt");
+        assert_eq!(std::fs::read(&artifact).unwrap(), b"node-c");
+        let report = read_diverge_report(host_ws, "ssh:sod-created");
+        assert_eq!(report_entry(&report, "c.txt")["reason"], "host_created");
+    }
+
+    /// Remote deletion, host unchanged → the deletion propagates to the host.
+    #[tokio::test]
+    async fn sod_deletion_host_unchanged_removes() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"a").unwrap();
+        std::fs::write(host_ws.join("b.txt"), b"b").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-del-clean");
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        fake.remove_file(&format!("{root}/b.txt")).await.unwrap();
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out");
+
+        assert!(!host_ws.join("b.txt").exists(), "b.txt deletion propagates");
+        assert!(host_ws.join("a.txt").exists(), "a.txt survives");
+    }
+
+    /// Remote deletion AND a concurrent host deletion of the same rel agree →
+    /// no-op: host stays absent and NO divergence report is written.
+    #[tokio::test]
+    async fn sod_deletion_host_also_absent_is_noop() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"a").unwrap();
+        std::fs::write(host_ws.join("b.txt"), b"b").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-del-agree");
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        // Node deletes b.txt on the remote AND the user deletes it on the host.
+        fake.remove_file(&format!("{root}/b.txt")).await.unwrap();
+        std::fs::remove_file(host_ws.join("b.txt")).unwrap();
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out");
+
+        assert!(!host_ws.join("b.txt").exists(), "b.txt stays absent");
+        assert!(
+            !host_ws.join(".ordius").exists(),
+            "agreeing deletions must not write a divergence report"
+        );
+    }
+
+    /// Remote deletion vs a concurrent host edit → host KEPT, report reason
+    /// `delete_vs_host_modified` with NO remote bytes recorded.
+    #[tokio::test]
+    async fn sod_deletion_host_modified_keeps() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"a").unwrap();
+        std::fs::write(host_ws.join("b.txt"), b"orig-b").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-del-mod");
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        fake.remove_file(&format!("{root}/b.txt")).await.unwrap();
+        std::fs::write(host_ws.join("b.txt"), b"user-b").unwrap();
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out");
+
+        assert_eq!(std::fs::read(host_ws.join("b.txt")).unwrap(), b"user-b");
+        let report = read_diverge_report(host_ws, "ssh:sod-del-mod");
+        let entry = report_entry(&report, "b.txt");
+        assert_eq!(entry["reason"], "delete_vs_host_modified");
+        assert!(
+            entry.get("diverged_path").is_none(),
+            "a delete conflict has no remote artifact; got {entry}"
+        );
+        assert!(
+            entry.get("remote_sha256").is_none(),
+            "a delete conflict has no remote bytes; got {entry}"
+        );
+    }
+
+    /// A remote symlink shadows a host file AND a host subtree → neither is
+    /// deleted; both are reported `remote_unsupported_symlink`.
+    #[tokio::test]
+    async fn sod_remote_symlink_keeps_host_file_and_subtree() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"ha").unwrap();
+        std::fs::create_dir(host_ws.join("sub")).unwrap();
+        std::fs::write(host_ws.join("sub").join("c.txt"), b"hc").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-symlink");
+        // The factory shares state with `fake`, so seed symlinks through it.
+        let factory = FakeWorkspaceTransportFactory::new(fake.clone());
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        // Node shadows a.txt and the sub subtree with remote symlinks.
+        factory.seed_symlink(&format!("{root}/a.txt"), "/etc/passwd");
+        factory.seed_symlink(&format!("{root}/sub"), "/var/evil");
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out");
+
+        // Both host paths survive untouched.
+        assert_eq!(std::fs::read(host_ws.join("a.txt")).unwrap(), b"ha");
+        assert_eq!(
+            std::fs::read(host_ws.join("sub").join("c.txt")).unwrap(),
+            b"hc",
+        );
+        // Report flags the unsupported symlinks.
+        let report = read_diverge_report(host_ws, "ssh:sod-symlink");
+        let reasons: Vec<&str> = report["diverged"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["reason"].as_str().unwrap())
+            .collect();
+        assert!(
+            reasons.iter().all(|r| *r == "remote_unsupported_symlink"),
+            "all entries must be remote_unsupported_symlink; got {reasons:?}"
+        );
+        assert!(
+            reasons.len() >= 2,
+            "both the file and the subtree symlink must be reported; got {reasons:?}"
+        );
+    }
+
+    /// The node creates an empty directory the host lacks → created on the host.
+    #[tokio::test]
+    async fn sod_empty_dir_created() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("keep.txt"), b"k").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-dir-create");
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        fake.mkdir(&format!("{root}/newdir")).await.unwrap();
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out");
+
+        assert!(host_ws.join("newdir").is_dir(), "newdir must be created");
+    }
+
+    /// The node empties then removes a directory the host did not touch → the
+    /// file is deleted AND the now-empty host dir is pruned.
+    #[tokio::test]
+    async fn sod_empty_dir_pruned() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::create_dir(host_ws.join("d")).unwrap();
+        std::fs::write(host_ws.join("d").join("x.txt"), b"x").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-dir-prune");
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        fake.remove_file(&format!("{root}/d/x.txt")).await.unwrap();
+        fake.remove_dir(&format!("{root}/d")).await.unwrap();
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out");
+
+        assert!(!host_ws.join("d").join("x.txt").exists(), "d/x.txt removed");
+        assert!(!host_ws.join("d").exists(), "empty host dir d pruned");
+    }
+
+    /// The node removes a dir, but the host added an untracked file under it →
+    /// the dir + untracked file survive; report reason `dir_delete_nonempty`.
+    #[tokio::test]
+    async fn sod_nonempty_dir_kept_reports() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::create_dir(host_ws.join("d")).unwrap();
+        std::fs::write(host_ws.join("d").join("x.txt"), b"x").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-dir-nonempty");
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        fake.remove_file(&format!("{root}/d/x.txt")).await.unwrap();
+        fake.remove_dir(&format!("{root}/d")).await.unwrap();
+        // Host adds an untracked file under d AFTER the baseline.
+        std::fs::write(host_ws.join("d").join("keep.txt"), b"u").unwrap();
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out");
+
+        assert_eq!(
+            std::fs::read(host_ws.join("d").join("keep.txt")).unwrap(),
+            b"u",
+            "untracked host file survives",
+        );
+        assert!(host_ws.join("d").is_dir(), "non-empty host dir d kept");
+        let report = read_diverge_report(host_ws, "ssh:sod-dir-nonempty");
+        assert_eq!(report_entry(&report, "d")["reason"], "dir_delete_nonempty");
+    }
+
+    /// The node replaces a directory with a file at the same rel (host
+    /// unchanged) → the host dir + its file go, and `d` becomes a regular file.
+    #[tokio::test]
+    async fn sod_type_change_dir_to_file() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::create_dir(host_ws.join("d")).unwrap();
+        std::fs::write(host_ws.join("d").join("old.txt"), b"o").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-type-change");
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        fake.remove_file(&format!("{root}/d/old.txt"))
+            .await
+            .unwrap();
+        fake.remove_dir(&format!("{root}/d")).await.unwrap();
+        fake.upload_file(&format!("{root}/d"), b"now-a-file")
+            .await
+            .unwrap();
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out");
+
+        assert!(
+            !host_ws.join("d").join("old.txt").exists(),
+            "the old dir child is gone",
+        );
+        let d_path = host_ws.join("d");
+        assert!(d_path.is_file(), "d must now be a regular file");
+        assert_eq!(std::fs::read(&d_path).unwrap(), b"now-a-file");
+    }
+
+    /// `max_files` is a fail-fast cap: when more entries would be touched than
+    /// allowed, `reconcile_out` errors BEFORE any host mutation.
+    #[tokio::test]
+    async fn sod_max_files_fail_fast() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"a").unwrap();
+        std::fs::write(host_ws.join("b.txt"), b"b").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-maxfiles");
+        let mgr = WorkspaceManager::new();
+        let binding = sftp_binding(
+            "/tmp/ordius-{{run.id}}",
+            WriteBackPolicy::SafeOrDiverge {
+                mode: ConflictDetect::Manifest,
+                ignore: vec![],
+                max_files: 1,
+            },
+        );
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        // Two changed files → 2 > max_files=1.
+        fake.upload_file(&format!("{root}/a.txt"), b"node-a")
+            .await
+            .unwrap();
+        fake.upload_file(&format!("{root}/b.txt"), b"node-b")
+            .await
+            .unwrap();
+
+        let err = mgr
+            .reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect_err("max_files cap must error");
+        assert!(
+            err.to_string().contains("max_files"),
+            "error should mention the cap; got: {err}"
         );
 
-        // No state was stored: nothing was uploaded to the remote, and a
-        // subsequent teardown is a no-op (cannot force-write a rejected binding).
+        // Nothing was written — both host files keep their ORIGINAL content.
+        assert_eq!(std::fs::read(host_ws.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(host_ws.join("b.txt")).unwrap(), b"b");
         assert!(
-            fake.stat("/tmp/ordius-r1").await.unwrap().is_none(),
-            "no remote root must be created when reconcile_in rejects the binding"
+            !diverged_dir(host_ws, "ssh:sod-maxfiles").exists(),
+            "fail-fast leaves no divergence artifacts",
         );
-        mgr.teardown_all(RunOutcome::Failed).await;
-        assert_eq!(
-            std::fs::read(host_ws.join("a.txt")).unwrap(),
-            b"host-a",
-            "teardown must not write anything back for a rejected SafeOrDiverge binding"
+    }
+
+    /// A clean (conflict-free) write-back leaves no `.ordius/` trace at all.
+    #[tokio::test]
+    async fn sod_report_omitted_no_divergence() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"orig").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-clean");
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        fake.upload_file(&format!("{root}/a.txt"), b"node")
+            .await
+            .unwrap();
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out");
+
+        assert_eq!(std::fs::read(host_ws.join("a.txt")).unwrap(), b"node");
+        assert!(
+            !host_ws.join(".ordius").exists(),
+            "a clean run must leave no .ordius trace",
         );
     }
 
