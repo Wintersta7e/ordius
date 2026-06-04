@@ -169,6 +169,32 @@ mod fake_impl {
         /// can prove the lock stayed tracked for teardown release.
         /// Toggled via [`FakeWorkspaceTransport::set_fail_upload`].
         fail_upload: bool,
+        /// Test-only count-based upload hook: when `Some(n)`, the first `n`
+        /// uploads (`upload_file` / `upload_file_atomic_via`) succeed and every
+        /// upload after that fails. Lets a test let owner.json (upload #0) land
+        /// but fail the FIRST host-file sync upload — proving `reconcile_in`
+        /// errors while the persistent lock stays tracked. `succeeded_uploads`
+        /// counts the
+        /// uploads that have actually landed so far.
+        /// Set via [`FakeWorkspaceTransport::set_fail_upload_after`].
+        fail_upload_after: Option<usize>,
+        /// Number of uploads that have succeeded (drives `fail_upload_after`).
+        succeeded_uploads: usize,
+    }
+
+    /// Whether the count-based upload gate (`fail_upload_after`) should fail THIS
+    /// upload. With no gate set → never trips (and consumes no count). With a gate
+    /// of `n`, the first `n` uploads succeed (each increments the counter) and
+    /// every upload after that trips. Called with the `FakeFs` lock held.
+    const fn count_gate_trips(fs: &mut FakeFs) -> bool {
+        match fs.fail_upload_after {
+            None => false,
+            Some(n) if fs.succeeded_uploads >= n => true,
+            Some(_) => {
+                fs.succeeded_uploads += 1;
+                false
+            },
+        }
     }
 
     /// In-memory fake for [`WorkspaceTransport`]. Clones share state.
@@ -195,6 +221,17 @@ mod fake_impl {
         /// removal stay healthy so a test can prove the lock stayed tracked.
         pub fn set_fail_upload(&self, fail: bool) {
             self.inner.lock().fail_upload = fail;
+        }
+
+        /// Test-only count-based upload hook: the first `n` uploads succeed and
+        /// every upload after that fails. Resets the success counter so the gate
+        /// is deterministic from this call. Lets a test land owner.json (upload
+        /// #0) but fail the first host-file sync upload (#1) via
+        /// `set_fail_upload_after(1)`, proving the persistent lock stays tracked.
+        pub fn set_fail_upload_after(&self, n: usize) {
+            let mut fs = self.inner.lock();
+            fs.fail_upload_after = Some(n);
+            fs.succeeded_uploads = 0;
         }
 
         /// Create the dir at `rel`, erroring if ANY entry already exists there
@@ -224,7 +261,7 @@ mod fake_impl {
 
         async fn upload_file(&self, rel: &str, bytes: &[u8]) -> Result<(), DispatchError> {
             let mut fs = self.inner.lock();
-            if fs.fail_upload {
+            if fs.fail_upload || count_gate_trips(&mut fs) {
                 drop(fs);
                 return Err(DispatchError::WorkspaceUnavailable {
                     env_id: "fake".into(),
@@ -255,7 +292,7 @@ mod fake_impl {
                 "temp_dir_rel must name the held lock-dir scratch"
             );
             let mut fs = self.inner.lock();
-            if fs.fail_upload {
+            if fs.fail_upload || count_gate_trips(&mut fs) {
                 drop(fs);
                 return Err(DispatchError::WorkspaceUnavailable {
                     env_id: "fake".into(),

@@ -192,12 +192,20 @@ fn sod_type_changes(
             {
                 return Err(host_io_err(&target, "type-change file remove", &e));
             }
-            if safety::host_target_is_symlink_safe(ctx.host_ws, rel)
-                && let Err(e) = std::fs::create_dir_all(&target)
-            {
-                return Err(host_io_err(&target, "type-change dir create", &e));
+            // Only advance host@in when the dir was actually created. A
+            // symlink-unsafe host path skips the mkdir, so the baseline stays
+            // pinned (the host won't hold the dir on the next reconcile).
+            if safety::host_target_is_symlink_safe(ctx.host_ws, rel) {
+                if let Err(e) = std::fs::create_dir_all(&target) {
+                    return Err(host_io_err(&target, "type-change dir create", &e));
+                }
+                applied.push(rel.clone());
+            } else {
+                tracing::warn!(
+                    rel,
+                    "skipping write-back: host path traverses a symlink; baseline stays pinned"
+                );
             }
-            applied.push(rel.clone());
         } else {
             report.diverged.push(report_only(
                 rel,
@@ -267,13 +275,21 @@ fn sod_dir_creates(
             continue; // already a dir
         }
         if matches_host_at_in(&host, ctx.host_at_in, rel) {
+            // Only advance host@in when the mkdir actually ran. A symlink-unsafe
+            // host path is skipped, so the baseline stays pinned (the host still
+            // won't hold the dir on the next reconcile).
             if safety::host_target_is_symlink_safe(ctx.host_ws, rel) {
                 let target = ctx.host_ws.join(rel);
                 if let Err(e) = std::fs::create_dir_all(&target) {
                     return Err(host_io_err(&target, "dir create", &e));
                 }
+                applied.push(rel.clone());
+            } else {
+                tracing::warn!(
+                    rel,
+                    "skipping write-back: host path traverses a symlink; baseline stays pinned"
+                );
             }
-            applied.push(rel.clone());
         } else {
             report.diverged.push(report_only(
                 rel,
@@ -307,10 +323,19 @@ fn sod_file_writes(
             continue; // host already holds the node's bytes
         }
         if matches_host_at_in(&host, ctx.host_at_in, rel) {
+            // Only advance host@in when the write actually landed. If the host
+            // path traverses a symlink we skip the write — advancing the baseline
+            // for bytes the host never received would spuriously diverge them on
+            // the next reconcile (the host still won't match). Keep host@in pinned.
             if safety::host_target_is_symlink_safe(ctx.host_ws, rel) {
                 write_host_file_atomic(ctx.host_ws, rel, &f.bytes)?;
+                applied.push(rel.to_string());
+            } else {
+                tracing::warn!(
+                    rel,
+                    "skipping write-back: host path traverses a symlink; baseline stays pinned"
+                );
             }
-            applied.push(rel.to_string());
         } else {
             diverge_file(
                 report,

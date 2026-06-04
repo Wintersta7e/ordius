@@ -261,6 +261,15 @@ impl WorkspaceManager {
         self.persistent_locks.lock().len()
     }
 
+    /// Number of remote roots currently marked preserved-on-write-back-failure
+    /// (test-only seam). A persistent root must NEVER be preserved (recovery is
+    /// ephemeral-only), so a persistent `reconcile_out` failure must keep this at 0.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn preserved_root_count(&self) -> usize {
+        self.preserved_roots.lock().len()
+    }
+
     /// Acquire an exclusive execution lease for `key`.
     ///
     /// Returns a RAII [`WorkspaceExecutionLease`] guard.  A second call with the
@@ -1198,6 +1207,11 @@ pub(super) async fn list_remote_files(
             continue;
         }
         let Some(rel) = entry.rel_path.strip_prefix(&prefix) else {
+            tracing::warn!(
+                entry_path = %entry.rel_path,
+                root,
+                "remote listing entry is outside the reconcile root; skipping"
+            );
             continue; // defensive: outside the root — ignore
         };
         if !safety::is_safe_relative(rel) {
@@ -3835,6 +3849,54 @@ mod tests {
         );
     }
 
+    /// COV-04: a malformed remote listing — a symlink `d` AND a listed child file
+    /// `d/x.txt` under it — must not let `d/x.txt` be written through the symlink.
+    /// `sod_partition`'s `keep` closure (`is_shadowed_by_symlink`) excludes the
+    /// shadowed child from `file_writes`, so the host never receives it and no
+    /// divergence artifact is produced for it.
+    #[tokio::test]
+    async fn sod_file_writes_shadow_filter_blocks_malformed_child() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("keep.txt"), b"k").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-shadow-child");
+        // Share state with `fake` to seed the symlink.
+        let factory = FakeWorkspaceTransportFactory::new(fake.clone());
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        // Malformed listing: a symlink `d` plus a listed child file under it.
+        factory.seed_symlink(&format!("{root}/d"), "/etc");
+        fake.upload_file(&format!("{root}/d/x.txt"), b"shadowed")
+            .await
+            .unwrap();
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out");
+
+        // The shadowed child must NOT be written to the host.
+        assert!(
+            !host_ws.join("d").join("x.txt").exists(),
+            "a child shadowed by a remote symlink must not be written through it"
+        );
+        // No divergence artifact for the shadowed child either (it was excluded
+        // from the write set up front, not diverged).
+        let artifact = diverged_dir(host_ws, "ssh:sod-shadow-child")
+            .join("d")
+            .join("x.txt");
+        assert!(
+            !artifact.exists(),
+            "no divergence artifact for a symlink-shadowed child"
+        );
+    }
+
     /// The node creates an empty directory the host lacks → created on the host.
     #[tokio::test]
     async fn sod_empty_dir_created() {
@@ -4650,6 +4712,67 @@ mod tests {
         );
     }
 
+    /// COV-01: when the FIRST additive host-file upload fails AFTER the lock dir
+    /// and owner.json land, persistent `reconcile_in` errors but the lock stays
+    /// TRACKED — and a later `teardown_all` releases it (`.ordius.lock` gone).
+    /// `set_fail_upload_after(1)` lets upload #0 (owner.json) succeed then fails
+    /// upload #1 (the first `sync_remote_additive` file).
+    #[tokio::test]
+    async fn persistent_reconcile_in_additive_error_after_lock_keeps_lock_tracked() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"hostA").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("persist-additive-fail");
+        let mgr = WorkspaceManager::new();
+        let binding = persistent_binding();
+
+        // owner.json (upload #0) succeeds; the first additive file upload (#1) fails.
+        fake.set_fail_upload_after(1);
+
+        let err = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect_err("additive upload failure must propagate");
+        assert!(
+            err.to_string().contains("injected upload failure"),
+            "got: {err}"
+        );
+
+        // owner.json DID land (the failure was the additive sync, not the lock).
+        assert!(
+            fake.stat("/srv/persist/.ordius.lock/owner.json")
+                .await
+                .unwrap()
+                .is_some(),
+            "owner.json (upload #0) must have landed before the additive failure"
+        );
+
+        // The lock is still TRACKED so teardown can release it.
+        assert_eq!(
+            mgr.persistent_lock_count(),
+            1,
+            "the lock must stay tracked after an additive-sync upload failure"
+        );
+
+        // Heal the gate so teardown's own work isn't blocked, then release.
+        fake.set_fail_upload_after(usize::MAX);
+        mgr.teardown_all(RunOutcome::Failed).await;
+
+        assert!(
+            fake.stat("/srv/persist/.ordius.lock")
+                .await
+                .unwrap()
+                .is_none(),
+            "teardown must release the tracked lock"
+        );
+        assert_eq!(
+            mgr.persistent_lock_count(),
+            0,
+            "lock map must be drained after teardown"
+        );
+    }
+
     // ── teardown_all: persistent lock release (T10) ───────────────────────────
 
     /// `teardown_all(Completed)` releases the persistent lock (removes the whole
@@ -4902,6 +5025,69 @@ mod tests {
         assert!(
             host_ws.join("g.txt").exists(),
             "host g.txt must exist after teardown (should be node-v1 or node-v2)"
+        );
+    }
+
+    /// COV-05: a PERSISTENT `reconcile_out` write-back failure must NOT preserve
+    /// the root (recovery is ephemeral-only). `preserved_root_count()` stays 0,
+    /// and a later same-key persistent `reconcile_in` must NOT move the root to a
+    /// `.recovery` sibling — the additive + no-delete-teardown invariants already
+    /// protect a persistent root, so it is never reset/recovered.
+    #[tokio::test]
+    async fn persistent_reconcile_out_failure_does_not_preserve_root() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"orig").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("persist-sod-outfail");
+        let root = "/srv/persist-sod";
+        let mgr = WorkspaceManager::new();
+        let binding = persistent_sod_binding();
+
+        mgr.reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("persistent reconcile_in (SoD)");
+
+        // Node produces output on the remote.
+        fake.upload_file(&format!("{root}/g.txt"), b"node-out")
+            .await
+            .unwrap();
+
+        // Drive reconcile_out to Err (the download hook fails the write-back).
+        fake.set_fail_download(true);
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect_err("reconcile_out write-back must fail");
+
+        // A persistent root is NEVER preserved — recovery is ephemeral-only.
+        assert_eq!(
+            mgr.preserved_root_count(),
+            0,
+            "a persistent reconcile_out failure must not preserve the root"
+        );
+
+        // Heal the transport; a second persistent reconcile_in for the same key
+        // must NOT rename the root to `.recovery` (no preserved entry to recover).
+        fake.set_fail_download(false);
+        mgr.reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("second persistent reconcile_in");
+
+        assert!(
+            fake.stat(root).await.unwrap().is_some(),
+            "persistent root must remain intact after a write-back failure"
+        );
+        assert!(
+            fake.stat(&format!("{root}.recovery"))
+                .await
+                .unwrap()
+                .is_none(),
+            "a persistent root must never be moved to a .recovery sibling"
+        );
+        // The node's output is still on the (un-reset) persistent root.
+        assert!(
+            fake.stat(&format!("{root}/g.txt")).await.unwrap().is_some(),
+            "the node's output survives on the persistent root"
         );
     }
 

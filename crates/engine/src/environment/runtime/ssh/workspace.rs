@@ -179,6 +179,29 @@ impl WorkspaceTransport for SshSftpTransport {
         file.shutdown()
             .await
             .map_err(|e| self.err("flush (tmp)", &e.into()))?;
+        // Stock OpenSSH SFTP `rename` won't overwrite an existing target, and a
+        // surviving target is possible on a retry (`reset_remote_to_host` keeps
+        // target files). Kind-aware remove-before-rename: a directory is a hard
+        // conflict; a file/symlink is the target we are replacing → remove it;
+        // NotFound (the common fresh-root case) → nothing to remove.
+        match self.session.symlink_metadata(rel).await {
+            Ok(attrs) if attrs.file_type().is_dir() => {
+                return Err(DispatchError::WorkspaceUnavailable {
+                    env_id: self.env_id.clone(),
+                    reason: format!(
+                        "remote target `{rel}` is a directory; cannot overwrite with a file"
+                    ),
+                });
+            },
+            Ok(_) => {
+                self.session
+                    .remove_file(rel)
+                    .await
+                    .map_err(|ref e| self.err("remove (pre-overwrite)", e))?;
+            },
+            Err(ref e) if is_not_found(e) => {},
+            Err(ref e) => return Err(self.err("stat (pre-overwrite)", e)),
+        }
         self.session
             .rename(tmp, rel)
             .await
@@ -224,11 +247,27 @@ impl WorkspaceTransport for SshSftpTransport {
         // entries). Residual window: if the rename below fails after the remove,
         // the remote is briefly missing a host file that the next reconcile
         // re-uploads (the host is the source of truth).
-        if self.session.symlink_metadata(target_rel).await.is_ok() {
-            self.session
-                .remove_file(target_rel)
-                .await
-                .map_err(|ref e| self.err("remove (pre-overwrite)", e))?;
+        // Kind-aware pre-overwrite: a directory must never be unlinked by
+        // `remove_file` (it would fail, or worse silently no-op on some servers);
+        // surface a clear conflict instead. A file/symlink is the host-owned
+        // target we are replacing → remove it. NotFound → nothing to remove.
+        match self.session.symlink_metadata(target_rel).await {
+            Ok(attrs) if attrs.file_type().is_dir() => {
+                return Err(DispatchError::WorkspaceUnavailable {
+                    env_id: self.env_id.clone(),
+                    reason: format!(
+                        "remote target `{target_rel}` is a directory; cannot overwrite with a file"
+                    ),
+                });
+            },
+            Ok(_) => {
+                self.session
+                    .remove_file(target_rel)
+                    .await
+                    .map_err(|ref e| self.err("remove (pre-overwrite)", e))?;
+            },
+            Err(ref e) if is_not_found(e) => {},
+            Err(ref e) => return Err(self.err("stat (pre-overwrite)", e)),
         }
         self.session
             .rename(tmp, target_rel)
