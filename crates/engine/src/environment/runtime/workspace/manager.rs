@@ -4674,6 +4674,194 @@ mod tests {
         );
     }
 
+    // ── persistent write-back: two-manifest split + teardown advancement (T12) ──
+
+    /// A persistent `SoD` binding (stable template + `SafeOrDiverge` policy), for the
+    /// two-manifest write-back tests.
+    fn persistent_sod_binding() -> WorkspaceBinding {
+        sftp_binding(
+            "/srv/persist-sod",
+            WriteBackPolicy::SafeOrDiverge {
+                mode: ConflictDetect::Manifest,
+                ignore: vec![],
+                max_files: default_max_files(),
+            },
+        )
+    }
+
+    /// A persistent Force binding (stable template + Force policy), for the
+    /// Force variant of the foreign-file test.
+    fn persistent_force_binding() -> WorkspaceBinding {
+        sftp_binding(
+            "/srv/persist-force",
+            WriteBackPolicy::Force { ignore: vec![] },
+        )
+    }
+
+    /// A pre-existing foreign file (present on the remote BEFORE `reconcile_in`)
+    /// must NOT be written back to the host after `reconcile_out` — it was already
+    /// in `last_remote_manifest`, so it is not a write-back delta.
+    ///
+    /// Tested with a Force policy (Force writes everything that changed relative to
+    /// `last_remote_manifest`; a file equal in old and new remote is not a change).
+    #[tokio::test]
+    async fn persistent_foreign_file_not_written_back_to_host_force() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"hostA").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("persist-foreign-force");
+        // Seed the foreign file on the remote BEFORE reconcile_in, so additive
+        // sync records it in last_remote_manifest but NOT in host_manifest_at_in.
+        let root = "/srv/persist-force";
+        fake.upload_file(&format!("{root}/foreign.txt"), b"F")
+            .await
+            .unwrap();
+
+        let mgr = WorkspaceManager::new();
+        let binding = persistent_force_binding();
+        mgr.reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("persistent reconcile_in (Force)");
+
+        // Node creates a new output file on the remote.
+        fake.upload_file(&format!("{root}/g.txt"), b"node-out")
+            .await
+            .unwrap();
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out (Force)");
+
+        // The node output IS written back.
+        assert_eq!(
+            std::fs::read(host_ws.join("g.txt")).unwrap(),
+            b"node-out",
+            "node output must be written back to the host"
+        );
+        // The pre-existing foreign file must NOT appear on the host.
+        assert!(
+            !host_ws.join("foreign.txt").exists(),
+            "foreign pre-existing remote file must not be imported to the host on write-back"
+        );
+    }
+
+    /// Same as `persistent_foreign_file_not_written_back_to_host_force` but with
+    /// a `SafeOrDiverge` policy.  The two-manifest delta check is the same: a file
+    /// present in `last_remote_manifest` with an unchanged hash is not a delta and
+    /// is never considered for write-back to the host.
+    #[tokio::test]
+    async fn persistent_foreign_file_not_written_back_to_host_sod() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"hostA").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("persist-foreign-sod");
+        let root = "/srv/persist-sod";
+        // Seed the foreign file BEFORE reconcile_in.
+        fake.upload_file(&format!("{root}/foreign.txt"), b"F")
+            .await
+            .unwrap();
+
+        let mgr = WorkspaceManager::new();
+        let binding = persistent_sod_binding();
+        mgr.reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("persistent reconcile_in (SoD)");
+
+        // Node creates a new output file on the remote.
+        fake.upload_file(&format!("{root}/g.txt"), b"node-out")
+            .await
+            .unwrap();
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out (SoD)");
+
+        // The node output IS written back.
+        assert_eq!(
+            std::fs::read(host_ws.join("g.txt")).unwrap(),
+            b"node-out",
+            "node output must be written back to the host"
+        );
+        // The pre-existing foreign file must NOT appear on the host.
+        assert!(
+            !host_ws.join("foreign.txt").exists(),
+            "foreign pre-existing remote file must not be imported to the host on write-back (SoD)"
+        );
+        // No spurious divergence entry for the foreign file either.
+        assert!(
+            !diverged_dir(host_ws, "ssh:persist-foreign-sod").exists(),
+            "no divergence dir should exist — the foreign file is not a delta"
+        );
+    }
+
+    /// After a successful `reconcile_out`, `host_manifest_at_in` is advanced to
+    /// the written-back state.  A subsequent remote re-touch (simulating a daemon
+    /// re-uploading the same key) must NOT produce a false divergence at teardown:
+    /// because the host still matches the advanced baseline, `SafeOrDiverge` sees
+    /// the host as unchanged and applies the update rather than diverging.
+    #[tokio::test]
+    async fn persistent_teardown_after_reconcile_out_no_false_diverge() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        // Host starts with no g.txt.
+
+        let (d, fake) = ssh_dispatcher_with_fake("persist-td-advance");
+        let root = "/srv/persist-sod";
+        let mgr = WorkspaceManager::new();
+        let binding = persistent_sod_binding();
+
+        // Step 1: reconcile_in (host is empty — g.txt absent).
+        mgr.reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+
+        // Step 2: node creates g.txt="node-v1" on the remote; reconcile_out
+        // writes it to the host and advances host_manifest_at_in to node-v1.
+        fake.upload_file(&format!("{root}/g.txt"), b"node-v1")
+            .await
+            .unwrap();
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out");
+        assert_eq!(
+            std::fs::read(host_ws.join("g.txt")).unwrap(),
+            b"node-v1",
+            "reconcile_out must have written node-v1 to the host"
+        );
+
+        // Step 3: daemon re-touches the remote with "node-v2".  The host still
+        // holds "node-v1" (the advanced host@in baseline).
+        fake.upload_file(&format!("{root}/g.txt"), b"node-v2")
+            .await
+            .unwrap();
+
+        // Step 4: teardown — should apply node-v2 (host matches advanced baseline
+        // → SafeOrDiverge sees no conflict).
+        mgr.teardown_all(RunOutcome::Completed).await;
+
+        // KEY assertion: the host must NOT be spuriously diverged.  It must either
+        // hold node-v2 (applied) or node-v1 (unchanged), but the divergence dir
+        // for g.txt must not exist.
+        let diverged = diverged_dir(host_ws, "ssh:persist-td-advance");
+        if diverged.exists() {
+            // Walk the diverged tree; fail with a clear message if g.txt is there.
+            let g_artifact = diverged.join("g.txt");
+            assert!(
+                !g_artifact.exists(),
+                "teardown must NOT falsely diverge g.txt after reconcile_out advanced host@in; \
+                 g.txt was found under the divergence dir — §10 regression"
+            );
+        }
+        // The host file should be present (either node-v1 or node-v2 is fine;
+        // the critical property is no false diverge, not which version won).
+        assert!(
+            host_ws.join("g.txt").exists(),
+            "host g.txt must exist after teardown (should be node-v1 or node-v2)"
+        );
+    }
+
     /// `teardown_all(CancelledByUser)` also releases the persistent lock — lock
     /// release is unconditional, unlike write-back which is skipped on cancel.
     #[tokio::test]
