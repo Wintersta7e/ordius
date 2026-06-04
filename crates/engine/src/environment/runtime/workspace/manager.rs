@@ -100,6 +100,10 @@ struct WorkspaceState {
     transport_factory: Arc<dyn WorkspaceTransportFactory>,
     /// Write-back policy for this workspace.
     write_back: WriteBackPolicy,
+    /// What WE uploaded at this node's `reconcile_in` (host@in). `SafeOrDiverge`
+    /// host-conflict baseline ONLY; `Force` never reads it. Advanced per-path on
+    /// write-back: applied rels move forward, diverged rels stay pinned.
+    host_manifest_at_in: safety::Manifest,
     /// Snapshot of the remote manifest as of the last `reconcile_in`/`reconcile_out`.
     /// Used as the write-back baseline by `reconcile_out`.
     last_remote_manifest: safety::Manifest,
@@ -113,6 +117,10 @@ impl std::fmt::Debug for WorkspaceState {
             .field("env_side_root", &self.env_side_root)
             .field("lifecycle", &self.lifecycle)
             .field("write_back", &self.write_back)
+            .field(
+                "host_manifest_at_in_files",
+                &self.host_manifest_at_in.files.len(),
+            )
             .field(
                 "last_remote_manifest_files",
                 &self.last_remote_manifest.files.len(),
@@ -278,13 +286,20 @@ impl WorkspaceManager {
         let mut preserve: std::collections::HashSet<(EnvId, String)> =
             std::collections::HashSet::new();
         for (key, s) in states {
+            // Both baselines come from the drained state; teardown owns these
+            // entries and does not store the advanced manifests back (the run
+            // loop has exited and nothing reads `state` afterwards).
+            let baselines = Baselines {
+                host_at_in: s.host_manifest_at_in.clone(),
+                remote: s.last_remote_manifest.clone(),
+            };
             if outcome != RunOutcome::CancelledByUser
                 && let Err(e) = reconcile_write_back(
                     &s.write_back,
                     &s.transport_factory,
                     &s.env_side_root,
                     &key.1,
-                    &s.last_remote_manifest,
+                    &baselines,
                     &s.run_id,
                     key.0.as_str(),
                 )
@@ -424,6 +439,11 @@ impl WorkspaceManager {
                     lifecycle,
                     transport_factory: Arc::clone(&factory),
                     write_back: write_back.clone(),
+                    // Ephemeral: both baselines equal the uploaded manifest (a
+                    // reset leaves the remote byte-for-byte equal to the host, no
+                    // foreign files). A later task overrides last_remote_manifest
+                    // for persistent roots (uploaded ∪ preserved foreign entries).
+                    host_manifest_at_in: uploaded.clone(),
                     last_remote_manifest: uploaded,
                     run_id: run.run_id.to_string(),
                 },
@@ -477,14 +497,17 @@ impl WorkspaceManager {
         let key = (dispatcher.info().id.clone(), host_ws.to_path_buf());
 
         // Extract everything we need by clone, then DROP the lock before awaiting.
-        let Some((root, factory, write_back, baseline, run_id)) = ({
+        let Some((root, factory, write_back, baselines, run_id)) = ({
             let st = self.state.lock(); // parking_lot — dropped before await
             st.get(&key).map(|s| {
                 (
                     s.env_side_root.clone(),
                     Arc::clone(&s.transport_factory),
                     s.write_back.clone(),
-                    s.last_remote_manifest.clone(),
+                    Baselines {
+                        host_at_in: s.host_manifest_at_in.clone(),
+                        remote: s.last_remote_manifest.clone(),
+                    },
                     s.run_id.clone(),
                 )
             })
@@ -494,12 +517,12 @@ impl WorkspaceManager {
 
         // Policy-dispatched: None no-ops, Force overwrites, SafeOrDiverge writes
         // back where the host is unchanged and diverges where it conflicts.
-        let new_remote = match reconcile_write_back(
+        let (new_remote, new_host_at_in) = match reconcile_write_back(
             &write_back,
             &factory,
             &root,
             host_ws,
-            &baseline,
+            &baselines,
             &run_id,
             key.0.as_str(),
         )
@@ -518,9 +541,12 @@ impl WorkspaceManager {
             },
         };
 
-        // Advance the baseline so the next reconcile_out diffs against this state.
+        // Advance both baselines so the next reconcile_out diffs against this
+        // state: the remote snapshot drives delta detection, and host@in drives
+        // SafeOrDiverge host-conflict checks (with diverged rels kept pinned).
         if let Some(s) = self.state.lock().get_mut(&key) {
             s.last_remote_manifest = new_remote;
+            s.host_manifest_at_in = new_host_at_in;
         }
         Ok(())
     }
@@ -981,24 +1007,53 @@ fn reconcile_host_dirs(
     }
 }
 
+/// The two baselines a write-back diffs against.
+///
+/// `remote` (the full post-`reconcile_in` remote snapshot — host files PLUS any
+/// preserved foreign files) drives remote-delta detection. `host_at_in` (what we
+/// uploaded at this node's `reconcile_in`) drives `SafeOrDiverge` host-conflict
+/// checks ONLY; `Force` ignores it.
+#[derive(Clone)]
+pub(super) struct Baselines {
+    pub(super) host_at_in: safety::Manifest,
+    pub(super) remote: safety::Manifest,
+}
+
 /// Dispatch a node's final write-back by policy, returning the advanced remote
-/// manifest (the new baseline). `None` is a no-op (baseline unchanged); `Force`
-/// overwrites the host; `SafeOrDiverge` writes back where the host is unchanged
-/// and diverges where it conflicts. Used by both `reconcile_out` and the
-/// `teardown_all` safety net so the two paths apply identical semantics.
+/// manifest and the advanced `host_at_in` baseline (the new write-back state).
+/// `None` is a no-op (both baselines unchanged); `Force` overwrites the host;
+/// `SafeOrDiverge` writes back where the host is unchanged and diverges where it
+/// conflicts. Used by both `reconcile_out` and the `teardown_all` safety net so
+/// the two paths apply identical semantics.
+///
+/// The advanced `host_at_in` is the post-write-back host state, per-path: applied
+/// rels (Force overwrote, or SOD copied the node bytes back) advance to the
+/// written-back bytes; diverged rels (SOD kept the host's own version) stay
+/// PINNED to the prior `host_at_in` so a later teardown re-run still sees the
+/// conflict; untouched rels are unchanged.
 async fn reconcile_write_back(
     policy: &WriteBackPolicy,
     factory: &Arc<dyn WorkspaceTransportFactory>,
     root: &str,
     host_ws: &Path,
-    baseline: &safety::Manifest,
+    baselines: &Baselines,
     run_id: &str,
     env_id: &str,
-) -> Result<safety::Manifest, DispatchError> {
+) -> Result<(safety::Manifest, safety::Manifest), DispatchError> {
     match policy {
-        WriteBackPolicy::None => Ok(baseline.clone()),
+        WriteBackPolicy::None => Ok((baselines.remote.clone(), baselines.host_at_in.clone())),
         WriteBackPolicy::Force { ignore } => {
-            write_back_delta(factory, root, host_ws, baseline, ignore).await
+            let new_remote =
+                write_back_delta(factory, root, host_ws, &baselines.remote, ignore).await?;
+            // Force applies exactly the remote delta (old remote → new remote) to
+            // the host, so advance host_at_in by that delta. For the ephemeral
+            // path host_at_in == baselines.remote, so this yields new_remote
+            // (both manifests advance together — no behaviour change). Foreign
+            // files (persistent, later) are equal in old/new remote ⇒ not a delta
+            // ⇒ never written into host_at_in.
+            let advanced_host_at_in =
+                advance_host_at_in_force(&baselines.host_at_in, &baselines.remote, &new_remote);
+            Ok((new_remote, advanced_host_at_in))
         },
         WriteBackPolicy::SafeOrDiverge {
             mode,
@@ -1011,12 +1066,55 @@ async fn reconcile_write_back(
                 ));
             }
             safe_or_diverge::write_back_safe_or_diverge(
-                factory, root, host_ws, baseline, ignore, *max_files, run_id, env_id,
+                factory, root, host_ws, baselines, ignore, *max_files, run_id, env_id,
             )
             .await
-            .map(|(manifest, _report)| manifest)
+            .map(|(remote, host_at_in, _report)| (remote, host_at_in))
         },
     }
+}
+
+/// Advance the `host_at_in` baseline after a `Force` write-back.
+///
+/// `Force` mirrors the remote delta (`old_remote` → `new_remote`) onto the host,
+/// so `host_at_in` advances by exactly that delta: changed/added file rels take
+/// the new entry, removed file rels are dropped, and dir adds/removes are mirrored
+/// in `dirs`. Rels equal in `old_remote` and `new_remote` are NOT touched — this
+/// is what keeps preserved foreign files (persistent reuse, a later task) out of
+/// `host_at_in` even though they appear in both remote snapshots. For the
+/// ephemeral path `host_at_in == old_remote`, so the result equals `new_remote`
+/// (both baselines advance together — no behaviour change).
+fn advance_host_at_in_force(
+    host_at_in: &safety::Manifest,
+    old_remote: &safety::Manifest,
+    new_remote: &safety::Manifest,
+) -> safety::Manifest {
+    let mut advanced = host_at_in.clone();
+
+    // File deltas: a rel whose entry changed/appeared takes the new entry; a rel
+    // that disappeared from the remote is dropped.
+    for (rel, entry) in &new_remote.files {
+        if old_remote.files.get(rel) != Some(entry) {
+            advanced.files.insert(rel.clone(), entry.clone());
+            advanced.dirs.remove(rel);
+        }
+    }
+    for rel in old_remote.files.keys() {
+        if !new_remote.files.contains_key(rel) {
+            advanced.files.remove(rel);
+        }
+    }
+
+    // Dir deltas: gained dirs are added, lost dirs removed.
+    for rel in new_remote.dirs.difference(&old_remote.dirs) {
+        advanced.dirs.insert(rel.clone());
+        advanced.files.remove(rel);
+    }
+    for rel in old_remote.dirs.difference(&new_remote.dirs) {
+        advanced.dirs.remove(rel);
+    }
+
+    advanced
 }
 
 /// Upper bound on recovery-sibling probes before giving up. A run could move
@@ -2763,6 +2861,84 @@ mod tests {
         assert_eq!(entry["reason"], "host_modified");
         assert!(entry.get("remote_sha256").is_some(), "got {entry}");
         assert!(entry.get("diverged_path").is_some(), "got {entry}");
+    }
+
+    /// A diverged rel keeps its `host@in` baseline PINNED across successive
+    /// write-backs: once `SafeOrDiverge` has preserved the host's own version,
+    /// the host-conflict baseline must NOT advance to the node's bytes. If it
+    /// did, a later write-back could see the host as "unchanged since upload"
+    /// and clobber a value the user is still actively editing (design H5 §10,
+    /// Codex R3).
+    ///
+    /// node1 diverges (host kept its own edit). The host is then set to exactly
+    /// the bytes a buggy advance would have pinned the baseline to ("node1"),
+    /// and node2 is written. With the baseline correctly pinned to "orig", the
+    /// host ("node1") still differs from `host@in` → diverges again (host kept).
+    /// With a buggy advance to "node1", the host would falsely match and node2
+    /// would overwrite it.
+    #[tokio::test]
+    async fn sod_diverged_path_stays_pinned_across_two_writebacks() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("out.txt"), b"orig").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-pin");
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        // First write-back: node sets "node1"; host concurrently edits to
+        // "user-edit" → host differs from host@in ("orig") → diverges.
+        fake.upload_file(&format!("{root}/out.txt"), b"node1")
+            .await
+            .unwrap();
+        std::fs::write(host_ws.join("out.txt"), b"user-edit").unwrap();
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out #1");
+
+        // Host kept its own edit; node bytes diverged.
+        assert_eq!(
+            std::fs::read(host_ws.join("out.txt")).unwrap(),
+            b"user-edit"
+        );
+        let report = read_diverge_report(host_ws, "ssh:sod-pin");
+        assert_eq!(report_entry(&report, "out.txt")["reason"], "host_modified");
+
+        // Now the host is edited to exactly the bytes a *buggy* advance would
+        // have pinned host@in to (the node1 bytes). With host@in correctly
+        // pinned to "orig", this is still a divergence (host != "orig").
+        std::fs::write(host_ws.join("out.txt"), b"node1").unwrap();
+        // Second write-back: node sets "node2".
+        fake.upload_file(&format!("{root}/out.txt"), b"node2")
+            .await
+            .unwrap();
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out #2");
+
+        // CRITICAL: the host is preserved — NOT overwritten with "node2".
+        // A bug that advanced host@in to "node1" after the first divergence
+        // would treat the host ("node1") as unchanged-since-upload and clobber
+        // it. The pin to "orig" keeps it a conflict.
+        assert_eq!(
+            std::fs::read(host_ws.join("out.txt")).unwrap(),
+            b"node1",
+            "diverged host@in must stay pinned to `orig`; the host must not be \
+             overwritten by node2"
+        );
+        let report = read_diverge_report(host_ws, "ssh:sod-pin");
+        let entry = report_entry(&report, "out.txt");
+        assert_eq!(entry["reason"], "host_modified");
+        assert_eq!(
+            std::fs::read(diverged_dir(host_ws, "ssh:sod-pin").join("out.txt")).unwrap(),
+            b"node2",
+            "the SECOND divergence preserves the node2 bytes"
+        );
     }
 
     /// A new node file at a rel the host never had → written back in place; no

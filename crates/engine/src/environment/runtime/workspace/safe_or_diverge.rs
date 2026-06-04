@@ -20,8 +20,8 @@ use serde::Serialize;
 use crate::environment::runtime::error::DispatchError;
 
 use super::manager::{
-    RemoteFile, RemoteListing, host_io_err, is_shadowed_by_symlink, list_remote_files, tmp_sibling,
-    write_host_file_atomic,
+    Baselines, RemoteFile, RemoteListing, host_io_err, is_shadowed_by_symlink, list_remote_files,
+    tmp_sibling, write_host_file_atomic,
 };
 use super::safety;
 use super::transport::WorkspaceTransportFactory;
@@ -31,7 +31,10 @@ struct SodCtx<'a> {
     host_ws: &'a Path,
     run_id: &'a str,
     env_id: &'a str,
-    baseline: &'a safety::Manifest,
+    /// The `host@in` baseline — what `reconcile_in` uploaded. Drives the
+    /// host-conflict check (`matches_host_at_in` / `conflict_reason`): "is this
+    /// host path still byte-and-type identical to what we uploaded?".
+    host_at_in: &'a safety::Manifest,
 }
 
 /// The host file hash when the host is a regular file, else `None`
@@ -108,19 +111,27 @@ fn diverge_file(
 /// host still matches `host@in` is removed (`remove_file`/`remove_dir`, never
 /// recursive); a non-empty host dir is kept (`dir_delete_nonempty`); a host that
 /// diverged is kept (`delete_vs_host_modified` / `host_unsafe`).
+///
+/// Rels whose deletion is applied (the host is removed, or was already absent —
+/// the node-deleted target is reached) are pushed to `applied` so the caller can
+/// advance `host@in` (drop the rel). Diverged / kept rels are not pushed (their
+/// `host@in` entry stays pinned).
 fn sod_deletions(
     ctx: &SodCtx,
     report: &mut DivergeReport,
+    applied: &mut Vec<String>,
     deletions: &[(String, bool)],
 ) -> Result<(), DispatchError> {
     for (rel, is_dir) in deletions {
         let host = classify_host_state(ctx.host_ws, rel);
         // No-op: the node deleted this rel and the host is already absent (the
-        // user agreed) — nothing to remove and no false conflict to report.
+        // user agreed) — nothing to remove and no false conflict to report. The
+        // node-deleted target is reached, so advance host@in (drop the rel).
         if host == HostState::Absent {
+            applied.push(rel.clone());
             continue;
         }
-        if !matches_host_at_in(&host, ctx.baseline, rel) {
+        if !matches_host_at_in(&host, ctx.host_at_in, rel) {
             let reason = match host {
                 HostState::UnsafeSymlink | HostState::Unreadable => DivergeReason::HostUnsafe,
                 _ => DivergeReason::DeleteVsHostModified,
@@ -135,8 +146,8 @@ fn sod_deletions(
             std::fs::remove_file(&target)
         };
         match res {
-            Ok(()) => {},
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Ok(()) => applied.push(rel.clone()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => applied.push(rel.clone()),
             Err(e) if *is_dir && e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
                 report
                     .diverged
@@ -154,18 +165,24 @@ fn sod_deletions(
 /// Phase 2 — file↔dir type-change replacements (the dir→file children were
 /// already removed in phase 1, so the host dir is empty here). A host that no
 /// longer matches `host@in` is preserved (diverged / reported).
+///
+/// Rels whose type change is applied (or whose target shape already exists) are
+/// pushed to `applied`; diverged rels are not (their `host@in` entry stays
+/// pinned).
 fn sod_type_changes(
     ctx: &SodCtx,
     report: &mut DivergeReport,
+    applied: &mut Vec<String>,
     file_to_dir: &[String],
     dir_to_file: &[&RemoteFile],
 ) -> Result<(), DispatchError> {
     for rel in file_to_dir {
         let host = classify_host_state(ctx.host_ws, rel);
         if host == HostState::Dir {
+            applied.push(rel.clone());
             continue; // already a dir
         }
-        if matches_host_at_in(&host, ctx.baseline, rel) {
+        if matches_host_at_in(&host, ctx.host_at_in, rel) {
             // Host is the uploaded file — remove it, then create the dir in its
             // place. A NotFound here is benign (already gone); any other fs
             // error means the node's dir output would be lost — propagate.
@@ -180,10 +197,11 @@ fn sod_type_changes(
             {
                 return Err(host_io_err(&target, "type-change dir create", &e));
             }
+            applied.push(rel.clone());
         } else {
             report.diverged.push(report_only(
                 rel,
-                conflict_reason(&host, ctx.baseline, rel),
+                conflict_reason(&host, ctx.host_at_in, rel),
                 &host,
             ));
         }
@@ -194,14 +212,16 @@ fn sod_type_changes(
         if let HostState::File { sha256_hex } = &host
             && *sha256_hex == f.entry.sha256_hex
         {
+            applied.push(rel.to_string());
             continue; // host already holds the node's bytes
         }
-        if matches_host_at_in(&host, ctx.baseline, rel) {
+        if matches_host_at_in(&host, ctx.host_at_in, rel) {
             match std::fs::remove_dir(ctx.host_ws.join(rel)) {
                 Ok(()) => {
                     if safety::host_target_is_symlink_safe(ctx.host_ws, rel) {
                         write_host_file_atomic(ctx.host_ws, rel, &f.bytes)?;
                     }
+                    applied.push(rel.to_string());
                 },
                 // Untracked host children remain — cannot replace; preserve bytes.
                 Err(_) => diverge_file(
@@ -220,7 +240,7 @@ fn sod_type_changes(
                 ctx,
                 rel,
                 &f.bytes,
-                conflict_reason(&host, ctx.baseline, rel),
+                conflict_reason(&host, ctx.host_at_in, rel),
                 &host,
                 &f.entry.sha256_hex,
             )?;
@@ -231,27 +251,33 @@ fn sod_type_changes(
 
 /// Phase 3 — create plain new directories (shallow-first). A host that diverged
 /// from `host@in` (now holds a file/symlink) is reported, not overwritten.
+///
+/// Rels whose dir create is applied (or that are already a dir) are pushed to
+/// `applied`; diverged rels are not (their `host@in` entry stays pinned).
 fn sod_dir_creates(
     ctx: &SodCtx,
     report: &mut DivergeReport,
+    applied: &mut Vec<String>,
     creates: &[String],
 ) -> Result<(), DispatchError> {
     for rel in creates {
         let host = classify_host_state(ctx.host_ws, rel);
         if host == HostState::Dir {
+            applied.push(rel.clone());
             continue; // already a dir
         }
-        if matches_host_at_in(&host, ctx.baseline, rel) {
+        if matches_host_at_in(&host, ctx.host_at_in, rel) {
             if safety::host_target_is_symlink_safe(ctx.host_ws, rel) {
                 let target = ctx.host_ws.join(rel);
                 if let Err(e) = std::fs::create_dir_all(&target) {
                     return Err(host_io_err(&target, "dir create", &e));
                 }
             }
+            applied.push(rel.clone());
         } else {
             report.diverged.push(report_only(
                 rel,
-                conflict_reason(&host, ctx.baseline, rel),
+                conflict_reason(&host, ctx.host_at_in, rel),
                 &host,
             ));
         }
@@ -262,9 +288,13 @@ fn sod_dir_creates(
 /// Phase 4 — write plain changed/new files. The host is overwritten only where
 /// it still matches `host@in`; otherwise the node's bytes are diverged and the
 /// host is kept.
+///
+/// Rels written back (or that already hold the node's bytes) are pushed to
+/// `applied`; diverged rels are not (their `host@in` entry stays pinned).
 fn sod_file_writes(
     ctx: &SodCtx,
     report: &mut DivergeReport,
+    applied: &mut Vec<String>,
     writes: &[&RemoteFile],
 ) -> Result<(), DispatchError> {
     for f in writes {
@@ -273,19 +303,21 @@ fn sod_file_writes(
         if let HostState::File { sha256_hex } = &host
             && *sha256_hex == f.entry.sha256_hex
         {
+            applied.push(rel.to_string());
             continue; // host already holds the node's bytes
         }
-        if matches_host_at_in(&host, ctx.baseline, rel) {
+        if matches_host_at_in(&host, ctx.host_at_in, rel) {
             if safety::host_target_is_symlink_safe(ctx.host_ws, rel) {
                 write_host_file_atomic(ctx.host_ws, rel, &f.bytes)?;
             }
+            applied.push(rel.to_string());
         } else {
             diverge_file(
                 report,
                 ctx,
                 rel,
                 &f.bytes,
-                conflict_reason(&host, ctx.baseline, rel),
+                conflict_reason(&host, ctx.host_at_in, rel),
                 &host,
                 &f.entry.sha256_hex,
             )?;
@@ -427,23 +459,28 @@ fn sod_partition<'a>(
 /// deletion (a baseline rel they shadow is reported `remote_unsupported_symlink`,
 /// host untouched). The four phases (deletions → type changes → dir creates →
 /// file writes) keep parents/children from colliding; each mutation re-classifies
-/// the host immediately before acting (the best-effort TOCTOU recheck). Returns
-/// the advanced remote manifest (the new baseline) and the report.
+/// the host immediately before acting (the best-effort TOCTOU recheck).
+///
+/// Delta detection (which rels the node changed) diffs the new remote snapshot
+/// against `baselines.remote`; host-conflict detection compares against
+/// `baselines.host_at_in`. Returns the advanced remote manifest, the advanced
+/// `host@in` baseline (applied rels move forward, diverged rels stay PINNED to
+/// the prior `host@in`), and the report.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn write_back_safe_or_diverge(
     factory: &Arc<dyn WorkspaceTransportFactory>,
     root: &str,
     host_ws: &Path,
-    baseline: &safety::Manifest,
+    baselines: &Baselines,
     ignore: &[String],
     max_files: usize,
     run_id: &str,
     env_id: &str,
-) -> Result<(safety::Manifest, DivergeReport), DispatchError> {
+) -> Result<(safety::Manifest, safety::Manifest, DivergeReport), DispatchError> {
     let t = factory.open().await?;
     let listing = list_remote_files(t, root).await?;
 
-    // Advanced baseline (returned regardless of conflicts).
+    // Advanced remote baseline (returned regardless of conflicts).
     let mut new_remote = safety::Manifest::new();
     new_remote.dirs.clone_from(&listing.dirs);
     for f in &listing.files {
@@ -451,7 +488,9 @@ pub(super) async fn write_back_safe_or_diverge(
     }
 
     // Classify the work up front so the cap fails fast before any host mutation.
-    let plan = sod_partition(baseline, &new_remote, &listing, ignore);
+    // Delta detection diffs against the remote baseline (not host@in), so a
+    // preserved foreign file is never seen as a new node output.
+    let plan = sod_partition(&baselines.remote, &new_remote, &listing, ignore);
     if plan.considered > max_files {
         return Err(DispatchError::WorkspaceUnavailable {
             env_id: "<host>".into(),
@@ -478,22 +517,51 @@ pub(super) async fn write_back_safe_or_diverge(
     }
 
     // Four-phase application (each mutation re-classifies the host immediately
-    // before acting — the best-effort TOCTOU recheck).
+    // before acting — the best-effort TOCTOU recheck). Host-conflict checks
+    // compare against host@in; `applied` collects every rel whose host reached
+    // the node target so host@in can advance for it (diverged rels stay pinned).
     let ctx = SodCtx {
         host_ws,
         run_id,
         env_id,
-        baseline,
+        host_at_in: &baselines.host_at_in,
     };
-    sod_deletions(&ctx, &mut report, &plan.deletions)?;
-    sod_type_changes(&ctx, &mut report, &plan.file_to_dir, &plan.dir_to_file)?;
-    sod_dir_creates(&ctx, &mut report, &plan.dir_creates)?;
-    sod_file_writes(&ctx, &mut report, &plan.file_writes)?;
+    let mut applied: Vec<String> = Vec::new();
+    sod_deletions(&ctx, &mut report, &mut applied, &plan.deletions)?;
+    sod_type_changes(
+        &ctx,
+        &mut report,
+        &mut applied,
+        &plan.file_to_dir,
+        &plan.dir_to_file,
+    )?;
+    sod_dir_creates(&ctx, &mut report, &mut applied, &plan.dir_creates)?;
+    sod_file_writes(&ctx, &mut report, &mut applied, &plan.file_writes)?;
 
     if !report.diverged.is_empty() {
         write_diverge_report(host_ws, run_id, env_id, &report)?;
     }
-    Ok((new_remote, report))
+
+    // Advance host@in per-path: applied rels take the node target from the new
+    // remote snapshot (a file entry, a dir, or a deletion); diverged and
+    // untouched rels keep their prior host@in entry (the diverged-pin — a later
+    // teardown re-run must still see the conflict).
+    let mut new_host_at_in = baselines.host_at_in.clone();
+    for rel in &applied {
+        if let Some(entry) = new_remote.files.get(rel) {
+            new_host_at_in.files.insert(rel.clone(), entry.clone());
+            new_host_at_in.dirs.remove(rel);
+        } else if new_remote.dirs.contains(rel) {
+            new_host_at_in.dirs.insert(rel.clone());
+            new_host_at_in.files.remove(rel);
+        } else {
+            // Applied a deletion — the rel is gone from the remote and the host.
+            new_host_at_in.files.remove(rel);
+            new_host_at_in.dirs.remove(rel);
+        }
+    }
+
+    Ok((new_remote, new_host_at_in, report))
 }
 
 // ── SafeOrDiverge divergence artifacts ─────────────────────────────────────────
