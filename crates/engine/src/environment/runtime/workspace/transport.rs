@@ -32,6 +32,15 @@ pub struct FileMeta {
     pub mode: u32,
 }
 
+/// Outcome of trying to atomically claim a lock directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockOutcome {
+    /// We created the lock dir — caller owns the lock.
+    Acquired,
+    /// The lock dir already exists as a directory — another run holds it.
+    Contended,
+}
+
 // ── Factory trait ─────────────────────────────────────────────────────────────
 
 /// Opens a fresh [`WorkspaceTransport`] per reconcile phase.
@@ -87,6 +96,12 @@ pub trait WorkspaceTransport: Send {
 
     /// Set Unix permission bits on `rel`.
     async fn set_permissions(&self, rel: &str, mode: u32) -> Result<(), DispatchError>;
+
+    /// Atomically create the lock directory at `rel` (a single, exclusive create —
+    /// NOT the idempotent mkdir-p). `Acquired` = we created it; `Contended` = it
+    /// already exists as a directory. A non-directory entry at `rel`, or an
+    /// unrecoverable transport error, returns `Err`.
+    async fn try_acquire_lock_dir(&self, rel: &str) -> Result<LockOutcome, DispatchError>;
 }
 
 // ── In-memory fake ────────────────────────────────────────────────────────────
@@ -111,7 +126,10 @@ mod fake_impl {
     use async_trait::async_trait;
     use parking_lot::Mutex;
 
-    use super::{DispatchError, FileKind, FileMeta, WorkspaceTransport, WorkspaceTransportFactory};
+    use super::{
+        DispatchError, FileKind, FileMeta, LockOutcome, WorkspaceTransport,
+        WorkspaceTransportFactory,
+    };
 
     #[derive(Debug, Default, Clone)]
     struct FakeFs {
@@ -151,9 +169,8 @@ mod fake_impl {
         }
 
         /// Create the dir at `rel`, erroring if ANY entry already exists there
-        /// (exclusive — models a single non-idempotent `mkdir`).
-        // wired to the trait in T5
-        #[allow(dead_code)]
+        /// (exclusive — models a single non-idempotent `mkdir`). Called by
+        /// `try_acquire_lock_dir`.
         pub(super) fn create_dir_exclusive(&self, rel: &str) -> Result<(), DispatchError> {
             let mut fs = self.inner.lock();
             if fs.dirs.contains(rel) || fs.files.contains_key(rel) || fs.symlinks.contains_key(rel)
@@ -419,6 +436,24 @@ mod fake_impl {
             self.inner.lock().modes.insert(rel.to_owned(), mode);
             Ok(())
         }
+
+        async fn try_acquire_lock_dir(&self, rel: &str) -> Result<LockOutcome, DispatchError> {
+            // Reuse the exclusive create: Ok => we made it; Err(exists) => check kind.
+            {
+                let fs = self.inner.lock();
+                if fs.files.contains_key(rel) || fs.symlinks.contains_key(rel) {
+                    return Err(DispatchError::WorkspaceUnavailable {
+                        env_id: "fake".into(),
+                        reason: format!("lock path exists but is not a directory: {rel}"),
+                    });
+                }
+                if fs.dirs.contains(rel) {
+                    return Ok(LockOutcome::Contended);
+                }
+            }
+            self.create_dir_exclusive(rel)?;
+            Ok(LockOutcome::Acquired)
+        }
     }
 
     /// Factory that hands out state-sharing clones of one [`FakeWorkspaceTransport`].
@@ -624,6 +659,36 @@ mod tests {
         assert!(
             t.create_dir_exclusive("f.txt").is_err(),
             "create_dir_exclusive where a file exists must fail"
+        );
+    }
+
+    // `try_acquire_lock_dir` claims the lock on the first call (`Acquired`),
+    // reports `Contended` on a second call against the now-held dir, and errors
+    // hard when a non-directory entry already occupies the lock path.
+    #[tokio::test]
+    async fn fake_try_acquire_lock_dir_acquire_then_contend() {
+        let t = FakeWorkspaceTransport::default();
+
+        // First call: we create the lock dir.
+        assert_eq!(
+            t.try_acquire_lock_dir("r/.ordius.lock").await.unwrap(),
+            LockOutcome::Acquired,
+            "first acquire must report Acquired"
+        );
+
+        // Second call: the dir is held, so we are contended.
+        assert_eq!(
+            t.try_acquire_lock_dir("r/.ordius.lock").await.unwrap(),
+            LockOutcome::Contended,
+            "second acquire must report Contended"
+        );
+
+        // A non-directory entry at the lock path is a hard error.
+        let t2 = FakeWorkspaceTransport::default();
+        t2.upload_file("r/.ordius.lock", b"x").await.unwrap();
+        assert!(
+            t2.try_acquire_lock_dir("r/.ordius.lock").await.is_err(),
+            "try_acquire_lock_dir over a file must error"
         );
     }
 }

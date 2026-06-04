@@ -16,7 +16,7 @@ use tokio::io::AsyncWriteExt as _;
 use crate::environment::runtime::error::DispatchError;
 use crate::environment::runtime::workspace::safety;
 use crate::environment::runtime::workspace::transport::{
-    FileKind, FileMeta, WorkspaceTransport, WorkspaceTransportFactory,
+    FileKind, FileMeta, LockOutcome, WorkspaceTransport, WorkspaceTransportFactory,
 };
 
 use super::connection::{RusshConnector, SshConnectionCache};
@@ -239,6 +239,50 @@ impl WorkspaceTransport for SshSftpTransport {
             .set_metadata(rel, attrs)
             .await
             .map_err(|ref e| self.err("set_metadata", e))
+    }
+
+    async fn try_acquire_lock_dir(&self, rel: &str) -> Result<LockOutcome, DispatchError> {
+        // Raw exclusive create — NOT the idempotent mkdir. SFTP returns a generic
+        // SSH_FX_FAILURE on collision (no distinct EEXIST), so on error we
+        // disambiguate with lstat (`symlink_metadata`, no-follow) to classify
+        // what's at `rel` (Codex MAJOR 3, design §8.1).
+        const MAX_RETRY: u32 = 3;
+        let mut last_err = None;
+        for _ in 0..MAX_RETRY {
+            match self.session.create_dir(rel).await {
+                Ok(()) => return Ok(LockOutcome::Acquired),
+                Err(ref create_err) => {
+                    let mapped = self.err("create_dir (lock)", create_err);
+                    match self.session.symlink_metadata(rel).await {
+                        // A directory is already there — another run holds the lock.
+                        Ok(attrs) if attrs.file_type().is_dir() => {
+                            return Ok(LockOutcome::Contended);
+                        },
+                        // A non-directory entry occupies the lock path — hard error.
+                        Ok(_) => {
+                            return Err(DispatchError::WorkspaceUnavailable {
+                                env_id: self.env_id.clone(),
+                                reason: format!("lock path exists but is not a directory: {rel}"),
+                            });
+                        },
+                        // Not found: we raced with a release between create + lstat
+                        // — fall through and retry the create (bounded by MAX_RETRY).
+                        Err(ref lstat_err) if is_not_found(lstat_err) => {
+                            last_err = Some(mapped);
+                        },
+                        // lstat itself failed for another reason — surface the
+                        // original create_dir error context (design §8.1).
+                        Err(_) => return Err(mapped),
+                    }
+                },
+            }
+        }
+        Err(
+            last_err.unwrap_or_else(|| DispatchError::WorkspaceUnavailable {
+                env_id: self.env_id.clone(),
+                reason: format!("could not acquire lock dir {rel} after {MAX_RETRY} attempts"),
+            }),
+        )
     }
 }
 
