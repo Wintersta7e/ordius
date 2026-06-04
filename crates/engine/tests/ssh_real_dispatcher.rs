@@ -838,6 +838,49 @@ fn h3_root(run_id: &str) -> String {
     format!("/tmp/ordius-h3-{run_id}")
 }
 
+/// `Sync { Sftp, SafeOrDiverge { Manifest } }` binding whose ephemeral root
+/// embeds `{{run.id}}`. With a [`uniq_run_id`] the expanded root is
+/// `/tmp/ordius-sod-<run_id>`. Mirrors the engine-internal `sod_binding` helper
+/// (manifest-mode conflict detection, no ignore patterns, default file cap).
+fn sod_binding() -> WorkspaceBinding {
+    use ordius_engine::environment::runtime::env::{
+        ConflictDetect, SyncStrategy, WriteBackPolicy, default_max_files,
+    };
+    WorkspaceBinding::Sync {
+        env_path_template: "/tmp/ordius-sod-{{run.id}}".into(),
+        strategy: SyncStrategy::Sftp,
+        write_back: WriteBackPolicy::SafeOrDiverge {
+            mode: ConflictDetect::Manifest,
+            ignore: vec![],
+            max_files: default_max_files(),
+        },
+    }
+}
+
+/// The expanded ephemeral root for `run_id` under [`sod_binding`].
+fn sod_root(run_id: &str) -> String {
+    format!("/tmp/ordius-sod-{run_id}")
+}
+
+/// Walk `dir` recursively, returning every regular file's path. Used to locate
+/// divergence artifacts under `<host_ws>/.ordius/diverged/` without hardcoding
+/// the `encode_segment`-encoded `<run>/<env>` path components.
+fn walk_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk_files(&path));
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+    out
+}
+
 /// Build a `RunContext` that targets `dispatcher` (an SSH env) with an ephemeral
 /// `Sync{Force}` binding, sharing the given `wm` so the per-key lease is visible
 /// across contexts that share an `(env, host_ws)` key.
@@ -1381,4 +1424,149 @@ async fn real_ssh_reconcile_in_clears_symlinks() {
 
     drop(t);
     wm.teardown_all(RunOutcome::Completed).await;
+}
+
+/// Test 5 — `SafeOrDiverge` write-back diverges (does NOT clobber) when the host
+/// is edited concurrently with the run.
+///
+/// The real-SSH analogue of the engine-internal `sod_host_modified_diverges`
+/// unit test (which uses the in-memory fake). Sequence:
+///   1. host workspace has `out.txt` = "host-original"; `reconcile_in` uploads it
+///      and captures the baseline manifest.
+///   2. the remote node rewrites `out.txt` = "node-output" AND creates `newdir/`.
+///   3. BEFORE `reconcile_out`, the host edits `out.txt` = "user-edit" — the
+///      concurrent edit that makes the write-back conflict.
+///   4. `reconcile_out` (policy `SafeOrDiverge { Manifest }`) must:
+///        - KEEP the host `out.txt` = "user-edit" (not clobber it),
+///        - still apply the non-conflicting `newdir/` create on the host,
+///        - stash the node's "node-output" bytes under
+///          `<host_ws>/.ordius/diverged/<enc run>/<enc env>/out.txt`,
+///        - write a `diverge-report.json` alongside it.
+///
+/// The divergence dir name embeds `encode_segment(run_id)`/`encode_segment(env_id)`,
+/// which the integration crate can't reconstruct without depending on a private
+/// helper — so the artifacts are located by walking `.ordius/diverged/`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "gated: requires ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"]
+#[allow(clippy::too_many_lines)]
+async fn safe_or_diverge_diverges_on_concurrent_host_edit() {
+    use ordius_engine::environment::runtime::workspace::{RunOutcome, RunScope, WorkspaceManager};
+
+    let Some(ssh) = build_dispatcher_for_transport_test().await else {
+        eprintln!(
+            "skipping SafeOrDiverge divergence test; set ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"
+        );
+        return;
+    };
+    // This test drives `reconcile_in`/`reconcile_out` directly (no RunContext);
+    // both key their state by `dispatcher.info().id` internally.
+    let dispatcher: Arc<dyn Dispatcher> = Arc::new(ssh);
+
+    // Host workspace with a single tracked file the run will conflict on.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let host_ws = tmp.path().to_path_buf();
+    std::fs::write(host_ws.join("out.txt"), b"host-original").unwrap();
+
+    let run_id = uniq_run_id("sod");
+    let root = sod_root(&run_id);
+    let wm = Arc::new(WorkspaceManager::new());
+    let binding = sod_binding();
+    let run_scope = RunScope {
+        run_id: &run_id,
+        workflow_id: "wf-sod",
+        workflow_name: "SafeOrDiverge Test",
+        started_at_iso: "2026-01-01T00:00:00Z",
+    };
+
+    // ── 1. Upload the host workspace + capture the baseline manifest ──
+    let cwd = wm
+        .reconcile_in(dispatcher.as_ref(), &binding, &host_ws, &run_scope)
+        .await
+        .expect("reconcile_in uploads the workspace");
+    assert_eq!(
+        cwd.as_str(),
+        root,
+        "expanded root must match the SafeOrDiverge template"
+    );
+
+    // ── 2. Remote node rewrites out.txt and creates a new dir ──
+    // Runs inside the synced ephemeral root (a real node would use the env cwd).
+    h3_remote_exec(
+        &dispatcher,
+        &format!("cd {root} && printf node-output > out.txt && mkdir -p newdir"),
+    )
+    .await;
+
+    // ── 3. Concurrent host edit AFTER the baseline upload — creates the conflict ──
+    std::fs::write(host_ws.join("out.txt"), b"user-edit").unwrap();
+
+    // ── 4. reconcile_out: SafeOrDiverge keeps the host, diverges the node bytes ──
+    wm.reconcile_out(dispatcher.as_ref(), &binding, &host_ws)
+        .await
+        .expect("reconcile_out runs the SafeOrDiverge write-back");
+
+    // Host out.txt is KEPT — the concurrent edit is not clobbered.
+    assert_eq!(
+        std::fs::read(host_ws.join("out.txt")).unwrap(),
+        b"user-edit",
+        "SafeOrDiverge must preserve the concurrent host edit, not clobber it"
+    );
+
+    // The non-conflicting dir create still applied to the host.
+    assert!(
+        host_ws.join("newdir").is_dir(),
+        "a non-conflicting remote dir create must still be applied to the host"
+    );
+
+    // The node's bytes are stashed under .ordius/diverged/ (path components are
+    // encode_segment-encoded, so we walk the tree rather than hardcode them).
+    let diverged_root = host_ws.join(".ordius").join("diverged");
+    assert!(
+        diverged_root.is_dir(),
+        "a conflict must produce a .ordius/diverged/ tree"
+    );
+    let artifacts = walk_files(&diverged_root);
+
+    // Some file named out.txt under the divergence tree holds the node output.
+    let node_artifact = artifacts
+        .iter()
+        .find(|p| p.file_name().is_some_and(|n| n == "out.txt"))
+        .expect("a diverged out.txt artifact must exist under .ordius/diverged/");
+    assert_eq!(
+        std::fs::read(node_artifact).unwrap(),
+        b"node-output",
+        "the diverged artifact must hold the node's output bytes"
+    );
+
+    // A diverge-report.json must exist somewhere under the divergence tree.
+    let report_path = artifacts
+        .iter()
+        .find(|p| p.file_name().is_some_and(|n| n == "diverge-report.json"))
+        .expect("a diverge-report.json must exist under .ordius/diverged/");
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+    let entry = report["diverged"]
+        .as_array()
+        .expect("report must have a diverged array")
+        .iter()
+        .find(|e| e["rel"] == "out.txt")
+        .expect("report must record the out.txt conflict");
+    assert_eq!(
+        entry["reason"], "host_modified",
+        "out.txt diverged because the host modified it concurrently"
+    );
+
+    // Teardown deletes the ephemeral root (write-back already ran above).
+    wm.teardown_all(RunOutcome::Completed).await;
+
+    let t = dispatcher
+        .workspace_transport()
+        .unwrap()
+        .open()
+        .await
+        .unwrap();
+    assert!(
+        t.stat(&root).await.unwrap().is_none(),
+        "remote ephemeral root must be deleted after teardown"
+    );
 }
