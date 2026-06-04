@@ -68,6 +68,19 @@ pub trait WorkspaceTransport: Send {
     /// Write `bytes` to the file at `rel`, creating or replacing it.
     async fn upload_file(&self, rel: &str, bytes: &[u8]) -> Result<(), DispatchError>;
 
+    /// Atomically write `bytes` to `target_rel` using a temp file inside
+    /// `temp_dir_rel` (which the caller guarantees exists and is private), then
+    /// rename onto `target_rel`. Unlike `upload_file`'s sibling temp, this never
+    /// collides with a foreign `<target>.tmp` on a persistent root. `temp_dir_rel`
+    /// and `target_rel` must be on the same filesystem (both under the root) so
+    /// the rename is atomic.
+    async fn upload_file_atomic_via(
+        &self,
+        target_rel: &str,
+        temp_dir_rel: &str,
+        bytes: &[u8],
+    ) -> Result<(), DispatchError>;
+
     /// Read and return the full contents of the file at `rel`.
     async fn download_file(&self, rel: &str) -> Result<Vec<u8>, DispatchError>;
 
@@ -200,6 +213,29 @@ mod fake_impl {
                 fs.dirs.insert(parent.to_owned());
             }
             fs.files.insert(rel.to_owned(), bytes.to_vec());
+            drop(fs);
+            Ok(())
+        }
+
+        async fn upload_file_atomic_via(
+            &self,
+            target_rel: &str,
+            temp_dir_rel: &str,
+            bytes: &[u8],
+        ) -> Result<(), DispatchError> {
+            // The fake has no real temp need: write straight to the target. The
+            // `temp_dir_rel` is irrelevant here (the real SFTP impl writes a
+            // unique temp under it then renames); we only assert it is non-empty
+            // so a caller can't accidentally pass `""`.
+            debug_assert!(
+                !temp_dir_rel.is_empty(),
+                "temp_dir_rel must name the held lock-dir scratch"
+            );
+            let mut fs = self.inner.lock();
+            if let Some(parent) = target_rel.rsplit_once('/').map(|(p, _)| p) {
+                fs.dirs.insert(parent.to_owned());
+            }
+            fs.files.insert(target_rel.to_owned(), bytes.to_vec());
             drop(fs);
             Ok(())
         }

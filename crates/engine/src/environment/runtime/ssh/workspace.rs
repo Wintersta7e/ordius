@@ -6,6 +6,7 @@
 //! error to `DispatchError::EnvUnreachable`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use russh_sftp::client::SftpSession;
@@ -69,6 +70,7 @@ impl WorkspaceTransportFactory for SshSftpTransportFactory {
         Ok(Box::new(SshSftpTransport {
             session: Arc::new(session),
             env_id: self.env_id.clone(),
+            temp_seq: AtomicU64::new(0),
         }))
     }
 }
@@ -79,6 +81,10 @@ impl WorkspaceTransportFactory for SshSftpTransportFactory {
 pub struct SshSftpTransport {
     session: Arc<SftpSession>,
     env_id: String,
+    /// Monotonic counter giving each `upload_file_atomic_via` temp a unique,
+    /// deterministic name inside the held lock dir (no randomness, no foreign
+    /// collision).
+    temp_seq: AtomicU64,
 }
 
 impl SshSftpTransport {
@@ -178,6 +184,42 @@ impl WorkspaceTransport for SshSftpTransport {
             .rename(tmp, rel)
             .await
             .map_err(|ref e| self.err("rename (upload atomic)", e))?;
+        Ok(())
+    }
+
+    async fn upload_file_atomic_via(
+        &self,
+        target_rel: &str,
+        temp_dir_rel: &str,
+        bytes: &[u8],
+    ) -> Result<(), DispatchError> {
+        // Ensure the target's parent exists (SFTP `create` does not).
+        if let Some(parent) = target_rel.rsplit_once('/').map(|(p, _)| p) {
+            self.mkdir(parent).await?;
+        }
+        // Write to a uniquely-named temp INSIDE the caller-owned `temp_dir_rel`
+        // (the held lock dir), then rename onto the target. The temp name uses a
+        // per-transport monotonic counter so two uploads in one phase never reuse
+        // a name, and it lives in our private dir so no foreign `<target>.tmp`
+        // can ever be clobbered. `temp_dir_rel` and `target_rel` are both under
+        // the same root ⇒ the rename is atomic on the same filesystem.
+        let n = self.temp_seq.fetch_add(1, Ordering::Relaxed);
+        let tmp = format!("{temp_dir_rel}/upload.{n}.ordius.tmp");
+        let mut file = self
+            .session
+            .create(tmp.clone())
+            .await
+            .map_err(|ref e| self.err("create (lock-dir tmp)", e))?;
+        file.write_all(bytes)
+            .await
+            .map_err(|e| self.err("write_all", &e.into()))?;
+        file.shutdown()
+            .await
+            .map_err(|e| self.err("flush (lock-dir tmp)", &e.into()))?;
+        self.session
+            .rename(tmp, target_rel)
+            .await
+            .map_err(|ref e| self.err("rename (atomic via lock-dir)", e))?;
         Ok(())
     }
 

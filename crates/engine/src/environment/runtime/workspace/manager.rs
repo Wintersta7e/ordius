@@ -734,6 +734,198 @@ async fn reset_remote_to_host(
     Ok(manifest)
 }
 
+/// Additive host→remote sync for a PERSISTENT root: upload/overwrite the host's
+/// files, create the host's dirs, but NEVER delete a remote-only file or
+/// non-empty dir (preserve foreign state — design D1).
+///
+/// Returns `(host_at_in, last_remote)`:
+/// - `host_at_in` = the manifest of bytes WE uploaded (host files + the host's
+///   dirs). Drives `SafeOrDiverge` host-conflict checks only.
+/// - `last_remote` = `host_at_in` PLUS the preserved remote-only entries from the
+///   listing (foreign files/dirs not present in the host walk). Drives
+///   remote-delta detection in `reconcile_out` so a foreign file is never seen as
+///   a new node output.
+///
+/// Mirrors [`reset_remote_to_host`]'s structure but is additive — no remote-only
+/// deletion. The obstruction pass (design §7 step 4) removes only entries that
+/// would block a host write and have no content of their own (escape symlinks,
+/// empty dirs at a host-file rel); a foreign file at a host-dir rel or a
+/// non-empty dir at a host-file rel is a genuine conflict and fails closed.
+///
+/// Uploads use [`WorkspaceTransport::upload_file_atomic_via`] with a temp under
+/// the held lock dir (`<root>/.ordius.lock/tmp`), so a pre-existing foreign
+/// `<target>.ordius.tmp` is never clobbered (§7.1).
+// Exercised by the additive-sync unit tests; the persistent `reconcile_in` wiring
+// that calls it in production lands in a later H5 task.
+#[allow(dead_code)]
+async fn sync_remote_additive(
+    factory: &Arc<dyn WorkspaceTransportFactory>,
+    root: &str,
+    host_ws: &Path,
+) -> Result<(safety::Manifest, safety::Manifest), DispatchError> {
+    let t = factory.open().await?;
+    t.mkdir(root).await?;
+    // Lock-dir temp scratch for collision-free uploads. Idempotent: in the real
+    // flow the lock dir already exists from acquisition.
+    let temp_dir_rel = format!("{root}/.ordius.lock/tmp");
+    t.mkdir(&temp_dir_rel).await?;
+
+    // Host targets (forward-slash rels, ignores applied — same as reset).
+    let entries = safety::walk_workspace(host_ws)?;
+    let target_files: HashSet<&str> = entries
+        .iter()
+        .filter(|e| e.kind == safety::EntryKind::File)
+        .map(|e| e.rel_path.as_str())
+        .collect();
+    let target_dirs: HashSet<&str> = entries
+        .iter()
+        .filter(|e| e.kind == safety::EntryKind::Dir)
+        .map(|e| e.rel_path.as_str())
+        .collect();
+
+    // Remote snapshot via a second transport: `list_remote_files` consumes the
+    // Box, downloads + hashes every foreign file (so `last_remote` carries
+    // correct hashes), and already drops reserved rels (`.ordius.lock`, default
+    // ignores). Defensively re-filter below in case a future fake omits the prune.
+    let listing = {
+        let t2 = factory.open().await?;
+        list_remote_files(t2, root).await?
+    };
+
+    // Clear only the obstructions that block a host write and own no content
+    // (escape symlinks, empty dirs at a host-file rel); fail closed on a genuine
+    // foreign conflict (design §7 step 4).
+    let t = clear_additive_obstructions(t, root, &target_files, &target_dirs, &listing).await?;
+
+    // ── Upload/create the host tree (no deletion of remote-only entries). ──
+    //
+    // The walk is sorted, so dirs precede their nested entries. Cap-check the
+    // bytes actually read and hash the SENT bytes into `host_at_in` (mirrors
+    // reset). Uploads write a temp under the held lock dir, never a foreign-
+    // clobbering sibling temp.
+    let mut tracker = safety::CapTracker::new(safety::UploadCaps::default());
+    let mut host_at_in = safety::Manifest::new();
+    for entry in &entries {
+        match entry.kind {
+            safety::EntryKind::Dir => {
+                t.mkdir(&format!("{root}/{}", entry.rel_path)).await?;
+                host_at_in.dirs.insert(entry.rel_path.clone());
+            },
+            safety::EntryKind::File => {
+                let bytes = safety::read_within_caps(&entry.abs, &mut tracker)?;
+                let remote_path = format!("{root}/{}", entry.rel_path);
+                t.upload_file_atomic_via(&remote_path, &temp_dir_rel, &bytes)
+                    .await?;
+                host_at_in.files.insert(
+                    entry.rel_path.clone(),
+                    safety::FileEntry {
+                        sha256_hex: safety::sha256_hex(&bytes),
+                        size: bytes.len() as u64,
+                        mode: entry.mode,
+                    },
+                );
+            },
+        }
+    }
+
+    // ── Build last_remote = host_at_in ∪ preserved remote-only entries. ──
+    //
+    // A listing entry is preserved iff it is NOT a host target and NOT reserved
+    // (the reserved filter is defensive — `list_remote_files` already drops them).
+    let mut last_remote = host_at_in.clone();
+    for f in &listing.files {
+        if host_at_in.files.contains_key(&f.rel) || safety::is_reserved_remote_rel(&f.rel) {
+            continue;
+        }
+        last_remote.files.insert(f.rel.clone(), f.entry.clone());
+    }
+    for d in &listing.dirs {
+        if host_at_in.dirs.contains(d) || safety::is_reserved_remote_rel(d) {
+            continue;
+        }
+        last_remote.dirs.insert(d.clone());
+    }
+
+    Ok((host_at_in, last_remote))
+}
+
+/// Obstruction pass for [`sync_remote_additive`] (design §7 step 4) — remove only
+/// remote entries that block a host write and own no content, fail closed on a
+/// genuine foreign conflict. Never deletes a remote-only file or a non-empty dir.
+///
+/// 1. A remote symlink AT a host-file rel OR on an ancestor of it → remove it
+///    (escape risk; the link has no content of its own, its target is untouched).
+/// 2. A remote dir exactly at a host-FILE rel → non-recursive `remove_dir`. `Ok`
+///    ⇒ it was empty, proceed; `Err` ⇒ foreign content under it (do NOT infer
+///    emptiness from the listing) → `WorkspaceUnavailable` conflict.
+/// 3. A remote file exactly at a host-DIR rel → `WorkspaceUnavailable` conflict
+///    (we will not delete a foreign file to make room for a dir).
+///
+/// `listing` is the reserved-filtered [`RemoteListing`]; the reserved re-checks
+/// are defensive in case a future transport omits the prune. Takes the transport
+/// by value and returns it so the caller reuses the same session for uploads (a
+/// borrowed `&dyn` would make the future `!Send`, since the trait is `Send` but
+/// not `Sync`).
+#[allow(dead_code)] // see sync_remote_additive
+async fn clear_additive_obstructions(
+    t: Box<dyn WorkspaceTransport>,
+    root: &str,
+    target_files: &HashSet<&str>,
+    target_dirs: &HashSet<&str>,
+    listing: &RemoteListing,
+) -> Result<Box<dyn WorkspaceTransport>, DispatchError> {
+    let remote_dirs: HashSet<&str> = listing.dirs.iter().map(String::as_str).collect();
+    let remote_files: HashSet<&str> = listing.files.iter().map(|f| f.rel.as_str()).collect();
+
+    // 1. Escape symlinks (at the rel or on an ancestor). Collect, dedup, remove.
+    let mut symlinks_to_remove: HashSet<&String> = HashSet::new();
+    for file_rel in target_files {
+        for sym in &listing.symlinks {
+            if safety::is_reserved_remote_rel(sym) {
+                continue;
+            }
+            if *file_rel == sym.as_str() || file_rel.starts_with(&format!("{sym}/")) {
+                symlinks_to_remove.insert(sym);
+            }
+        }
+    }
+    for sym in symlinks_to_remove {
+        t.remove_file(&format!("{root}/{sym}")).await?;
+    }
+
+    // 2. Remote dir at a host-file rel → try remove_dir; any failure is a conflict.
+    for file_rel in target_files {
+        if safety::is_reserved_remote_rel(file_rel) {
+            continue;
+        }
+        if remote_dirs.contains(*file_rel)
+            && let Err(e) = t.remove_dir(&format!("{root}/{file_rel}")).await
+        {
+            return Err(DispatchError::WorkspaceUnavailable {
+                env_id: "<remote>".into(),
+                reason: format!(
+                    "remote directory blocks host file `{file_rel}` (non-empty); resolve manually: {e}"
+                ),
+            });
+        }
+    }
+
+    // 3. Remote file at a host-dir rel → conflict.
+    for dir_rel in target_dirs {
+        if safety::is_reserved_remote_rel(dir_rel) {
+            continue;
+        }
+        if remote_files.contains(*dir_rel) {
+            return Err(DispatchError::WorkspaceUnavailable {
+                env_id: "<remote>".into(),
+                reason: format!("remote file blocks host directory `{dir_rel}`; resolve manually"),
+            });
+        }
+    }
+
+    Ok(t)
+}
+
 /// One regular file from a [`RemoteListing`]: its root-stripped rel, downloaded
 /// bytes, and the [`safety::FileEntry`] hashed from those bytes.
 pub(super) struct RemoteFile {
@@ -2445,6 +2637,163 @@ mod tests {
                 .await
                 .unwrap(),
             b"real-b"
+        );
+    }
+
+    // ── sync_remote_additive (persistent host→remote, no foreign deletion) ─────
+
+    /// Build an `Arc<dyn WorkspaceTransportFactory>` plus a state-sharing handle
+    /// to the underlying fake "remote", for direct `sync_remote_additive` tests.
+    fn additive_factory() -> (Arc<dyn WorkspaceTransportFactory>, FakeWorkspaceTransport) {
+        let fake = FakeWorkspaceTransport::default();
+        let factory: Arc<dyn WorkspaceTransportFactory> =
+            Arc::new(FakeWorkspaceTransportFactory::new(fake.clone()));
+        (factory, fake)
+    }
+
+    /// Additive sync uploads the host's files but never deletes a remote-only
+    /// file: `host_at_in` carries only host files; `last_remote` carries host
+    /// files PLUS the preserved foreign entry.
+    #[tokio::test]
+    async fn additive_preserves_remote_only_file() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"hostA").unwrap();
+
+        let (factory, fake) = additive_factory();
+        let root = "/tmp/persist-root";
+        fake.mkdir(root).await.unwrap();
+        fake.upload_file(&format!("{root}/foreign.txt"), b"F")
+            .await
+            .unwrap();
+
+        let (host_at_in, last_remote) = sync_remote_additive(&factory, root, host_ws)
+            .await
+            .expect("additive sync");
+
+        // Remote holds both the host file and the untouched foreign file.
+        assert_eq!(
+            fake.download_file(&format!("{root}/a.txt")).await.unwrap(),
+            b"hostA"
+        );
+        assert_eq!(
+            fake.download_file(&format!("{root}/foreign.txt"))
+                .await
+                .unwrap(),
+            b"F",
+            "foreign remote-only file must survive"
+        );
+
+        // host_at_in = host files only.
+        assert!(host_at_in.files.contains_key("a.txt"));
+        assert!(
+            !host_at_in.files.contains_key("foreign.txt"),
+            "host_at_in must not include the foreign file"
+        );
+
+        // last_remote = host files PLUS the preserved foreign entry.
+        assert!(last_remote.files.contains_key("a.txt"));
+        assert!(
+            last_remote.files.contains_key("foreign.txt"),
+            "last_remote must include the preserved foreign file"
+        );
+    }
+
+    /// A pre-existing foreign `<target>.ordius.tmp` on the persistent root must
+    /// survive an additive upload of the host's `<target>` — the lock-dir temp
+    /// scheme never writes a sibling temp that would clobber it.
+    #[tokio::test]
+    async fn additive_temp_collision_safe() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"hostA").unwrap();
+
+        let (factory, fake) = additive_factory();
+        let root = "/tmp/persist-temp";
+        fake.mkdir(root).await.unwrap();
+        // A foreign file that shares the sibling-temp name `upload_file` would use.
+        fake.upload_file(&format!("{root}/a.txt.ordius.tmp"), b"foreign-temp")
+            .await
+            .unwrap();
+
+        sync_remote_additive(&factory, root, host_ws)
+            .await
+            .expect("additive sync");
+
+        assert_eq!(
+            fake.download_file(&format!("{root}/a.txt")).await.unwrap(),
+            b"hostA"
+        );
+        assert_eq!(
+            fake.download_file(&format!("{root}/a.txt.ordius.tmp"))
+                .await
+                .unwrap(),
+            b"foreign-temp",
+            "foreign sibling temp must be untouched by the additive upload"
+        );
+    }
+
+    /// An empty remote dir sitting exactly where a host file must be written is
+    /// removed (`remove_dir` succeeds), and the host file replaces it.
+    #[tokio::test]
+    async fn additive_empty_dir_at_file_path_removed() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("d"), b"x").unwrap();
+
+        let (factory, fake) = additive_factory();
+        let root = "/tmp/persist-emptydir";
+        fake.mkdir(root).await.unwrap();
+        // An EMPTY dir at the host-file rel `d`.
+        fake.mkdir(&format!("{root}/d")).await.unwrap();
+
+        sync_remote_additive(&factory, root, host_ws)
+            .await
+            .expect("additive sync");
+
+        let meta = fake
+            .stat(&format!("{root}/d"))
+            .await
+            .unwrap()
+            .expect("d must exist");
+        assert_eq!(meta.kind, FileKind::File, "d must now be the host file");
+        assert_eq!(
+            fake.download_file(&format!("{root}/d")).await.unwrap(),
+            b"x"
+        );
+    }
+
+    /// A NON-empty remote dir where a host file must go is a genuine conflict —
+    /// `sync_remote_additive` errors (no foreign deletion) and the child survives.
+    #[tokio::test]
+    async fn additive_nonempty_dir_at_file_path_conflicts() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("d"), b"x").unwrap();
+
+        let (factory, fake) = additive_factory();
+        let root = "/tmp/persist-nonemptydir";
+        fake.mkdir(root).await.unwrap();
+        fake.mkdir(&format!("{root}/d")).await.unwrap();
+        fake.upload_file(&format!("{root}/d/keep.txt"), b"k")
+            .await
+            .unwrap();
+
+        let err = sync_remote_additive(&factory, root, host_ws)
+            .await
+            .expect_err("non-empty dir at a host-file path must conflict");
+        assert!(
+            matches!(err, DispatchError::WorkspaceUnavailable { .. }),
+            "expected WorkspaceUnavailable conflict; got {err:?}"
+        );
+
+        // The foreign content under the conflicting dir is untouched.
+        assert_eq!(
+            fake.download_file(&format!("{root}/d/keep.txt"))
+                .await
+                .unwrap(),
+            b"k",
+            "foreign child must survive a conflict"
         );
     }
 
