@@ -153,15 +153,18 @@ pub struct WorkspaceManager {
     /// Populated by `reconcile_in` and consumed by `reconcile_out`.
     state: SyncMutex<HashMap<WorkspaceKey, WorkspaceState>>,
 
-    /// Every ephemeral env-side root created this run, keyed by root → factory.
+    /// Every ephemeral env-side root created this run, keyed by `(EnvId, root)` → factory.
     ///
     /// `state` is keyed by `(EnvId, host_ws)`, so `parallel`/`compose` children
     /// that inherit the parent `host_ws` but run under distinct `run_id`s collapse
     /// onto one `state` entry — each `reconcile_in` overwrites the prior. This map
     /// records *every* distinct ephemeral root so `teardown_all` deletes them all,
-    /// not just the last; using the root string as the key dedups `loop_for`'s
-    /// repeated same-root inserts.
-    ephemeral_roots: SyncMutex<HashMap<String, Arc<dyn WorkspaceTransportFactory>>>,
+    /// not just the last. Keying by `(EnvId, root)` prevents two envs whose
+    /// templates expand to the same root string on different servers from
+    /// colliding (the later factory would otherwise clobber the earlier — a leak
+    /// or a delete against the wrong server), while still dedup'ing `loop_for`'s
+    /// repeated same-`(env, root)` inserts.
+    ephemeral_roots: SyncMutex<HashMap<(EnvId, String), Arc<dyn WorkspaceTransportFactory>>>,
 
     /// Test-only seam: records the last [`RunOutcome`] passed to
     /// [`Self::teardown_all`]. Lets run-loop tests observe that
@@ -228,9 +231,14 @@ impl WorkspaceManager {
     ///
     /// Fires on every run-loop exit path (success, error, or panic), before the
     /// engine's sender/token/lock cleanup. For each prepared workspace it writes
-    /// changed files back to the host (only for [`WriteBackPolicy::Force`],
-    /// skipped entirely on user cancel) and deletes every tracked ephemeral
-    /// env-side root (not just the last per key).
+    /// changed files back to the host via the policy dispatcher
+    /// ([`reconcile_write_back`]) — `None` is a no-op, `Force` overwrites, and
+    /// `SafeOrDiverge` writes back where the host is unchanged while preserving
+    /// the host copy where it conflicts — skipped entirely on user cancel. It
+    /// then deletes every tracked ephemeral env-side root (not just the last per
+    /// key), EXCEPT any root whose write-back failed: that root is the only copy
+    /// of the node's output, so it is kept on the server for manual recovery
+    /// rather than destroyed.
     ///
     /// Best-effort and panic-free: per-env errors are logged and swallowed so a
     /// failure on one workspace never aborts cleanup of the others nor unwinds
@@ -250,20 +258,27 @@ impl WorkspaceManager {
         };
 
         // Write-back safety net: a node may have panicked between reconcile_in
-        // and reconcile_out, leaving changes unwritten. Fire the write-back ONLY
-        // for `Force` — `None` never writes back, and `SafeOrDiverge` is rejected
-        // up front by `reconcile_in` (so it can never reach here, and must never
-        // be force-written). User cancel skips entirely. No-op when reconcile_out
-        // already advanced the baseline.
+        // and reconcile_out, leaving changes unwritten. Route through the policy
+        // dispatcher so every policy applies its real semantics — `None` no-ops,
+        // `Force` overwrites, `SafeOrDiverge` writes back where the host is
+        // unchanged and diverges where it conflicts. User cancel skips entirely.
+        // A no-op when reconcile_out already advanced the baseline.
+        //
+        // A root whose write-back FAILED is recorded in `preserve`: its env-side
+        // tree is the only copy of the node's output, so cleanup below must keep
+        // it for recovery rather than destroy it.
+        let mut preserve: std::collections::HashSet<(EnvId, String)> =
+            std::collections::HashSet::new();
         for (key, s) in states {
             if outcome != RunOutcome::CancelledByUser
-                && let WriteBackPolicy::Force { ignore } = &s.write_back
-                && let Err(e) = write_back_delta(
+                && let Err(e) = reconcile_write_back(
+                    &s.write_back,
                     &s.transport_factory,
                     &s.env_side_root,
                     &key.1,
                     &s.last_remote_manifest,
-                    ignore,
+                    &s.run_id,
+                    key.0.as_str(),
                 )
                 .await
             {
@@ -272,20 +287,31 @@ impl WorkspaceManager {
                     error = %e,
                     "teardown write-back failed"
                 );
+                preserve.insert((key.0.clone(), s.env_side_root.clone()));
             }
         }
 
         // Ephemeral cleanup: delete *every* root recorded this run, not just the
         // last per key. parallel/compose children share host_ws (one `state`
-        // entry) but each gets its own run-id root — all are tracked here.
-        let roots: Vec<(String, Arc<dyn WorkspaceTransportFactory>)> = {
+        // entry) but each gets its own run-id root — all are tracked here. A root
+        // in `preserve` (its write-back failed) is the sole copy of the node's
+        // output, so it is kept on the server for recovery instead of deleted.
+        let roots: Vec<((EnvId, String), Arc<dyn WorkspaceTransportFactory>)> = {
             std::mem::take(&mut *self.ephemeral_roots.lock())
                 .into_iter()
                 .collect()
         };
-        for (root, factory) in roots {
-            if let Err(e) = remove_tree(factory.as_ref(), &root).await {
-                tracing::warn!(env_root = %root, error = %e, "ephemeral teardown failed");
+        for (key, factory) in roots {
+            if preserve.contains(&key) {
+                tracing::warn!(
+                    env_id = %key.0.as_str(),
+                    env_root = %key.1,
+                    "keeping remote workspace root after failed write-back (the only copy of the node's output); not deleting it so it can be recovered"
+                );
+                continue;
+            }
+            if let Err(e) = remove_tree(factory.as_ref(), &key.1).await {
+                tracing::warn!(env_root = %key.1, error = %e, "ephemeral teardown failed");
             }
         }
     }
@@ -379,9 +405,10 @@ impl WorkspaceManager {
         // The reset succeeded, so the root really exists on the remote. Sync
         // insert; the guard drops before the return — no await held.
         if lifecycle == Lifecycle::Ephemeral {
-            self.ephemeral_roots
-                .lock()
-                .insert(root.clone(), Arc::clone(&factory));
+            self.ephemeral_roots.lock().insert(
+                (dispatcher.info().id.clone(), root.clone()),
+                Arc::clone(&factory),
+            );
         }
 
         Ok(EnvPath::new(root))
@@ -2265,6 +2292,201 @@ mod tests {
         assert!(
             !outside.path().join("pwned.txt").exists(),
             "write-back must not follow a host-side symlinked directory"
+        );
+    }
+
+    /// A write-back that FAILS during teardown must NOT destroy the ephemeral
+    /// root: that env-side tree is the only copy of the node's output. The fake's
+    /// injected `download` failure drives the write-back error (while `list_tree`/
+    /// `remove_*` stay healthy, so the only reason the root survives is the
+    /// preserve skip — not a coincidentally-failed deletion). The root is kept
+    /// for manual recovery.
+    #[tokio::test]
+    async fn teardown_preserves_root_when_writeback_fails() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"original").unwrap();
+
+        let (mgr, fake, root) = manager_seeded_via_reconcile(
+            "/tmp/ordius-wb-fail-{{run.id}}",
+            host_ws,
+            WriteBackPolicy::Force { ignore: vec![] },
+        )
+        .await;
+
+        // Node produced output on the remote.
+        fake.upload_file(&format!("{root}/a.txt"), b"modified")
+            .await
+            .unwrap();
+
+        // Make the write-back fail: `list_remote_files` downloads each file and
+        // propagates the error, so `reconcile_write_back` returns Err. `list_tree`
+        // and removal stay healthy, so a non-preserved root WOULD be deleted —
+        // surviving here proves the preserve skip fired, not a failed remove_tree.
+        fake.set_fail_download(true);
+
+        mgr.teardown_all(RunOutcome::Failed).await;
+
+        // The ephemeral root and the node's output must still be present (NOT
+        // deleted) — `stat`/`list_tree` are unaffected by the download hook.
+        assert!(
+            fake.stat(&root).await.unwrap().is_some(),
+            "ephemeral root must be preserved when its write-back failed"
+        );
+        assert!(
+            fake.stat(&format!("{root}/a.txt")).await.unwrap().is_some(),
+            "the node's only copy of its output must not be destroyed"
+        );
+    }
+
+    /// Two envs with DIFFERENT ids whose templates expand to the SAME root string
+    /// (e.g. the same path on different servers) must each be tracked + torn down
+    /// via their OWN factory. Before the `(EnvId, root)` re-key, the second
+    /// `reconcile_in` clobbered the first in the root-keyed map — one server's
+    /// root leaked, or the wrong server's tree was deleted.
+    #[tokio::test]
+    async fn teardown_two_envs_same_root_no_cross_clobber() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"host-a").unwrap();
+
+        // Two distinct envs ("ssh:a" / "ssh:b"), each with its OWN fake "server".
+        let (d_a, fake_a) = ssh_dispatcher_with_fake("a");
+        let (d_b, fake_b) = ssh_dispatcher_with_fake("b");
+        let mgr = WorkspaceManager::new();
+
+        // Same template → same expanded root string on both servers (the run id
+        // is identical via `sample_run`), so the strings collide exactly — still
+        // Ephemeral via the `{{run.id}}` marker.
+        let binding = sftp_binding("/tmp/ordius-shared-{{run.id}}", WriteBackPolicy::None);
+
+        let root_a = mgr
+            .reconcile_in(&d_a, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in env a")
+            .as_str()
+            .to_string();
+        let root_b = mgr
+            .reconcile_in(&d_b, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in env b")
+            .as_str()
+            .to_string();
+
+        assert_eq!(
+            root_a, root_b,
+            "same template + run id → identical root string"
+        );
+
+        // Each server has its own copy of the workspace before teardown.
+        assert!(fake_a.stat(&root_a).await.unwrap().is_some());
+        assert!(fake_b.stat(&root_b).await.unwrap().is_some());
+
+        mgr.teardown_all(RunOutcome::Completed).await;
+
+        // BOTH roots deleted, each via its OWN factory — no cross-clobber and no
+        // leak. Before the fix the env-b factory overwrote env-a's entry, so
+        // env-a's root was never reached (it would still exist here).
+        assert!(
+            fake_a.stat(&root_a).await.unwrap().is_none(),
+            "env a's root must be deleted via env a's own factory"
+        );
+        assert!(
+            fake_b.stat(&root_b).await.unwrap().is_none(),
+            "env b's root must be deleted via env b's own factory"
+        );
+    }
+
+    /// A `SafeOrDiverge` node that never reached `reconcile_out` (e.g. it failed
+    /// mid-run) still gets its write-back via the teardown dispatcher. When the
+    /// host changed concurrently, teardown must DIVERGE (keep the host, stash the
+    /// node bytes under `.ordius/diverged/`) — NOT force-overwrite the host.
+    #[tokio::test]
+    async fn teardown_safe_or_diverge_failed_run_diverges() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"orig").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-teardown");
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let root = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in")
+            .as_str()
+            .to_string();
+
+        // Node wrote output remotely; the host was edited concurrently AFTER the
+        // baseline upload — a conflict. reconcile_out is intentionally NOT called
+        // (simulating a node that failed before its write-back ran).
+        fake.upload_file(&format!("{root}/a.txt"), b"node-out")
+            .await
+            .unwrap();
+        std::fs::write(host_ws.join("a.txt"), b"user-edit").unwrap();
+
+        mgr.teardown_all(RunOutcome::Failed).await;
+
+        // Host preserved (NOT force-clobbered).
+        assert_eq!(
+            std::fs::read(host_ws.join("a.txt")).unwrap(),
+            b"user-edit",
+            "teardown must diverge, not force-overwrite the host"
+        );
+        // Node bytes stashed under the divergence dir.
+        let artifact = diverged_dir(host_ws, "ssh:sod-teardown").join("a.txt");
+        assert_eq!(
+            std::fs::read(&artifact).unwrap(),
+            b"node-out",
+            "node output must be preserved under .ordius/diverged/"
+        );
+        let report = read_diverge_report(host_ws, "ssh:sod-teardown");
+        let entry = report_entry(&report, "a.txt");
+        assert_eq!(entry["reason"], "host_modified");
+    }
+
+    /// User cancellation skips the `SafeOrDiverge` write-back entirely (no host
+    /// write, no divergence artifacts) but STILL deletes the ephemeral root —
+    /// cleanup is unconditional even though write-back is skipped.
+    #[tokio::test]
+    async fn teardown_cancelled_skips_writeback() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"orig").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("sod-cancel");
+        let mgr = WorkspaceManager::new();
+        let binding = sod_binding();
+        let root = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in")
+            .as_str()
+            .to_string();
+
+        // Both a remote change and a conflicting host edit are present — yet user
+        // cancel must skip the write-back regardless.
+        fake.upload_file(&format!("{root}/a.txt"), b"node-out")
+            .await
+            .unwrap();
+        std::fs::write(host_ws.join("a.txt"), b"user-edit").unwrap();
+
+        mgr.teardown_all(RunOutcome::CancelledByUser).await;
+
+        // No write-back: host untouched, no divergence dir created.
+        assert_eq!(
+            std::fs::read(host_ws.join("a.txt")).unwrap(),
+            b"user-edit",
+            "user cancel must skip write-back"
+        );
+        assert!(
+            !diverged_dir(host_ws, "ssh:sod-cancel").exists(),
+            "user cancel must not produce divergence artifacts"
+        );
+        // Cleanup still happens.
+        assert!(
+            fake.stat(&root).await.unwrap().is_none(),
+            "ephemeral root must be deleted even on user cancel"
         );
     }
 

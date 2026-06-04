@@ -123,12 +123,32 @@ mod fake_impl {
         dirs: BTreeSet<String>,
         /// symlink path → target (no-follow semantics, like real SFTP)
         symlinks: BTreeMap<String, String>,
+        /// Test-only error hook: when set, `download_file` returns an error
+        /// instead of bytes. Lets a test drive a *write-back* failure
+        /// (`list_remote_files` downloads each file and propagates the error)
+        /// WITHOUT also breaking `list_tree` — so `remove_tree` (which lists +
+        /// removes, never downloads) still works. That isolation is what lets the
+        /// preserve-on-failure test prove cleanup was *skipped*, not merely failed.
+        /// Toggled via [`FakeWorkspaceTransport::set_fail_download`].
+        fail_download: bool,
     }
 
     /// In-memory fake for [`WorkspaceTransport`]. Clones share state.
     #[derive(Debug, Clone, Default)]
     pub struct FakeWorkspaceTransport {
         inner: Arc<Mutex<FakeFs>>,
+    }
+
+    impl FakeWorkspaceTransport {
+        /// Test-only error hook: when `fail` is `true`, every subsequent
+        /// `download_file` call returns an error instead of bytes. Used to drive a
+        /// write-back failure in teardown tests — the write-back paths download
+        /// each remote file and propagate the error, while `list_tree`/`stat`/
+        /// `remove_*` stay healthy (so `remove_tree` still works and a test can
+        /// distinguish "cleanup skipped" from "cleanup failed").
+        pub fn set_fail_download(&self, fail: bool) {
+            self.inner.lock().fail_download = fail;
+        }
     }
 
     #[async_trait]
@@ -150,12 +170,23 @@ mod fake_impl {
         }
 
         async fn download_file(&self, rel: &str) -> Result<Vec<u8>, DispatchError> {
-            self.inner.lock().files.get(rel).cloned().ok_or_else(|| {
-                DispatchError::WorkspaceUnavailable {
+            let fs = self.inner.lock();
+            // Test-only error hook: simulate a transport read failure so a test can
+            // drive a write-back error (the write-back paths download each file and
+            // propagate the error via `?`) while listing/removal stay healthy.
+            if fs.fail_download {
+                return Err(DispatchError::WorkspaceUnavailable {
+                    env_id: "fake".into(),
+                    reason: format!("injected download failure for: {rel}"),
+                });
+            }
+            fs.files
+                .get(rel)
+                .cloned()
+                .ok_or_else(|| DispatchError::WorkspaceUnavailable {
                     env_id: "fake".into(),
                     reason: format!("file not found: {rel}"),
-                }
-            })
+                })
         }
 
         async fn list_tree(&self, rel: &str) -> Result<Vec<FileMeta>, DispatchError> {
