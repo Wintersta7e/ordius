@@ -762,6 +762,11 @@ pub(super) async fn list_remote_files(
         if !safety::is_safe_relative(rel) {
             continue;
         }
+        // Reserved remote paths (the lock dir and anything under it) must never
+        // appear in manifests, write-back targets, or deletion candidates.
+        if safety::is_reserved_remote_rel(rel) {
+            continue;
+        }
         match entry.kind {
             FileKind::File => {
                 let bytes = t.download_file(&entry.rel_path).await?;
@@ -3615,6 +3620,62 @@ mod tests {
             !host_ws.join("src/o.txt").exists(),
             "the in-place host file must not be created by divergence"
         );
+    }
+
+    /// `list_remote_files` must exclude `.ordius.lock` (and anything nested under
+    /// it) from the returned listing — those entries must never appear in any
+    /// manifest, write-back target, or deletion candidate.
+    #[tokio::test]
+    async fn list_remote_files_excludes_ordius_lock() {
+        use super::super::transport::{FakeWorkspaceTransportFactory, WorkspaceTransportFactory};
+
+        let factory = FakeWorkspaceTransportFactory::default();
+        let root = "/tmp/ws-lock-test";
+
+        // Seed a normal file and lock-dir entries.
+        let t = factory.open().await.unwrap();
+        t.mkdir(root).await.unwrap();
+        t.upload_file(&format!("{root}/out.txt"), b"result")
+            .await
+            .unwrap();
+        t.mkdir(&format!("{root}/.ordius.lock")).await.unwrap();
+        t.upload_file(&format!("{root}/.ordius.lock/owner.json"), b"{}")
+            .await
+            .unwrap();
+        drop(t);
+
+        let transport = factory.open().await.unwrap();
+        let listing = list_remote_files(transport, root)
+            .await
+            .expect("list_remote_files must succeed");
+
+        // The normal file is present.
+        assert!(
+            listing.files.iter().any(|f| f.rel == "out.txt"),
+            "out.txt must appear in the listing; files: {:?}",
+            listing.files.iter().map(|f| &f.rel).collect::<Vec<_>>()
+        );
+
+        // Nothing from .ordius.lock in any collection.
+        for f in &listing.files {
+            assert!(
+                !f.rel.starts_with(".ordius.lock"),
+                ".ordius.lock file leaked into listing.files: {}",
+                f.rel
+            );
+        }
+        for d in &listing.dirs {
+            assert!(
+                !d.starts_with(".ordius.lock"),
+                ".ordius.lock dir leaked into listing.dirs: {d}"
+            );
+        }
+        for s in &listing.symlinks {
+            assert!(
+                !s.starts_with(".ordius.lock"),
+                ".ordius.lock symlink leaked into listing.symlinks: {s}"
+            );
+        }
     }
 
     /// The report serializes `reason` in `snake_case` and omits the optional sha

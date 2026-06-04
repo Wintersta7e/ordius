@@ -158,7 +158,8 @@ pub fn classify_artifact_path(host_ws: &Path, rel: &str) -> ArtifactPathState {
 
 /// Default-ignored path prefixes (checked against the first path segment or
 /// multi-segment leading prefix).
-const DEFAULT_IGNORED_DIRS: &[&str] = &[".git", ".ordius", "target", "node_modules"];
+const DEFAULT_IGNORED_DIRS: &[&str] =
+    &[".git", ".ordius", ".ordius.lock", "target", "node_modules"];
 
 /// Default-ignored exact filenames.
 const DEFAULT_IGNORED_NAMES: &[&str] = &[".env"];
@@ -216,6 +217,18 @@ pub fn should_ignore(rel: &str, user_globs: &[String]) -> bool {
         }
     }
     false
+}
+
+/// Whether a remote-listing rel must be excluded from manifests, write-back, and
+/// reset-deletion entirely (the lock dir and other default-ignored trees).
+///
+/// The single choke point for the *remote* tree so the reserved `.ordius.lock`
+/// dir never becomes a manifest entry or a write-back target. Mirrors
+/// [`is_default_ignored`]: any rel whose first segment is one of
+/// [`DEFAULT_IGNORED_DIRS`] (including `.ordius.lock`) returns `true`.
+#[must_use]
+pub fn is_reserved_remote_rel(rel: &str) -> bool {
+    is_default_ignored(rel)
 }
 
 /// Simple `*`-glob match.  `*` matches any sequence of characters that does
@@ -943,6 +956,28 @@ mod tests {
             || std::fs::read_dir(&dir).is_ok();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         can_read
+    }
+
+    // ── is_reserved_remote_rel ──
+
+    #[test]
+    fn is_reserved_remote_rel_rejects_lock_dir_and_contents() {
+        assert!(
+            is_reserved_remote_rel(".ordius.lock"),
+            ".ordius.lock dir itself must be reserved"
+        );
+        assert!(
+            is_reserved_remote_rel(".ordius.lock/owner.json"),
+            ".ordius.lock/owner.json must be reserved"
+        );
+        assert!(
+            is_reserved_remote_rel(".ordius.lock/tmp/x"),
+            ".ordius.lock/tmp/x must be reserved"
+        );
+        assert!(
+            !is_reserved_remote_rel("src/main.rs"),
+            "src/main.rs must not be reserved"
+        );
     }
 
     // ── hash_file ──
