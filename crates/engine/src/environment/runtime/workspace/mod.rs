@@ -1,5 +1,7 @@
 /// Workspace sync manager skeleton.
 pub mod manager;
+/// `SafeOrDiverge` conflict-aware write-back (extracted from `manager`).
+mod safe_or_diverge;
 /// Upload safety helpers (ignore rules, caps, walk, manifest).
 pub mod safety;
 /// Workspace transport traits and implementations.
