@@ -866,6 +866,30 @@ fn sod_root(run_id: &str) -> String {
     format!("/tmp/ordius-sod-{run_id}")
 }
 
+/// `Sync { Sftp, Force }` binding whose env root is STABLE (no `{{run.id}}`),
+/// so it classifies as a *persistent* workspace: the same `slug` resolves to
+/// the same root across runs, the root is reused (never auto-deleted), and a
+/// remote `.ordius.lock` guards concurrent ownership. The slug is a parameter so
+/// the reuse test can pass the SAME slug to two runs while the contention/temp
+/// tests use their own. Force is the simplest write-back for these tests (the
+/// persistent additive sync — not the write-back mode — is what's under test).
+fn persistent_binding(slug: &str) -> WorkspaceBinding {
+    use ordius_engine::environment::runtime::env::{SyncStrategy, WriteBackPolicy};
+    WorkspaceBinding::Sync {
+        env_path_template: format!("/home/ordius/ordius-persist-{slug}"),
+        strategy: SyncStrategy::Sftp,
+        write_back: WriteBackPolicy::Force { ignore: vec![] },
+    }
+}
+
+/// The expanded persistent root for `slug` under [`persistent_binding`]. Stable
+/// across runs (no `{{run.id}}`), so it is the shared root the reuse test drives
+/// twice and the cleanup target the tests own (persistent roots aren't deleted
+/// at teardown — only the lock is released).
+fn persistent_root(slug: &str) -> String {
+    format!("/home/ordius/ordius-persist-{slug}")
+}
+
 /// Walk `dir` recursively, returning every regular file's path. Used to locate
 /// divergence artifacts under `<host_ws>/.ordius/diverged/` without hardcoding
 /// the `encode_segment`-encoded `<run>/<env>` path components.
@@ -1691,4 +1715,298 @@ async fn safe_or_diverge_recovers_preserved_root() {
     // Leave the container tidy: the recovery tree is intentionally untracked, so
     // the test owns cleaning it up.
     h3_remote_exec(&dispatcher, &format!("rm -rf {recovery}")).await;
+}
+
+/// Test 7 — a PERSISTENT workspace is reused across two independent runs.
+///
+/// The stable root (no `{{run.id}}`) is created + locked by run 1, kept on
+/// teardown (only the lock is released), then re-locked + re-synced by run 2 on
+/// the SAME root. Asserts the three persistent-reuse invariants:
+///   - run 2 re-acquires the lock run 1 released (no `WorkspaceUnavailable`),
+///   - a foreign file planted between the runs SURVIVES (additive sync never
+///     deletes remote-only content),
+///   - run 2's host bytes overwrite the tracked file (`out.txt`).
+/// The test owns cleanup: persistent roots are never auto-deleted, so it
+/// `rm -rf`s the root at the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "gated: requires ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"]
+async fn persistent_reuse_across_two_runs() {
+    use ordius_engine::environment::runtime::workspace::{RunOutcome, RunScope, WorkspaceManager};
+
+    let Some(ssh) = build_dispatcher_for_transport_test().await else {
+        eprintln!(
+            "skipping persistent reuse test; set ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"
+        );
+        return;
+    };
+    let dispatcher: Arc<dyn Dispatcher> = Arc::new(ssh);
+
+    // One STABLE slug → one shared persistent root for BOTH runs.
+    let slug = uniq_run_id("persist-reuse");
+    let root = persistent_root(&slug);
+    let binding = persistent_binding(&slug);
+
+    // ── RUN 1: create + lock + upload, then teardown keeps the root ──
+    let tmp1 = tempfile::TempDir::new().unwrap();
+    let host_ws1 = tmp1.path().to_path_buf();
+    std::fs::write(host_ws1.join("out.txt"), b"run1-output").unwrap();
+
+    let run_id1 = uniq_run_id("persist-reuse-r1");
+    let wm1 = Arc::new(WorkspaceManager::new());
+    let run_scope1 = RunScope {
+        run_id: &run_id1,
+        top_run_id: &run_id1,
+        workflow_id: "wf-persist-reuse",
+        workflow_name: "Persistent Reuse Test (run 1)",
+        started_at_iso: "2026-01-01T00:00:00Z",
+    };
+
+    let cwd1 = wm1
+        .reconcile_in(dispatcher.as_ref(), &binding, &host_ws1, &run_scope1)
+        .await
+        .expect("run 1 reconcile_in acquires the lock and uploads");
+    assert_eq!(
+        cwd1.as_str(),
+        root,
+        "the persistent root is the stable template (no {{run.id}})"
+    );
+
+    // A node writes the tracked file inside the synced root.
+    h3_remote_exec(
+        &dispatcher,
+        &format!("cd {root} && printf run1-output > out.txt"),
+    )
+    .await;
+
+    wm1.reconcile_out(dispatcher.as_ref(), &binding, &host_ws1)
+        .await
+        .expect("run 1 reconcile_out writes back");
+
+    // Teardown releases the lock but KEEPS the persistent root.
+    wm1.teardown_all(RunOutcome::Completed).await;
+
+    let t = dispatcher
+        .workspace_transport()
+        .unwrap()
+        .open()
+        .await
+        .unwrap();
+    assert!(
+        t.stat(&root).await.unwrap().is_some(),
+        "a persistent root must survive teardown (only the lock is released)"
+    );
+
+    // ── Plant a FOREIGN file directly on the kept root, between the runs ──
+    h3_remote_exec(&dispatcher, &format!("printf FOREIGN > {root}/foreign.txt")).await;
+
+    // ── RUN 2: a fresh manager + host re-locks + re-syncs the SAME root ──
+    let tmp2 = tempfile::TempDir::new().unwrap();
+    let host_ws2 = tmp2.path().to_path_buf();
+    std::fs::write(host_ws2.join("out.txt"), b"run2-output").unwrap();
+
+    let run_id2 = uniq_run_id("persist-reuse-r2");
+    let wm2 = Arc::new(WorkspaceManager::new());
+    let run_scope2 = RunScope {
+        run_id: &run_id2,
+        top_run_id: &run_id2,
+        workflow_id: "wf-persist-reuse",
+        workflow_name: "Persistent Reuse Test (run 2)",
+        started_at_iso: "2026-01-01T00:00:01Z",
+    };
+
+    let cwd2 = wm2
+        .reconcile_in(dispatcher.as_ref(), &binding, &host_ws2, &run_scope2)
+        .await
+        .expect("run 2 must re-acquire the lock run 1 released");
+    assert_eq!(
+        cwd2.as_str(),
+        root,
+        "run 2 resolves to the SAME persistent root"
+    );
+
+    // The root still exists, the foreign file survived (additive sync never
+    // deletes remote-only content), and run 2's host bytes are now in place.
+    assert!(
+        t.stat(&root).await.unwrap().is_some(),
+        "the persistent root is still present for run 2"
+    );
+    assert_eq!(
+        t.download_file(&format!("{root}/foreign.txt"))
+            .await
+            .unwrap(),
+        b"FOREIGN",
+        "a foreign file planted between runs must survive the additive re-sync"
+    );
+    assert_eq!(
+        t.download_file(&format!("{root}/out.txt")).await.unwrap(),
+        b"run2-output",
+        "run 2's host bytes overwrite the tracked file"
+    );
+
+    wm2.teardown_all(RunOutcome::Completed).await;
+    assert!(
+        t.stat(&root).await.unwrap().is_some(),
+        "the persistent root is kept after run 2's teardown too"
+    );
+
+    // CLEANUP — persistent roots are never auto-deleted, so the test owns it.
+    h3_remote_exec(&dispatcher, &format!("rm -rf {root}")).await;
+}
+
+/// Test 8 — the persistent `.ordius.lock` excludes a second concurrent run and
+/// names the holder, then frees on teardown.
+///
+/// Manager A locks the root and holds it (no teardown). Manager B (a distinct
+/// run id) `reconcile_in` on the same root must fail with `WorkspaceUnavailable`
+/// whose message names run A's id. After A tears down, B retries and SUCCEEDS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "gated: requires ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"]
+async fn persistent_lock_contention() {
+    use ordius_engine::environment::runtime::error::DispatchError;
+    use ordius_engine::environment::runtime::workspace::{RunOutcome, RunScope, WorkspaceManager};
+
+    let Some(ssh) = build_dispatcher_for_transport_test().await else {
+        eprintln!(
+            "skipping persistent lock contention test; set ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"
+        );
+        return;
+    };
+    let dispatcher: Arc<dyn Dispatcher> = Arc::new(ssh);
+
+    let slug = uniq_run_id("persist-lock");
+    let root = persistent_root(&slug);
+    let binding = persistent_binding(&slug);
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let host_ws = tmp.path().to_path_buf();
+    std::fs::write(host_ws.join("a.txt"), b"x").unwrap();
+
+    // ── Manager A acquires the lock and HOLDS it (no teardown yet) ──
+    let run_id_a = uniq_run_id("persist-lock-a");
+    let wm_a = Arc::new(WorkspaceManager::new());
+    let scope_a = RunScope {
+        run_id: &run_id_a,
+        top_run_id: &run_id_a,
+        workflow_id: "wf-persist-lock",
+        workflow_name: "Persistent Lock Contention (A)",
+        started_at_iso: "2026-01-01T00:00:00Z",
+    };
+    wm_a.reconcile_in(dispatcher.as_ref(), &binding, &host_ws, &scope_a)
+        .await
+        .expect("manager A acquires the persistent lock");
+
+    // ── Manager B (distinct run id) is excluded while A holds the lock ──
+    let run_id_b = uniq_run_id("persist-lock-b");
+    let wm_b = Arc::new(WorkspaceManager::new());
+    let scope_b = RunScope {
+        run_id: &run_id_b,
+        top_run_id: &run_id_b,
+        workflow_id: "wf-persist-lock",
+        workflow_name: "Persistent Lock Contention (B)",
+        started_at_iso: "2026-01-01T00:00:01Z",
+    };
+    let err = wm_b
+        .reconcile_in(dispatcher.as_ref(), &binding, &host_ws, &scope_b)
+        .await
+        .expect_err("manager B must be refused while A holds the lock");
+    assert!(
+        matches!(err, DispatchError::WorkspaceUnavailable { .. }),
+        "contention must surface as WorkspaceUnavailable; got {err:?}"
+    );
+    assert!(
+        err.to_string().contains(&run_id_a),
+        "the contention error must name the holding run ({run_id_a}); got: {err}"
+    );
+
+    // ── A tears down → lock freed → B now succeeds ──
+    wm_a.teardown_all(RunOutcome::Completed).await;
+    let cwd_b = wm_b
+        .reconcile_in(dispatcher.as_ref(), &binding, &host_ws, &scope_b)
+        .await
+        .expect("manager B acquires the lock once A released it");
+    assert_eq!(
+        cwd_b.as_str(),
+        root,
+        "B resolves to the same persistent root"
+    );
+
+    // CLEANUP — release B's lock, then delete the persistent root.
+    wm_b.teardown_all(RunOutcome::Completed).await;
+    h3_remote_exec(&dispatcher, &format!("rm -rf {root}")).await;
+}
+
+/// Test 9 — the persistent additive upload uses a lock-dir staging temp, NOT a
+/// deterministic sibling `<target>.ordius.tmp`, so a pre-existing foreign file
+/// at that sibling name is never clobbered.
+///
+/// A foreign `out.txt.ordius.tmp` is planted on the root before `reconcile_in`.
+/// After the additive host→remote sync, `out.txt` holds the host's bytes AND the
+/// foreign sibling temp is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "gated: requires ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"]
+async fn persistent_temp_collision() {
+    use ordius_engine::environment::runtime::workspace::{RunOutcome, RunScope, WorkspaceManager};
+
+    let Some(ssh) = build_dispatcher_for_transport_test().await else {
+        eprintln!(
+            "skipping persistent temp collision test; set ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"
+        );
+        return;
+    };
+    let dispatcher: Arc<dyn Dispatcher> = Arc::new(ssh);
+
+    let slug = uniq_run_id("persist-temp");
+    let root = persistent_root(&slug);
+    let binding = persistent_binding(&slug);
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let host_ws = tmp.path().to_path_buf();
+    std::fs::write(host_ws.join("out.txt"), b"host-bytes").unwrap();
+
+    // Plant a foreign file at the deterministic sibling-temp name the OLD scheme
+    // would have used (create the root first so the file lands inside it).
+    h3_remote_exec(
+        &dispatcher,
+        &format!("mkdir -p {root} && printf foreign-temp > {root}/out.txt.ordius.tmp"),
+    )
+    .await;
+
+    let run_id = uniq_run_id("persist-temp-r");
+    let wm = Arc::new(WorkspaceManager::new());
+    let run_scope = RunScope {
+        run_id: &run_id,
+        top_run_id: &run_id,
+        workflow_id: "wf-persist-temp",
+        workflow_name: "Persistent Temp Collision Test",
+        started_at_iso: "2026-01-01T00:00:00Z",
+    };
+
+    let cwd = wm
+        .reconcile_in(dispatcher.as_ref(), &binding, &host_ws, &run_scope)
+        .await
+        .expect("reconcile_in additively uploads the host file");
+    assert_eq!(cwd.as_str(), root, "resolves to the stable persistent root");
+
+    let t = dispatcher
+        .workspace_transport()
+        .unwrap()
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(
+        t.download_file(&format!("{root}/out.txt")).await.unwrap(),
+        b"host-bytes",
+        "the host's out.txt is uploaded"
+    );
+    assert_eq!(
+        t.download_file(&format!("{root}/out.txt.ordius.tmp"))
+            .await
+            .unwrap(),
+        b"foreign-temp",
+        "the foreign sibling temp must be UNTOUCHED — staging is inside the lock dir"
+    );
+
+    wm.teardown_all(RunOutcome::Completed).await;
+    // CLEANUP — persistent root is kept by teardown; the test owns its removal.
+    h3_remote_exec(&dispatcher, &format!("rm -rf {root}")).await;
 }
