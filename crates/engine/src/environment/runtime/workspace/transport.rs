@@ -149,6 +149,23 @@ mod fake_impl {
         pub fn set_fail_download(&self, fail: bool) {
             self.inner.lock().fail_download = fail;
         }
+
+        /// Create the dir at `rel`, erroring if ANY entry already exists there
+        /// (exclusive — models a single non-idempotent `mkdir`).
+        // wired to the trait in T5
+        #[allow(dead_code)]
+        pub(super) fn create_dir_exclusive(&self, rel: &str) -> Result<(), DispatchError> {
+            let mut fs = self.inner.lock();
+            if fs.dirs.contains(rel) || fs.files.contains_key(rel) || fs.symlinks.contains_key(rel)
+            {
+                return Err(DispatchError::WorkspaceUnavailable {
+                    env_id: "fake".into(),
+                    reason: format!("already exists: {rel}"),
+                });
+            }
+            fs.dirs.insert(rel.to_string());
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -372,17 +389,29 @@ mod fake_impl {
 
         async fn remove_dir(&self, rel: &str) -> Result<(), DispatchError> {
             let mut fs = self.inner.lock();
-            if fs.dirs.remove(rel) {
-                fs.modes.remove(rel);
+            if !fs.dirs.contains(rel) {
                 drop(fs);
-                Ok(())
-            } else {
-                drop(fs);
-                Err(DispatchError::WorkspaceUnavailable {
+                return Err(DispatchError::WorkspaceUnavailable {
                     env_id: "fake".into(),
                     reason: format!("dir not found: {rel}"),
-                })
+                });
             }
+            // POSIX ENOTEMPTY: fail if any file, dir, or symlink is a strict child.
+            let child_prefix = format!("{rel}/");
+            let has_children = fs.files.keys().any(|k| k.starts_with(&child_prefix))
+                || fs.dirs.iter().any(|k| k.starts_with(&child_prefix))
+                || fs.symlinks.keys().any(|k| k.starts_with(&child_prefix));
+            if has_children {
+                drop(fs);
+                return Err(DispatchError::WorkspaceUnavailable {
+                    env_id: "fake".into(),
+                    reason: format!("directory not empty: {rel}"),
+                });
+            }
+            fs.dirs.remove(rel);
+            fs.modes.remove(rel);
+            drop(fs);
+            Ok(())
         }
 
         async fn set_permissions(&self, rel: &str, mode: u32) -> Result<(), DispatchError> {
@@ -545,5 +574,55 @@ mod tests {
 
         // A missing source still errors.
         assert!(t.rename("nope", "x").await.is_err());
+    }
+
+    // `remove_dir` must fail on a non-empty directory (POSIX ENOTEMPTY) so
+    // tests that probe for an obstruction don't pass spuriously.
+    #[tokio::test]
+    async fn fake_remove_dir_fails_on_non_empty() {
+        let t = FakeWorkspaceTransport::default();
+        t.mkdir("d").await.unwrap();
+        t.upload_file("d/child.txt", b"x").await.unwrap();
+
+        // Non-empty: must fail.
+        assert!(
+            t.remove_dir("d").await.is_err(),
+            "remove_dir on non-empty directory must fail"
+        );
+
+        // Remove the child, then the now-empty dir succeeds and stat returns None.
+        t.remove_file("d/child.txt").await.unwrap();
+        t.remove_dir("d").await.unwrap();
+        assert!(
+            t.stat("d").await.unwrap().is_none(),
+            "dir must be gone after removing contents + remove_dir"
+        );
+    }
+
+    // `create_dir_exclusive` must fail if the path already exists (as dir, file,
+    // or symlink) and succeed exactly once on a fresh path.
+    #[tokio::test]
+    async fn fake_create_dir_exclusive_rejects_existing() {
+        let t = FakeWorkspaceTransport::default();
+
+        // First call: succeeds and the dir is visible.
+        t.create_dir_exclusive("d").unwrap();
+        assert!(
+            t.stat("d").await.unwrap().is_some(),
+            "dir must exist after create_dir_exclusive"
+        );
+
+        // Second call on the same path: must fail.
+        assert!(
+            t.create_dir_exclusive("d").is_err(),
+            "create_dir_exclusive on existing dir must fail"
+        );
+
+        // Also fails when a file already occupies the path.
+        t.upload_file("f.txt", b"x").await.unwrap();
+        assert!(
+            t.create_dir_exclusive("f.txt").is_err(),
+            "create_dir_exclusive where a file exists must fail"
+        );
     }
 }
