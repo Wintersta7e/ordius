@@ -1040,13 +1040,23 @@ async fn sync_remote_additive(
     // (the reserved filter is defensive — `list_remote_files` already drops them).
     let mut last_remote = host_at_in.clone();
     for f in &listing.files {
-        if host_at_in.files.contains_key(&f.rel) || safety::is_reserved_remote_rel(&f.rel) {
+        if host_at_in.files.contains_key(&f.rel)
+            || host_at_in.dirs.contains(&f.rel)
+            || safety::is_reserved_remote_rel(&f.rel)
+        {
             continue;
         }
         last_remote.files.insert(f.rel.clone(), f.entry.clone());
     }
     for d in &listing.dirs {
-        if host_at_in.dirs.contains(d) || safety::is_reserved_remote_rel(d) {
+        // Also skip dirs that are host FILE targets: the obstruction pass may have
+        // removed an empty remote dir at a host-file rel, but the pre-upload
+        // `listing.dirs` still lists it — re-adding it would leave `last_remote`
+        // holding BOTH file `d` and dir `d`.
+        if host_at_in.dirs.contains(d)
+            || host_at_in.files.contains_key(d)
+            || safety::is_reserved_remote_rel(d)
+        {
             continue;
         }
         last_remote.dirs.insert(d.clone());
@@ -2971,6 +2981,35 @@ mod tests {
         assert_eq!(
             fake.download_file(&format!("{root}/d")).await.unwrap(),
             b"x"
+        );
+    }
+
+    /// When an empty remote dir at a host-FILE rel is removed by the obstruction
+    /// pass, the pre-upload `listing.dirs` still lists it; `last_remote` must NOT
+    /// re-add it as a dir, or it would hold BOTH file `d` and dir `d`.
+    #[tokio::test]
+    async fn additive_removed_empty_dir_not_in_last_remote() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("d"), b"x").unwrap();
+
+        let (factory, fake) = additive_factory();
+        let root = "/tmp/persist-dedup";
+        fake.mkdir(root).await.unwrap();
+        // An EMPTY dir at the host-file rel `d` (removed by the obstruction pass).
+        fake.mkdir(&format!("{root}/d")).await.unwrap();
+
+        let (_host_at_in, last_remote) = sync_remote_additive(&factory, root, host_ws)
+            .await
+            .expect("additive sync");
+
+        assert!(
+            last_remote.files.contains_key("d"),
+            "last_remote must carry the host file `d`"
+        );
+        assert!(
+            !last_remote.dirs.contains("d"),
+            "last_remote must NOT also carry a stale dir `d` for the same rel"
         );
     }
 

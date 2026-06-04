@@ -1323,6 +1323,65 @@ async fn real_ssh_cancel_skips_writeback_timeout_keeps() {
     }
 }
 
+/// Ephemeral teardown removes node-created IGNORED paths under the root.
+///
+/// A remote node creates `.git/HEAD` and `.env` under the ephemeral root —
+/// reserved/ignored rels that `list_remote_files` filters out at the manifest
+/// boundary, but that the destructive teardown walk (`list_tree` → recursive
+/// `remove`) must still see, or `remove_dir(root)` fails non-empty and the
+/// ephemeral root leaks. Regression guard for the `list_tree` raw-listing fix:
+/// before it, the pruned listing hid `.git`/`.env`, so the root survived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "gated: requires ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"]
+async fn ephemeral_teardown_cleans_node_created_ignored_paths() {
+    use ordius_engine::environment::runtime::workspace::{RunOutcome, WorkspaceManager};
+
+    let Some(ssh) = build_dispatcher_for_transport_test().await else {
+        eprintln!(
+            "skipping ephemeral-teardown ignored-paths test; set ORDIUS_REAL_SSH_TEST=1 \
+             ORDIUS_TEST_SSH_HOST=user@box"
+        );
+        return;
+    };
+    let env_id = ssh.info().id.clone();
+    let dispatcher: Arc<dyn Dispatcher> = Arc::new(ssh);
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let host_ws = tmp.path().to_path_buf();
+    std::fs::write(host_ws.join("a.txt"), "x").unwrap();
+
+    let run_id = uniq_run_id("teardown-ignored");
+    let root = h3_root(&run_id);
+    let wm = Arc::new(WorkspaceManager::new());
+    let ctx = h3_run_context(&dispatcher, &env_id, &host_ws, &run_id, &wm);
+
+    // Ephemeral reconcile_in uploads the host workspace under the {{run.id}} root.
+    h3_reconcile_in_and_run(&ctx, &dispatcher, &env_id, "true").await;
+
+    // A remote node creates IGNORED paths (`.git/`, `.env`) under the root — these
+    // are filtered from the manifest but must be cleaned up by teardown.
+    h3_remote_exec(
+        &dispatcher,
+        &format!("mkdir -p {root}/.git && printf y > {root}/.git/HEAD && printf z > {root}/.env"),
+    )
+    .await;
+
+    // Ephemeral + Completed ⇒ teardown deletes the root.
+    wm.teardown_all(RunOutcome::Completed).await;
+
+    let t = dispatcher
+        .workspace_transport()
+        .unwrap()
+        .open()
+        .await
+        .unwrap();
+    assert!(
+        t.stat(&root).await.unwrap().is_none(),
+        "ephemeral root must be deleted even when a node created ignored paths \
+         (.git/.env) under it"
+    );
+}
+
 /// Test 4 — `reconcile_in`'s reset clears pre-existing remote symlinks (both a
 /// target-path link and an intermediate-dir link) so no stale link redirects an
 /// upload. After reset, the target path must be a regular `File` with host

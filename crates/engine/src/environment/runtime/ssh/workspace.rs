@@ -15,7 +15,6 @@ use russh_sftp::protocol::{FileAttributes, StatusCode};
 use tokio::io::AsyncWriteExt as _;
 
 use crate::environment::runtime::error::DispatchError;
-use crate::environment::runtime::workspace::safety;
 use crate::environment::runtime::workspace::transport::{
     FileKind, FileMeta, LockOutcome, WorkspaceTransport, WorkspaceTransportFactory,
 };
@@ -217,12 +216,20 @@ impl WorkspaceTransport for SshSftpTransport {
             .await
             .map_err(|e| self.err("flush (lock-dir tmp)", &e.into()))?;
         // SFTP `SSH_FXP_RENAME` does not overwrite an existing target on a stock
-        // OpenSSH server (it returns FAILURE). The ephemeral reset deletes targets
-        // before upload, but the additive persistent path routinely overwrites a
-        // file kept from a prior run, so drop the target first (best-effort —
-        // `NotFound` is fine). The target is a host-owned file we are replacing,
-        // not foreign content, and our new bytes are safe in the lock-dir temp.
-        let _removed = self.session.remove_file(target_rel).await.is_err();
+        // OpenSSH server, and russh-sftp 2.3 exposes no posix-rename extension.
+        // Only drop the target when it already exists (the overwrite case on a
+        // reused persistent root); the common first-upload case skips the remove
+        // entirely. The dropped target is a host-owned file we are replacing
+        // (never foreign content — the additive obstruction pass cleared non-file
+        // entries). Residual window: if the rename below fails after the remove,
+        // the remote is briefly missing a host file that the next reconcile
+        // re-uploads (the host is the source of truth).
+        if self.session.symlink_metadata(target_rel).await.is_ok() {
+            self.session
+                .remove_file(target_rel)
+                .await
+                .map_err(|ref e| self.err("remove (pre-overwrite)", e))?;
+        }
         self.session
             .rename(tmp, target_rel)
             .await
@@ -239,7 +246,7 @@ impl WorkspaceTransport for SshSftpTransport {
 
     async fn list_tree(&self, rel: &str) -> Result<Vec<FileMeta>, DispatchError> {
         let mut results = Vec::new();
-        list_tree_recursive(&self.session, rel, rel, &self.env_id, &mut results).await?;
+        list_tree_recursive(&self.session, rel, &self.env_id, &mut results).await?;
         Ok(results)
     }
 
@@ -339,20 +346,18 @@ impl WorkspaceTransport for SshSftpTransport {
 /// *within* `dir` (the directory itself is not listed), descending into
 /// subdirectories without following symlinks.
 ///
-/// `root` is the path passed to the top-level [`WorkspaceTransport::list_tree`]
-/// call.  Each entry's `rel_path` is the full remote SFTP path (as returned by
-/// `entry.path()`); callers strip the `root/` prefix to obtain the
-/// root-relative segment.  We compute the same root-relative segment here to
-/// apply the reserved-dir filter before emitting or recursing.
+/// This is a RAW listing — no ignore/reserved filter is applied. Destructive
+/// consumers (`remove_tree` teardown, `reset_remote_to_host`) must see every
+/// node-created entry, including ignored ones (`.git`, `node_modules`, `.env`,
+/// ...), or an empty-dir removal of the root would fail with non-empty leftovers
+/// and the ephemeral root would leak. Reserved/ignored rels are filtered at the
+/// manifest boundary instead (`list_remote_files` via `is_reserved_remote_rel`).
 async fn list_tree_recursive(
     session: &SftpSession,
     dir: &str,
-    root: &str,
     env_id: &str,
     results: &mut Vec<FileMeta>,
 ) -> Result<(), DispatchError> {
-    let prefix = format!("{root}/");
-
     let entries = session
         .read_dir(dir)
         .await
@@ -362,15 +367,6 @@ async fn list_tree_recursive(
         let path = entry.path();
         let ft = entry.file_type();
         let meta = entry.metadata();
-
-        // Compute the root-relative segment (same stripping callers apply).
-        let root_rel = path.strip_prefix(&prefix).unwrap_or(path.as_str());
-
-        // Never descend into / emit reserved trees (.ordius.lock, .git, ...) —
-        // the lock dir must never reach a manifest (Codex R2 MAJOR §9.2).
-        if safety::is_reserved_remote_rel(root_rel) {
-            continue;
-        }
 
         let kind = if ft.is_dir() {
             FileKind::Dir
@@ -389,7 +385,7 @@ async fn list_tree_recursive(
 
         // Recurse into directories but not symlinks (don't follow).
         if ft.is_dir() {
-            Box::pin(list_tree_recursive(session, &path, root, env_id, results)).await?;
+            Box::pin(list_tree_recursive(session, &path, env_id, results)).await?;
         }
     }
 
