@@ -86,6 +86,21 @@ enum Lifecycle {
     Ephemeral,
 }
 
+/// Persisted in `<root>/.ordius.lock/owner.json` so a contending run can name who
+/// holds the lock. (H5 persistent-reuse lock.)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)] // populated by H5 persistent-lock acquire path; unused until then
+pub(super) struct LockOwner {
+    /// Top-level run id (child workflows inherit the parent snapshot).
+    pub(super) top_run_id: String,
+    /// The specific (possibly child) run that acquired the lock.
+    pub(super) current_run_id: String,
+    /// Host that ran the acquiring process.
+    pub(super) host: String,
+    /// ISO-8601 acquisition time (the run's `started_at`).
+    pub(super) started_at: String,
+}
+
 /// Per-key state for the per-node reconcile machinery (H3+).
 ///
 /// Populated by `reconcile_in` and read by `reconcile_out` for write-back
@@ -181,6 +196,13 @@ pub struct WorkspaceManager {
     /// (clearing the entry) before resetting the root clean.
     preserved_roots: SyncMutex<HashSet<(EnvId, String)>>,
 
+    /// Remote locks held this run, keyed (`EnvId`, root). A lock is inserted the
+    /// instant its `.ordius.lock` dir is created (before `owner.json`), so teardown
+    /// can always release it. Released (rmdir) by `teardown_all`. (H5.)
+    #[allow(dead_code)]
+    // populated and released by H5 persistent-lock acquire/teardown; unused until then
+    persistent_locks: SyncMutex<HashMap<(EnvId, String), Arc<dyn WorkspaceTransportFactory>>>,
+
     /// Test-only seam: records the last [`RunOutcome`] passed to
     /// [`Self::teardown_all`]. Lets run-loop tests observe that
     /// teardown fired with the correct outcome on every exit path.
@@ -206,6 +228,7 @@ impl Default for WorkspaceManager {
             state: SyncMutex::new(HashMap::new()),
             ephemeral_roots: SyncMutex::new(HashMap::new()),
             preserved_roots: SyncMutex::new(HashSet::new()),
+            persistent_locks: SyncMutex::new(HashMap::new()),
             #[cfg(any(test, feature = "testing"))]
             last_outcome: std::sync::Mutex::new(None),
         }
@@ -3779,5 +3802,24 @@ mod tests {
             !host_ws.join(".ordius").exists(),
             "no divergence dir must be created for a rejected empty id"
         );
+    }
+
+    /// `LockOwner` serialises to JSON and deserialises back without loss.
+    /// Used by the H5 persistent-workspace lock machinery to persist owner
+    /// metadata to `<root>/.ordius.lock/owner.json`.
+    #[test]
+    fn lock_owner_json_round_trips() {
+        let owner = LockOwner {
+            top_run_id: "top".into(),
+            current_run_id: "child".into(),
+            host: "box".into(),
+            started_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&owner).unwrap();
+        let back: LockOwner = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.top_run_id, "top");
+        assert_eq!(back.current_run_id, "child");
+        assert_eq!(back.host, "box");
+        assert_eq!(back.started_at, "2026-01-01T00:00:00Z");
     }
 }

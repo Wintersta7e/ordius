@@ -51,6 +51,7 @@ async-trait = { workspace = true }
 ordius-helper = { path = "../ordius-helper", default-features = false }
 russh = { workspace = true }
 russh-sftp = { workspace = true }
+gethostname = "1.1.0"
 
 [build-dependencies]
 sha2 = { workspace = true }
