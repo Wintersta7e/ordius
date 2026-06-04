@@ -66,33 +66,22 @@ pub fn is_safe_relative(rel: &str) -> bool {
             .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
-/// Whether writing `host_ws/rel` would traverse an existing symlink.
+/// Whether writing `host_ws/rel` would traverse an existing symlink or a
+/// component that cannot be classified.
 ///
-/// Returns `false` if any existing component of `host_ws/<rel>` is a symlink —
-/// a host-side symlinked directory could redirect a write outside the
-/// workspace. Only existing components are checked; missing ones are created as
-/// real directories by the caller. Complements [`is_safe_relative`], which only
-/// inspects the path string (`..`), not the live host filesystem.
+/// Thin bool view over [`classify_artifact_path`]: `true` only when every
+/// existing component of `host_ws/<rel>` is a real (non-symlink) entry that can
+/// be `lstat`-ed. A symlink component — which could redirect a write outside
+/// the workspace — or a `symlink_metadata` error other than `NotFound` (e.g. a
+/// permission error) yields `false`. This **fails closed**: a component we
+/// cannot classify is never treated as safe to write through, matching the
+/// rules [`classify_artifact_path`] applies during write-back. Missing
+/// components are fine; the caller creates them as real directories. Complements
+/// [`is_safe_relative`], which only inspects the path string (`..`), not the
+/// live host filesystem.
 #[must_use]
 pub fn host_target_is_symlink_safe(host_ws: &Path, rel: &str) -> bool {
-    use std::path::Component;
-    let mut cur = host_ws.to_path_buf();
-    for comp in Path::new(rel).components() {
-        match comp {
-            Component::Normal(c) => {
-                cur.push(c);
-                if let Ok(md) = std::fs::symlink_metadata(&cur)
-                    && md.file_type().is_symlink()
-                {
-                    return false;
-                }
-            },
-            Component::CurDir => {},
-            // is_safe_relative already rejects these; be defensive.
-            _ => return false,
-        }
-    }
-    true
+    matches!(classify_artifact_path(host_ws, rel), ArtifactPathState::Ok)
 }
 
 /// Encode `s` as a single filesystem-safe path segment (base64url, no pad).
@@ -911,6 +900,34 @@ mod tests {
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert_eq!(state, ArtifactPathState::Unreadable, "got {state:?}");
+    }
+
+    // host_target_is_symlink_safe must fail closed on the same EACCES that makes
+    // classify_artifact_path report Unreadable: a component we cannot lstat is
+    // not safe to write through.
+    #[cfg(unix)]
+    #[test]
+    fn host_target_is_symlink_safe_fails_closed_on_permission_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if running_as_root() {
+            eprintln!("skipping: running as root, permission bits are bypassed");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let host_ws = tmp.path();
+
+        let blocked = host_ws.join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let safe = host_target_is_symlink_safe(host_ws, "blocked/child");
+
+        // Restore perms so tempdir cleanup can recurse.
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(!safe, "EACCES component must be treated as unsafe");
     }
 
     /// True when the test process can lstat inside a 0o000 directory it owns —
