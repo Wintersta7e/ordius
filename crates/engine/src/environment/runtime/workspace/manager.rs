@@ -100,6 +100,9 @@ struct WorkspaceState {
     /// Snapshot of the remote manifest as of the last `reconcile_in`/`reconcile_out`.
     /// Used as the write-back baseline by `reconcile_out`.
     last_remote_manifest: safety::Manifest,
+    /// Run id of the reconcile that populated this state (for divergence paths).
+    #[allow(dead_code)] // read by the divergence path in a later task
+    run_id: String,
 }
 
 impl std::fmt::Debug for WorkspaceState {
@@ -362,6 +365,7 @@ impl WorkspaceManager {
                     transport_factory: Arc::clone(&factory),
                     write_back: write_back.clone(),
                     last_remote_manifest: uploaded,
+                    run_id: run.run_id.to_string(),
                 },
             );
         }
