@@ -36,7 +36,7 @@ use crate::environment::runtime::error::DispatchError;
 use crate::environment::runtime::transport::EnvPath;
 
 use super::safety;
-use super::transport::{FileKind, WorkspaceTransportFactory};
+use super::transport::{FileKind, WorkspaceTransport, WorkspaceTransportFactory};
 
 // ── Type aliases ──────────────────────────────────────────────────────────────
 
@@ -602,6 +602,101 @@ async fn reset_remote_to_host(
     Ok(manifest)
 }
 
+/// One regular file from a [`RemoteListing`]: its root-stripped rel, downloaded
+/// bytes, and the [`safety::FileEntry`] hashed from those bytes.
+struct RemoteFile {
+    rel: String,
+    bytes: Vec<u8>,
+    entry: safety::FileEntry,
+}
+
+/// A fully-downloaded snapshot of one remote tree, classified by kind.
+///
+/// Built only from a transport listing that succeeded end to end: every regular
+/// file was listed AND downloaded. A partial failure aborts via `?` so a
+/// transport error can never read as "entry absent" (which would drive a
+/// spurious host deletion — data loss).
+struct RemoteListing {
+    /// Regular files (rel root-stripped), with bytes + per-file metadata.
+    files: Vec<RemoteFile>,
+    /// Directory rels (root-stripped).
+    dirs: std::collections::BTreeSet<String>,
+    /// Symlink rels (root-stripped). Used to shadow deletions: a host rel under
+    /// a remote symlink is not really gone, just hidden by the link.
+    symlinks: std::collections::BTreeSet<String>,
+}
+
+/// List `root` via a fresh transport and classify every entry under it.
+///
+/// Strips the `{root}/` prefix and drops the root entry itself (transports
+/// differ on whether they list it). Unsafe (`..`/absolute) rels are skipped.
+/// Regular files are downloaded and hashed into [`RemoteFile`]; dirs and
+/// symlinks are recorded by rel. `list_tree` / `download_file` errors PROPAGATE
+/// via `?`: a transport failure must NEVER be treated as "absent".
+async fn list_remote_files(
+    t: Box<dyn WorkspaceTransport>,
+    root: &str,
+) -> Result<RemoteListing, DispatchError> {
+    let prefix = format!("{root}/");
+    let entries = t.list_tree(root).await?;
+
+    let mut listing = RemoteListing {
+        files: Vec::new(),
+        dirs: std::collections::BTreeSet::new(),
+        symlinks: std::collections::BTreeSet::new(),
+    };
+
+    for entry in &entries {
+        // Drop the root entry itself; only its contents are reconciled.
+        if entry.rel_path == root {
+            continue;
+        }
+        let Some(rel) = entry.rel_path.strip_prefix(&prefix) else {
+            continue; // defensive: outside the root — ignore
+        };
+        if !safety::is_safe_relative(rel) {
+            continue;
+        }
+        match entry.kind {
+            FileKind::File => {
+                let bytes = t.download_file(&entry.rel_path).await?;
+                let sha256_hex = safety::sha256_hex(&bytes);
+                let size = bytes.len() as u64;
+                listing.files.push(RemoteFile {
+                    rel: rel.to_string(),
+                    bytes,
+                    entry: safety::FileEntry {
+                        sha256_hex,
+                        size,
+                        mode: entry.mode,
+                    },
+                });
+            },
+            FileKind::Dir => {
+                listing.dirs.insert(rel.to_string());
+            },
+            FileKind::Symlink => {
+                listing.symlinks.insert(rel.to_string());
+            },
+        }
+    }
+
+    Ok(listing)
+}
+
+/// Whether `rel` is shadowed by some remote symlink in `symlinks` — i.e. the rel
+/// equals a symlink, or sits under a symlinked directory. A shadowed host rel is
+/// not really "deleted on the remote", just hidden by the link, so its host file
+/// or directory must be left alone.
+fn is_shadowed_by_symlink<'a>(
+    rel: &str,
+    symlinks: &'a std::collections::BTreeSet<String>,
+) -> Option<&'a String> {
+    symlinks
+        .iter()
+        .find(|s| rel == s.as_str() || rel.starts_with(&format!("{s}/")))
+}
+
 /// Propagate remote changes at `root` back to the host workspace at `host_ws`,
 /// returning the new remote manifest (the advanced write-back baseline).
 ///
@@ -613,7 +708,12 @@ async fn reset_remote_to_host(
 ///   ignore globs).
 /// - A rel present in `baseline` but absent from the remote is *deleted* on the
 ///   host (same guards; best-effort per-file so one failed unlink does not
-///   abort the rest).
+///   abort the rest), UNLESS the rel is shadowed by a remote symlink — a node
+///   replacing a file/dir with a symlink at the same rel is not a deletion.
+/// - Directories the remote gained are created on the host; directories that
+///   became empty (in `baseline.dirs`, gone from the remote) are pruned
+///   deepest-first with `remove_dir` (never `remove_dir_all`), so an untracked
+///   host file keeps its directory alive.
 ///
 /// `list_tree` / `download_file` errors PROPAGATE via `?`: a transport failure
 /// must never read as "file absent", which would trigger a spurious host
@@ -626,35 +726,22 @@ async fn write_back_delta(
     ignore: &[String],
 ) -> Result<safety::Manifest, DispatchError> {
     let t = factory.open().await?;
-    let prefix = format!("{root}/");
 
-    // 1. Build the new remote manifest from a fully-successful listing +
+    // 1. Build the new remote snapshot from a fully-successful listing +
     // downloads. Any transport error here aborts the whole write-back (no
-    // spurious deletions). Only regular files contribute.
-    let listing = t.list_tree(root).await?;
-    let mut new_remote = safety::Manifest::new();
-    for entry in &listing {
-        if entry.kind != FileKind::File {
-            continue;
-        }
-        let Some(rel) = entry.rel_path.strip_prefix(&prefix) else {
-            continue; // defensive: outside the root — ignore for manifest purposes
-        };
-        if !safety::is_safe_relative(rel) {
-            continue;
-        }
-        let bytes = t.download_file(&entry.rel_path).await?;
-        new_remote.files.insert(
-            rel.to_string(),
-            safety::FileEntry {
-                sha256_hex: safety::sha256_hex(&bytes),
-                size: bytes.len() as u64,
-                mode: entry.mode,
-            },
-        );
+    // spurious deletions). Files, dirs, and symlinks are all classified.
+    let listing = list_remote_files(t, root).await?;
 
-        // 2. Write changed / new files to the host, under the same guards as
-        // H2 write-back. Skip silently on a guard failure.
+    // Collect the new remote manifest (the advanced baseline) and write changed
+    // / new files to the host under the same guards as H2 write-back.
+    let mut new_remote = safety::Manifest::new();
+    new_remote.dirs.clone_from(&listing.dirs);
+    for f in &listing.files {
+        let rel = f.rel.as_str();
+        new_remote.files.insert(rel.to_string(), f.entry.clone());
+
+        // 2. Write changed / new files to the host. Skip silently on a guard
+        // failure (host symlink traversal / ignore glob).
         if !safety::host_target_is_symlink_safe(host_ws, rel) {
             tracing::warn!(
                 rel,
@@ -669,17 +756,28 @@ async fn write_back_delta(
         let changed = baseline
             .files
             .get(rel)
-            .is_none_or(|meta| meta.sha256_hex != new_remote.files[rel].sha256_hex);
+            .is_none_or(|meta| meta.sha256_hex != f.entry.sha256_hex);
         if changed {
-            write_host_file_atomic(host_ws, rel, &bytes)?;
+            write_host_file_atomic(host_ws, rel, &f.bytes)?;
         }
     }
 
-    // 3. Deletion propagation: a rel in `baseline` but absent from `new_remote`
-    // was deleted by the node — mirror that on the host, under identical guards.
-    // Best-effort: a failed unlink is logged and skipped, never aborting.
+    // 3. File-deletion propagation: a rel in `baseline.files` but absent from the
+    // new remote was deleted by the node — mirror that on the host, under
+    // identical guards. A rel shadowed by a remote symlink is NOT a deletion (the
+    // node replaced the file/dir with a link), so skip it. Best-effort: a failed
+    // unlink is logged and skipped, never aborting.
     for rel in baseline.files.keys() {
         if new_remote.files.contains_key(rel) {
+            continue;
+        }
+        if let Some(s) = is_shadowed_by_symlink(rel, &listing.symlinks) {
+            tracing::warn!(
+                rel,
+                env_root = root,
+                symlink = %s,
+                "skipping host deletion: rel is shadowed by a remote symlink"
+            );
             continue;
         }
         if !safety::is_safe_relative(rel)
@@ -703,7 +801,105 @@ async fn write_back_delta(
         }
     }
 
+    // 4 + 5. Mirror directory adds/removes onto the host (create gained dirs,
+    // prune emptied ones deepest-first), honouring the symlink-shadow guard.
+    reconcile_host_dirs(
+        host_ws,
+        root,
+        baseline,
+        &new_remote,
+        &listing.symlinks,
+        ignore,
+    );
+
     Ok(new_remote)
+}
+
+/// Create directories the remote gained and prune host directories that the
+/// remote dropped, mirroring `baseline.dirs` → `new_remote.dirs`.
+///
+/// - **Create:** dirs in `new_remote.dirs − baseline.dirs`, shallow-first,
+///   via `create_dir_all` under the host-symlink guard.
+/// - **Prune:** dirs in `baseline.dirs − new_remote.dirs`, deepest-first, via
+///   `remove_dir` (NEVER `remove_dir_all`) so an untracked host file keeps its
+///   directory alive; `DirectoryNotEmpty` / `NotFound` are silent skips.
+///
+/// Both passes skip a rel shadowed by a remote symlink (the node replaced the
+/// dir with a link, not a deletion) and apply the same
+/// `is_safe_relative` / `host_target_is_symlink_safe` / `should_ignore` guards
+/// used for files. All filesystem errors are best-effort (warn, never abort).
+fn reconcile_host_dirs(
+    host_ws: &Path,
+    root: &str,
+    baseline: &safety::Manifest,
+    new_remote: &safety::Manifest,
+    symlinks: &std::collections::BTreeSet<String>,
+    ignore: &[String],
+) {
+    // Create gained dirs shallow-first (lexicographic — parents precede children).
+    let mut new_dirs: Vec<&String> = new_remote.dirs.difference(&baseline.dirs).collect();
+    new_dirs.sort_unstable();
+    for rel in new_dirs {
+        if !safety::is_safe_relative(rel)
+            || safety::should_ignore(rel, ignore)
+            || is_shadowed_by_symlink(rel, symlinks).is_some()
+        {
+            continue;
+        }
+        if !safety::host_target_is_symlink_safe(host_ws, rel) {
+            tracing::warn!(
+                rel,
+                env_root = root,
+                "skipping dir create: host path traverses a symlink"
+            );
+            continue;
+        }
+        if let Err(e) = std::fs::create_dir_all(host_ws.join(rel)) {
+            tracing::warn!(
+                rel,
+                env_root = root,
+                error = %e,
+                "failed to create host dir on write-back (best-effort)"
+            );
+        }
+    }
+
+    // Prune emptied dirs deepest-first (longest path first).
+    let mut gone_dirs: Vec<&String> = baseline.dirs.difference(&new_remote.dirs).collect();
+    gone_dirs.sort_unstable_by_key(|d| std::cmp::Reverse(d.len()));
+    for rel in gone_dirs {
+        if let Some(s) = is_shadowed_by_symlink(rel, symlinks) {
+            tracing::warn!(
+                rel,
+                env_root = root,
+                symlink = %s,
+                "skipping host dir prune: rel is shadowed by a remote symlink"
+            );
+            continue;
+        }
+        if !safety::is_safe_relative(rel)
+            || !safety::host_target_is_symlink_safe(host_ws, rel)
+            || safety::should_ignore(rel, ignore)
+        {
+            continue;
+        }
+        match std::fs::remove_dir(host_ws.join(rel)) {
+            Ok(()) => {},
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                ) => {},
+            Err(e) => {
+                tracing::warn!(
+                    rel,
+                    env_root = root,
+                    error = %e,
+                    "failed to prune empty host dir on write-back (best-effort)"
+                );
+            },
+        }
+    }
 }
 
 /// Recursively remove `root` and everything under it via the transport: files
@@ -1729,6 +1925,132 @@ mod tests {
             std::fs::read(host_ws2.join("a.txt")).unwrap(),
             b"orig",
             "None policy must not write back"
+        );
+    }
+
+    /// Force write-back prunes a host directory that became empty after its only
+    /// file was deleted on the remote — but keeps a dir that still holds an
+    /// untracked host file (present on host, absent from baseline + remote).
+    #[tokio::test]
+    async fn write_back_prunes_empty_host_dir_but_keeps_nonempty() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        // Baseline: dir `d` holding `d/x.txt`, plus dir `e` holding `e/y.txt`.
+        std::fs::create_dir(host_ws.join("d")).unwrap();
+        std::fs::write(host_ws.join("d").join("x.txt"), b"x").unwrap();
+        std::fs::create_dir(host_ws.join("e")).unwrap();
+        std::fs::write(host_ws.join("e").join("y.txt"), b"y").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("prune-empty");
+        let mgr = WorkspaceManager::new();
+        let binding = sftp_binding(
+            "/tmp/ordius-{{run.id}}",
+            WriteBackPolicy::Force { ignore: vec![] },
+        );
+
+        // reconcile_in establishes baseline {dirs: d, e; files: d/x.txt, e/y.txt}.
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        // Node deletes BOTH dirs' files on the remote so neither dir remains.
+        fake.remove_file(&format!("{root}/d/x.txt")).await.unwrap();
+        fake.remove_dir(&format!("{root}/d")).await.unwrap();
+        fake.remove_file(&format!("{root}/e/y.txt")).await.unwrap();
+        fake.remove_dir(&format!("{root}/e")).await.unwrap();
+
+        // Drop an UNTRACKED file into host `e/` (present on host, NOT in baseline,
+        // NOT on remote) so the prune must leave `e/` standing.
+        std::fs::write(host_ws.join("e").join("keep.txt"), b"keep").unwrap();
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out Force");
+
+        // `d` had only its tracked file: deletion propagates AND the empty dir is pruned.
+        assert!(
+            !host_ws.join("d").join("x.txt").exists(),
+            "d/x.txt must be deleted"
+        );
+        assert!(
+            !host_ws.join("d").exists(),
+            "empty host dir d must be pruned"
+        );
+        // `e` still holds an untracked file: its tracked file goes, but the dir stays.
+        assert!(
+            !host_ws.join("e").join("y.txt").exists(),
+            "e/y.txt must be deleted"
+        );
+        assert!(
+            host_ws.join("e").exists(),
+            "non-empty host dir e must be kept"
+        );
+        assert!(
+            host_ws.join("e").join("keep.txt").exists(),
+            "untracked host file e/keep.txt must survive"
+        );
+    }
+
+    /// Force write-back must NOT delete a host file/subtree when the remote
+    /// replaces it with a symlink at the same rel — the symlink shadows the rel,
+    /// so the absence of a regular file there is not a real deletion.
+    #[tokio::test]
+    async fn write_back_does_not_delete_host_when_remote_replaces_file_with_symlink() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        // Baseline: file `a.txt` and dir `d` holding `d/c.txt`.
+        std::fs::write(host_ws.join("a.txt"), b"host-a").unwrap();
+        std::fs::create_dir(host_ws.join("d")).unwrap();
+        std::fs::write(host_ws.join("d").join("c.txt"), b"host-c").unwrap();
+
+        let (d, fake) = ssh_dispatcher_with_fake("symlink-shadow");
+        let factory = FakeWorkspaceTransportFactory::new(fake.clone());
+        let mgr = WorkspaceManager::new();
+        let binding = sftp_binding(
+            "/tmp/ordius-{{run.id}}",
+            WriteBackPolicy::Force { ignore: vec![] },
+        );
+
+        // reconcile_in establishes baseline {files: a.txt, d/c.txt; dirs: d}.
+        let cwd = mgr
+            .reconcile_in(&d, &binding, host_ws, &sample_run())
+            .await
+            .expect("reconcile_in");
+        let root = cwd.as_str().to_string();
+
+        // The node replaces the regular file `a.txt` with a symlink, and replaces
+        // the directory `d` (and thus the file under it) with a symlink at `d`.
+        fake.remove_file(&format!("{root}/a.txt")).await.unwrap();
+        factory.seed_symlink(&format!("{root}/a.txt"), "/etc/passwd");
+        fake.remove_file(&format!("{root}/d/c.txt")).await.unwrap();
+        fake.remove_dir(&format!("{root}/d")).await.unwrap();
+        factory.seed_symlink(&format!("{root}/d"), "/var/evil");
+
+        mgr.reconcile_out(&d, &binding, host_ws)
+            .await
+            .expect("reconcile_out Force");
+
+        // The symlink shadows `a.txt`: the host file must NOT be deleted.
+        assert!(
+            host_ws.join("a.txt").exists(),
+            "host a.txt must NOT be deleted when remote replaces it with a symlink"
+        );
+        assert_eq!(
+            std::fs::read(host_ws.join("a.txt")).unwrap(),
+            b"host-a",
+            "host a.txt content must be untouched"
+        );
+        // The symlink at `d` shadows the whole `d/` subtree: `d/c.txt` survives.
+        assert!(
+            host_ws.join("d").join("c.txt").exists(),
+            "host d/c.txt must NOT be deleted when remote replaces dir d with a symlink"
+        );
+        assert_eq!(
+            std::fs::read(host_ws.join("d").join("c.txt")).unwrap(),
+            b"host-c",
+            "host d/c.txt content must be untouched"
         );
     }
 
