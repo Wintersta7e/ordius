@@ -1570,3 +1570,117 @@ async fn safe_or_diverge_diverges_on_concurrent_host_edit() {
         "remote ephemeral root must be deleted after teardown"
     );
 }
+
+/// Test 6 — a root preserved by a failed `reconcile_out` write-back is MOVED to a
+/// recovery sibling by the next same-key `reconcile_in`, which then resets the
+/// root clean. Real-SSH analogue of the in-memory `reconcile_in_recovers_preserved_root`
+/// unit test. Sequence:
+///   1. host `out.txt` = "host-original"; `reconcile_in` uploads + baselines it.
+///   2. the remote node rewrites `out.txt` = "node-output".
+///   3. `chmod 000` the remote file so `reconcile_out`'s download fails — the
+///      write-back errors and the root is preserved (the real analogue of the
+///      fake's `set_fail_download`).
+///   4. `chmod 644` to heal, then `reconcile_in` again for the SAME key: the
+///      preserved output is renamed to `<root>.recovery` and the root reset to
+///      the host.
+///   5. teardown deletes the (now ordinary) ephemeral root but leaves the
+///      recovery copy for manual retrieval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "gated: requires ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"]
+async fn safe_or_diverge_recovers_preserved_root() {
+    use ordius_engine::environment::runtime::workspace::{RunOutcome, RunScope, WorkspaceManager};
+
+    let Some(ssh) = build_dispatcher_for_transport_test().await else {
+        eprintln!(
+            "skipping recovery test; set ORDIUS_REAL_SSH_TEST=1 ORDIUS_TEST_SSH_HOST=user@box"
+        );
+        return;
+    };
+    let dispatcher: Arc<dyn Dispatcher> = Arc::new(ssh);
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let host_ws = tmp.path().to_path_buf();
+    std::fs::write(host_ws.join("out.txt"), b"host-original").unwrap();
+
+    let run_id = uniq_run_id("sod-rec");
+    let root = sod_root(&run_id);
+    let wm = Arc::new(WorkspaceManager::new());
+    let binding = sod_binding();
+    let run_scope = RunScope {
+        run_id: &run_id,
+        workflow_id: "wf-sod-rec",
+        workflow_name: "SafeOrDiverge Recovery Test",
+        started_at_iso: "2026-01-01T00:00:00Z",
+    };
+
+    // ── 1. Upload the workspace + capture the baseline ──
+    let cwd = wm
+        .reconcile_in(dispatcher.as_ref(), &binding, &host_ws, &run_scope)
+        .await
+        .expect("reconcile_in uploads the workspace");
+    assert_eq!(cwd.as_str(), root);
+
+    // ── 2. Remote node produces output ──
+    h3_remote_exec(
+        &dispatcher,
+        &format!("cd {root} && printf node-output > out.txt"),
+    )
+    .await;
+
+    // ── 3. Make the output unreadable so reconcile_out's download fails and the
+    //       root is preserved ──
+    h3_remote_exec(&dispatcher, &format!("chmod 000 {root}/out.txt")).await;
+    wm.reconcile_out(dispatcher.as_ref(), &binding, &host_ws)
+        .await
+        .expect_err("reconcile_out write-back must fail on the unreadable file");
+
+    // ── 4. Heal, then reconcile_in again for the SAME key: recover + reset ──
+    h3_remote_exec(&dispatcher, &format!("chmod 644 {root}/out.txt")).await;
+    let reused = wm
+        .reconcile_in(dispatcher.as_ref(), &binding, &host_ws, &run_scope)
+        .await
+        .expect("reconcile_in must recover the preserved root, not refuse");
+    assert_eq!(
+        reused.as_str(),
+        root,
+        "the same key resolves to the same root"
+    );
+
+    let t = dispatcher
+        .workspace_transport()
+        .unwrap()
+        .open()
+        .await
+        .unwrap();
+    let recovery = format!("{root}.recovery");
+
+    // The recovery sibling holds the node's preserved output verbatim.
+    assert_eq!(
+        t.download_file(&format!("{recovery}/out.txt"))
+            .await
+            .unwrap(),
+        b"node-output",
+        "the recovery copy must keep the node's output"
+    );
+    // The reset root mirrors the host workspace.
+    assert_eq!(
+        t.download_file(&format!("{root}/out.txt")).await.unwrap(),
+        b"host-original",
+        "the recovered root must be reset to the host workspace"
+    );
+
+    // ── 5. Teardown deletes the (now ordinary) ephemeral root, keeps recovery ──
+    wm.teardown_all(RunOutcome::Completed).await;
+    assert!(
+        t.stat(&root).await.unwrap().is_none(),
+        "the recovered (reset) root is a normal ephemeral root — teardown deletes it"
+    );
+    assert!(
+        t.stat(&recovery).await.unwrap().is_some(),
+        "the recovery copy survives teardown for manual retrieval"
+    );
+
+    // Leave the container tidy: the recovery tree is intentionally untracked, so
+    // the test owns cleaning it up.
+    h3_remote_exec(&dispatcher, &format!("rm -rf {recovery}")).await;
+}

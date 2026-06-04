@@ -280,24 +280,76 @@ mod fake_impl {
 
         async fn rename(&self, from: &str, to: &str) -> Result<(), DispatchError> {
             let mut fs = self.inner.lock();
-            if let Some(data) = fs.files.remove(from) {
-                fs.files.insert(to.to_owned(), data);
-                if let Some(mode) = fs.modes.remove(from) {
-                    fs.modes.insert(to.to_owned(), mode);
+
+            // `from` must name an existing entry, like real `rename(2)`.
+            if !fs.files.contains_key(from)
+                && !fs.dirs.contains(from)
+                && !fs.symlinks.contains_key(from)
+            {
+                drop(fs);
+                return Err(DispatchError::WorkspaceUnavailable {
+                    env_id: "fake".into(),
+                    reason: format!("rename source not found: {from}"),
+                });
+            }
+
+            // Renaming a directory moves its whole subtree atomically server-side
+            // (POSIX `rename(2)` relinks the inode; children's paths change with
+            // it). Reparent `from` and every descendant: `from` → `to`, and any
+            // `from/<rest>` → `to/<rest>`, across files, dirs, and symlinks.
+            let child_prefix = format!("{from}/");
+            let reparent = |k: &str| -> Option<String> {
+                if k == from {
+                    Some(to.to_owned())
+                } else {
+                    k.strip_prefix(&child_prefix)
+                        .map(|rest| format!("{to}/{rest}"))
                 }
-                drop(fs);
-                return Ok(());
+            };
+
+            let moved_files: Vec<(String, String)> = fs
+                .files
+                .keys()
+                .filter_map(|k| reparent(k).map(|nk| (k.clone(), nk)))
+                .collect();
+            for (old, new) in moved_files {
+                if let Some(data) = fs.files.remove(&old) {
+                    fs.files.insert(new.clone(), data);
+                }
+                if let Some(mode) = fs.modes.remove(&old) {
+                    fs.modes.insert(new, mode);
+                }
             }
-            if fs.dirs.remove(from) {
-                fs.dirs.insert(to.to_owned());
-                drop(fs);
-                return Ok(());
+
+            let moved_dirs: Vec<(String, String)> = fs
+                .dirs
+                .iter()
+                .filter_map(|k| reparent(k).map(|nk| (k.clone(), nk)))
+                .collect();
+            for (old, new) in moved_dirs {
+                fs.dirs.remove(&old);
+                fs.dirs.insert(new.clone());
+                if let Some(mode) = fs.modes.remove(&old) {
+                    fs.modes.insert(new, mode);
+                }
             }
+
+            let moved_links: Vec<(String, String)> = fs
+                .symlinks
+                .keys()
+                .filter_map(|k| reparent(k).map(|nk| (k.clone(), nk)))
+                .collect();
+            for (old, new) in moved_links {
+                if let Some(target) = fs.symlinks.remove(&old) {
+                    fs.symlinks.insert(new.clone(), target);
+                }
+                if let Some(mode) = fs.modes.remove(&old) {
+                    fs.modes.insert(new, mode);
+                }
+            }
+
             drop(fs);
-            Err(DispatchError::WorkspaceUnavailable {
-                env_id: "fake".into(),
-                reason: format!("rename source not found: {from}"),
-            })
+            Ok(())
         }
 
         async fn remove_file(&self, rel: &str) -> Result<(), DispatchError> {
@@ -459,5 +511,39 @@ mod tests {
         assert_eq!(md.size, 5);
         t.remove_file("a/f.txt").await.unwrap();
         assert!(t.stat("a/f.txt").await.unwrap().is_none());
+    }
+
+    // Renaming a directory must move its whole subtree (like real `rename(2)`),
+    // not just the directory entry — children's paths move with the parent and
+    // the old paths disappear.
+    #[tokio::test]
+    async fn fake_rename_moves_directory_subtree() {
+        let factory = FakeWorkspaceTransportFactory::default();
+        factory.seed_symlink("d/link", "../x");
+        let t = factory.open().await.unwrap();
+        t.mkdir("d").await.unwrap();
+        t.mkdir("d/sub").await.unwrap();
+        t.upload_file("d/a.txt", b"a").await.unwrap();
+        t.upload_file("d/sub/b.txt", b"b").await.unwrap();
+
+        t.rename("d", "d.bak").await.unwrap();
+
+        // The whole subtree moved under the new name.
+        assert_eq!(t.download_file("d.bak/a.txt").await.unwrap(), b"a");
+        assert_eq!(t.download_file("d.bak/sub/b.txt").await.unwrap(), b"b");
+        assert_eq!(
+            t.stat("d.bak/sub").await.unwrap().unwrap().kind,
+            FileKind::Dir
+        );
+        assert_eq!(t.read_link("d.bak/link").await.unwrap(), "../x");
+
+        // Nothing remains at the old paths.
+        assert!(t.stat("d").await.unwrap().is_none());
+        assert!(t.stat("d/a.txt").await.unwrap().is_none());
+        assert!(t.stat("d/sub/b.txt").await.unwrap().is_none());
+        assert!(t.stat("d/link").await.unwrap().is_none());
+
+        // A missing source still errors.
+        assert!(t.rename("nope", "x").await.is_err());
     }
 }

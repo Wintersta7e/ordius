@@ -166,10 +166,11 @@ pub struct WorkspaceManager {
     /// repeated same-`(env, root)` inserts.
     ephemeral_roots: SyncMutex<HashMap<(EnvId, String), Arc<dyn WorkspaceTransportFactory>>>,
 
-    /// Remote roots whose write-back failed and must not be reset or deleted
-    /// (recoverable output). A `reconcile_out` write-back failure records
-    /// `(EnvId, root)` here so a later same-key `reconcile_in` refuses to reset
-    /// that root and `teardown_all` keeps it on the server for recovery.
+    /// Remote roots whose write-back failed and hold the only copy of a node's
+    /// output (recoverable). A `reconcile_out` write-back failure records
+    /// `(EnvId, root)` here so `teardown_all` keeps the root on the server, and
+    /// a later same-key `reconcile_in` moves it aside to a recovery sibling
+    /// (clearing the entry) before resetting the root clean.
     preserved_roots: SyncMutex<HashSet<(EnvId, String)>>,
 
     /// Test-only seam: records the last [`RunOutcome`] passed to
@@ -378,20 +379,22 @@ impl WorkspaceManager {
             DispatchError::Unsupported("environment has no workspace transport".into())
         })?;
 
-        // Refuse to reset a root whose earlier `reconcile_out` write-back failed:
-        // it is the only copy of that node's output. Resetting it host→remote
-        // would destroy the unreconciled changes.
-        if self
-            .preserved_roots
-            .lock()
-            .contains(&(dispatcher.info().id.clone(), root.clone()))
-        {
-            return Err(DispatchError::WorkspaceUnavailable {
-                env_id: dispatcher.info().id.as_str().into(),
-                reason: format!(
-                    "remote root `{root}` holds unreconciled output from a failed write-back; refusing to reset it (recover or clear it manually)"
-                ),
-            });
+        // A root whose earlier `reconcile_out` write-back failed holds the only
+        // copy of that node's output. Resetting it host→remote would destroy the
+        // unreconciled changes, so move it aside to a recovery sibling and clear
+        // the flag; the reset below then recreates the root clean. The recovery
+        // copy stays on the server for manual retrieval. If the move itself fails
+        // the error propagates and the root is left intact (fail closed).
+        let preserve_key = (dispatcher.info().id.clone(), root.clone());
+        if self.preserved_roots.lock().contains(&preserve_key) {
+            let recovery = recover_preserved_root(&factory, &root).await?;
+            self.preserved_roots.lock().remove(&preserve_key);
+            tracing::warn!(
+                env_id = %preserve_key.0.as_str(),
+                env_root = root,
+                recovery_path = recovery,
+                "earlier write-back failed; moved the unreconciled output aside for recovery and reset the workspace"
+            );
         }
 
         let uploaded = match reset_remote_to_host(&factory, &root, host_ws).await {
@@ -505,8 +508,9 @@ impl WorkspaceManager {
             Ok(m) => m,
             Err(e) => {
                 // The env-side root still holds the node's unreconciled output.
-                // Record it so a later same-key `reconcile_in` refuses to reset
-                // it and `teardown_all` keeps it for recovery instead of deleting.
+                // Record it so `teardown_all` keeps it for recovery instead of
+                // deleting, and a later same-key `reconcile_in` moves it aside
+                // (not reset over it).
                 self.preserved_roots
                     .lock()
                     .insert((key.0.clone(), root.clone()));
@@ -1483,6 +1487,47 @@ async fn reconcile_write_back(
             .map(|(manifest, _report)| manifest)
         },
     }
+}
+
+/// Upper bound on recovery-sibling probes before giving up. A run could move
+/// the same preserved root aside more than once (e.g. a `loop_for` that keeps
+/// failing write-back), so several `.recovery.N` names may already exist; the
+/// cap stops an always-"exists" transport from looping forever.
+const RECOVERY_PROBE_LIMIT: u32 = 1000;
+
+/// Move a preserved remote `root` aside so a fresh reconcile can recreate it
+/// clean, returning the path the output was moved to.
+///
+/// A root reaches here only when an earlier write-back failed and left the sole
+/// copy of a node's output under it. Rather than wedge the run, rename `root` to
+/// the first free sibling `<root>.recovery[.N]` — probed via `stat` so repeated
+/// recoveries within one run do not collide. A directory rename is recursive and
+/// atomic server-side, so the whole subtree moves in one step. The recovery copy
+/// is left on the server for the user to retrieve; teardown neither tracks nor
+/// deletes it. Any `stat`/`rename` transport error propagates so the caller
+/// fails closed with `root` untouched.
+async fn recover_preserved_root(
+    factory: &Arc<dyn WorkspaceTransportFactory>,
+    root: &str,
+) -> Result<String, DispatchError> {
+    let t = factory.open().await?;
+    for n in 0..RECOVERY_PROBE_LIMIT {
+        let recovery = if n == 0 {
+            format!("{root}.recovery")
+        } else {
+            format!("{root}.recovery.{n}")
+        };
+        if t.stat(&recovery).await?.is_none() {
+            t.rename(root, &recovery).await?;
+            return Ok(recovery);
+        }
+    }
+    Err(DispatchError::WorkspaceUnavailable {
+        env_id: "<remote>".into(),
+        reason: format!(
+            "no free recovery path for preserved root `{root}` after {RECOVERY_PROBE_LIMIT} attempts"
+        ),
+    })
 }
 
 /// Recursively remove `root` and everything under it via the transport: files
@@ -2488,16 +2533,18 @@ mod tests {
     }
 
     /// After a `reconcile_out` write-back failure preserves a root, a later
-    /// same-key `reconcile_in` must REFUSE to reset it (resetting host→remote
-    /// would destroy the unreconciled output). The refusal is a
-    /// `WorkspaceUnavailable` error and the remote output is left untouched.
+    /// same-key `reconcile_in` MOVES the unreconciled output aside to a recovery
+    /// sibling and resets the root clean — rather than wedging the run. The
+    /// recovery copy keeps the node's bytes; the reset root mirrors the host; and
+    /// the root, no longer preserved, is deleted by teardown while the recovery
+    /// copy survives for manual retrieval.
     #[tokio::test]
-    async fn reconcile_in_refuses_reset_of_preserved_root() {
+    async fn reconcile_in_recovers_preserved_root() {
         let host = tempfile::TempDir::new().unwrap();
         let host_ws = host.path();
         std::fs::write(host_ws.join("a.txt"), b"orig").unwrap();
 
-        let (d, fake) = ssh_dispatcher_with_fake("sod-in-refuse");
+        let (d, fake) = ssh_dispatcher_with_fake("sod-in-recover");
         let mgr = WorkspaceManager::new();
         let binding = sod_binding();
         let root = mgr
@@ -2517,28 +2564,48 @@ mod tests {
             .await
             .expect_err("reconcile_out write-back must fail");
 
-        // Heal the transport: a fresh reconcile_in for the SAME key would now
-        // reset the root host→remote — but the preserve guard must refuse.
+        // Heal the transport and reconcile_in for the SAME key again: the
+        // preserved output is moved aside and the root is reset to the host.
         fake.set_fail_download(false);
-        let err = mgr
+        let reused = mgr
             .reconcile_in(&d, &binding, host_ws, &sample_run())
             .await
-            .expect_err("reconcile_in must refuse to reset a preserved root");
-        match err {
-            DispatchError::WorkspaceUnavailable { reason, .. } => {
-                assert!(
-                    reason.contains("failed write-back") && reason.contains(&root),
-                    "refusal must name the preserved root + reason: {reason}"
-                );
-            },
-            other => panic!("expected WorkspaceUnavailable, got: {other}"),
-        }
+            .expect("reconcile_in must recover, not refuse")
+            .as_str()
+            .to_string();
+        assert_eq!(reused, root, "the same key resolves to the same root");
 
-        // The node's unreconciled output on the remote is untouched (not reset).
+        // The recovery sibling holds the node's unreconciled output verbatim.
+        let recovery = format!("{root}.recovery");
+        assert!(
+            fake.stat(&recovery).await.unwrap().is_some(),
+            "preserved output must be moved to a recovery sibling"
+        );
+        assert_eq!(
+            fake.download_file(&format!("{recovery}/a.txt"))
+                .await
+                .unwrap(),
+            b"node-out",
+            "the recovery copy must keep the node's output"
+        );
+
+        // The reset root now mirrors the host (a.txt == the host bytes).
         assert_eq!(
             fake.download_file(&format!("{root}/a.txt")).await.unwrap(),
-            b"node-out",
-            "the preserved root's output must not be overwritten by the refused reset"
+            b"orig",
+            "the recovered root must be reset to the host workspace"
+        );
+
+        // The root is no longer preserved: teardown deletes it (a normal
+        // ephemeral root now) while keeping the recovery copy for the user.
+        mgr.teardown_all(RunOutcome::Failed).await;
+        assert!(
+            fake.stat(&root).await.unwrap().is_none(),
+            "the recovered (reset) root is a normal ephemeral root — teardown deletes it"
+        );
+        assert!(
+            fake.stat(&recovery).await.unwrap().is_some(),
+            "the recovery copy survives teardown for manual retrieval"
         );
     }
 
