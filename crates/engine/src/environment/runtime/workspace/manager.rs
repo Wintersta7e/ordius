@@ -4430,6 +4430,56 @@ mod tests {
         assert_eq!(mgr_b.persistent_lock_count(), 0);
     }
 
+
+    /// COV-02: a second run contends for a held persistent lock but `owner.json`
+    /// cannot be read (here: every download fails) → the contention error falls
+    /// back to the generic "locked by another run" message with no owner named,
+    /// rather than failing differently or panicking.
+    #[tokio::test]
+    async fn persistent_contention_without_owner_json_uses_generic_message() {
+        let host = tempfile::TempDir::new().unwrap();
+        let host_ws = host.path();
+        std::fs::write(host_ws.join("a.txt"), b"hostA").unwrap();
+
+        let fake = FakeWorkspaceTransport::default();
+        let d_a = ssh_dispatcher_sharing("persist-a", &fake);
+        let d_b = ssh_dispatcher_sharing("persist-b", &fake);
+        let binding = persistent_binding();
+
+        let mgr_a = WorkspaceManager::new();
+        mgr_a
+            .reconcile_in(&d_a, &binding, host_ws, &sample_run())
+            .await
+            .expect("manager A acquires the lock");
+
+        // The lock + owner.json now exist; make every download fail so B's
+        // Contended arm reads None and uses the generic message.
+        fake.set_fail_download(true);
+
+        let run_b = RunScope {
+            run_id: "r2",
+            top_run_id: "r2",
+            workflow_id: "wf2",
+            workflow_name: "Other",
+            started_at_iso: "2026-02-02T00:00:00Z",
+        };
+        let mgr_b = WorkspaceManager::new();
+        let err = mgr_b
+            .reconcile_in(&d_b, &binding, host_ws, &run_b)
+            .await
+            .expect_err("manager B must fail on a held lock");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("locked by another run"),
+            "expected the generic contention message; got: {msg}"
+        );
+        assert!(
+            !msg.contains("r1"),
+            "owner run must NOT be named when owner.json is unreadable; got: {msg}"
+        );
+        assert_eq!(mgr_b.persistent_lock_count(), 0);
+    }
+
     /// Two persistent `reconcile_in` calls on the SAME manager + key are
     /// idempotent: the second skips lock acquisition (lock already held) and does
     /// not clobber owner.json with a second write.

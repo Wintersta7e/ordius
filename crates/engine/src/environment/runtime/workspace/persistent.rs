@@ -286,3 +286,72 @@ pub(super) fn advance_host_at_in_force(
 
     advanced
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::advance_host_at_in_force;
+    use super::safety::{FileEntry, Manifest};
+
+    fn fe(sha: &str) -> FileEntry {
+        FileEntry {
+            sha256_hex: sha.into(),
+            size: 1,
+            mode: 0o644,
+        }
+    }
+
+    /// COV-03/06: `advance_host_at_in_force` mirrors exactly the remote
+    /// write-back delta onto the `host_at_in` baseline — a created file/dir is
+    /// added, a removed file is dropped — while a FOREIGN remote file that is
+    /// unchanged across the write-back (present and equal in both snapshots, so
+    /// not part of the delta) must stay OUT of the baseline. Pulling an unchanged
+    /// foreign file in would make the next persistent reconcile treat it as
+    /// host-known and risk reading a later remote change to it as a host
+    /// deletion.
+    #[test]
+    fn advance_host_at_in_force_applies_delta_keeps_unchanged_foreign() {
+        // Host baseline at reconcile-in: a host file plus one the node deletes.
+        let mut host_at_in = Manifest::default();
+        host_at_in.files.insert("app.txt".into(), fe("aaa"));
+        host_at_in.files.insert("gone.txt".into(), fe("ggg"));
+
+        // Remote BEFORE write-back: the host files plus a foreign file.
+        let mut old_remote = Manifest::default();
+        old_remote.files.insert("app.txt".into(), fe("aaa"));
+        old_remote.files.insert("gone.txt".into(), fe("ggg"));
+        old_remote.files.insert("foreign.txt".into(), fe("fff"));
+
+        // Remote AFTER the node ran: foreign UNCHANGED, gone.txt removed, a file
+        // and a dir created.
+        let mut new_remote = Manifest::default();
+        new_remote.files.insert("app.txt".into(), fe("aaa"));
+        new_remote.files.insert("foreign.txt".into(), fe("fff"));
+        new_remote.files.insert("out.txt".into(), fe("ooo"));
+        new_remote.dirs.insert("subdir".into());
+
+        let advanced = advance_host_at_in_force(&host_at_in, &old_remote, &new_remote);
+
+        // Unchanged foreign file: stays OUT of the advanced host baseline.
+        assert!(
+            !advanced.files.contains_key("foreign.txt"),
+            "an unchanged foreign remote file must not advance into host_at_in"
+        );
+        // Real deltas mirror onto the baseline.
+        assert_eq!(
+            advanced.files.get("out.txt"),
+            Some(&fe("ooo")),
+            "the node-created file must advance into host_at_in"
+        );
+        assert!(
+            !advanced.files.contains_key("gone.txt"),
+            "a remotely-removed file must drop from host_at_in"
+        );
+        assert!(
+            advanced.dirs.contains("subdir"),
+            "a node-created dir must advance into host_at_in"
+        );
+        // The untouched host file remains.
+        assert!(advanced.files.contains_key("app.txt"));
+    }
+}
