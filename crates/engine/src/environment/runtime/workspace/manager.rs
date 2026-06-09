@@ -54,6 +54,10 @@ pub(crate) type WorkspaceKey = (EnvId, PathBuf);
 /// Inner map type for the per-key execution lease registry.
 type LeaseMap = HashMap<WorkspaceKey, Arc<tokio::sync::Mutex<()>>>;
 
+/// Inner map type for the per-(`EnvId`, root) persistent-lock acquire-gate
+/// registry (CONC-01 in-process serialization).
+type AcquireGateMap = HashMap<(EnvId, String), Arc<tokio::sync::Mutex<()>>>;
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /// RAII guard for a node's exclusive execution cycle on one workspace key.
@@ -197,6 +201,18 @@ pub struct WorkspaceManager {
     /// can always release it. Released (rmdir) by `teardown_all`. (H5.)
     persistent_locks: SyncMutex<HashMap<(EnvId, String), Arc<dyn WorkspaceTransportFactory>>>,
 
+    /// Per-(`EnvId`, root) in-process gate serialising persistent-lock
+    /// acquisition. `leases` serialises same-[`WorkspaceKey`] (`(EnvId, host_ws)`)
+    /// reconcile cycles, but two nodes with DIFFERENT `host_ws` that expand to the
+    /// SAME persistent root get different keys and would otherwise both race the
+    /// remote `.ordius.lock` `create_dir` — one wins, the other sees `Contended`
+    /// and fails spuriously with "locked by another run" though it is the same
+    /// run-tree. This gate serialises the check-then-acquire on `(EnvId, root)` so
+    /// the second contender observes the now-tracked lock and takes the
+    /// already-held path. Genuine cross-run contention is unaffected (the loser
+    /// still finds no tracked lock and reports the real owner). (CONC-01.)
+    persistent_acquire_gates: SyncMutex<AcquireGateMap>,
+
     /// Test-only seam: records the last [`RunOutcome`] passed to
     /// [`Self::teardown_all`]. Lets run-loop tests observe that
     /// teardown fired with the correct outcome on every exit path.
@@ -223,6 +239,7 @@ impl Default for WorkspaceManager {
             ephemeral_roots: SyncMutex::new(HashMap::new()),
             preserved_roots: SyncMutex::new(HashSet::new()),
             persistent_locks: SyncMutex::new(HashMap::new()),
+            persistent_acquire_gates: SyncMutex::new(HashMap::new()),
             #[cfg(any(test, feature = "testing"))]
             last_outcome: std::sync::Mutex::new(None),
         }
@@ -590,11 +607,28 @@ impl WorkspaceManager {
 
         // 2. Lock-once per (env, root) this run. If we already hold it (a later
         //    node / retry / loop iteration on the same key), skip acquisition.
+        //    Serialise the check-then-acquire in-process via a per-(env, root)
+        //    gate so two nodes with DIFFERENT host_ws but the SAME persistent root
+        //    don't both race the remote create_dir — without it the loser sees
+        //    `Contended` and fails spuriously though it is the same run-tree
+        //    (CONC-01). The gate is released before the additive sync below, so
+        //    distinct-host_ws syncs onto the same root still proceed concurrently.
         let lock_key = (env_id.clone(), root.to_string());
-        let already_held = self.persistent_locks.lock().contains_key(&lock_key);
-        if !already_held {
-            self.acquire_persistent_lock(factory, &lock_key, root, run)
-                .await?;
+        {
+            let gate = {
+                // parking_lot map lock — dropped before the `.await` below.
+                let mut gates = self.persistent_acquire_gates.lock();
+                Arc::clone(
+                    gates
+                        .entry(lock_key.clone())
+                        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+                )
+            };
+            let _acquire_guard = gate.lock_owned().await;
+            if !self.persistent_locks.lock().contains_key(&lock_key) {
+                self.acquire_persistent_lock(factory, &lock_key, root, run)
+                    .await?;
+            }
         }
 
         // 3. Additive host→remote sync (never deletes remote-only content). On
@@ -4425,6 +4459,69 @@ mod tests {
         assert_eq!(
             owner_first.current_run_id, owner_second.current_run_id,
             "owner.json must not be clobbered on the idempotent second call"
+        );
+    }
+
+
+    /// CONC-01: two concurrent persistent `reconcile_in` calls for the SAME
+    /// (env, root) but DIFFERENT `host_ws` — distinct [`WorkspaceKey`]s, so the
+    /// per-key execution lease does NOT serialise them — must NOT race the remote
+    /// `.ordius.lock`. Without the per-(env, root) acquire gate the loser sees
+    /// `Contended` and fails spuriously with "locked by another run" though both
+    /// belong to the same run-tree. The fake's armed lock-acquire gate stalls the
+    /// first acquirer (before it creates the lock dir) while the second advances,
+    /// making the interleaving deterministic.
+    #[tokio::test]
+    async fn persistent_concurrent_same_root_distinct_host_ws_no_spurious_contention() {
+        let host_a = tempfile::TempDir::new().unwrap();
+        std::fs::write(host_a.path().join("a.txt"), b"hostA").unwrap();
+        let host_b = tempfile::TempDir::new().unwrap();
+        std::fs::write(host_b.path().join("b.txt"), b"hostB").unwrap();
+
+        // One env (one env_id) reached via two different host workspaces → same
+        // persistent root + same lock_key, but distinct WorkspaceKeys (so the
+        // execution lease keyed by (env, host_ws) does not serialise them).
+        let (d, fake) = ssh_dispatcher_with_fake("conc-same-root");
+        let mgr = WorkspaceManager::new();
+        let binding = persistent_binding();
+        let run = sample_run();
+
+        // Arm the gate so the FIRST lock acquisition parks before creating the dir.
+        fake.arm_lock_acquire_gate();
+
+        let fut_a = mgr.reconcile_in(&d, &binding, host_a.path(), &run);
+        let fut_b = mgr.reconcile_in(&d, &binding, host_b.path(), &run);
+        let driver = async {
+            // Wait until the first acquirer has parked at the gate, let the second
+            // advance to (post-fix) the in-process gate / (pre-fix) the remote
+            // create_dir, then release the first.
+            fake.await_lock_acquire_parked().await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            fake.release_lock_acquire();
+        };
+
+        let (ra, rb, ()) = tokio::join!(fut_a, fut_b, driver);
+        ra.expect("first concurrent persistent reconcile_in must succeed");
+        rb.expect("second concurrent persistent reconcile_in must not spuriously contend");
+
+        // Exactly one remote lock was acquired + tracked for the whole run-tree.
+        assert_eq!(
+            mgr.persistent_lock_count(),
+            1,
+            "the same-root lock must be acquired exactly once across both nodes"
+        );
+        // Both host trees synced additively onto the shared root.
+        let owner = read_owner(&fake, "/srv/persist").await;
+        assert_eq!(owner.current_run_id, "r1");
+        assert_eq!(
+            fake.download_file("/srv/persist/a.txt").await.unwrap(),
+            b"hostA"
+        );
+        assert_eq!(
+            fake.download_file("/srv/persist/b.txt").await.unwrap(),
+            b"hostB"
         );
     }
 

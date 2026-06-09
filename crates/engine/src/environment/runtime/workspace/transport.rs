@@ -135,14 +135,33 @@ pub trait WorkspaceTransport: Send {
 mod fake_impl {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use async_trait::async_trait;
     use parking_lot::Mutex;
+    use tokio::sync::Notify;
 
     use super::{
         DispatchError, FileKind, FileMeta, LockOutcome, WorkspaceTransport,
         WorkspaceTransportFactory,
     };
+
+    /// Test-only choreography seam for deterministically interleaving two
+    /// concurrent persistent-lock acquisitions (CONC-01). When `armed`, the next
+    /// `try_acquire_lock_dir` signals `entered` and then parks on `release`
+    /// BEFORE it creates the lock dir — letting a test stall the first acquirer
+    /// while a second same-root acquirer runs, so the in-process serialization
+    /// (or its absence) is observable deterministically.
+    #[derive(Debug, Default)]
+    struct LockAcquireGate {
+        /// When `true`, the next `try_acquire_lock_dir` parks once (disarming).
+        armed: AtomicBool,
+        /// Signalled by the fake the instant it parks (so the test knows the
+        /// first acquisition has reached the gate before releasing it).
+        entered: Notify,
+        /// Signalled by the test to release the parked acquisition.
+        release: Notify,
+    }
 
     #[derive(Debug, Default, Clone)]
     struct FakeFs {
@@ -180,6 +199,10 @@ mod fake_impl {
         fail_upload_after: Option<usize>,
         /// Number of uploads that have succeeded (drives `fail_upload_after`).
         succeeded_uploads: usize,
+        /// Test-only choreography seam (see [`LockAcquireGate`]). Shared via an
+        /// `Arc` so `try_acquire_lock_dir` can clone it out and `await` without
+        /// holding the `FakeFs` lock across the await.
+        lock_acquire_gate: Arc<LockAcquireGate>,
     }
 
     /// Whether the count-based upload gate (`fail_upload_after`) should fail THIS
@@ -249,6 +272,31 @@ mod fake_impl {
             fs.dirs.insert(rel.to_string());
             drop(fs);
             Ok(())
+        }
+
+        /// Test-only choreography seam: arm the lock-acquire gate so the NEXT
+        /// `try_acquire_lock_dir` parks (before creating the dir) until
+        /// [`Self::release_lock_acquire`] fires. Lets a test deterministically
+        /// interleave two concurrent same-root acquisitions (CONC-01).
+        pub fn arm_lock_acquire_gate(&self) {
+            self.inner
+                .lock()
+                .lock_acquire_gate
+                .armed
+                .store(true, Ordering::SeqCst);
+        }
+
+        /// Await until a `try_acquire_lock_dir` call has parked at the armed gate.
+        pub async fn await_lock_acquire_parked(&self) {
+            let gate = { self.inner.lock().lock_acquire_gate.clone() };
+            gate.entered.notified().await;
+        }
+
+        /// Release a `try_acquire_lock_dir` parked at the armed gate (see
+        /// [`Self::arm_lock_acquire_gate`]).
+        pub fn release_lock_acquire(&self) {
+            let gate = { self.inner.lock().lock_acquire_gate.clone() };
+            gate.release.notify_one();
         }
     }
 
@@ -541,6 +589,15 @@ mod fake_impl {
         }
 
         async fn try_acquire_lock_dir(&self, rel: &str) -> Result<LockOutcome, DispatchError> {
+            // Test-only choreography seam: if armed, park here (before reading the
+            // fs and creating the dir) until the test releases us, so a concurrent
+            // same-root acquisition can be interleaved deterministically (CONC-01).
+            let gate = { self.inner.lock().lock_acquire_gate.clone() };
+            if gate.armed.swap(false, Ordering::SeqCst) {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+
             // Reuse the exclusive create: Ok => we made it; Err(exists) => check kind.
             {
                 let fs = self.inner.lock();
