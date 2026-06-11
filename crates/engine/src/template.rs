@@ -364,6 +364,12 @@ pub fn substitute_in_config(
 ///   over any port-synthesis fallback.
 /// - `version` — from `Found(HttpEndpoint::version)`, `Binary::version`,
 ///   or `Toolchain::version`. `None` until the resource is probed.
+/// - `path` — absolute filesystem path to the resolved binary.
+///   `Binary::path` for binary resources; `Toolchain::exe_path` for
+///   toolchains; `None` for `HttpEndpoint` (no path concept).
+/// - `capabilities` — comma-separated list of capability names (serde
+///   `snake_case` spelling, e.g. `"cli_agent_print"`) for `Binary`
+///   resources; `None` for non-binary variants.
 /// - `id` — the resource id verbatim from the registry definition.
 /// - `kind` — `http_endpoint` / `binary` / `toolchain` via serde
 ///   (`ResourceKind` carries `rename_all = "snake_case"`), so the
@@ -415,6 +421,32 @@ where
                 | ResourceDetail::Binary { version, .. }
                 | ResourceDetail::Toolchain { version, .. } => version,
             };
+        }
+        if field == "path" {
+            let outcome = catalogs.get(&effective_env)?.lookup(&id)?;
+            let ResourceProbeOutcome::Found(detail) = outcome else {
+                return None;
+            };
+            return match detail {
+                ResourceDetail::Binary { path, .. } => Some(path),
+                ResourceDetail::Toolchain { exe_path, .. } => Some(exe_path),
+                ResourceDetail::HttpEndpoint { .. } => None,
+            };
+        }
+        if field == "capabilities" {
+            let outcome = catalogs.get(&effective_env)?.lookup(&id)?;
+            let ResourceProbeOutcome::Found(ResourceDetail::Binary { capabilities, .. }) = outcome
+            else {
+                return None;
+            };
+            return Some(
+                capabilities
+                    .iter()
+                    .filter_map(|c| serde_json::to_value(c).ok())
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
         }
 
         // Registry-derived fields walk the per-run frozen registry at

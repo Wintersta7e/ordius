@@ -678,4 +678,32 @@ mod run_snapshot_resolver {
         assert_eq!(resolver("nope", "base_url"), None);
         assert_eq!(resolver("nope", "version"), None);
     }
+
+    #[test]
+    fn resolver_exposes_binary_path() {
+        use crate::environment::runtime::resource::Capability;
+
+        let wf = WorkflowId("wf".to_string());
+        let env = EnvId::local();
+        let id = ResourceId("claude-cli".to_string());
+
+        let registry = registry_with_def("claude-cli", ResourceKind::Binary, &wf);
+        let outcome = ResourceProbeOutcome::Found(ResourceDetail::Binary {
+            path: "/home/u/.local/bin/claude".to_string(),
+            version: Some("2.1.0".to_string()),
+            capabilities: vec![Capability::CliAgentPrint],
+        });
+        let catalog = catalog_with_outcome(env.clone(), id, outcome);
+        let catalogs = Arc::new(HashMap::from([(env.clone(), catalog)]));
+
+        let resolver = build_run_snapshot_resources_resolver(registry, wf, env, catalogs);
+
+        assert_eq!(
+            resolver("claude-cli", "path").as_deref(),
+            Some("/home/u/.local/bin/claude"),
+        );
+        assert_eq!(resolver("claude-cli", "version").as_deref(), Some("2.1.0"),);
+        // Binary has no base_url — must not synthesize one.
+        assert_eq!(resolver("claude-cli", "base_url"), None);
+    }
 }
