@@ -97,7 +97,33 @@ pub fn assemble_prompt(
         .join("\n\n")
 }
 
-/// Allowlist gate on user-supplied extra flags.
+/// Flags a user may NOT smuggle through `extra_flags`: anything that changes
+/// the agent's permission/sandbox posture or loads config. The node's
+/// `permission` field is the single source of truth for sandboxing, so a
+/// shared/imported workflow can't display `permission: read` while silently
+/// escalating via `extra_flags`. Matched case-sensitively (Unix short flags
+/// are case-sensitive — `-C` is codex's cwd flag, distinct from `-c` config)
+/// against each token's name portion (before any `=`). Entries use each CLI's
+/// real spelling (e.g. claude's camelCase `--allowedTools`).
+const DENIED_EXTRA_FLAGS: &[&str] = &[
+    "--dangerously-skip-permissions",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--permission-mode",
+    "--permission-prompt-tool",
+    "--allowedTools",
+    "--disallowedTools",
+    "--sandbox",
+    "--ask-for-approval",
+    "--full-auto",
+    "--trust-all-tools",
+    "-a",
+    "-c",
+    "--config",
+];
+
+/// Gate on user-supplied extra flags: (1) a character allowlist blocking shell
+/// metacharacters, and (2) a denylist rejecting permission/sandbox/config
+/// overrides (see [`DENIED_EXTRA_FLAGS`]). Returns the split tokens.
 #[allow(unreachable_pub, dead_code)]
 pub fn sanitize_extra_flags(raw: &str) -> Result<Vec<String>, String> {
     let ok = raw
@@ -108,7 +134,17 @@ pub fn sanitize_extra_flags(raw: &str) -> Result<Vec<String>, String> {
             "coding-agent: extra_flags contains disallowed characters: {raw:?}"
         ));
     }
-    Ok(raw.split_whitespace().map(str::to_string).collect())
+    let tokens: Vec<String> = raw.split_whitespace().map(str::to_string).collect();
+    for tok in &tokens {
+        let name = tok.split('=').next().unwrap_or(tok);
+        if DENIED_EXTRA_FLAGS.contains(&name) {
+            return Err(format!(
+                "coding-agent: extra_flags may not override permission/sandbox flags ({tok:?}); \
+                 use the node's permission field instead"
+            ));
+        }
+    }
+    Ok(tokens)
 }
 
 /// Normalized agent result, dialect-agnostic.
@@ -181,18 +217,19 @@ fn parse_codex_jsonl(stdout: &str) -> Option<AgentOutput> {
             text = Some(t.to_string());
         }
     }
-    text.map(|t| AgentOutput {
-        text: t,
-        session_id: session_id.clone(),
-        is_error: false,
-    })
-    .or_else(|| {
-        session_id.clone().map(|_| AgentOutput {
-            text: String::new(),
-            session_id,
+    match (text, session_id) {
+        (Some(t), sid) => Some(AgentOutput {
+            text: t,
+            session_id: sid,
             is_error: false,
-        })
-    })
+        }),
+        (None, sid @ Some(_)) => Some(AgentOutput {
+            text: String::new(),
+            session_id: sid,
+            is_error: false,
+        }),
+        (None, None) => None,
+    }
 }
 
 #[cfg(test)]
@@ -222,6 +259,10 @@ mod tests {
     #[test]
     fn codex_print_flags_and_permission() {
         assert_eq!(print_flags("codex"), vec!["exec", "--json"]);
+        assert_eq!(
+            permission_flags("codex", Permission::Read),
+            vec!["--sandbox", "read-only"]
+        );
         assert_eq!(
             permission_flags("codex", Permission::Edit),
             vec!["--sandbox", "workspace-write"]
@@ -275,6 +316,21 @@ mod tests {
         assert!(sanitize_extra_flags("--model gpt-5.5 -C ./x").is_ok());
         assert!(sanitize_extra_flags("--foo; rm -rf /").is_err());
         assert!(sanitize_extra_flags("$(whoami)").is_err());
+    }
+
+    #[test]
+    fn sanitize_extra_flags_rejects_permission_escalation() {
+        // A workflow must not silently override the node's permission via extra_flags.
+        assert!(sanitize_extra_flags("--dangerously-skip-permissions").is_err());
+        assert!(sanitize_extra_flags("--dangerously-bypass-approvals-and-sandbox").is_err());
+        assert!(sanitize_extra_flags("--permission-mode bypassPermissions").is_err());
+        assert!(sanitize_extra_flags("--permission-mode=acceptEdits").is_err());
+        assert!(sanitize_extra_flags("--sandbox workspace-write").is_err());
+        assert!(sanitize_extra_flags("--allowedTools Bash").is_err());
+        assert!(sanitize_extra_flags("--config foo").is_err());
+        assert!(sanitize_extra_flags("-c key=val").is_err());
+        // Benign flags still pass.
+        assert!(sanitize_extra_flags("--model gpt-5.5 -C ./repo --verbose").is_ok());
     }
 
     #[test]
