@@ -78,6 +78,14 @@ impl NodeExecutor for SubprocessExecutor {
         ctx: &RunContext,
         cancel: CancellationToken,
     ) -> Result<NodeOutputs, NodeError> {
+        // The coding-agent built-in shares the Subprocess backend but needs a
+        // distinct path: resolve the picked agent resource to its binary, build
+        // the print-mode argv, feed the assembled prompt over stdin, and
+        // normalize the agent's structured output.
+        if nt.id == crate::executor::builtins::coding_agent::NODE_TYPE_ID {
+            return self.run_coding_agent(node, ctx, cancel).await;
+        }
+
         // Resolve every templated input synchronously, in a separate
         // stack frame, so the SubstitutionContext + its closures
         // fully drop before any await — otherwise their non-Send
@@ -298,6 +306,291 @@ fn resolve_templated_inputs(
         env_pairs,
         stdin_body,
     })
+}
+
+/// Resolved, owned inputs for a `coding-agent` invocation, handed from the
+/// sync prep phase into the async spawn phase. Mirrors `ResolvedInputs`'
+/// frame discipline so the non-Send `SubstitutionContext` drops before any
+/// await.
+struct AgentInvocation {
+    args: Vec<String>,
+    stdin_prompt: String,
+    agent_id: String,
+}
+
+/// Build the `coding-agent` argv tail + stdin prompt with full template
+/// substitution, in a single sync pass. Returns owned strings so the caller's
+/// future never holds the `SubstitutionContext` (non-Send closures) across an
+/// await. The resolved binary `path` and the agent resource come from the
+/// async resolution step; this only handles the templated config fields.
+fn build_agent_invocation(
+    node: &Node,
+    ctx: &RunContext,
+    agent_id: String,
+) -> Result<AgentInvocation, NodeError> {
+    use crate::executor::builtins::coding_agent as ca;
+    let secrets_resolver = crate::executor::context::make_secrets_resolver(ctx);
+    let kv_resolver = |_: &str| -> Option<String> { None };
+    let env_allowlist = default_env_allowlist();
+    let effective_env = node
+        .target_env
+        .clone()
+        .unwrap_or_else(|| ctx.run_snapshot.default_env.clone());
+    let resources_resolver: crate::template::BoxedResourceResolver =
+        crate::template::build_run_snapshot_resources_resolver(
+            std::sync::Arc::clone(&ctx.run_snapshot.registry),
+            ctx.run_snapshot.workflow_id.clone(),
+            effective_env,
+            std::sync::Arc::clone(&ctx.run_snapshot.catalogs),
+        );
+    let subctx = SubstitutionContext {
+        vars: &ctx.variables,
+        secrets: &secrets_resolver,
+        upstream_outputs: &ctx.upstream_outputs,
+        current_inputs: &ctx.current_inputs,
+        current_config: &node.config,
+        kv: &kv_resolver,
+        env: &*ctx.env,
+        env_allowlist: &env_allowlist,
+        resources: &resources_resolver,
+        run_id: &ctx.run_id,
+        workspace: &ctx.workspace,
+        started_at_iso: &ctx.started_at_iso,
+        workflow_id: &ctx.workflow_id,
+        workflow_name: &ctx.workflow_name,
+    };
+    let sub = |raw: &str| substitute(raw, &subctx).map_err(|e| NodeError::Template(e.to_string()));
+
+    let raw_prompt = node
+        .config
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| NodeError::Config("coding-agent: config.prompt (string) required".into()))?;
+    let prompt = sub(raw_prompt)?;
+    // persona / output-format / context come in Phase C.
+    let stdin_prompt = ca::assemble_prompt(None, &prompt, None, None);
+
+    let permission = node
+        .config
+        .get("permission")
+        .and_then(serde_json::Value::as_str)
+        .and_then(ca::Permission::parse);
+    let model_owned = match node
+        .config
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        Some(m) => Some(sub(m)?),
+        None => None,
+    };
+    let extra_tokens = match node
+        .config
+        .get("extra_flags")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        Some(e) => ca::sanitize_extra_flags(&sub(e)?).map_err(NodeError::Config)?,
+        None => Vec::new(),
+    };
+    let args = ca::build_agent_argv(&agent_id, permission, model_owned.as_deref(), &extra_tokens);
+    Ok(AgentInvocation {
+        args,
+        stdin_prompt,
+        agent_id,
+    })
+}
+
+/// Resolved agent binary: the dispatcher to spawn through, the binary's
+/// env-side path, and the resource id (= dialect key for argv/normalize).
+struct ResolvedAgent {
+    dispatcher: Arc<dyn crate::environment::runtime::dispatcher::Dispatcher>,
+    path: String,
+    agent_id: String,
+}
+
+impl SubprocessExecutor {
+    /// Resolve the node's `agent` resource ref to a runnable CLI agent binary
+    /// in the node's effective env: lookup the run catalog, falling back to an
+    /// opportunistic re-probe, then require a `Binary` detail proving
+    /// `CliAgentPrint`. Mirrors the resolution flow in [`super::builtins::llm`].
+    async fn resolve_agent_binary(
+        node: &Node,
+        ctx: &RunContext,
+        cancel: &CancellationToken,
+    ) -> Result<ResolvedAgent, NodeError> {
+        use crate::environment::runtime::ResourceProbeOutcome;
+        use crate::environment::runtime::catalog::ResourceDetail;
+        use crate::environment::runtime::resource::{Capability, ResourceRef};
+
+        let rref: ResourceRef = node
+            .config
+            .get("agent")
+            .ok_or_else(|| {
+                NodeError::Config("coding-agent: config.agent (resource) required".into())
+            })
+            .and_then(|v| {
+                serde_json::from_value(v.clone())
+                    .map_err(|e| NodeError::Config(format!("coding-agent: invalid agent ref: {e}")))
+            })?;
+
+        let effective_env = node
+            .target_env
+            .clone()
+            .unwrap_or_else(|| ctx.run_snapshot.default_env.clone());
+        let dispatcher = ctx
+            .run_snapshot
+            .dispatcher(&effective_env)
+            .ok_or_else(|| {
+                NodeError::Config(format!(
+                    "coding-agent: env '{}' not in run snapshot scope",
+                    effective_env.as_str()
+                ))
+            })?
+            .clone();
+        let catalog = ctx.run_snapshot.catalog(&effective_env).ok_or_else(|| {
+            NodeError::Config(format!(
+                "coding-agent: env '{}' has no catalog",
+                effective_env.as_str()
+            ))
+        })?;
+
+        // Mirror llm.rs: lookup → opportunistic_reprobe fallback.
+        let outcome = if let Some(o @ ResourceProbeOutcome::Found(_)) = catalog.lookup(rref.id()) {
+            o
+        } else {
+            let workflow_id = ctx.run_snapshot.workflow_id.clone();
+            let (def, _scope) = ctx
+                .run_snapshot
+                .registry
+                .resolve(rref.id(), &effective_env, Some(&workflow_id))
+                .ok_or_else(|| {
+                    NodeError::Config(format!(
+                        "coding-agent: resource '{}' not in registry (env '{}')",
+                        rref.id().0,
+                        effective_env.as_str()
+                    ))
+                })?;
+            let def = def.clone();
+            Arc::clone(catalog)
+                .opportunistic_reprobe(&def, Arc::clone(&dispatcher), cancel.child_token())
+                .await
+        };
+        let ResourceProbeOutcome::Found(ResourceDetail::Binary {
+            path, capabilities, ..
+        }) = outcome
+        else {
+            return Err(NodeError::Config(format!(
+                "coding-agent: resource '{}' is not a detected CLI agent (binary) in env '{}'",
+                rref.id().0,
+                effective_env.as_str()
+            )));
+        };
+        if !capabilities.contains(&Capability::CliAgentPrint) {
+            return Err(NodeError::Config(format!(
+                "coding-agent: resource '{}' does not prove CliAgentPrint",
+                rref.id().0
+            )));
+        }
+        Ok(ResolvedAgent {
+            dispatcher,
+            path,
+            agent_id: rref.id().0.clone(),
+        })
+    }
+
+    /// Run a `coding-agent` node: resolve the picked agent resource to its
+    /// binary path (proving `CliAgentPrint`), build the print-mode argv, feed
+    /// the assembled prompt over stdin, spawn via the env dispatcher, then
+    /// normalize the agent's structured output onto the `text` / `exit_code` /
+    /// `session_id` ports.
+    async fn run_coding_agent(
+        &self,
+        node: &Node,
+        ctx: &RunContext,
+        cancel: CancellationToken,
+    ) -> Result<NodeOutputs, NodeError> {
+        use crate::executor::builtins::coding_agent as ca;
+
+        let ResolvedAgent {
+            dispatcher,
+            path,
+            agent_id,
+        } = Self::resolve_agent_binary(node, ctx, &cancel).await?;
+
+        let inv = build_agent_invocation(node, ctx, agent_id)?;
+        let cwd = ctx
+            .env_cwd()
+            .ok_or_else(|| NodeError::Config("coding-agent: env_cwd not set by run loop".into()))?;
+        let process_cmd = ProcessCmd {
+            program: path,
+            args: inv.args,
+            env: HashMap::new(),
+            cwd: Some(cwd),
+            stdin: Some(Bytes::from(inv.stdin_prompt.into_bytes())),
+            stdout: ProcessStdio::Piped,
+            stderr: ProcessStdio::Piped,
+        };
+        let mut proc = dispatcher
+            .spawn(process_cmd)
+            .await
+            .map_err(|e| NodeError::Subprocess(format!("spawn: {e}")))?;
+
+        let emitter = ctx.emitter.clone();
+        let iteration = ctx.iteration;
+        let attempt = ctx.attempt.load(std::sync::atomic::Ordering::Relaxed);
+        let stdout_handle = spawn_line_reader(
+            proc.take_stdout(),
+            emitter.clone(),
+            node.id.clone(),
+            iteration,
+            attempt,
+            CHANNEL_STDOUT,
+        );
+        let stderr_handle = spawn_line_reader(
+            proc.take_stderr(),
+            emitter,
+            node.id.clone(),
+            iteration,
+            attempt,
+            CHANNEL_STDERR,
+        );
+
+        let outcome = tokio::select! {
+            wait_res = proc.wait() => Outcome::Exit(wait_res),
+            () = cancel.cancelled() => {
+                drop(proc.cancel().await);
+                Outcome::Cancelled
+            }
+        };
+        let stdout_lines = stdout_handle.await.unwrap_or_default();
+        let _stderr_lines = stderr_handle.await.unwrap_or_default();
+
+        let exit = match outcome {
+            Outcome::Cancelled => return Err(NodeError::Cancelled),
+            Outcome::Exit(Err(e)) => return Err(NodeError::Subprocess(format!("wait: {e}"))),
+            Outcome::Exit(Ok(exit)) => exit,
+        };
+
+        let joined = stdout_lines.join("\n");
+        let norm = ca::normalize_output(&inv.agent_id, &joined);
+        let mut outputs = NodeOutputs::new();
+        outputs.insert(
+            ca::PORT_EXIT_CODE.into(),
+            PortValue::Number(f64::from(exit.code)),
+        );
+        outputs.insert(ca::PORT_TEXT.into(), PortValue::String(norm.text));
+        if let Some(sid) = norm.session_id {
+            outputs.insert(ca::PORT_SESSION_ID.into(), PortValue::String(sid));
+        }
+        if norm.is_error {
+            return Err(NodeError::Other(format!(
+                "coding-agent: agent reported is_error (exit {})",
+                exit.code
+            )));
+        }
+        Ok(outputs)
+    }
 }
 
 /// Outcome of the `tokio::select!` between `proc.wait()` and `cancel`.

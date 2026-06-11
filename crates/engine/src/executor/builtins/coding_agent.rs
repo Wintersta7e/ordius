@@ -147,6 +147,35 @@ pub fn sanitize_extra_flags(raw: &str) -> Result<Vec<String>, String> {
     Ok(tokens)
 }
 
+/// Assemble the agent argv tail (everything after the binary path). Order:
+/// print/structured flags → model → sanitized `extra_flags` → permission flags
+/// LAST, so `extra_flags` can never override the node's permission posture.
+#[allow(unreachable_pub, dead_code)]
+pub fn build_agent_argv(
+    agent_id: &str,
+    permission: Option<Permission>,
+    model: Option<&str>,
+    extra_flags: &[String],
+) -> Vec<String> {
+    let mut args: Vec<String> = print_flags(agent_id)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if let Some(m) = model.filter(|s| !s.is_empty()) {
+        args.push("--model".into());
+        args.push(m.to_string());
+    }
+    args.extend(extra_flags.iter().cloned());
+    if let Some(level) = permission {
+        args.extend(
+            permission_flags(agent_id, level)
+                .into_iter()
+                .map(str::to_string),
+        );
+    }
+    args
+}
+
 /// Normalized agent result, dialect-agnostic.
 #[allow(unreachable_pub, dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -331,6 +360,39 @@ mod tests {
         assert!(sanitize_extra_flags("-c key=val").is_err());
         // Benign flags still pass.
         assert!(sanitize_extra_flags("--model gpt-5.5 -C ./repo --verbose").is_ok());
+    }
+
+    #[test]
+    fn build_argv_puts_permission_last() {
+        let argv = build_agent_argv(
+            "claude-code",
+            Some(Permission::Read),
+            Some("opus"),
+            &["--verbose".to_string()],
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "--print",
+                "--output-format",
+                "json",
+                "--model",
+                "opus",
+                "--verbose",
+                "--permission-mode",
+                "plan"
+            ]
+        );
+        // permission flags appear AFTER extra_flags
+        let perm_idx = argv.iter().position(|a| a == "--permission-mode").unwrap();
+        let extra_idx = argv.iter().position(|a| a == "--verbose").unwrap();
+        assert!(perm_idx > extra_idx);
+    }
+
+    #[test]
+    fn build_argv_omits_model_and_permission_when_absent() {
+        let argv = build_agent_argv("codex", None, None, &[]);
+        assert_eq!(argv, vec!["exec", "--json"]);
     }
 
     #[test]
