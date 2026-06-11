@@ -486,7 +486,7 @@ function CodingAgentParameters({
   effectiveEnv,
   onPatch,
 }: CodingAgentParametersProps): JSX.Element {
-  const agentId = readResourceId(node.config.resource) ?? "";
+  const agentId = readResourceId(node.config.agent) ?? "";
   const [permLevels, setPermLevels] = useState<string[]>([]);
 
   useEffect(() => {
@@ -504,7 +504,7 @@ function CodingAgentParameters({
     ([key]) => !definedFieldNames.has(key),
   );
   const remainingFields = nodeType.config.filter(
-    (f) => f.name !== "resource" && f.name !== "permission",
+    (f) => f.name !== "agent" && f.name !== "permission",
   );
   return (
     <>
@@ -516,7 +516,7 @@ function CodingAgentParameters({
             onPatch(node.id, {
               config: {
                 ...node.config,
-                resource: next
+                agent: next
                   ? { id: next, required_capability: "cli_agent_print" }
                   : null,
               },

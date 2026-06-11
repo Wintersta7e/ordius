@@ -97,65 +97,22 @@ pub fn assemble_prompt(
         .join("\n\n")
 }
 
-/// Flags a user may NOT smuggle through `extra_flags`: anything that changes
-/// the agent's permission/sandbox posture or loads config. The node's
-/// `permission` field is the single source of truth for sandboxing, so a
-/// shared/imported workflow can't display `permission: read` while silently
-/// escalating via `extra_flags`. Matched case-sensitively (Unix short flags
-/// are case-sensitive — `-C` is codex's cwd flag, distinct from `-c` config)
-/// against each token's name portion (before any `=`). Entries use each CLI's
-/// real spelling (e.g. claude's camelCase `--allowedTools`).
-const DENIED_EXTRA_FLAGS: &[&str] = &[
-    "--dangerously-skip-permissions",
-    "--dangerously-bypass-approvals-and-sandbox",
-    "--permission-mode",
-    "--permission-prompt-tool",
-    "--allowedTools",
-    "--disallowedTools",
-    "--sandbox",
-    "--ask-for-approval",
-    "--full-auto",
-    "--trust-all-tools",
-    "-a",
-    "-c",
-    "--config",
-];
-
-/// Gate on user-supplied extra flags: (1) a character allowlist blocking shell
-/// metacharacters, and (2) a denylist rejecting permission/sandbox/config
-/// overrides (see [`DENIED_EXTRA_FLAGS`]). Returns the split tokens.
+/// Whether we have a non-interactive invocation recipe for this agent id.
+/// Resources advertising `CliAgentPrint` are self-asserted, so the executor
+/// also requires the id to be a known agent before running the binary.
 #[allow(unreachable_pub, dead_code)]
-pub fn sanitize_extra_flags(raw: &str) -> Result<Vec<String>, String> {
-    let ok = raw
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || " -_=./:@,".contains(c));
-    if !ok {
-        return Err(format!(
-            "coding-agent: extra_flags contains disallowed characters: {raw:?}"
-        ));
-    }
-    let tokens: Vec<String> = raw.split_whitespace().map(str::to_string).collect();
-    for tok in &tokens {
-        let name = tok.split('=').next().unwrap_or(tok);
-        if DENIED_EXTRA_FLAGS.contains(&name) {
-            return Err(format!(
-                "coding-agent: extra_flags may not override permission/sandbox flags ({tok:?}); \
-                 use the node's permission field instead"
-            ));
-        }
-    }
-    Ok(tokens)
+pub fn is_known_agent(agent_id: &str) -> bool {
+    !print_flags(agent_id).is_empty()
 }
 
 /// Assemble the agent argv tail (everything after the binary path). Order:
-/// print/structured flags → model → sanitized `extra_flags` → permission flags
-/// LAST, so `extra_flags` can never override the node's permission posture.
+/// print/structured flags → model → permission flags LAST, so the model never
+/// shadows the node's permission posture.
 #[allow(unreachable_pub, dead_code)]
 pub fn build_agent_argv(
     agent_id: &str,
     permission: Option<Permission>,
     model: Option<&str>,
-    extra_flags: &[String],
 ) -> Vec<String> {
     let mut args: Vec<String> = print_flags(agent_id)
         .into_iter()
@@ -165,7 +122,6 @@ pub fn build_agent_argv(
         args.push("--model".into());
         args.push(m.to_string());
     }
-    args.extend(extra_flags.iter().cloned());
     if let Some(level) = permission {
         args.extend(
             permission_flags(agent_id, level)
@@ -207,12 +163,10 @@ fn raw(stdout: &str) -> AgentOutput {
 
 fn parse_claude_json(stdout: &str) -> Option<AgentOutput> {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+    // Require a string `result`; valid-but-unrecognized JSON falls back to raw.
+    let result = v.get("result").and_then(|r| r.as_str())?;
     Some(AgentOutput {
-        text: v
-            .get("result")
-            .and_then(|r| r.as_str())
-            .unwrap_or_default()
-            .to_string(),
+        text: result.to_string(),
         session_id: v
             .get("session_id")
             .and_then(|s| s.as_str())
@@ -246,19 +200,13 @@ fn parse_codex_jsonl(stdout: &str) -> Option<AgentOutput> {
             text = Some(t.to_string());
         }
     }
-    match (text, session_id) {
-        (Some(t), sid) => Some(AgentOutput {
-            text: t,
-            session_id: sid,
-            is_error: false,
-        }),
-        (None, sid @ Some(_)) => Some(AgentOutput {
-            text: String::new(),
-            session_id: sid,
-            is_error: false,
-        }),
-        (None, None) => None,
-    }
+    // Only treat the run as parsed when an agent_message text was found; a
+    // thread_id without any message falls back to raw stdout.
+    text.map(|t| AgentOutput {
+        text: t,
+        session_id,
+        is_error: false,
+    })
 }
 
 #[cfg(test)]
@@ -341,35 +289,17 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_extra_flags_accepts_safe_rejects_metachars() {
-        assert!(sanitize_extra_flags("--model gpt-5.5 -C ./x").is_ok());
-        assert!(sanitize_extra_flags("--foo; rm -rf /").is_err());
-        assert!(sanitize_extra_flags("$(whoami)").is_err());
-    }
-
-    #[test]
-    fn sanitize_extra_flags_rejects_permission_escalation() {
-        // A workflow must not silently override the node's permission via extra_flags.
-        assert!(sanitize_extra_flags("--dangerously-skip-permissions").is_err());
-        assert!(sanitize_extra_flags("--dangerously-bypass-approvals-and-sandbox").is_err());
-        assert!(sanitize_extra_flags("--permission-mode bypassPermissions").is_err());
-        assert!(sanitize_extra_flags("--permission-mode=acceptEdits").is_err());
-        assert!(sanitize_extra_flags("--sandbox workspace-write").is_err());
-        assert!(sanitize_extra_flags("--allowedTools Bash").is_err());
-        assert!(sanitize_extra_flags("--config foo").is_err());
-        assert!(sanitize_extra_flags("-c key=val").is_err());
-        // Benign flags still pass.
-        assert!(sanitize_extra_flags("--model gpt-5.5 -C ./repo --verbose").is_ok());
+    fn is_known_agent_only_for_recipe_agents() {
+        assert!(is_known_agent("claude-code"));
+        assert!(is_known_agent("codex"));
+        assert!(is_known_agent("aider"));
+        assert!(!is_known_agent("bash"));
+        assert!(!is_known_agent(""));
     }
 
     #[test]
     fn build_argv_puts_permission_last() {
-        let argv = build_agent_argv(
-            "claude-code",
-            Some(Permission::Read),
-            Some("opus"),
-            &["--verbose".to_string()],
-        );
+        let argv = build_agent_argv("claude-code", Some(Permission::Read), Some("opus"));
         assert_eq!(
             argv,
             vec![
@@ -378,20 +308,19 @@ mod tests {
                 "json",
                 "--model",
                 "opus",
-                "--verbose",
                 "--permission-mode",
                 "plan"
             ]
         );
-        // permission flags appear AFTER extra_flags
+        // permission flags appear AFTER the --model value
         let perm_idx = argv.iter().position(|a| a == "--permission-mode").unwrap();
-        let extra_idx = argv.iter().position(|a| a == "--verbose").unwrap();
-        assert!(perm_idx > extra_idx);
+        let model_idx = argv.iter().position(|a| a == "opus").unwrap();
+        assert!(perm_idx > model_idx);
     }
 
     #[test]
     fn build_argv_omits_model_and_permission_when_absent() {
-        let argv = build_agent_argv("codex", None, None, &[]);
+        let argv = build_agent_argv("codex", None, None);
         assert_eq!(argv, vec!["exec", "--json"]);
     }
 
@@ -424,6 +353,26 @@ mod tests {
     fn normalize_claude_unparseable_falls_back_to_raw() {
         let n = normalize_output("claude-code", "not json at all");
         assert_eq!(n.text, "not json at all");
+        assert!(!n.is_error);
+    }
+
+    #[test]
+    fn normalize_claude_valid_json_without_result_falls_back_to_raw() {
+        // Valid JSON, but no string `result` field → raw fallback (not empty text).
+        let stdout = r#"{"type":"system","session_id":"abc123"}"#;
+        let n = normalize_output("claude-code", stdout);
+        assert_eq!(n.text, stdout);
+        assert_eq!(n.session_id, None);
+        assert!(!n.is_error);
+    }
+
+    #[test]
+    fn normalize_codex_thread_started_only_falls_back_to_raw() {
+        // thread_id but no agent_message → raw fallback (not empty text).
+        let stdout = r#"{"type":"thread.started","thread_id":"t1"}"#;
+        let n = normalize_output("codex", stdout);
+        assert_eq!(n.text, stdout);
+        assert_eq!(n.session_id, None);
         assert!(!n.is_error);
     }
 }

@@ -954,20 +954,6 @@ fn coding_agent_spec() -> NodeType {
                 default: None,
                 required: false,
             },
-            ConfigFieldDef {
-                name: "cwd".into(),
-                label: "Working dir (optional)".into(),
-                ty: ConfigFieldType::String,
-                default: None,
-                required: false,
-            },
-            ConfigFieldDef {
-                name: "extra_flags".into(),
-                label: "Extra flags (optional)".into(),
-                ty: ConfigFieldType::String,
-                default: None,
-                required: false,
-            },
         ],
         execution: ExecutionSpec {
             backend: ExecutionBackend::Subprocess,

@@ -370,11 +370,23 @@ fn build_agent_invocation(
     // persona / output-format / context come in Phase C.
     let stdin_prompt = ca::assemble_prompt(None, &prompt, None, None);
 
-    let permission = node
+    // Absent permission defaults to the SAFEST level for agents with a sandbox
+    // model; agents without one stay None. An explicit-but-invalid value errors.
+    let permission = match node
         .config
         .get("permission")
         .and_then(serde_json::Value::as_str)
-        .and_then(ca::Permission::parse);
+    {
+        Some(s) => Some(ca::Permission::parse(s).ok_or_else(|| {
+            NodeError::Config(format!(
+                "coding-agent: invalid permission {s:?} (expected read|edit|full)"
+            ))
+        })?),
+        None if !ca::supported_permission_levels(&agent_id).is_empty() => {
+            Some(ca::Permission::Read)
+        },
+        None => None,
+    };
     let model_owned = match node
         .config
         .get("model")
@@ -384,16 +396,7 @@ fn build_agent_invocation(
         Some(m) => Some(sub(m)?),
         None => None,
     };
-    let extra_tokens = match node
-        .config
-        .get("extra_flags")
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.is_empty())
-    {
-        Some(e) => ca::sanitize_extra_flags(&sub(e)?).map_err(NodeError::Config)?,
-        None => Vec::new(),
-    };
-    let args = ca::build_agent_argv(&agent_id, permission, model_owned.as_deref(), &extra_tokens);
+    let args = ca::build_agent_argv(&agent_id, permission, model_owned.as_deref());
     Ok(AgentInvocation {
         args,
         stdin_prompt,
@@ -517,6 +520,14 @@ impl SubprocessExecutor {
             path,
             agent_id,
         } = Self::resolve_agent_binary(node, ctx, &cancel).await?;
+
+        // `CliAgentPrint` is self-asserted by the resource; also require a known
+        // agent id so a resource can't point this node at an arbitrary binary.
+        if !ca::is_known_agent(&agent_id) {
+            return Err(NodeError::Config(format!(
+                "coding-agent: '{agent_id}' is not a supported coding agent (no non-interactive recipe)"
+            )));
+        }
 
         let inv = build_agent_invocation(node, ctx, agent_id)?;
         let cwd = ctx

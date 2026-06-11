@@ -9,12 +9,14 @@
 //! via the resource's advertised capabilities); on any other invocation it
 //! reads + discards stdin and prints one canned result line.
 //!
-//! The resource uses a fresh id (not a builtin like `claude-code`) so the
-//! boot probe never caches a real agent that happens to be on the test
-//! machine's PATH; the executor's `opportunistic_reprobe` is what resolves
-//! the stub. A fresh (unknown) id takes `normalize_output`'s raw-passthrough
-//! path, so `text` is the stub's stdout verbatim. Claude/codex dialect
-//! parsing is covered by the `coding_agent` unit tests.
+//! The resource uses the `aider` id: a *known* agent (so the executor's
+//! known-agent gate admits it) that has no structured-output dialect, so
+//! `normalize_output` takes the raw-passthrough path and `text` is the stub's
+//! stdout verbatim. `aider`'s recipe (`--message`) and absence of a sandbox
+//! model also mean no permission flags are appended. The boot probe never
+//! caches a real `aider` because the workflow-scoped resource points the probe
+//! at the stub path, and `opportunistic_reprobe` is what resolves it.
+//! Claude/codex dialect parsing is covered by the `coding_agent` unit tests.
 
 #![cfg(unix)]
 
@@ -51,11 +53,14 @@ echo 'hello from stub'
 }
 
 /// A workflow-scoped resource definition whose binary probe resolves the stub
-/// and advertises `cli_agent_print`. The id is fresh (not a builtin) so the
-/// boot probe never shadows it with a real on-PATH agent.
+/// and advertises `cli_agent_print`. Uses the `aider` id: a known agent (so the
+/// executor's known-agent gate admits it) with no structured-output dialect, so
+/// the result takes `normalize_output`'s raw-passthrough path. The probe points
+/// at the stub path, so the boot probe resolves the stub rather than any real
+/// on-PATH `aider`.
 fn stub_resource_def(stub_path: &str) -> ResourceDefinition {
     serde_json::from_value(serde_json::json!({
-        "id": "stub-agent",
+        "id": "aider",
         "kind": "binary",
         "advertised_capabilities": ["cli_agent_print"],
         "probe": {
@@ -64,14 +69,16 @@ fn stub_resource_def(stub_path: &str) -> ResourceDefinition {
             "version_args": ["--version"],
             "version_regex": r"^(\S+)",
         },
-        "override_lower_scope": false,
+        // `aider` is a builtin resource at a lower scope; overriding it points
+        // the probe at the stub instead of any real on-PATH aider.
+        "override_lower_scope": true,
     }))
     .expect("stub resource def deserializes")
 }
 
 fn coding_agent_node() -> Node {
     let mut config = HashMap::new();
-    config.insert("agent".into(), serde_json::json!("stub-agent"));
+    config.insert("agent".into(), serde_json::json!("aider"));
     config.insert("prompt".into(), serde_json::json!("do the thing"));
     Node {
         id: "a".into(),
