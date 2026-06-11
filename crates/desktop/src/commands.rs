@@ -378,6 +378,12 @@ pub fn list_node_types(state: tauri::State<'_, AppState>) -> Result<Vec<NodeType
         .collect())
 }
 
+/// Permission levels the given detected agent supports (empty ⇒ hide the control).
+#[tauri::command]
+pub fn list_agent_permission_levels(agent_id: String) -> Vec<String> {
+    ordius_engine::agent_permission_levels(&agent_id)
+}
+
 // ─── Workspaces ──────────────────────────────────────────────────
 
 /// Every registered workspace.

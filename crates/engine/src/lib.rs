@@ -54,6 +54,34 @@ pub use types::{
 };
 pub use validation::{ValidationError, validate};
 
+/// Permission levels a detected coding-agent meaningfully supports (drives the
+/// desktop node UI). Empty ⇒ the agent has no sandbox model.
+#[must_use]
+pub fn agent_permission_levels(agent_id: &str) -> Vec<String> {
+    crate::executor::builtins::coding_agent::supported_permission_levels(agent_id)
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(test)]
+mod public_api_tests {
+    use super::agent_permission_levels;
+
+    #[test]
+    fn agent_permission_levels_public_api() {
+        assert_eq!(
+            agent_permission_levels("claude-code"),
+            vec!["read", "edit", "full"]
+        );
+        assert_eq!(
+            agent_permission_levels("codex"),
+            vec!["read", "edit", "full"]
+        );
+        assert!(agent_permission_levels("aider").is_empty());
+    }
+}
+
 use crate::db::DbPool;
 use crate::environment::runtime::{
     ResourceRegistry, install_builtin_resources, load_user_resources,

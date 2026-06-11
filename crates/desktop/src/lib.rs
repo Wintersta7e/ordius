@@ -43,6 +43,7 @@ pub fn run() {
             commands::list_runs,
             commands::get_run,
             commands::list_node_types,
+            commands::list_agent_permission_levels,
             commands::list_workspaces,
             commands::add_workspace,
             commands::remove_workspace,

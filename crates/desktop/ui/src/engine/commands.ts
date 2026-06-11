@@ -241,6 +241,10 @@ export function listEnvironmentDefinitions(
  * mutates `env_specs` or the registry. The HostDirect wizard calls this
  * before committing the result via {@link enableHostDirect}.
  */
+export function listAgentPermissionLevels(agentId: string): Promise<string[]> {
+  return invoke("list_agent_permission_levels", { agentId });
+}
+
 export function testHostDirect(
   envId: string,
   resourceId: string,

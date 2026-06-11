@@ -7,6 +7,8 @@
 // variables + triggers when nothing is selected.
 
 import type { JSX } from "react";
+import { useEffect, useState } from "react";
+import { listAgentPermissionLevels } from "../../engine/commands";
 
 import type {
   ConfigFieldDef,
@@ -273,6 +275,13 @@ function NodeProps({
             effectiveEnv={effectiveEnv}
             onPatch={onPatch}
           />
+        ) : nodeType.id === "coding-agent" ? (
+          <CodingAgentParameters
+            node={node}
+            nodeType={nodeType}
+            effectiveEnv={effectiveEnv}
+            onPatch={onPatch}
+          />
         ) : (
           <GenericParameters
             node={node}
@@ -439,6 +448,95 @@ function LlmParameters({
           }
         />
       </Field>
+      {remainingFields.map((field) => (
+        <ConfigFieldRow
+          key={field.name}
+          field={field}
+          value={node.config?.[field.name]}
+          onChange={(value) =>
+            onPatch(node.id, {
+              config: { ...node.config, [field.name]: value },
+            })
+          }
+        />
+      ))}
+      {adhocEntries.map(([key, value]) => (
+        <Field key={key} label={key} hint="custom">
+          <TextInput
+            value={String(value ?? "")}
+            onChange={(next) =>
+              onPatch(node.id, {
+                config: { ...node.config, [key]: next },
+              })
+            }
+          />
+        </Field>
+      ))}
+    </>
+  );
+}
+
+interface CodingAgentParametersProps extends ParameterRendererProps {
+  effectiveEnv: string;
+}
+
+function CodingAgentParameters({
+  node,
+  nodeType,
+  effectiveEnv,
+  onPatch,
+}: CodingAgentParametersProps): JSX.Element {
+  const agentId = readResourceId(node.config.resource) ?? "";
+  const [permLevels, setPermLevels] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (!agentId) {
+      setPermLevels([]);
+      return;
+    }
+    listAgentPermissionLevels(agentId)
+      .then(setPermLevels)
+      .catch(() => setPermLevels([]));
+  }, [agentId]);
+
+  const definedFieldNames = new Set(nodeType.config.map((f) => f.name));
+  const adhocEntries = Object.entries(node.config ?? {}).filter(
+    ([key]) => !definedFieldNames.has(key),
+  );
+  const remainingFields = nodeType.config.filter(
+    (f) => f.name !== "resource" && f.name !== "permission",
+  );
+  return (
+    <>
+      <Field label="agent" hint="CLI coding-agent via env-aware registry">
+        <ResourcePicker
+          envId={effectiveEnv}
+          value={agentId || null}
+          onChange={(next) =>
+            onPatch(node.id, {
+              config: {
+                ...node.config,
+                resource: next
+                  ? { id: next, required_capability: "cli_agent_print" }
+                  : null,
+              },
+            })
+          }
+          capabilityFilter="cli_agent_print"
+          placeholder="(pick a detected agent)"
+        />
+      </Field>
+      {permLevels.length > 0 && (
+        <Field label="permission" hint="sandbox level">
+          <SegRow
+            value={(node.config.permission as string) ?? permLevels[0]}
+            options={permLevels}
+            onChange={(next) =>
+              onPatch(node.id, { config: { ...node.config, permission: next } })
+            }
+          />
+        </Field>
+      )}
       {remainingFields.map((field) => (
         <ConfigFieldRow
           key={field.name}
