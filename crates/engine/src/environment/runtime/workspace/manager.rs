@@ -4430,7 +4430,6 @@ mod tests {
         assert_eq!(mgr_b.persistent_lock_count(), 0);
     }
 
-
     /// COV-02: a second run contends for a held persistent lock but `owner.json`
     /// cannot be read (here: every download fails) → the contention error falls
     /// back to the generic "locked by another run" message with no owner named,
@@ -4511,7 +4510,6 @@ mod tests {
             "owner.json must not be clobbered on the idempotent second call"
         );
     }
-
 
     /// CONC-01: two concurrent persistent `reconcile_in` calls for the SAME
     /// (env, root) but DIFFERENT `host_ws` — distinct [`WorkspaceKey`]s, so the

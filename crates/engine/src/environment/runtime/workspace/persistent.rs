@@ -287,7 +287,6 @@ pub(super) fn advance_host_at_in_force(
     advanced
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::advance_host_at_in_force;
