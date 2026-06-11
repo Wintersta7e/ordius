@@ -425,6 +425,7 @@ impl SubprocessExecutor {
         use crate::environment::runtime::ResourceProbeOutcome;
         use crate::environment::runtime::catalog::ResourceDetail;
         use crate::environment::runtime::resource::{Capability, ResourceRef};
+        use crate::executor::builtins::coding_agent as ca;
 
         let rref: ResourceRef = node
             .config
@@ -458,23 +459,35 @@ impl SubprocessExecutor {
             ))
         })?;
 
-        // Mirror llm.rs: lookup → opportunistic_reprobe fallback.
+        // Resolve the definition AND its scope FIRST, so the trust gate runs
+        // before any probe/lookup. A workflow- or env-local-scoped override of a
+        // known agent id is rejected here — only built-in or user-global agents
+        // may run, so an imported workflow can't repoint a known id at an
+        // arbitrary binary.
+        let workflow_id = ctx.run_snapshot.workflow_id.clone();
+        let (def, scope) = ctx
+            .run_snapshot
+            .registry
+            .resolve(rref.id(), &effective_env, Some(&workflow_id))
+            .ok_or_else(|| {
+                NodeError::Config(format!(
+                    "coding-agent: resource '{}' not in registry (env '{}')",
+                    rref.id().0,
+                    effective_env.as_str()
+                ))
+            })?;
+        if !ca::agent_scope_is_trusted(&scope) {
+            return Err(NodeError::Config(format!(
+                "coding-agent: resource '{}' is defined at an untrusted scope ({scope:?}); \
+                 only built-in or user-global agents may run (workflow/env-local overrides are rejected)",
+                rref.id().0
+            )));
+        }
+        let def = def.clone();
+        // Mirror llm.rs: catalog fast-path → opportunistic_reprobe fallback.
         let outcome = if let Some(o @ ResourceProbeOutcome::Found(_)) = catalog.lookup(rref.id()) {
             o
         } else {
-            let workflow_id = ctx.run_snapshot.workflow_id.clone();
-            let (def, _scope) = ctx
-                .run_snapshot
-                .registry
-                .resolve(rref.id(), &effective_env, Some(&workflow_id))
-                .ok_or_else(|| {
-                    NodeError::Config(format!(
-                        "coding-agent: resource '{}' not in registry (env '{}')",
-                        rref.id().0,
-                        effective_env.as_str()
-                    ))
-                })?;
-            let def = def.clone();
             Arc::clone(catalog)
                 .opportunistic_reprobe(&def, Arc::clone(&dispatcher), cancel.child_token())
                 .await

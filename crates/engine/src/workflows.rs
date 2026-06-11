@@ -424,6 +424,16 @@ fn validate_nodes<S: std::hash::BuildHasher>(
             validate_node_resource(rref_val, node, &res_ctx, effective_env)?;
         }
 
+        // 1b. A `coding-agent` node names its agent via `config.agent`, which is
+        //     also a `ResourceRef`. Give it the same load-time validation as
+        //     `config.resource` so a malformed or unknown agent ref is caught at
+        //     load rather than mid-run.
+        if node.ty == "coding-agent"
+            && let Some(agent_val) = node.config.get("agent")
+        {
+            validate_node_resource(agent_val, node, &res_ctx, effective_env)?;
+        }
+
         // 2. `http` node validations.
         if node.ty == "http" {
             // 2a. Validate `origin` wire form at load so users get the

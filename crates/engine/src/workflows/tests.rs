@@ -455,6 +455,46 @@ mod validation_tests {
     }
 
     #[test]
+    fn load_in_registry_rejects_unknown_coding_agent_ref() {
+        // A `coding-agent` node names its agent via `config.agent` (a
+        // ResourceRef), which gets the same load-time validation as
+        // `config.resource`: an unknown id is rejected at load.
+        let tmp = TempDir::new().unwrap();
+        let id = "wf-bad-agent";
+        let dir = tmp.path().join("workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.json"));
+        std::fs::write(
+            &path,
+            r#"{
+                "id":"wf-bad-agent","name":"x",
+                "nodes":[{"id":"n1","type":"coding-agent","name":"x","config":{"agent":"no-such-agent","prompt":"hi"}}],
+                "edges":[]
+            }"#,
+        )
+        .unwrap();
+        let registry = ResourceRegistry::new();
+        let err = super::load_in_registry(
+            tmp.path(),
+            id,
+            &registry,
+            &EnvRegistry::new(),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        match err {
+            super::WorkflowsError::ResourceNotInRegistry {
+                node_id,
+                resource_id,
+            } => {
+                assert_eq!(node_id, "n1");
+                assert_eq!(resource_id, "no-such-agent");
+            },
+            other => panic!("expected ResourceNotInRegistry, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn load_in_registry_rejects_unadvertised_capability() {
         let tmp = TempDir::new().unwrap();
         let id = "wf-bad-cap";

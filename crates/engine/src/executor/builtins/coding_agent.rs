@@ -3,6 +3,17 @@
 //! stdin, result on the `text` port. Pure helpers here; the executor branch
 //! lives in `executor/subprocess.rs`.
 
+use crate::environment::runtime::ScopeKey;
+
+/// A coding-agent may only run a resource defined at a TRUSTED scope: a
+/// shipped built-in or a user-global definition. Workflow- and env-local-scoped
+/// definitions are rejected, so an imported workflow cannot override a known
+/// agent id (e.g. `aider`) to point at an arbitrary binary.
+#[allow(unreachable_pub, dead_code)]
+pub const fn agent_scope_is_trusted(scope: &ScopeKey) -> bool {
+    matches!(scope, ScopeKey::Builtin | ScopeKey::UserGlobal)
+}
+
 /// Stable node-type id. NOT `"agent"` — that id is reserved → `llm`
 /// (`loader.rs` [`RESERVED_NODE_TYPE_IDS`]), so we use `coding-agent`.
 #[allow(unreachable_pub, dead_code)]
@@ -212,6 +223,20 @@ fn parse_codex_jsonl(stdout: &str) -> Option<AgentOutput> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_scope_trust_gate() {
+        use crate::environment::runtime::ScopeKey;
+        use crate::environment::runtime::{EnvId, WorkflowId};
+        assert!(agent_scope_is_trusted(&ScopeKey::Builtin));
+        assert!(agent_scope_is_trusted(&ScopeKey::UserGlobal));
+        assert!(!agent_scope_is_trusted(&ScopeKey::EnvLocal {
+            id: EnvId::new("e")
+        }));
+        assert!(!agent_scope_is_trusted(&ScopeKey::Workflow {
+            id: WorkflowId("w".into())
+        }));
+    }
 
     #[test]
     fn claude_print_flags_and_permission() {
