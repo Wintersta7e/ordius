@@ -5,6 +5,7 @@
 // awkward re-export shim (clippy's redundant_pub_crate /
 // unreachable_pub crossfire is unkind to that pattern).
 pub(crate) mod checkpoint;
+pub(crate) mod coding_agent;
 pub(crate) mod compose;
 pub(crate) mod condition;
 pub(crate) mod delay;
