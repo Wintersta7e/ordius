@@ -6,6 +6,7 @@
 use crate::executor::builtins::checkpoint::{
     NODE_TYPE_ID as CHECKPOINT_NODE_TYPE_ID, PAUSE_NODE_TYPE_ID,
 };
+use crate::executor::builtins::coding_agent::NODE_TYPE_ID as CODING_AGENT_NODE_TYPE_ID;
 use crate::executor::builtins::compose::NODE_TYPE_ID as COMPOSE_NODE_TYPE_ID;
 use crate::executor::builtins::condition::NODE_TYPE_ID as CONDITION_NODE_TYPE_ID;
 use crate::executor::builtins::delay::NODE_TYPE_ID as DELAY_NODE_TYPE_ID;
@@ -90,6 +91,7 @@ impl Registry {
         r.register(compose_spec());
         r.register(parallel_spec());
         r.register(docker_run_spec());
+        r.register(coding_agent_spec());
         r
     }
 }
@@ -892,6 +894,94 @@ fn llm_spec() -> NodeType {
     }
 }
 
+/// `coding-agent` built-in: run a detected CLI coding agent (claude/codex/…)
+/// in non-interactive mode via the env dispatcher. Prompt → stdin; result →
+/// `text`. The `SubprocessExecutor` keys off `CODING_AGENT_NODE_TYPE_ID`.
+fn coding_agent_spec() -> NodeType {
+    NodeType {
+        id: CODING_AGENT_NODE_TYPE_ID.into(),
+        name: "Coding Agent".into(),
+        category: Category::Llm,
+        tags: vec![],
+        icon: "bot".into(),
+        description: "Run a detected CLI coding agent (claude, codex, …) on a prompt. \
+                      Prompt over stdin, result on the text port."
+            .into(),
+        inputs: vec![],
+        outputs: vec![
+            PortDef {
+                name: "text".into(),
+                ty: PortType::String,
+                required: false,
+            },
+            PortDef {
+                name: "exit_code".into(),
+                ty: PortType::Number,
+                required: false,
+            },
+            PortDef {
+                name: "session_id".into(),
+                ty: PortType::String,
+                required: false,
+            },
+        ],
+        config: vec![
+            ConfigFieldDef {
+                name: "agent".into(),
+                label: "Agent".into(),
+                ty: ConfigFieldType::String,
+                default: None,
+                required: true,
+            },
+            ConfigFieldDef {
+                name: "prompt".into(),
+                label: "Prompt".into(),
+                ty: ConfigFieldType::Textarea,
+                default: None,
+                required: true,
+            },
+            ConfigFieldDef {
+                name: "permission".into(),
+                label: "Permission".into(),
+                ty: ConfigFieldType::Select,
+                default: Some(serde_json::json!(["read", "edit", "full"])),
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "model".into(),
+                label: "Model (optional)".into(),
+                ty: ConfigFieldType::String,
+                default: None,
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "cwd".into(),
+                label: "Working dir (optional)".into(),
+                ty: ConfigFieldType::String,
+                default: None,
+                required: false,
+            },
+            ConfigFieldDef {
+                name: "extra_flags".into(),
+                label: "Extra flags (optional)".into(),
+                ty: ConfigFieldType::String,
+                default: None,
+                required: false,
+            },
+        ],
+        execution: ExecutionSpec {
+            backend: ExecutionBackend::Subprocess,
+            command: vec![],
+            stdin_template: None,
+            env: HashMap::new(),
+            timeout_ms: None,
+            output_parse: OutputParse::Text,
+            output_map: HashMap::new(),
+        },
+        skip_config_templates: true,
+    }
+}
+
 fn condition_spec() -> NodeType {
     NodeType {
         id: CONDITION_NODE_TYPE_ID.into(),
@@ -983,5 +1073,17 @@ mod tests {
                 "transform",
             ],
         );
+    }
+
+    #[test]
+    fn coding_agent_is_registered_with_expected_ports() {
+        let r = Registry::with_v1_1_builtins();
+        let nt = r.get("coding-agent").expect("coding-agent registered");
+        assert_eq!(nt.execution.backend, ExecutionBackend::Subprocess);
+        assert!(nt.skip_config_templates);
+        let out: Vec<&str> = nt.outputs.iter().map(|p| p.name.as_str()).collect();
+        assert!(out.contains(&"text") && out.contains(&"exit_code") && out.contains(&"session_id"));
+        let cfg: Vec<&str> = nt.config.iter().map(|f| f.name.as_str()).collect();
+        assert!(cfg.contains(&"agent") && cfg.contains(&"prompt") && cfg.contains(&"permission"));
     }
 }
