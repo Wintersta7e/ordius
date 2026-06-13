@@ -157,3 +157,44 @@ async fn escape_runs_only_after_loop_budget_exhausted() {
          final evaluation (last cond done seq {last_cond_done})"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn green_branch_runs_commit_and_never_escape() {
+    let home = tempfile::TempDir::new().unwrap();
+    let engine = Arc::new(Engine::new(home.path().to_path_buf()).await.unwrap());
+
+    // Same shape, cond always true: no "true" loop edge, so commit runs and
+    // the false-branch escape is skipped (never runs).
+    let wf = Arc::new(Workflow {
+        id: "wf_loop_green".into(),
+        name: "loop green".into(),
+        schema_version: 1,
+        created_at: None,
+        updated_at: None,
+        variables: HashMap::new(),
+        triggers: vec![],
+        nodes: vec![
+            delay_node("a"),
+            condition_bool_node("cond", true),
+            delay_node("escape"),
+            delay_node("commit"),
+        ],
+        edges: vec![
+            fwd("e1", "a", "cond"),
+            loop_edge("eloop", "cond", "a", "false", 2),
+            fwd_branch("e2", "cond", "escape", "false"),
+            fwd_branch("e3", "cond", "commit", "true"),
+        ],
+        resources: vec![],
+        default_env: None,
+    });
+
+    let summary = engine
+        .run_workflow(wf, HashMap::new(), "test", false, None)
+        .await
+        .expect("green-path run completes");
+    assert_eq!(summary.status, "done", "run summary: {summary:?}");
+
+    assert_eq!(count_runs(&engine, &summary.run_id, "commit"), 1);
+    assert_eq!(count_runs(&engine, &summary.run_id, "escape"), 0);
+}
