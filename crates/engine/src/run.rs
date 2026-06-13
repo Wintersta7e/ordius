@@ -1353,10 +1353,12 @@ fn finalize_node_run(
     Ok(())
 }
 
-/// Route a freshly-completed condition node's `branch` output
-/// into the scheduler + fire any loop edge keyed off that branch.
-/// No-op for non-condition nodes or condition outputs missing the
-/// `branch` String port.
+/// Route a freshly-completed condition node's `branch` output into the
+/// scheduler: fire a matching loop edge if one is ready, otherwise resolve the
+/// branch terminally. The call site skips `complete_node` for condition nodes,
+/// so this function owns their completion — a non-condition node returns
+/// immediately (already completed by the caller), and a condition that emitted
+/// no `branch` port is completed generically here so it isn't stranded.
 fn route_condition_outputs(
     sched: &mut crate::scheduler::Scheduler<'_>,
     iterations: &mut HashMap<String, u32>,
