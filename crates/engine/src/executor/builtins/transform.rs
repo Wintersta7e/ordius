@@ -1,15 +1,16 @@
 //! `transform` built-in: `template`, `jsonpath`, `regex_extract`,
-//! `regex_replace`. Single primary output: `text` (string).
+//! `regex_replace`, `hash`. Single primary output: `text` (string).
 
 use super::util::config_str;
 use crate::executor::{NodeError, NodeExecutor, NodeOutputs, RunContext};
 use crate::types::{Node, NodeType, PortValue};
 use async_trait::async_trait;
 use jsonpath_rust::JsonPath;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio_util::sync::CancellationToken;
 
-/// Three ops: `jsonpath`, `regex_extract`, `regex_replace`.
+/// Five ops: `template`, `jsonpath`, `regex_extract`, `regex_replace`, `hash`.
 /// Output port `text` carries the resulting string.
 #[allow(unreachable_pub)]
 pub const NODE_TYPE_ID: &str = "transform";
@@ -40,7 +41,7 @@ impl NodeExecutor for TransformExecutor {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| {
                 NodeError::Config(
-                    "transform: 'op' required: template|jsonpath|regex_extract|regex_replace"
+                    "transform: 'op' required: template|jsonpath|regex_extract|regex_replace|hash"
                         .into(),
                 )
             })?;
@@ -49,6 +50,7 @@ impl NodeExecutor for TransformExecutor {
             "jsonpath" => apply_jsonpath(&node.config)?,
             "regex_extract" => apply_regex_extract(&node.config)?,
             "regex_replace" => apply_regex_replace(&node.config)?,
+            "hash" => apply_hash(&node.config)?,
             other => {
                 return Err(NodeError::Config(format!(
                     "transform: unknown op '{other}'"
@@ -134,6 +136,20 @@ fn apply_regex_replace(cfg: &HashMap<String, serde_json::Value>) -> Result<Strin
     let re = regex::Regex::new(pattern)
         .map_err(|e| NodeError::Config(format!("transform.regex_replace: invalid pattern: {e}")))?;
     Ok(re.replace_all(input, replacement).into_owned())
+}
+
+fn apply_hash(cfg: &HashMap<String, serde_json::Value>) -> Result<String, NodeError> {
+    let input = config_str(cfg, "input", "transform")?;
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in &digest {
+        use std::fmt::Write as _;
+        // `write!` to a String is infallible.
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    Ok(hex)
 }
 
 #[cfg(test)]

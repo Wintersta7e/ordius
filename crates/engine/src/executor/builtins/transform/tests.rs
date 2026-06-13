@@ -123,3 +123,41 @@ async fn template_op_missing_template_field_is_config_error() {
     let res = run_transform(&serde_json::json!({"op": "template"})).await;
     assert!(matches!(res, Err(NodeError::Config(_))));
 }
+
+#[tokio::test]
+async fn hash_op_emits_known_sha256_hex() {
+    // sha256("hello world") computed independently.
+    let s = run_transform(&serde_json::json!({
+        "op": "hash",
+        "input": "hello world",
+    }))
+    .await
+    .unwrap();
+    assert_eq!(
+        s,
+        "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    );
+}
+
+#[tokio::test]
+async fn hash_op_identical_inputs_hash_equal_different_differ() {
+    // The GR-1 "no progress" check: same content -> same digest;
+    // changed content -> different digest.
+    let a = run_transform(&serde_json::json!({"op":"hash","input":"same"}))
+        .await
+        .unwrap();
+    let b = run_transform(&serde_json::json!({"op":"hash","input":"same"}))
+        .await
+        .unwrap();
+    let c = run_transform(&serde_json::json!({"op":"hash","input":"other"}))
+        .await
+        .unwrap();
+    assert_eq!(a, b);
+    assert_ne!(a, c);
+}
+
+#[tokio::test]
+async fn hash_op_missing_input_is_config_error() {
+    let res = run_transform(&serde_json::json!({"op": "hash"})).await;
+    assert!(matches!(res, Err(NodeError::Config(_))));
+}
