@@ -247,28 +247,10 @@ impl<'a> Scheduler<'a> {
     }
 
     /// BFS from `start` through forward edges, stopping at `end`
-    /// (exclusive). Returns the nodes between `start` and `end`
-    /// on the looping subgraph; the caller adds `end` to the
-    /// reset set itself.
+    /// (exclusive). Thin caller over [`collect_loop_subgraph`] so the
+    /// scheduler and the validator share one implementation.
     fn collect_loop_subgraph(&self, start: &str, end: &str) -> Vec<String> {
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut out: Vec<String> = Vec::new();
-        let mut q: Vec<String> = vec![start.to_string()];
-        while let Some(cur) = q.pop() {
-            if cur == end {
-                continue;
-            }
-            if !seen.insert(cur.clone()) {
-                continue;
-            }
-            if let Some(outs) = self.outgoing.get(cur.as_str()) {
-                for e in outs {
-                    q.push(e.to_node_id.clone());
-                }
-            }
-            out.push(cur);
-        }
-        out
+        collect_loop_subgraph(&self.outgoing, start, end)
     }
 
     /// Return ids of nodes that have transitioned to `Skipped`
@@ -301,6 +283,40 @@ impl<'a> Scheduler<'a> {
             }
         }
     }
+}
+
+/// BFS from `start` through the forward-edge adjacency `outgoing`,
+/// stopping at `end` (exclusive). Returns every node between `start`
+/// and `end` on the looping subgraph; callers that need `end` in the
+/// set add it themselves. Shared by the scheduler's loop reset and the
+/// validator's loop green-check (GR-5).
+///
+/// `outgoing` maps a node id to its outgoing Forward edges — exactly
+/// the index the scheduler builds in [`Scheduler::new`]. The validator
+/// builds an equivalent index from the workflow's Forward edges.
+pub(crate) fn collect_loop_subgraph(
+    outgoing: &HashMap<&str, Vec<&Edge>>,
+    start: &str,
+    end: &str,
+) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    let mut q: Vec<String> = vec![start.to_string()];
+    while let Some(cur) = q.pop() {
+        if cur == end {
+            continue;
+        }
+        if !seen.insert(cur.clone()) {
+            continue;
+        }
+        if let Some(outs) = outgoing.get(cur.as_str()) {
+            for e in outs {
+                q.push(e.to_node_id.clone());
+            }
+        }
+        out.push(cur);
+    }
+    out
 }
 
 #[cfg(test)]
