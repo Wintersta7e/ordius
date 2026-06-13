@@ -396,7 +396,29 @@ fn build_agent_invocation(
         Some(m) => Some(sub(m)?),
         None => None,
     };
-    let args = ca::build_agent_argv(&agent_id, permission, model_owned.as_deref());
+    // Opt-in session resume: substitute the template, then pass the resolved
+    // id through to the argv builder. Empty after substitution = fresh (the
+    // default policy); build_agent_argv treats "" like None.
+    let resume_owned = match node
+        .config
+        .get("resume_session")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        Some(r) => {
+            let resolved = sub(r)?;
+            // A kv-get miss surfaces `value` as JSON null, which templates to the
+            // literal "null"; treat that (and empty) as "no stored id" -> fresh.
+            (!resolved.is_empty() && resolved != "null").then_some(resolved)
+        },
+        None => None,
+    };
+    let args = ca::build_agent_argv(
+        &agent_id,
+        permission,
+        model_owned.as_deref(),
+        resume_owned.as_deref(),
+    );
     Ok(AgentInvocation {
         args,
         stdin_prompt,

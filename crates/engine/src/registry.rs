@@ -954,6 +954,13 @@ fn coding_agent_spec() -> NodeType {
                 default: None,
                 required: false,
             },
+            ConfigFieldDef {
+                name: "resume_session".into(),
+                label: "Resume session (optional)".into(),
+                ty: ConfigFieldType::Textarea,
+                default: None,
+                required: false,
+            },
         ],
         execution: ExecutionSpec {
             backend: ExecutionBackend::Subprocess,
@@ -1071,5 +1078,9 @@ mod tests {
         assert!(out.contains(&"text") && out.contains(&"exit_code") && out.contains(&"session_id"));
         let cfg: Vec<&str> = nt.config.iter().map(|f| f.name.as_str()).collect();
         assert!(cfg.contains(&"agent") && cfg.contains(&"prompt") && cfg.contains(&"permission"));
+        assert!(
+            nt.config.iter().any(|c| c.name == "resume_session"),
+            "coding-agent should expose a resume_session config field"
+        );
     }
 }

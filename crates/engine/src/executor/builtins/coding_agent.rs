@@ -91,6 +91,23 @@ pub fn supported_permission_levels(agent_id: &str) -> Vec<&'static str> {
     }
 }
 
+/// Args that resume a prior session/thread, per agent id. claude takes a
+/// `--resume <id>` flag; codex resumes via the `resume` subcommand of `exec`
+/// (so the caller must splice these in right after `exec`, not append them).
+/// Agents with no known resume recipe return empty and ignore the id.
+///
+/// codex `--ephemeral` forks a fresh thread and must never accompany resume;
+/// it is intentionally absent from `print_flags`, so resume never collides
+/// with it here.
+#[allow(unreachable_pub, dead_code)]
+pub fn resume_args(agent_id: &str, session_id: &str) -> Vec<String> {
+    match agent_id {
+        "claude-code" => vec!["--resume".into(), session_id.to_string()],
+        "codex" => vec!["resume".into(), session_id.to_string()],
+        _ => Vec::new(),
+    }
+}
+
 /// Join the non-empty prompt sections with blank lines, in the fixed order
 /// persona → prompt → output-format → context.
 #[allow(unreachable_pub, dead_code)]
@@ -117,18 +134,37 @@ pub fn is_known_agent(agent_id: &str) -> bool {
 }
 
 /// Assemble the agent argv tail (everything after the binary path). Order:
-/// print/structured flags → model → permission flags LAST, so the model never
-/// shadows the node's permission posture.
+/// print/structured flags → resume args → model → permission flags LAST, so
+/// the model never shadows the node's permission posture. `resume` carries an
+/// optional prior session/thread id; an empty id is treated as no resume.
+///
+/// claude appends `--resume <id>` after the print flags. codex resumes via the
+/// `resume` subcommand of `exec`, so its resume pair is spliced in right after
+/// the leading `exec` token rather than appended.
 #[allow(unreachable_pub, dead_code)]
 pub fn build_agent_argv(
     agent_id: &str,
     permission: Option<Permission>,
     model: Option<&str>,
+    resume: Option<&str>,
 ) -> Vec<String> {
-    let mut args: Vec<String> = print_flags(agent_id)
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let print = print_flags(agent_id);
+    let resume_id = resume.filter(|s| !s.is_empty());
+    let resume = resume_id.map_or_else(Vec::new, |id| resume_args(agent_id, id));
+
+    let mut args: Vec<String> = Vec::new();
+    if agent_id == "codex" && !resume.is_empty() {
+        // codex: `exec resume <id> --json …` — splice resume after `exec`.
+        let mut it = print.into_iter().map(str::to_string);
+        if let Some(first) = it.next() {
+            args.push(first); // "exec"
+        }
+        args.extend(resume);
+        args.extend(it); // "--json"
+    } else {
+        args.extend(print.into_iter().map(str::to_string));
+        args.extend(resume);
+    }
     if let Some(m) = model.filter(|s| !s.is_empty()) {
         args.push("--model".into());
         args.push(m.to_string());
@@ -324,7 +360,7 @@ mod tests {
 
     #[test]
     fn build_argv_puts_permission_last() {
-        let argv = build_agent_argv("claude-code", Some(Permission::Read), Some("opus"));
+        let argv = build_agent_argv("claude-code", Some(Permission::Read), Some("opus"), None);
         assert_eq!(
             argv,
             vec![
@@ -345,7 +381,7 @@ mod tests {
 
     #[test]
     fn build_argv_omits_model_and_permission_when_absent() {
-        let argv = build_agent_argv("codex", None, None);
+        let argv = build_agent_argv("codex", None, None, None);
         assert_eq!(argv, vec!["exec", "--json"]);
     }
 
@@ -399,5 +435,95 @@ mod tests {
         assert_eq!(n.text, stdout);
         assert_eq!(n.session_id, None);
         assert!(!n.is_error);
+    }
+
+    #[test]
+    fn resume_args_claude_uses_resume_flag() {
+        assert_eq!(
+            resume_args("claude-code", "sess-1"),
+            vec!["--resume", "sess-1"]
+        );
+    }
+
+    #[test]
+    fn resume_args_codex_uses_resume_subcommand() {
+        // codex resumes via the `resume` subcommand of `exec`, not a flag.
+        assert_eq!(resume_args("codex", "thread-9"), vec!["resume", "thread-9"]);
+    }
+
+    #[test]
+    fn resume_args_unknown_agent_is_empty() {
+        assert!(resume_args("aider", "whatever").is_empty());
+        assert!(resume_args("gemini-cli", "whatever").is_empty());
+    }
+
+    #[test]
+    fn build_argv_claude_appends_resume_flag() {
+        let argv = build_agent_argv("claude-code", Some(Permission::Edit), None, Some("sess-1"));
+        assert_eq!(
+            argv,
+            vec![
+                "--print",
+                "--output-format",
+                "json",
+                "--resume",
+                "sess-1",
+                "--permission-mode",
+                "acceptEdits",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_argv_codex_inserts_resume_after_exec() {
+        // Must produce `codex exec resume <id> --json …`, with `resume <id>`
+        // wedged between `exec` and `--json` (codex treats resume as a
+        // subcommand of exec).
+        let argv = build_agent_argv("codex", Some(Permission::Read), None, Some("thread-9"));
+        assert_eq!(
+            argv,
+            vec![
+                "exec",
+                "resume",
+                "thread-9",
+                "--json",
+                "--sandbox",
+                "read-only",
+            ]
+        );
+        // `--ephemeral` is never emitted alongside resume.
+        assert!(!argv.iter().any(|a| a == "--ephemeral"));
+    }
+
+    #[test]
+    fn build_argv_no_resume_matches_legacy_shape() {
+        // None resume → identical to the pre-B5 argv.
+        let argv = build_agent_argv("claude-code", Some(Permission::Read), Some("opus"), None);
+        assert_eq!(
+            argv,
+            vec![
+                "--print",
+                "--output-format",
+                "json",
+                "--model",
+                "opus",
+                "--permission-mode",
+                "plan",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_argv_empty_resume_is_ignored() {
+        // Empty string must behave like None (no resume flag).
+        let argv = build_agent_argv("claude-code", None, None, Some(""));
+        assert_eq!(argv, vec!["--print", "--output-format", "json"]);
+    }
+
+    #[test]
+    fn build_argv_resume_unknown_agent_omits_resume() {
+        // aider has print flags but no resume recipe → resume id is dropped.
+        let argv = build_agent_argv("aider", None, None, Some("sess-1"));
+        assert_eq!(argv, vec!["--message"]);
     }
 }
