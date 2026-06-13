@@ -20,6 +20,7 @@ use crate::environment::runtime::env::WorkspaceBinding;
 use crate::environment::runtime::workspace::{RunOutcome, RunScope, WorkspaceManager};
 use crate::events::{EventType, RunEvent};
 use crate::executor::builtins::condition::NODE_TYPE_ID as CONDITION_NODE_TYPE_ID;
+use crate::executor::builtins::loop_for::NODE_TYPE_ID as LOOP_FOR_NODE_TYPE_ID;
 use crate::executor::{Dispatcher, NodeError, NodeExecutor, RunContext, wrap_process_env};
 use crate::recorder::{NodeRunRow, RunRecorder};
 use crate::scheduler::Scheduler;
@@ -723,7 +724,7 @@ impl Engine {
                         // dormant while the loop iterates. Promoting here (before
                         // the branch is resolved) would arm the escape on the
                         // first iteration.
-                        if node.ty != CONDITION_NODE_TYPE_ID {
+                        if node.ty != CONDITION_NODE_TYPE_ID && node.ty != LOOP_FOR_NODE_TYPE_ID {
                             sched.complete_node(&node.id);
                         }
                         route_condition_outputs(
@@ -1367,7 +1368,7 @@ fn route_condition_outputs(
     iteration: u32,
     outputs: &crate::executor::NodeOutputs,
 ) {
-    if node.ty != CONDITION_NODE_TYPE_ID {
+    if node.ty != CONDITION_NODE_TYPE_ID && node.ty != LOOP_FOR_NODE_TYPE_ID {
         return;
     }
     let Some(PortValue::String(branch)) = outputs.get("branch") else {
