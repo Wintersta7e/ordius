@@ -127,7 +127,14 @@ fn compare_ordered(
     let ord = if let (Some(a), Some(b)) = (left.as_f64(), right.as_f64()) {
         a.partial_cmp(&b)
     } else if let (Some(a), Some(b)) = (left.as_str(), right.as_str()) {
-        Some(a.cmp(b))
+        // Template substitution turns `{{nodes.X.outputs.text}}` into a
+        // JSON string, so numeric values arrive quoted. When BOTH sides
+        // parse as numbers, compare numerically; otherwise fall back to
+        // lexicographic string ordering (real words, mixed digit/word).
+        match (a.parse::<f64>(), b.parse::<f64>()) {
+            (Ok(na), Ok(nb)) => na.partial_cmp(&nb),
+            _ => Some(a.cmp(b)),
+        }
     } else {
         return Err(NodeError::Config(format!(
             "condition.compare.{op}: left and right must both be numbers or both strings"

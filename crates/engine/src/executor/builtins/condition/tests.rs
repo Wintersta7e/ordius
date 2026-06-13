@@ -212,3 +212,49 @@ async fn compare_unknown_op_is_config_error() {
     .await;
     assert!(matches!(res, Err(NodeError::Config(_))));
 }
+
+#[tokio::test]
+async fn compare_ge_string_encoded_numbers_is_numeric() {
+    // Regression: "10" and "9" arrive as JSON strings (what template
+    // substitution produces). Numerically 10 >= 9 is true; the old
+    // lexicographic compare wrongly made "10" < "9".
+    let s = run_condition(&serde_json::json!({
+        "mode":"compare","op":"ge","left":"10","right":"9"
+    }))
+    .await
+    .unwrap();
+    assert_eq!(s, "true");
+}
+
+#[tokio::test]
+async fn compare_lt_string_encoded_numbers_is_numeric() {
+    let s = run_condition(&serde_json::json!({
+        "mode":"compare","op":"lt","left":"9","right":"10"
+    }))
+    .await
+    .unwrap();
+    assert_eq!(s, "true");
+}
+
+#[tokio::test]
+async fn compare_lt_real_strings_stays_lexicographic() {
+    // Non-numeric strings still compare lexicographically.
+    let s = run_condition(&serde_json::json!({
+        "mode":"compare","op":"lt","left":"apple","right":"banana"
+    }))
+    .await
+    .unwrap();
+    assert_eq!(s, "true");
+}
+
+#[tokio::test]
+async fn compare_lt_one_numeric_string_one_word_stays_lexicographic() {
+    // Only one operand parses as a number: keep string compare, not an
+    // error. "5" < "abc" lexicographically (digits sort before letters).
+    let s = run_condition(&serde_json::json!({
+        "mode":"compare","op":"lt","left":"5","right":"abc"
+    }))
+    .await
+    .unwrap();
+    assert_eq!(s, "true");
+}
