@@ -266,3 +266,114 @@ fn done_workflow_is_not_stalled() {
     assert!(s.is_done());
     assert!(!s.is_stalled());
 }
+
+/// Mirror exactly what `run.rs::route_condition_outputs` does for one resolved
+/// condition: try the loop first; on a fire return the iteration (and touch
+/// nothing downstream); on no fire resolve the branch terminally. The run loop
+/// never calls `complete_node` for a condition, so neither do these tests.
+fn route_once(s: &mut Scheduler<'_>, cond: &str, branch: &str) -> Option<u32> {
+    if let Some(fire) = s.try_loop(cond, branch) {
+        Some(fire.iteration)
+    } else {
+        s.resolve_condition(cond, branch);
+        None
+    }
+}
+
+#[test]
+fn loop_escape_stays_dormant_then_arms_at_exhaustion() {
+    // a -> cond ; loop(cond -> a, "false", max 2) ; escape(cond -> escape, "false").
+    let w = wf(
+        vec![node("a"), node("cond"), node("escape")],
+        vec![
+            fwd("e1", "a", "cond"),
+            loop_edge("eloop", "cond", "a", "false", 2),
+            fwd_branch("e2", "cond", "escape", "false"),
+        ],
+    );
+    let mut s = Scheduler::new(&w);
+
+    // Two false iterations within budget: loop fires, escape stays dormant.
+    for expected in 1..=2 {
+        s.complete_node("a"); // `a` is a non-branch node: completes + promotes cond
+        assert_eq!(s.state_of("cond"), NodeState::Ready);
+        assert_eq!(route_once(&mut s, "cond", "false"), Some(expected));
+        assert_eq!(
+            s.state_of("escape"),
+            NodeState::Pending,
+            "escape must stay dormant while the loop has budget"
+        );
+    }
+
+    // Budget exhausted: no loop fires, escape arms exactly once.
+    s.complete_node("a");
+    assert_eq!(route_once(&mut s, "cond", "false"), None);
+    assert_eq!(s.state_of("cond"), NodeState::Done);
+    assert_eq!(
+        s.state_of("escape"),
+        NodeState::Ready,
+        "escape must arm once the loop budget is exhausted"
+    );
+}
+
+#[test]
+fn green_exit_survives_red_iterations() {
+    // The commit-restoration proof: cond is false for 3 iterations (commit must
+    // NOT be skipped), then true -> commit arms, escape is skipped.
+    let w = wf(
+        vec![node("a"), node("cond"), node("escape"), node("commit")],
+        vec![
+            fwd("e1", "a", "cond"),
+            loop_edge("eloop", "cond", "a", "false", 10),
+            fwd_branch("e2", "cond", "escape", "false"),
+            fwd_branch("e3", "cond", "commit", "true"),
+        ],
+    );
+    let mut s = Scheduler::new(&w);
+
+    for expected in 1..=3 {
+        s.complete_node("a");
+        assert_eq!(route_once(&mut s, "cond", "false"), Some(expected));
+        assert_eq!(
+            s.state_of("commit"),
+            NodeState::Pending,
+            "commit must NOT be skipped during red iterations"
+        );
+        assert_eq!(s.state_of("escape"), NodeState::Pending);
+    }
+
+    // cond finally goes true (budget not yet exhausted): no "true" loop edge,
+    // so route resolves terminally -> commit arms, escape skipped.
+    s.complete_node("a");
+    assert_eq!(route_once(&mut s, "cond", "true"), None);
+    assert_eq!(
+        s.state_of("commit"),
+        NodeState::Ready,
+        "green exit must arm after earlier red iterations"
+    );
+    assert_eq!(
+        s.state_of("escape"),
+        NodeState::Skipped,
+        "the false-branch escape is skipped on the green path"
+    );
+}
+
+#[test]
+fn loop_with_single_iteration_budget() {
+    // max 1: first false fires the loop, second false exhausts -> escape.
+    let w = wf(
+        vec![node("a"), node("cond"), node("escape")],
+        vec![
+            fwd("e1", "a", "cond"),
+            loop_edge("eloop", "cond", "a", "false", 1),
+            fwd_branch("e2", "cond", "escape", "false"),
+        ],
+    );
+    let mut s = Scheduler::new(&w);
+    s.complete_node("a");
+    assert_eq!(route_once(&mut s, "cond", "false"), Some(1));
+    assert_eq!(s.state_of("escape"), NodeState::Pending);
+    s.complete_node("a");
+    assert_eq!(route_once(&mut s, "cond", "false"), None);
+    assert_eq!(s.state_of("escape"), NodeState::Ready);
+}
