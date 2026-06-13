@@ -377,3 +377,36 @@ fn loop_with_single_iteration_budget() {
     assert_eq!(route_once(&mut s, "cond", "false"), None);
     assert_eq!(s.state_of("escape"), NodeState::Ready);
 }
+
+#[test]
+fn try_loop_resets_subgraph_and_condition() {
+    // a -> body -> cond, with a Loop edge cond -(false)-> body.
+    let w = wf(
+        vec![node("a"), node("body"), node("cond")],
+        vec![
+            fwd("e1", "a", "body"),
+            fwd("e2", "body", "cond"),
+            loop_edge("L", "cond", "body", "false", 3),
+        ],
+    );
+    let mut s = Scheduler::new(&w);
+    s.start_node("a");
+    s.complete_node("a");
+    s.start_node("body");
+    s.complete_node("body");
+    s.start_node("cond");
+    // Condition resolves false and fires the loop.
+    s.resolve_condition("cond", "false");
+    let fire = s.try_loop("cond", "false").expect("loop should fire");
+    assert_eq!(fire.iteration, 1);
+    // The reset set is the subgraph (body) plus the condition node itself.
+    let mut reset = fire.reset_nodes;
+    reset.sort();
+    assert_eq!(reset, vec!["body".to_string(), "cond".to_string()]);
+    // body has an incoming forward edge (a -> body) so it resets to Pending;
+    // cond likewise (body -> cond) resets to Pending.
+    assert_eq!(s.state_of("body"), NodeState::Pending);
+    assert_eq!(s.state_of("cond"), NodeState::Pending);
+    // The upstream node `a` is untouched.
+    assert_eq!(s.state_of("a"), NodeState::Done);
+}
