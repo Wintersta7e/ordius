@@ -718,7 +718,14 @@ impl Engine {
                                 ("duration_ms".into(), serde_json::json!(duration)),
                             ]),
                         )?;
-                        sched.complete_node(&node.id);
+                        // A condition node owns its own downstream promotion in
+                        // route_condition_outputs, so a loop's escape edge stays
+                        // dormant while the loop iterates. Promoting here (before
+                        // the branch is resolved) would arm the escape on the
+                        // first iteration.
+                        if node.ty != CONDITION_NODE_TYPE_ID {
+                            sched.complete_node(&node.id);
+                        }
                         route_condition_outputs(
                             &mut sched,
                             &mut iterations,
@@ -1362,11 +1369,20 @@ fn route_condition_outputs(
         return;
     }
     let Some(PortValue::String(branch)) = outputs.get("branch") else {
+        // Defensive: a condition with no branch port — complete it generically
+        // so downstream is not stranded (the call site skipped complete_node).
+        sched.complete_node(&node.id);
         return;
     };
     let branch = branch.clone();
-    sched.resolve_condition(&node.id, &branch);
+    // Try the loop FIRST. If it fires we are mid-loop: touch nothing
+    // downstream so the escape/exit and the other branch stay dormant
+    // (try_loop already reset the condition + loop subgraph). Only when no
+    // loop fires — no loop edge for this branch, or the budget is exhausted —
+    // do we resolve the branch terminally (skip non-matching, mark Done, and
+    // promote the matching forward edges, arming the escape/exit).
     let Some(fire) = sched.try_loop(&node.id, &branch) else {
+        sched.resolve_condition(&node.id, &branch);
         return;
     };
     let mut payload: HashMap<String, serde_json::Value> = HashMap::with_capacity(2);
