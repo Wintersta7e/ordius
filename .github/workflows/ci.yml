@@ -74,7 +74,7 @@ jobs:
       - name: Collect coverage (lcov)
         run: cargo llvm-cov --workspace --exclude ordius-desktop --features testing --locked --lcov --output-path lcov.info -- --test-threads=1
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           files: lcov.info
           fail_ci_if_error: false
